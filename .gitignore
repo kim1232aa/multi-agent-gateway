@@ -1,0 +1,7 @@
+node_modules/
+server/node_modules/
+server/dist/
+server/temp/
+kimi-web-src
+web/
+*.log
