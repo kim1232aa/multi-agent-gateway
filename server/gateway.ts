@@ -21,11 +21,13 @@ import { spawnKimiServer, type KimiChild } from './kimi-child.js';
 import { createStaticServer } from './static.js';
 import { CodexProviderAdapter, ClaudeProviderAdapter } from './facade.js';
 import { codexGatewayCommandNames } from './native-commands.js';
+import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsSearch } from './fs-local.js';
 import {
   ProviderError,
   isProviderName,
   type GatewayEvent,
   type Message,
+  type NativeCommand,
   type ProviderAdapter,
   type ProviderName,
   type Session,
@@ -419,6 +421,106 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持恢复归档`, 400);
         await adapter.setArchived(nativeId, false);
         return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId)), requestId);
+      }
+      if (tail === ':undo' && req.method === 'POST') {
+        // 撤销最近 count 轮。codex:thread/rollback(0.147.0 实测历史真消失,
+        // 但官方已标 DEPRECATED)。claude:stream-json 下 /rewind 是 TUI 专用
+        // (二进制注册表 supportsNonInteractive:false),无可用机制,如实 400。
+        if (!adapter.rollback) throw new ProviderError('unsupported', `${sp} 不支持撤销(claude stream-json 无 /rewind 机制)`, 400);
+        const body = (await readBody(req).catch(() => ({}))) as { count?: number };
+        const count = Math.max(1, Math.min(50, Number(body.count ?? 1) || 1));
+        await adapter.rollback(nativeId, count);
+        return ok(res, { undone: true, count }, requestId);
+      }
+      if (tail === ':compact' && req.method === 'POST') {
+        const body = (await readBody(req).catch(() => ({}))) as { instruction?: string };
+        const sid = prefixedId(sp, nativeId);
+        hub.broadcast(sid, frame(sid, hub, 'compaction.started', { trigger: 'manual', ...(body.instruction ? { instruction: body.instruction } : {}) }));
+        if (adapter.compact) {
+          // codex:thread/compact/start,压缩过程走 item 通知,这里立即收尾。
+          await adapter.compact(nativeId);
+          hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
+          return ok(res, { compacted: true }, requestId);
+        }
+        // claude:CLI 在 stream-json 下原生执行 /compact(2.1.226 实测),
+        // 作为真 prompt 发出,输出即压缩结果。
+        hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
+        return ok(res, await submitPrompt(adapter, sp, nativeId, { content: [{ type: 'text', text: `/compact${body.instruction ? ` ${body.instruction}` : ''}` }] }, hub), requestId);
+      }
+      if (tail === ':fork' && req.method === 'POST') {
+        // codex:thread/fork(0.147.0 实测);claude 的 --fork-session 要新 spawn
+        // 流程,未做,如实 400。
+        if (!adapter.fork) throw new ProviderError('unsupported', `${sp} 不支持分叉`, 400);
+        const forked = await adapter.fork(nativeId);
+        // 前端拿到新会话后直接跳转;广播 session.created 让列表刷新。
+        const sid = prefixedId(sp, forked.id);
+        hub.broadcast(sid, frame(sid, hub, 'event.session.created', { session: sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)) }));
+        return ok(res, sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)), requestId);
+      }
+      if (tail === '/warnings' && req.method === 'GET') {
+        // 前端每次打开会话自动拉;本地 provider 无警告机制,回空。
+        return ok(res, { warnings: [] }, requestId);
+      }
+      if (tail === '/children' && req.method === 'GET') {
+        // 前端目前无调用(client 层未接线);如实回空页。
+        return ok(res, { items: [], has_more: false }, requestId);
+      }
+      if (tail === '/children' && req.method === 'POST') {
+        throw new ProviderError('unsupported', `${sp} 不支持子会话(codex 子线程只能 agent 内部 spawn)`, 400);
+      }
+      if (tail === '/skills' && req.method === 'GET') {
+        // codex:skills/list 原生目录;claude:斜杠命令即 skill(2.1.226 起统一),
+        // 从 initialize 目录里挑 kind==='prompt' 的近似(它没有独立 skill 标记)。
+        if (adapter.listSkills) {
+          const skills = await adapter.listSkills(nativeId).catch(() => [] as Array<Record<string, unknown>>);
+          return ok(res, { skills: skills.map((s) => ({ name: s.name, description: s.description ?? '', source: 'codex' })) }, requestId);
+        }
+        const cmds = adapter.listCommands
+          ? await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[])
+          : [];
+        return ok(res, { skills: cmds.filter((c) => c.kind === 'prompt').map((c) => ({ name: c.name, description: c.description, source: 'claude' })) }, requestId);
+      }
+      const skillActivate = /^\/skills\/([^/:]+):activate$/.exec(tail);
+      if (skillActivate && req.method === 'POST') {
+        // 激活 = 把 "/skill名 参数" 作为 prompt 发出:claude CLI 原生执行;
+        // codex 由 facade 在 startTurn 里展开 SKILL.md 正文(实测可用路径)。
+        const body = (await readBody(req).catch(() => ({}))) as { args?: string };
+        const name = decodeURIComponent(skillActivate[1]);
+        const text = `/${name}${body.args ? ` ${body.args}` : ''}`;
+        await submitPrompt(adapter, sp, nativeId, { content: [{ type: 'text', text }] }, hub);
+        return ok(res, { activated: true, skill_name: name }, requestId);
+      }
+      // --- fs:*(文件树/@提及/搜索/git 状态;网关本机实现,cwd 沙箱防穿越) ---
+      if (tail.startsWith('/fs:') || /^\/fs\/.*:download$/.test(tail)) {
+        const session = await getSession(adapter, sp, nativeId);
+        const cwd = session.metadata?.cwd;
+        if (!cwd) throw new ProviderError('invalid_request', '会话没有工作目录', 400);
+        if (tail === '/fs:list' && req.method === 'POST') {
+          const body = (await readBody(req).catch(() => ({}))) as { path?: string; depth?: number; include_git_status?: boolean };
+          return ok(res, await fsList(cwd, body), requestId);
+        }
+        if (tail === '/fs:read' && req.method === 'POST') {
+          const body = (await readBody(req)) as { path: string; offset?: number; length?: number };
+          return ok(res, await fsRead(cwd, body), requestId);
+        }
+        if (tail === '/fs:search' && req.method === 'POST') {
+          const body = (await readBody(req)) as { query: string; limit?: number };
+          return ok(res, await fsSearch(cwd, body), requestId);
+        }
+        if (tail === '/fs:grep' && req.method === 'POST') {
+          const body = (await readBody(req)) as { pattern: string; regex?: boolean; case_sensitive?: boolean };
+          return ok(res, await fsGrep(cwd, body), requestId);
+        }
+        if (tail === '/fs:git_status' && req.method === 'POST') {
+          const body = (await readBody(req).catch(() => ({}))) as { paths?: string[] };
+          return ok(res, await fsGitStatus(cwd, body.paths), requestId);
+        }
+        if (tail === '/fs:diff' && req.method === 'POST') {
+          const body = (await readBody(req)) as { path: string };
+          return ok(res, await fsDiff(cwd, body), requestId);
+        }
+        // fs:open/fs:reveal/fs:open-in/fs download 前端是死代码入口,如实 400。
+        throw new ProviderError('unsupported', `${tail} 未实现(打开/下载在纯 web 端无意义)`, 400);
       }
       if (tail === '/goal' && req.method === 'GET') {
         if (!adapter.getGoal) return ok(res, null, requestId);

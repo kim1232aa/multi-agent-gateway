@@ -308,6 +308,9 @@ export class CodexAdapter {
    * 失败(实测)——跨重启续聊必须先 thread/resume。
    */
   private liveThreads = new Set<string>();
+  /** 线程启动/恢复时显式指定的模型(thread/settings/update 的 model 必填,要用它)。 */
+  private threadModels = new Map<string, string>();
+  private configModelCache: string | null = null;
   private readyPromise: Promise<void> | null = null;
   private closed = false;
 
@@ -786,6 +789,7 @@ export class CodexAdapter {
     });
     const thread = ThreadStartResponseSchema.parse(raw).thread;
     this.liveThreads.add(thread.id);
+    if (options.model) this.threadModels.set(thread.id, options.model);
     return thread;
   }
 
@@ -804,6 +808,7 @@ export class CodexAdapter {
     });
     const thread = ThreadResumeResponseSchema.parse(raw).thread;
     this.liveThreads.add(threadId);
+    if (options.model) this.threadModels.set(threadId, options.model);
     return thread;
   }
 
@@ -996,6 +1001,37 @@ export class CodexAdapter {
     const raw = await this.request('thread/backgroundTerminals/list', { threadId, cursor: null, limit: null });
     const data = (raw as { data?: unknown }).data;
     return Array.isArray(data) ? (data as Array<Record<string, unknown>>) : [];
+  }
+
+  /**
+   * 会话级 plan 模式(thread/settings/update 的 collaborationMode,0.147.0
+   * 实测需 experimentalApi——本网关 initialize 已开)。plan 模式下模型只出
+   * 计划(plan ThreadItem),不直接执行。
+   */
+  /** 线程有效模型:显式设置过的优先,否则读 config/read 的全局默认(缓存)。 */
+  private async effectiveModel(threadId: string): Promise<string> {
+    const explicit = this.threadModels.get(threadId);
+    if (explicit) return explicit;
+    if (!this.configModelCache) {
+      const raw = (await this.request('config/read', {})) as { config?: { model?: unknown } };
+      const m = raw?.config?.model;
+      if (typeof m !== 'string' || !m) throw new Error('config/read 未返回 model');
+      this.configModelCache = m;
+    }
+    return this.configModelCache;
+  }
+
+  async setCollaborationMode(threadId: string, mode: 'plan' | 'default'): Promise<void> {
+    await this.connect();
+    // 0.147.0 实测:必填的是 collaborationMode.settings.model(非空字符串,
+    // null/缺省都报 missing field `model`);给当前有效模型 = 不换模型只切模式。
+    const model = await this.effectiveModel(threadId);
+    await this.withThreadRetry(threadId, () =>
+      this.request('thread/settings/update', {
+        threadId,
+        collaborationMode: { mode, settings: { model, reasoningEffort: null, developerInstructions: null } },
+      }),
+    );
   }
 
   /**

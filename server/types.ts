@@ -323,6 +323,9 @@ export interface ProviderAdapter {
   /** 原生斜杠命令目录(可选)。sessionId 可用于项目级命令发现。 */
   listCommands?(sessionId?: string): Promise<NativeCommand[]>;
 
+  /** 原生 skills 目录(可选;codex skills/list)。claude 的 skill 即斜杠命令,不实现。 */
+  listSkills?(sessionId?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>>;
+
   /** 记录会话级模型选择(内存态;影响后续 startTurn)。 */
   setModel?(sessionId: string, model: string): Promise<void>;
 

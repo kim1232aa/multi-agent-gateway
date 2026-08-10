@@ -300,6 +300,21 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.sessionPermission.get(sessionId);
   }
 
+  // -- plan 模式(collaborationMode,0.147.0 实测需 experimentalApi) --------------
+
+  private readonly sessionPlan = new Map<string, boolean>();
+
+  async setPlanMode(sessionId: string, on: boolean): Promise<void> {
+    // 先落 RPC(失败不记内存态,UI 不会显示假开关)。
+    await this.inner.setCollaborationMode(sessionId, on ? 'plan' : 'default');
+    if (on) this.sessionPlan.set(sessionId, true);
+    else this.sessionPlan.delete(sessionId);
+  }
+
+  getPlanMode(sessionId: string): boolean | undefined {
+    return this.sessionPlan.get(sessionId);
+  }
+
   // -- 会话操作(RPC 直通,全部 0.147.0 实测存在) --------------------------------
 
   async steer(sessionId: string, turnId: string, text: string): Promise<void> {
@@ -431,6 +446,11 @@ export class CodexProviderAdapter implements ProviderAdapter {
       .map((s) => ({ name: s.name as string, description: (s.description as string) ?? '', path: s.path as string }));
     this.skillsCache = { ts: Date.now(), skills };
     return skills;
+  }
+
+  /** 原生 skills 目录(透传 codex skills/list,带 5 分钟缓存)。 */
+  async listSkills(): Promise<Array<{ name: string; description: string; path: string; scope: string; enabled: boolean }>> {
+    return this.inner.listSkills();
   }
 
   /** 完整目录:client 命令 + 网关代执行命令 + skills(0.147.0 实测 93 条)。 */
