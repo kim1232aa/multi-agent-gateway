@@ -1,0 +1,11 @@
+{
+  "version": "0.33.0",
+  "tag": "@moonshot-ai/kimi-code@0.33.0",
+  "commit": "53c832dfdf9566afd59a8b3d54ebd36d3cb03d72",
+  "files": {
+    "index.html": "sha256:eb26b5bf954abe4de3da35009f69befce2528f4a19741314feebe783a174931f",
+    "boot.js": "sha256:da7b21b2f99d1fa0fee85fef6a5871db7b57a168a078c4ad107914881cb44f09",
+    "assets/index-B-HzRssS.js": "sha256:075ab45fd3801b18163671bf107d45be85cde25f9e3d0094494aa4b9c37825bb",
+    "assets/index-C6xpOIeW.css": "sha256:f107ca7600517b364100c6ad1c7d8b89d58d31904f96bd6e2d814dc87eb0e138"
+  }
+}

@@ -30,6 +30,8 @@ export interface KimiProxyOptions {
    * Authorization 头 —— 网关自己的 token 与上游 token 不同,必须换票。
    */
   upstreamToken?: string;
+  /** 网关内部的 provider 分流参数不上游 kap-server。 */
+  stripQueryParams?: string[];
 }
 
 /** RFC 9110 逐跳头 + 代理由 fetch 自行管理的头,转发时剥离。 */
@@ -84,6 +86,7 @@ export function createKimiHttpProxy(options?: KimiProxyOptions) {
     if (!isKimiApiPath(req.url)) return false;
 
     const target = new URL(req.url ?? '/', upstream);
+    for (const name of options?.stripQueryParams ?? []) target.searchParams.delete(name);
 
     const headers = new Headers();
     for (let i = 0; i < req.rawHeaders.length; i += 2) {

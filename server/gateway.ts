@@ -13,9 +13,11 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
+import type { Duplex } from 'node:stream';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { loadWebShell, type WebShell } from './web-assets.js';
 import { createKimiHttpProxy } from './kimi-proxy.js';
 import { spawnKimiServer, type KimiChild } from './kimi-child.js';
 import { createStaticServer } from './static.js';
@@ -54,8 +56,12 @@ export interface GatewayOptions {
    * - 'off':不提供 Kimi 路径(仅剩 Codex/Claude)。
    */
   kimi?: 'spawn' | 'off' | { upstream: string; token?: string };
-  /** kimi-web 构建产物目录(SPA 静态托管);缺省不托管,仅 API。 */
+  /** kimi-web 构建产物目录(SPA 静态托管);默认仓库 web-dist。 */
   staticDir?: string;
+  /** 注入层目录;默认仓库 web-extension。 */
+  extensionDir?: string;
+  /** 官方资产 manifest;默认仓库 web-origin-manifest.json。 */
+  manifestPath?: string;
 }
 
 /** 已解析的 Kimi 上游;token 必存在(spawn 模式一定能解析到)。 */
@@ -218,7 +224,11 @@ class SessionHub {
 // 主服务
 // ---------------------------------------------------------------------------
 
-export async function startGateway(options: GatewayOptions = {}): Promise<{ url: string; close: () => Promise<void> }> {
+export async function startGateway(options: GatewayOptions = {}): Promise<{
+  url: string;
+  close: () => Promise<void>;
+  web: { injectionEnabled: boolean; reason: string } | null;
+}> {
   const port = options.port ?? 58629;
   const host = options.host ?? '127.0.0.1';
   const token = options.token ?? randomBytes(24).toString('base64url');
@@ -240,10 +250,23 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
   }
 
   // Kimi 路径的 HTTP 代理:命中 Kimi 专属请求时换票转发到 kap-server。
-  const kimiHttp = kimi ? createKimiHttpProxy({ upstream: kimi.url, upstreamToken: kimi.token }) : null;
+  // provider 是网关内部的分流参数,上游不认识,转发前删除。
+  const kimiHttp = kimi
+    ? createKimiHttpProxy({ upstream: kimi.url, upstreamToken: kimi.token, stripQueryParams: ['provider', 'token'] })
+    : null;
 
-  // SPA 静态托管(非 API 路径)。
-  const serveStatic = options.staticDir ? createStaticServer(options.staticDir) : null;
+  // SPA 静态托管:校验官方 0.33 资产后只在 index 响应内存中注入扩展。
+  const staticDir = options.staticDir;
+  let webShell: WebShell | null = null;
+  if (staticDir) {
+    const repoRoot = path.resolve(staticDir, '..');
+    webShell = await loadWebShell({
+      root: staticDir,
+      extensionDir: options.extensionDir ?? path.join(repoRoot, 'web-extension'),
+      manifestPath: options.manifestPath ?? path.join(repoRoot, 'web-origin-manifest.json'),
+    });
+  }
+  const serveStatic = staticDir ? createStaticServer(staticDir, webShell ?? undefined) : null;
 
   // 直接向上游发 REST(聚合列表 / 建 Kimi 会话时用)。
   const kimiFetch = async (path: string, init?: RequestInit): Promise<unknown> => {
@@ -327,7 +350,41 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       }, requestId);
     }
     if (sub === '/auth') {
-      return ok(res, { ready: true, providers_count: 3, default_model: '', managed_provider: false }, requestId);
+      if (provider && provider !== 'kimi') {
+        const models = adapters[provider].listModels ? await adapters[provider].listModels().catch(() => []) : [];
+        const defaultModel = models[0]?.model ?? null;
+        return ok(res, {
+          ready: defaultModel !== null,
+          providers_count: 1,
+          default_model: defaultModel,
+          managed_provider: null,
+        }, requestId);
+      }
+      return ok(res, { ready: true, providers_count: 1, default_model: null, managed_provider: null }, requestId);
+    }
+
+    // 非 Kimi provider 复用官方 0.33 配置 UI，但配置只投影到当前 provider，
+    // 不把 Claude/Codex 模型写进 Kimi 的 config.toml。
+    if (provider && provider !== 'kimi' && sub === '/config' && (req.method === 'GET' || req.method === 'POST')) {
+      const patch = req.method === 'POST'
+        ? ((await readBody(req)) as Record<string, unknown>)
+        : {};
+      return ok(res, await providerConfigView(provider, adapters[provider], kimiFetch, patch), requestId);
+    }
+    if (provider && provider !== 'kimi' && sub === '/providers' && req.method === 'GET') {
+      return ok(res, { items: [await providerDto(provider, adapters[provider])] }, requestId);
+    }
+    if (provider && provider !== 'kimi' && isProviderRefreshRoute(sub) && req.method === 'POST') {
+      try {
+        await adapters[provider].listModels?.();
+        return ok(res, { changed: [], unchanged: [provider], failed: [] }, requestId);
+      } catch (error) {
+        return ok(res, {
+          changed: [],
+          unchanged: [],
+          failed: [{ provider, reason: error instanceof Error ? error.message : String(error) }],
+        }, requestId);
+      }
     }
     if (sub === '/models' && req.method === 'GET') {
       // claude/codex → 各自 adapter 的原生目录;kimi(或未指定)→ 代理上游,
@@ -382,6 +439,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
     }
     if (sub === '/fs:home' && req.method === 'GET') {
       return ok(res, { home: os.homedir(), recent_roots: [] }, requestId);
+    }
+
+    const workspaceSkills = /^\/workspaces\/([^/:]+)\/skills$/.exec(sub);
+    if (workspaceSkills && provider && provider !== 'kimi' && req.method === 'GET') {
+      return ok(res, { skills: await adapterSkills(adapters[provider], provider) }, requestId);
     }
 
     // --- workspaces ---
@@ -489,16 +551,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         throw new ProviderError('unsupported', `${sp} 不支持子会话(codex 子线程只能 agent 内部 spawn)`, 400);
       }
       if (tail === '/skills' && req.method === 'GET') {
-        // codex:skills/list 原生目录;claude:斜杠命令即 skill(2.1.226 起统一),
-        // 从 initialize 目录里挑 kind==='prompt' 的近似(它没有独立 skill 标记)。
-        if (adapter.listSkills) {
-          const skills = await adapter.listSkills(nativeId).catch(() => [] as Array<Record<string, unknown>>);
-          return ok(res, { skills: skills.map((s) => ({ name: s.name, description: s.description ?? '', source: 'codex' })) }, requestId);
-        }
-        const cmds = adapter.listCommands
-          ? await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[])
-          : [];
-        return ok(res, { skills: cmds.filter((c) => c.kind === 'prompt').map((c) => ({ name: c.name, description: c.description, source: 'claude' })) }, requestId);
+        return ok(res, { skills: await adapterSkills(adapter, sp, nativeId) }, requestId);
       }
       const skillActivate = /^\/skills\/([^/:]+):activate$/.exec(tail);
       if (skillActivate && req.method === 'POST') {
@@ -629,6 +682,15 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         const items = adapter.listCommands ? await adapter.listCommands(nativeId) : [];
         return ok(res, { items }, requestId);
       }
+      if (tail === '/messages' && req.method === 'GET') {
+        return ok(res, await listAdapterMessages(adapter, sp, nativeId, url), requestId);
+      }
+      if (tail === '/transcript/plan' && req.method === 'GET') {
+        return ok(res, {
+          agent_id: url.searchParams.get('agent_id') ?? 'main',
+          plans: [],
+        }, requestId);
+      }
       if (tail === '/snapshot' && req.method === 'GET') {
         return ok(res, await snapshot(adapter, sp, nativeId, hub), requestId);
       }
@@ -713,6 +775,15 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         hub.broadcast(sid, frame(sid, hub, 'event.question.dismissed', {
           question_id: qid, dismissed_at: new Date().toISOString(),
         }));
+        const activeAfterDismiss = hub.busy.get(sid);
+        const pendingAfterDismiss = (activeAfterDismiss?.pendingApprovals.size ?? 0) > 0
+          ? 'approval'
+          : (activeAfterDismiss?.pendingQuestions.size ?? 0) > 0 ? 'question' : 'none';
+        hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', {
+          busy: activeAfterDismiss !== undefined,
+          main_turn_active: activeAfterDismiss !== undefined,
+          pending_interaction: pendingAfterDismiss,
+        }));
         return ok(res, { dismissed: true, dismissed_at: new Date().toISOString() }, requestId);
       }
       if (tail === '/prompts:steer' && req.method === 'POST') {
@@ -775,7 +846,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
   }
 
   // WebSocket:单连接,按订阅的会话 id 前缀分流(Kimi → relay 上游,Codex/Claude → 本地 hub)。
-  attachGatewayWebSocket(server, token, hub, kimi);
+  const gatewaySockets = new Set<Duplex>();
+  attachGatewayWebSocket(server, token, hub, kimi, gatewaySockets);
 
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once('error', rejectListen);
@@ -797,8 +869,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
   const url = `http://${host}:${actualPort}`;
   return {
     url,
+    web: webShell
+      ? { injectionEnabled: webShell.injectionEnabled, reason: webShell.reason }
+      : null,
     close: () =>
       new Promise((resolveClose) => {
+        for (const socket of gatewaySockets) socket.destroy();
         server.close(() => {
           void (kimi?.child?.close() ?? Promise.resolve()).then(() => resolveClose());
         });
@@ -829,21 +905,44 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
   if (!url.pathname.startsWith(API)) return false;
   if (url.pathname === `${API}/ws`) return false; // WS 一律由网关终止,按订阅分流
   const provider = url.searchParams.get('provider');
-  // 显式 provider=kimi → 整个请求透传上游(列表/工作区也直接取上游视图)。
-  // 例外:POST /sessions 必须由网关 createSession 处理 —— daemon 有怪癖,
-  // create 不落地 agent_config.model,网关要在创建后补 /profile 设模型。
+  // 显式 Kimi 视图全部透明代理。只有创建会话需要网关补 profile/model。
   if (provider === 'kimi') {
     return !(url.pathname === `${API}/sessions` && req.method === 'POST');
   }
   if (provider && provider !== 'kimi') return false;
+
+  // 官方 Kimi 新建会话也经过网关，以便补齐 daemon 不会落地的模型配置；
+  // GET /sessions 仍保持原版上游分页语义。
+  if (!provider && url.pathname === `${API}/sessions` && req.method === 'POST') return false;
+
   const sessMatch = /^\/api\/v1\/sessions\/([^/:]+)/.exec(url.pathname);
   if (sessMatch) {
     const id = decodeURIComponent(sessMatch[1]);
-    // 只有带 codex_/claude_ 前缀的才不代理给 Kimi。
     return !id.startsWith('codex_') && !id.startsWith('claude_');
   }
-  // 非会话路由(meta/auth/workspaces/sessions 列表)由本网关处理(聚合三 provider 视图)。
-  return false;
+
+  // 官方客户端的文件预览 URL 不带 provider。扩展会给新请求补上 provider；
+  // 对遗留的本地上传 id 仍留在网关，其余文件请求交给 Kimi 保持原生语义。
+  if (url.pathname.startsWith(`${API}/files/`)) {
+    let id = '';
+    try {
+      id = decodeURIComponent(url.pathname.slice(`${API}/files/`.length));
+    } catch {
+      return true;
+    }
+    return !uploads.has(id);
+  }
+
+  // 没有 provider 参数时就是纯官方 Kimi Web 语义。只保留网关自身必须终止
+  // 的基础路由，其余原生/未来路由默认透明代理，避免升级后被 unknown route
+  // 打断。扩展模式的列表/模型/config/files 请求都会显式附 provider。
+  const gatewayOwned = new Set([
+    `${API}/healthz`,
+    `${API}/meta`,
+    `${API}/fs:browse`,
+    `${API}/fs:home`,
+  ]);
+  return !gatewayOwned.has(url.pathname);
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +950,92 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
 // ---------------------------------------------------------------------------
 
 type KimiFetch = (path: string, init?: RequestInit) => Promise<unknown>;
+
+function isProviderRefreshRoute(sub: string): boolean {
+  return sub === '/providers:refresh' || sub === '/providers:refresh_oauth' || /^\/providers\/[^/:]+:refresh$/.test(sub);
+}
+
+async function providerDto(provider: Exclude<ProviderName, 'kimi'>, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
+  const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
+  return {
+    id: provider,
+    type: provider,
+    default_model: models[0]?.model ?? '',
+    has_api_key: true,
+    status: 'connected',
+    models: models.map((model) => model.model),
+  };
+}
+
+async function providerConfigView(
+  provider: Exclude<ProviderName, 'kimi'>,
+  adapter: ProviderAdapter,
+  kimiFetch: KimiFetch,
+  patch: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const base = (await kimiFetch('/config').catch(() => ({ providers: {} }))) as Record<string, unknown>;
+  const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
+  const requestedModel = typeof patch.default_model === 'string' ? patch.default_model : undefined;
+  const defaultModel = requestedModel ?? models[0]?.model ?? '';
+  const baseProviders = base.providers && typeof base.providers === 'object'
+    ? (base.providers as Record<string, unknown>)
+    : {};
+  return {
+    ...base,
+    ...patch,
+    providers: {
+      ...baseProviders,
+      [provider]: {
+        type: provider,
+        default_model: defaultModel,
+        has_api_key: true,
+      },
+    },
+    default_provider: provider,
+    default_model: defaultModel,
+  };
+}
+
+function skillDto(command: NativeCommand, provider: Exclude<ProviderName, 'kimi'>): Record<string, unknown> {
+  return {
+    name: command.name,
+    description: command.description,
+    path: '',
+    source: provider,
+    type: 'prompt',
+    disable_model_invocation: false,
+  };
+}
+
+async function adapterSkills(
+  adapter: ProviderAdapter,
+  provider: Exclude<ProviderName, 'kimi'>,
+  sessionId?: string,
+): Promise<Record<string, unknown>[]> {
+  const byName = new Map<string, Record<string, unknown>>();
+  if (adapter.listSkills) {
+    const skills = await adapter.listSkills(sessionId).catch(() => []);
+    for (const skill of skills) {
+      if (!skill || typeof skill.name !== 'string' || skill.enabled === false) continue;
+      byName.set(skill.name, {
+        name: skill.name,
+        description: skill.description ?? '',
+        path: skill.path ?? '',
+        source: provider,
+        type: 'prompt',
+        disable_model_invocation: false,
+      });
+    }
+  }
+  if (adapter.listCommands) {
+    const commands = await adapter.listCommands(sessionId).catch(() => [] as NativeCommand[]);
+    for (const command of commands) {
+      if (command.kind !== 'prompt' || byName.has(command.name)) continue;
+      byName.set(command.name, skillDto(command, provider));
+    }
+  }
+  return [...byName.values()];
+}
 
 function workspaceDto(root: string, name?: string): Record<string, unknown> {
   const slug = root.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
@@ -1057,10 +1242,23 @@ async function createSession(
   // 新建会话时前端已让用户选了模型/thinking(composer 的 pick 随 create 一起
   // 来);不应用的话首轮 turn 会跑在默认模型上,UI 却显示用户的选择(审查发现)。
   const adapter = adapters[target];
-  const createCfg = (b as { agent_config?: { model?: string; thinking?: string } }).agent_config;
+  const createCfg = (b as {
+    agent_config?: {
+      model?: string;
+      thinking?: string;
+      permission_mode?: string;
+      plan_mode?: boolean;
+    };
+  }).agent_config;
   if (createCfg?.model && adapter.setModel) await adapter.setModel(session.id, createCfg.model);
   if (typeof createCfg?.thinking === 'string' && adapter.setThinking) {
     await adapter.setThinking(session.id, createCfg.thinking);
+  }
+  if (typeof createCfg?.permission_mode === 'string' && adapter.setPermission) {
+    await adapter.setPermission(session.id, createCfg.permission_mode);
+  }
+  if (typeof createCfg?.plan_mode === 'boolean' && adapter.setPlanMode) {
+    await adapter.setPlanMode(session.id, createCfg.plan_mode);
   }
   return sessionDto(session, adapter.getModel?.(session.id), adapter.getUsage?.(session.id));
 }
@@ -1136,6 +1334,34 @@ function messageDto(m: Message, sid: string): Record<string, unknown> {
     created_at: m.created_at,
     ...(m.metadata ? { metadata: m.metadata } : {}),
   };
+}
+
+async function listAdapterMessages(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  url: URL,
+): Promise<Record<string, unknown>> {
+  let messages = [...await adapter.getHistory(nativeId).catch(() => [] as Message[])].reverse();
+  const beforeId = url.searchParams.get('before_id');
+  const afterId = url.searchParams.get('after_id');
+  const cursor = beforeId ?? afterId;
+  const cursorIndex = cursor ? messages.findIndex((message) => message.id === cursor) : -1;
+  if (cursorIndex >= 0) {
+    messages = beforeId ? messages.slice(cursorIndex + 1) : messages.slice(0, cursorIndex);
+  }
+
+  const requestedSize = Number(url.searchParams.get('page_size') ?? 50);
+  const pageSize = Number.isFinite(requestedSize)
+    ? Math.min(100, Math.max(1, Math.trunc(requestedSize)))
+    : 50;
+  const hasMore = messages.length > pageSize;
+  let page = messages.slice(0, pageSize);
+  const role = url.searchParams.get('role');
+  if (role) page = page.filter((message) => message.role === role);
+
+  const sid = prefixedId(provider, nativeId);
+  return { items: page.map((message) => messageDto(message, sid)), has_more: hasMore };
 }
 
 function listPrompts(sid: string, hub: SessionHub): Record<string, unknown> {
@@ -1762,6 +1988,7 @@ function attachGatewayWebSocket(
   token: string,
   hub: SessionHub,
   kimi: KimiUpstream | null,
+  gatewaySockets: Set<Duplex>,
 ): void {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -1785,6 +2012,7 @@ function attachGatewayWebSocket(
     ];
     if (proto) headers.push(`Sec-WebSocket-Protocol: ${proto}`);
     socket.write(headers.concat('\r\n').join('\r\n'));
+    gatewaySockets.add(socket);
 
     const sendObj = (obj: Record<string, unknown>): void => {
       if (!socket.destroyed) wsSendText(socket, JSON.stringify(obj));
@@ -1927,6 +2155,7 @@ function attachGatewayWebSocket(
       }
     });
     const cleanup = (): void => {
+      gatewaySockets.delete(socket);
       for (const off of localOffs.values()) off();
       localOffs.clear();
       upstream?.close();

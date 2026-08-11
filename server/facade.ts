@@ -8,7 +8,7 @@
  * 只在这里做协议映射,不改两个 adapter 的内部实现(它们已各自实测通过)。
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { CodexAdapter, type CodexEvent } from './codex-adapter.js';
 import { ClaudeAdapter, type ClaudeAdapterEvent } from './claude-adapter.js';
@@ -744,8 +744,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
     const history = await this.inner.getHistory(sessionId);
-    return history.map((m) => ({
-      id: randomUUID(),
+    return history.map((m, index) => ({
+      id: `msg_${createHash('sha256')
+        .update(JSON.stringify([sessionId, index, m.role, m.timestamp ?? '', m.text]))
+        .digest('hex')
+        .slice(0, 24)}`,
       session_id: sessionId,
       role: m.role,
       content: [{ type: 'text', text: m.text }],

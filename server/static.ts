@@ -6,10 +6,11 @@
  * - 非文件路径(前端路由)回退到 index.html。
  */
 
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { extname, join, normalize } from 'node:path';
+import { extname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { WebShell } from './web-assets.js';
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -24,45 +25,99 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
   '.wasm': 'application/wasm',
+  '.riv': 'application/octet-stream',
   '.txt': 'text/plain; charset=utf-8',
   '.webmanifest': 'application/manifest+json',
 };
 
-export function createStaticServer(root: string): (req: IncomingMessage, res: ServerResponse) => boolean {
+const STATIC_EXTENSIONS = new Set(Object.keys(MIME).filter((ext) => ext !== '.html'));
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+};
+
+export function createStaticServer(root: string, shell?: WebShell): (req: IncomingMessage, res: ServerResponse) => boolean {
   const indexHtml = join(root, 'index.html');
+  const rootNorm = normalize(root);
+  const rootReal = realpathSync(rootNorm);
+  const isInsideRoot = (candidate: string): boolean => {
+    let candidateReal: string;
+    try {
+      candidateReal = realpathSync(candidate);
+    } catch {
+      return false;
+    }
+    const rel = relative(rootReal, candidateReal);
+    return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
+  };
   return (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') return false;
     const url = new URL(req.url ?? '/', 'http://localhost');
-    let pathname = decodeURIComponent(url.pathname);
+    let pathname: string;
+    try {
+      pathname = decodeURIComponent(url.pathname);
+    } catch {
+      res.writeHead(400, SECURITY_HEADERS).end();
+      return true;
+    }
+
+    const extension = shell?.extensionAsset(pathname);
+    if (extension) {
+      const headers = { ...SECURITY_HEADERS, 'content-type': extension.contentType, 'cache-control': 'no-cache' };
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { ...headers, 'content-length': String(extension.body.byteLength) }).end();
+      } else {
+        res.writeHead(200, headers).end(extension.body);
+      }
+      return true;
+    }
+
     if (pathname === '/') pathname = '/index.html';
 
     // 防目录穿越:规范化后必须仍落在 root 内。注意 startsWith 要带路径分隔
     // 符边界,否则 /srv/dist-private 会通过 /srv/dist 的前缀检查(实测可读出
-    // root 外的兄弟目录)。
-    const rootNorm = normalize(root);
-    const filePath = normalize(join(root, pathname));
-    if (filePath !== rootNorm && !filePath.startsWith(rootNorm + '/')) {
-      res.writeHead(403).end();
+    // root 外的兄弟目录)。realpath 额外拦住 web-dist 内指向外部的符号链接。
+    const filePath = normalize(join(rootNorm, pathname));
+    if (filePath !== rootNorm && !filePath.startsWith(rootNorm + sep)) {
+      res.writeHead(403, SECURITY_HEADERS).end();
+      return true;
+    }
+    const fileExists = existsSync(filePath);
+    if (fileExists && !isInsideRoot(filePath)) {
+      res.writeHead(403, SECURITY_HEADERS).end();
       return true;
     }
 
-    const isFile = existsSync(filePath) && statSync(filePath).isFile();
+    const isFile = fileExists && statSync(filePath).isFile();
+    const requestedExt = extname(pathname).toLowerCase();
+    if (!isFile && (pathname.startsWith('/assets/') || STATIC_EXTENSIONS.has(requestedExt))) {
+      res.writeHead(404, { ...SECURITY_HEADERS, 'content-type': 'text/plain; charset=utf-8' }).end('not found');
+      return true;
+    }
     const target = isFile ? filePath : indexHtml; // SPA fallback
     if (!existsSync(target)) return false;
 
     const ext = extname(target).toLowerCase();
+    const body = target === indexHtml && shell ? shell.indexHtml : null;
+    const size = body?.byteLength ?? statSync(target).size;
     const headers: Record<string, string> = {
+      ...SECURITY_HEADERS,
       'content-type': MIME[ext] ?? 'application/octet-stream',
       // 哈希资产长缓存;index.html 与未命中路径不缓存。
       'cache-control': target.includes('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
     };
     if (req.method === 'HEAD') {
-      res.writeHead(200, { ...headers, 'content-length': String(statSync(target).size) }).end();
+      res.writeHead(200, { ...headers, 'content-length': String(size) }).end();
       return true;
     }
-    res.writeHead(200, headers);
-    createReadStream(target).pipe(res);
+    if (body) {
+      res.writeHead(200, headers).end(body);
+    } else {
+      res.writeHead(200, headers);
+      createReadStream(target).pipe(res);
+    }
     return true;
   };
 }

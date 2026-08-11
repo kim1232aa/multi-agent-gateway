@@ -1,0 +1,13 @@
+.multi-agent-provider-pill {
+  flex: none;
+}
+
+.multi-agent-provider-menu .md-name {
+  flex: 1;
+}
+
+@media (max-width: 640px) {
+  .multi-agent-provider-pill .mp-name {
+    max-width: 64px;
+  }
+}

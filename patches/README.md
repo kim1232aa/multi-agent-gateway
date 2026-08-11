@@ -1,34 +1,19 @@
-# 前端补丁:kimi-web-gateway.patch
+# Kimi Web 基线说明
 
-multi-agent-gateway 的前端是 Kimi Code Web 0.33.0(仓库 `MoonshotAI/kimi-code`,
-基线 commit `c2d7beb`)的 `apps/kimi-web` 加上本补丁。补丁包含全部网关适配:
-provider 分段选择器、codex/claude 会话接入、原生斜杠命令目录、Plan 门控放开等
-(21 个修改文件 + 2 个新文件,约 600 行)。
+`web-dist/` 现在严格保存官方 `@moonshot-ai/kimi-code@0.33.0` 的
+`apps/kimi-code/dist-web`，来源 commit 为
+`53c832dfdf9566afd59a8b3d54ebd36d3cb03d72`。关键文件的 SHA-256 记录在
+`web-origin-manifest.json`。
 
-`web-dist/` 是构建产物(已入库);本补丁是**源码的唯一出处**——`/tmp` 下的工作
-副本随时会被系统清理,重建前端必须从这里出发。
+此前提交的 `c2d7beb` 实际对应 0.28.1 时代的公开源码，不是 0.33.0 的 Web
+源码；旧的 `kimi-web-gateway.patch` 已退役，不能再作为构建来源。官方 0.33
+Web 源码已迁移到内部仓库，公开仓库只提供预编译 `dist-web`。
 
-## 重建步骤
+## 正确的扩展方式
 
-```bash
-git clone https://github.com/MoonshotAI/kimi-code.git /tmp/kimi-code
-cd /tmp/kimi-code
-git checkout c2d7beb
-git apply /path/to/multi-agent-gateway/patches/kimi-web-gateway.patch
-cd apps/kimi-web
-npm install
-npm run build
-rsync -a --delete dist/ /path/to/multi-agent-gateway/web-dist/
-```
+不要修改或重编 `web-dist/`。网关启动时校验 manifest，向官方 `index.html` 的
+内存响应注入 `web-extension/boot.js` 和 `web-extension/style.css`；官方 JS、CSS
+和其他静态资源保持原样。校验失败时自动回退为纯官方 Kimi Web。
 
-## 改前端时
-
-1. 在打过补丁的 `/tmp/kimi-code` 里改 `apps/kimi-web`。
-2. `npm run build` + rsync 到 `web-dist/`。
-3. 重新生成补丁并一起提交(新文件先 `git add -N` 再 diff):
-   ```bash
-   cd /tmp/kimi-code
-   git add -N apps/kimi-web/src/composables/useDraftAgent.ts apps/kimi-web/src/lib/sessionProvider.ts
-   git diff -- apps/kimi-web > /path/to/multi-agent-gateway/patches/kimi-web-gateway.patch
-   git reset -q
-   ```
+如需升级版本，应先确认官方 tag 和 commit，重新生成完整 `web-dist/` 与
+`web-origin-manifest.json`，再同步检查注入点和浏览器回归。

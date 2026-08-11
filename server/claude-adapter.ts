@@ -507,6 +507,10 @@ export class ClaudeAdapter {
   // -- internals --------------------------------------------------------------
 
   private findSessionFile(sessionId: string): string | null {
+    // Claude transcript ids are UUIDs; reject separators before constructing a path.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
+      return null;
+    }
     let projectDirs: fs.Dirent[];
     try {
       projectDirs = fs.readdirSync(this.projectsDir, { withFileTypes: true });

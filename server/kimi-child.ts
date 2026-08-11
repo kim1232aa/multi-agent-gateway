@@ -80,7 +80,7 @@ function trySpawn(bin: string, port: number, extraEnv?: Record<string, string>):
               child.kill('SIGTERM');
               // 兜底:3 秒不退就 SIGKILL。
               setTimeout(() => {
-                if (child.exitCode === null && !child.killed) child.kill('SIGKILL');
+                if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
                 done();
               }, 3_000).unref();
             }),
