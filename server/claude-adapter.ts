@@ -119,6 +119,11 @@ export interface StartTurnOptions {
    * acceptEdits/auto/bypassPermissions/manual/dontAsk/plan)。
    */
   permissionMode?: string;
+  /**
+   * 完整 user content 块(图片/PDF 附件时优先于 prompt 单文本块;
+   * 2.1.226 复核:stream-json 接受 image/document base64 block)。
+   */
+  contentBlocks?: Array<Record<string, unknown>>;
   onEvent: (event: ClaudeAdapterEvent) => void;
 }
 
@@ -374,10 +379,11 @@ export class ClaudeAdapter {
     });
 
     // Send the single user message for this turn, then close stdin so the CLI
-    // finishes the turn and exits.
+    // finishes the turn and exits. contentBlocks carries image/document
+    // attachments (2.1.226 verified); otherwise a single text block.
     const userLine = JSON.stringify({
       type: "user",
-      message: { role: "user", content: [{ type: "text", text: prompt }] },
+      message: { role: "user", content: opts.contentBlocks ?? [{ type: "text", text: prompt }] },
     });
     child.stdin!.write(userLine + "\n");
     child.stdin!.end();

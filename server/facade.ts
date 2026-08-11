@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import * as fsp from 'node:fs/promises';
 import { CodexAdapter, type CodexEvent } from './codex-adapter.js';
 import { ClaudeAdapter, type ClaudeAdapterEvent } from './claude-adapter.js';
 import { expandCodexSkill, listClaudeCommands, listCodexCommands } from './native-commands.js';
@@ -29,6 +30,7 @@ import {
   type SessionPage,
   type SessionUsage,
   type StartTurnInput,
+  type TurnAttachment,
   type TurnHandle,
 } from './types.js';
 
@@ -43,6 +45,36 @@ function workspaceIdFromCwd(cwd: string, provider: string): string {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * kap-server 的附件物化话术:目标 provider 没有对应输入项时(文件/视频),
+ * 以路径文本交给模型,让它自己用 Read 工具打开。
+ */
+function fileAttachText(a: TurnAttachment): string {
+  const mime = a.mediaType ?? 'application/octet-stream';
+  const size = a.size ?? 0;
+  const name = a.name ?? a.path?.split('/').pop() ?? 'file';
+  return `Attached file "${name}" (${mime}, ${size} bytes): ${a.path} — open it with the Read tool`;
+}
+
+/**
+ * 把网关附件翻译成 codex turn/start 的 input items:
+ * localImage/image 是原生项;filePathText 物化成文本项。prompt 文本殿后。
+ */
+function codexInputItems(prompt: string, attachments: TurnAttachment[]): Array<Record<string, unknown>> {
+  const items: Array<Record<string, unknown>> = [];
+  for (const a of attachments) {
+    if (a.kind === 'localImage' && a.path) {
+      items.push({ type: 'localImage', path: a.path });
+    } else if (a.kind === 'imageDataUrl' && a.dataUrl) {
+      items.push({ type: 'image', url: a.dataUrl });
+    } else if (a.kind === 'filePathText' && a.path) {
+      items.push({ type: 'text', text: fileAttachText(a), text_elements: [] });
+    }
+  }
+  if (prompt.trim()) items.push({ type: 'text', text: prompt, text_elements: [] });
+  return items;
 }
 
 /** 把一个事件 push 队列包装成 AsyncIterable,终态后结束。 */
@@ -200,8 +232,16 @@ export class CodexProviderAdapter implements ProviderAdapter {
     // app-server 的 thread/start 不带标题参数;用户指定的标题存 renames,
     // toSession 优先取它(否则 create 响应和列表都退回 preview/截断 id)。
     if (input.title) this.renames.set(thread.id as string, input.title);
+    // 空 thread 不落盘、不进 thread/list(实测 0.147.0):cwd 记内存,网关
+    // getSession 兜底才不会造 HOME 假目录(F9)。
+    this.threadCwd.set(thread.id as string, cwd);
     this.invalidateListCache(); // 新线程,列表缓存失效
     return this.toSession(thread, cwd);
+  }
+
+  /** 网关 getSession 兜底用:新建未落盘的会话也能拿到真实 cwd。 */
+  getCwd(sessionId: string): string | undefined {
+    return this.threadCwd.get(sessionId);
   }
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
@@ -245,7 +285,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
     // 'off' = 用户显式关掉 thinking 控制;codex 没有"关闭推理"的概念,
     // 诚实做法是回落到服务端默认 effort(不传),而不是造假一个档位。
     const thinking = this.sessionThinking.get(input.sessionId);
-    const handle = await this.inner.startTurn(input.sessionId, prompt, {
+    const attachments = input.attachments ?? [];
+    const turnInput: string | Array<Record<string, unknown>> =
+      attachments.length > 0 ? codexInputItems(prompt, attachments) : prompt;
+    const handle = await this.inner.startTurn(input.sessionId, turnInput, {
       model: this.sessionModels.get(input.sessionId),
       effort: thinking && thinking !== 'off' ? thinking : undefined,
       approvalPolicy: codexApprovalPolicy(this.sessionPermission.get(input.sessionId)),
@@ -273,6 +316,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   private readonly sessionThinking = new Map<string, string>();
   private readonly renames = new Map<string, string>();
+  private readonly threadCwd = new Map<string, string>();
   private readonly sessionPermission = new Map<string, string>();
   private readonly sessionUsage = new Map<string, SessionUsage>();
 
@@ -469,7 +513,14 @@ export class CodexProviderAdapter implements ProviderAdapter {
       approve_always: 'acceptForSession',
       reject: 'decline',
     };
-    this.inner.resolveApproval(approvalId, map[decision]);
+    // 重复点击/重试时 codex 侧 parked 请求已不存在:幂等成功而非 500(审查发现);
+    // 此前不 await,同步 throw 会变成未捕获异常。
+    try {
+      this.inner.resolveApproval(approvalId, map[decision]);
+    } catch (err) {
+      if (err instanceof Error && /no pending server request/.test(err.message)) return;
+      throw err;
+    }
   }
 
   async resolveQuestion(_sessionId: string, questionId: string, answer: string | Record<string, string[]>): Promise<void> {
@@ -485,6 +536,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private toSession(thread: Record<string, unknown>, cwdOverride?: string): Session {
     const cwd = cwdOverride ?? (thread.cwd as string) ?? process.cwd();
     const id = thread.id as string;
+    // 列表扫到的历史会话也回填 cwd,充实 getCwd 兜底。
+    if (thread.cwd || cwdOverride) this.threadCwd.set(id, cwd);
     return {
       id,
       workspace_id: workspaceIdFromCwd(cwd, 'codex'),
@@ -705,7 +758,27 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const sessionId = input.sessionId;
     // claude CLI 在 -p stream-json 模式下自己执行 "/name args"(2.1.226
     // 实测 /compact /mcp 均产生真实输出),网关不展开、不拦截,原样直通。
-    const prompt = textOfInput(input.input);
+    let prompt = textOfInput(input.input);
+    // 附件翻译(2.1.226 复核:stream-json user message 支持 image/document
+    // base64 block):图片/PDF 内联成原生块;读盘失败或其他类型物化成路径
+    // 文本(kap-server 话术),让模型自己用 Read 打开。
+    const blocks: Array<Record<string, unknown>> = [];
+    const notes: string[] = [];
+    for (const a of input.attachments ?? []) {
+      if (a.kind === 'localImage' && a.path) {
+        const data = await fsp.readFile(a.path).catch(() => null);
+        if (data) blocks.push({ type: 'image', source: { type: 'base64', media_type: a.mediaType ?? 'image/png', data: data.toString('base64') } });
+        else notes.push(fileAttachText(a));
+      } else if (a.kind === 'imageDataUrl' && a.dataUrl) {
+        const m = /^data:([^;]+);base64,([\s\S]*)$/.exec(a.dataUrl);
+        if (m) blocks.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } });
+      } else if (a.kind === 'filePathText' && a.path) {
+        const data = a.mediaType === 'application/pdf' ? await fsp.readFile(a.path).catch(() => null) : null;
+        if (data) blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: data.toString('base64') } });
+        else notes.push(fileAttachText(a));
+      }
+    }
+    if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
     // isNew 是一次性的:首轮用 --session-id 建档,之后必须 --resume,
     // 否则 CLI 以 "session id 已存在" 直接退出(实测,turn 静默空转)。
     const isNew = this.created.delete(sessionId);
@@ -858,8 +931,10 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     };
 
     // startTurn 在 result 事件后 resolve;不 await,后台跑。
+    const contentBlocks =
+      blocks.length > 0 ? [...blocks, ...(prompt.trim() ? [{ type: 'text', text: prompt }] : [])] : undefined;
     void this.inner
-      .startTurn({ sessionId, prompt, cwd, isNew, model, effort, permissionMode, onEvent: emit })
+      .startTurn({ sessionId, prompt, cwd, isNew, model, effort, permissionMode, contentBlocks, onEvent: emit })
       .catch((err: unknown) => {
         stream.push({
           kind: 'turn',
@@ -1013,6 +1088,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       metadata: { cwd: s.cwd },
       provider: 'claude',
     };
+  }
+
+  /** 网关 getSession 兜底用:新建未落盘的会话也能拿到真实 cwd,不造 HOME 假目录。 */
+  getCwd(sessionId: string): string | undefined {
+    return this.sessionCwd.get(sessionId);
   }
 }
 

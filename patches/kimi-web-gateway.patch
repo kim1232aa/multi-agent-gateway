@@ -64,7 +64,7 @@ index 5708bcc..a5ce76d 100644
        :pending-question-actions="client.pendingQuestionActions"
        :pending-approval-actions="client.pendingApprovalActions"
 diff --git a/apps/kimi-web/src/api/daemon/client.ts b/apps/kimi-web/src/api/daemon/client.ts
-index d8b1833..3cd5e55 100644
+index d8b1833..6adc2ce 100644
 --- a/apps/kimi-web/src/api/daemon/client.ts
 +++ b/apps/kimi-web/src/api/daemon/client.ts
 @@ -5,6 +5,7 @@ import type { KimiApiConfig } from '../config';
@@ -124,15 +124,17 @@ index d8b1833..3cd5e55 100644
    }): Promise<AppSession> {
      // The real daemon requires `metadata` to be an object (rejects a missing
      // metadata with 40001), so always send it — with cwd when provided.
-@@ -388,6 +399,7 @@ export class DaemonKimiWebApi implements KimiWebApi {
+@@ -388,6 +399,9 @@ export class DaemonKimiWebApi implements KimiWebApi {
      if (input.workspaceId !== undefined) body['workspace_id'] = input.workspaceId;
      if (input.title !== undefined) body['title'] = input.title;
      if (input.model !== undefined) body['agent_config'] = { model: input.model };
-+    if (input.provider !== undefined) body['provider'] = input.provider;
++    // multi-agent-gateway:仅非 kimi 时携带——kimi 是网关缺省分流,带上只会让
++    // body 偏离原版形状(原版 daemon 对未知字段的容忍度未验证,不带最稳)。
++    if (input.provider !== undefined && input.provider !== 'kimi') body['provider'] = input.provider;
      const data = await this.http.post<WireSession>('/sessions', body);
      return toAppSession(data);
    }
-@@ -1119,9 +1131,14 @@ export class DaemonKimiWebApi implements KimiWebApi {
+@@ -1119,9 +1133,14 @@ export class DaemonKimiWebApi implements KimiWebApi {
     * switcher + grouping work immediately off existing sessions until the daemon
     * ships the registry.
     */
@@ -149,7 +151,7 @@ index d8b1833..3cd5e55 100644
        return (data.items ?? []).map(toAppWorkspace);
      } catch {
        return [];
-@@ -1200,12 +1217,19 @@ export class DaemonKimiWebApi implements KimiWebApi {
+@@ -1200,12 +1219,22 @@ export class DaemonKimiWebApi implements KimiWebApi {
    // PRESUMED — not in current daemon docs; isolated here, swap when backend defines them.
    // -------------------------------------------------------------------------
  
@@ -157,8 +159,11 @@ index d8b1833..3cd5e55 100644
 +  async listModels(provider?: SessionProvider): Promise<AppModel[]> {
      // PRESUMED endpoint: GET /v1/models → { items: WireModel[] }
 -    const data = await this.http.get<{ items: WireModel[] }>('/models');
-+    // multi-agent-gateway:?provider= 分流到该 provider 的原生模型目录。
-+    const data = await this.http.get<{ items: WireModel[] }>('/models', { provider });
++    // multi-agent-gateway:?provider= 分流到该 provider 的原生模型目录;
++    // kimi 是缺省分流,不带参保持原版请求形状(UI 审查)。
++    const data = await this.http.get<{ items: WireModel[] }>('/models', {
++      provider: provider && provider !== 'kimi' ? provider : undefined,
++    });
      return data.items.map(toAppModel);
    }
  
@@ -171,6 +176,28 @@ index d8b1833..3cd5e55 100644
    async listProviders(): Promise<AppProvider[]> {
      // PRESUMED endpoint: GET /v1/providers → { items: WireProvider[] }
      const data = await this.http.get<{ items: WireProvider[] }>('/providers');
+@@ -1363,13 +1392,19 @@ export class DaemonKimiWebApi implements KimiWebApi {
+   // File upload
+   // -------------------------------------------------------------------------
+ 
+-  async uploadFile(input: { file: Blob; name?: string }): Promise<{ id: string; name: string; mediaType: string; size: number }> {
++  async uploadFile(input: { file: Blob; name?: string; provider?: SessionProvider }): Promise<{ id: string; name: string; mediaType: string; size: number }> {
+     const formData = new FormData();
+     formData.append('file', input.file, input.name ?? (input.file instanceof File ? input.file.name : 'upload'));
+     if (input.name !== undefined) {
+       formData.append('name', input.name);
+     }
+-    const data = await this.http.postForm<WireFileMeta>('/files', formData);
++    // multi-agent-gateway:?provider=kimi 时网关整请求透传上游 kap-server
++    // (kimi 会话的附件由上游自管);claude/codex 或不带 → 网关本地存储,
++    // 提交 prompt 时翻译成各家输入。
++    const data = await this.http.postForm<WireFileMeta>(
++      input.provider ? `/files?provider=${input.provider}` : '/files',
++      formData,
++    );
+     return {
+       id: data.id,
+       name: data.name,
 diff --git a/apps/kimi-web/src/api/daemon/mappers.ts b/apps/kimi-web/src/api/daemon/mappers.ts
 index 5eeda29..b7ae461 100644
 --- a/apps/kimi-web/src/api/daemon/mappers.ts
@@ -227,7 +254,7 @@ index 900d98b..6f8988b 100644
    id: string;
    type: string;
 diff --git a/apps/kimi-web/src/api/types.ts b/apps/kimi-web/src/api/types.ts
-index 5c34d26..3aec7e0 100644
+index 5c34d26..9ef5304 100644
 --- a/apps/kimi-web/src/api/types.ts
 +++ b/apps/kimi-web/src/api/types.ts
 @@ -2,6 +2,8 @@
@@ -293,6 +320,15 @@ index 5c34d26..3aec7e0 100644
    listProviders(): Promise<AppProvider[]>;
    addProvider(input: { type: string; apiKey?: string; baseUrl?: string; defaultModel?: string }): Promise<AppProvider>;
    deleteProvider(id: string): Promise<{ deleted: true }>;
+@@ -777,7 +797,7 @@ export interface KimiWebApi {
+   refreshOAuthProviderModels(): Promise<ProviderRefreshResult>;
+ 
+   // File upload / download
+-  uploadFile(input: { file: Blob; name?: string }): Promise<{ id: string; name: string; mediaType: string; size: number }>;
++  uploadFile(input: { file: Blob; name?: string; provider?: SessionProvider }): Promise<{ id: string; name: string; mediaType: string; size: number }>;
+   getFileUrl(fileId: string): string;
+   /** Fetch a file's bytes with auth — feed the resulting Blob to a blob URL for <video>/<img> src. */
+   getFileBlob(fileId: string): Promise<Blob>;
 diff --git a/apps/kimi-web/src/components/SessionRow.vue b/apps/kimi-web/src/components/SessionRow.vue
 index e95cce4..58a1b95 100644
 --- a/apps/kimi-web/src/components/SessionRow.vue
@@ -323,18 +359,26 @@ index e95cce4..58a1b95 100644
             active. "Answer" = an askUserQuestion is waiting; "Approve" = a
             permission request is waiting. The list-level interaction fact is
 diff --git a/apps/kimi-web/src/components/Sidebar.vue b/apps/kimi-web/src/components/Sidebar.vue
-index e422b22..92b767d 100644
+index e422b22..c242cde 100644
 --- a/apps/kimi-web/src/components/Sidebar.vue
 +++ b/apps/kimi-web/src/components/Sidebar.vue
 @@ -20,6 +20,7 @@ import {
    saveCollapsedWorkspaces,
  } from '../lib/storage';
  import { moveInOrder, type DropPosition, type WorkspaceSortMode } from '../lib/workspaceOrder';
-+import { providerOfSessionId, providerFilter, setProviderFilter } from '../lib/sessionProvider';
++import { providerOfSessionId, providerFilter, setProviderFilter, type ProviderFilter } from '../lib/sessionProvider';
  import type { Session, WorkspaceGroup as WorkspaceGroupType, WorkspaceView } from '../types';
  import SearchSessionsDialog from './dialogs/SearchSessionsDialog.vue';
  import WorkspaceGroup from './WorkspaceGroup.vue';
-@@ -196,6 +197,24 @@ const allCollapsed = computed(
+@@ -30,6 +31,7 @@ import Kbd from './ui/Kbd.vue';
+ import Menu from './ui/Menu.vue';
+ import MenuItem from './ui/MenuItem.vue';
+ import Pill from './ui/Pill.vue';
++import SegmentedControl from './ui/SegmentedControl.vue';
+ 
+ const { t } = useI18n();
+ 
+@@ -196,6 +198,32 @@ const allCollapsed = computed(
      props.groups.every((g) => collapsedIds.value.has(g.workspace.id)),
  );
  
@@ -356,33 +400,49 @@ index e422b22..92b767d 100644
 +    .filter((g) => g.sessions.length > 0);
 +});
 +
++/** SegmentedControl 选项;'all' 走 i18n,三家专名硬编码。 */
++const providerOptions = computed(() => [
++  { value: 'all', label: t('sidebar.allProviders') },
++  { value: 'kimi', label: 'Kimi' },
++  { value: 'claude', label: 'Claude' },
++  { value: 'codex', label: 'Codex' },
++]);
++
  // ---------------------------------------------------------------------------
  // In-group expand / collapse (show-more pagination)
  // ---------------------------------------------------------------------------
-@@ -713,6 +732,22 @@ onBeforeUnmount(() => {
+@@ -703,9 +731,8 @@ onBeforeUnmount(() => {
+         </IconButton>
+       </div>
+ 
+-      <!-- Session search — opens the Spotlight-style search dialog. Last fixed
+-           row above the list, so it carries the scroll-linked seam. -->
+-      <div class="search-wrap" :class="{ 'search-wrap--scrolled': sessionsScrolled }">
++      <!-- Session search — opens the Spotlight-style search dialog. -->
++      <div class="search-wrap">
+         <button class="search" type="button" @click="openSearch">
+           <Icon class="search-icon" name="search" />
+           <span class="search-input">{{ t('sidebar.search') }}</span>
+@@ -713,6 +740,18 @@ onBeforeUnmount(() => {
          </button>
        </div>
  
-+      <!-- Provider 分段过滤(multi-agent-gateway):全部 / Kimi / Claude / Codex -->
-+      <div class="provider-filter" role="tablist" aria-label="provider filter">
-+        <button
-+          v-for="opt in (['all', 'kimi', 'claude', 'codex'] as const)"
-+          :key="opt"
-+          type="button"
-+          role="tab"
-+          class="provider-filter-item"
-+          :class="{ active: providerFilter === opt }"
-+          :aria-selected="providerFilter === opt"
-+          @click.stop="setProviderFilter(opt)"
-+        >
-+          {{ opt === 'all' ? t('sidebar.allProviders') : opt === 'kimi' ? 'Kimi' : opt === 'claude' ? 'Claude' : 'Codex' }}
-+        </button>
++      <!-- Provider 分段过滤(multi-agent-gateway):全部 / Kimi / Claude / Codex。
++           它是列表上方最后一个固定行,承担滚动接缝(原版契约在 search-wrap)。 -->
++      <div class="provider-filter" :class="{ 'provider-filter--scrolled': sessionsScrolled }">
++        <SegmentedControl
++          :model-value="providerFilter"
++          :options="providerOptions"
++          size="sm"
++          aria-label="provider filter"
++          @update:model-value="setProviderFilter($event as ProviderFilter)"
++        />
 +      </div>
 +
        <!-- Session list — grouped by workspace -->
        <div class="sessions" @scroll="onSessionsScroll">
          <!-- Empty state — only when no workspace is registered at all; empty
-@@ -747,7 +782,7 @@ onBeforeUnmount(() => {
+@@ -747,7 +786,7 @@ onBeforeUnmount(() => {
              </div>
            </div>
            <div
@@ -391,39 +451,43 @@ index e422b22..92b767d 100644
              :key="g.workspace.id"
              class="ws-drop-target"
              :class="{
-@@ -1088,6 +1123,36 @@ onBeforeUnmount(() => {
+@@ -1071,23 +1110,35 @@ onBeforeUnmount(() => {
+   white-space: nowrap;
+ }
+ 
+-/* Session search — the wrapper is the last fixed row above the list and
+-   carries the scroll-linked seam: its bottom border/shadow only appear once
+-   the session list has actually scrolled, so an unscrolled list shows no
+-   abrupt boundary. */
++/* Session search — fixed row above the provider filter. */
+ .search-wrap {
+   padding: 0 var(--sb-inset);
+   position: relative;
+   z-index: 1;
+   background: var(--color-sidebar-bg);
++}
++/* Provider 分段过滤条(multi-agent-gateway):列表上方最后一个固定行,
++   承担滚动接缝(原版契约在 search-wrap);控件复用设计系统 SegmentedControl。 */
++.provider-filter {
++  padding: var(--space-2) var(--sb-inset);
++  position: relative;
++  z-index: 1;
++  background: var(--color-sidebar-bg);
+   border-bottom: 1px solid transparent;
+   transition: border-color var(--duration-base) var(--ease-out),
+     box-shadow var(--duration-base) var(--ease-out);
+ }
+-.search-wrap--scrolled {
++.provider-filter--scrolled {
    border-bottom-color: var(--line);
    box-shadow: var(--shadow-sm);
  }
-+/* Provider 分段过滤条(multi-agent-gateway):跟随侧边栏对齐契约。 */
-+.provider-filter {
++.provider-filter :deep(.ui-seg) {
 +  display: flex;
-+  gap: 2px;
-+  padding: var(--space-2) var(--sb-inset) 0;
-+  background: var(--color-sidebar-bg);
++  width: 100%;
 +}
-+.provider-filter-item {
++.provider-filter :deep(.ui-seg__item) {
 +  flex: 1;
-+  margin: 0;
-+  padding: 4px 0;
-+  border: none;
-+  border-radius: var(--radius-sm);
-+  background: transparent;
-+  color: var(--color-text-tertiary);
-+  font-size: var(--ui-font-size-sm);
-+  cursor: pointer;
-+  transition:
-+    background var(--duration-fast) var(--ease-out),
-+    color var(--duration-fast) var(--ease-out);
-+}
-+.provider-filter-item:hover {
-+  background: var(--sb-hover);
-+  color: var(--color-text-secondary);
-+}
-+.provider-filter-item.active {
-+  background: var(--color-hover);
-+  color: var(--color-text-primary);
-+  font-weight: 500;
 +}
  .search {
    display: flex;
@@ -459,7 +523,7 @@ index 160c77a..acd4818 100644
        @submit="emit('submit', $event)"
        @steer="emit('steer', $event)"
 diff --git a/apps/kimi-web/src/components/chat/Composer.vue b/apps/kimi-web/src/components/chat/Composer.vue
-index 5d2e16f..1c492ef 100644
+index 5d2e16f..f65fcc4 100644
 --- a/apps/kimi-web/src/components/chat/Composer.vue
 +++ b/apps/kimi-web/src/components/chat/Composer.vue
 @@ -5,11 +5,12 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
@@ -654,7 +718,7 @@ index 5d2e16f..1c492ef 100644
          <div v-if="dropdownOpen && status" class="model-dropdown" role="menu" @click.stop>
 +          <!-- Agent(仅新建会话的草稿作曲器展示;已有会话的提供方由会话 id 决定) -->
 +          <template v-if="!sessionId">
-+            <div class="md-section">Agent</div>
++            <div class="md-section">{{ t('model.agentSection') }}</div>
 +            <button
 +              v-for="a in AGENT_OPTIONS"
 +              :key="a.id"
@@ -953,7 +1017,7 @@ index 62d31af..77f6feb 100644
      setModel,
      thinkingLevelForModelId,
 diff --git a/apps/kimi-web/src/composables/client/useWorkspaceState.ts b/apps/kimi-web/src/composables/client/useWorkspaceState.ts
-index 03a541f..b16b8cc 100644
+index 03a541f..8996bbd 100644
 --- a/apps/kimi-web/src/composables/client/useWorkspaceState.ts
 +++ b/apps/kimi-web/src/composables/client/useWorkspaceState.ts
 @@ -7,10 +7,12 @@
@@ -966,7 +1030,7 @@ index 03a541f..b16b8cc 100644
  import { i18n } from '../../i18n';
  import { useConfirmDialog } from '../useConfirmDialog';
 +import { useDraftAgent } from '../useDraftAgent';
-+import { providerFilter, providerQueryParam } from '../../lib/sessionProvider';
++import { providerFilter, providerOfSessionId, providerQueryParam } from '../../lib/sessionProvider';
  import { isDaemonApiError } from '../../api/errors';
  import { SERVER_AUTH_UNAUTHORIZED_CODE } from '../../api/daemon/http';
  import { isPlaceholderSessionUsage } from '../../api/daemon/mappers';
@@ -1037,7 +1101,20 @@ index 03a541f..b16b8cc 100644
      // The create echo may return model as '' (same daemon quirk as /profile);
      // keep the user's pick so the status line doesn't snap back to the default.
      const created =
-@@ -2748,6 +2764,20 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+@@ -1769,7 +1785,11 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+   async function uploadImage(file: Blob, name?: string): Promise<{ fileId: string; name: string; mediaType: string } | null> {
+     try {
+       const api = getKimiWebApi();
+-      const result = await api.uploadFile({ file, name });
++      // multi-agent-gateway:kimi 会话的上传透传上游(上游自管附件);
++      // claude/codex 存网关本地,提交 prompt 时翻译。草稿态按 draft agent 预判。
++      const sid = rawState.activeSessionId;
++      const provider = sid ? providerOfSessionId(sid) : useDraftAgent().draftAgent.value;
++      const result = await api.uploadFile({ file, name, provider });
+       return { fileId: result.id, name: result.name, mediaType: result.mediaType };
+     } catch (err) {
+       pushOperationFailure('uploadImage', err);
+@@ -2748,6 +2768,20 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
      }
    }
  
@@ -1060,10 +1137,10 @@ index 03a541f..b16b8cc 100644
      clearFileDiff,
 diff --git a/apps/kimi-web/src/composables/useDraftAgent.ts b/apps/kimi-web/src/composables/useDraftAgent.ts
 new file mode 100644
-index 0000000..523c47e
+index 0000000..7840ed7
 --- /dev/null
 +++ b/apps/kimi-web/src/composables/useDraftAgent.ts
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,32 @@
 +// apps/kimi-web/src/composables/useDraftAgent.ts
 +//
 +// 新会话的 Agent 选择(Kimi / Claude / Codex)。multi-agent-gateway 按
@@ -1072,18 +1149,13 @@ index 0000000..523c47e
 +// 选择持久化在 localStorage,刷新后保留上次选择。
 +
 +import { ref } from 'vue';
++import { safeGetString, safeSetString, STORAGE_KEYS } from '../lib/storage';
 +
 +export type DraftAgent = 'kimi' | 'claude' | 'codex';
 +
-+const STORAGE_KEY = 'kimi-web.draftAgent';
-+
 +function readInitial(): DraftAgent {
-+  try {
-+    const raw = localStorage.getItem(STORAGE_KEY);
-+    if (raw === 'claude' || raw === 'codex' || raw === 'kimi') return raw;
-+  } catch {
-+    // localStorage 不可用时用默认
-+  }
++  const raw = safeGetString(STORAGE_KEYS.draftAgent);
++  if (raw === 'claude' || raw === 'codex' || raw === 'kimi') return raw;
 +  return 'kimi';
 +}
 +
@@ -1097,11 +1169,7 @@ index 0000000..523c47e
 +    draftAgent,
 +    setDraftAgent(agent: DraftAgent): void {
 +      draftAgent.value = agent;
-+      try {
-+        localStorage.setItem(STORAGE_KEY, agent);
-+      } catch {
-+        // 忽略持久化失败
-+      }
++      safeSetString(STORAGE_KEYS.draftAgent, agent);
 +    },
 +  };
 +}
@@ -1232,6 +1300,17 @@ index ef44f0f..c3f7cfd 100644
    login: { desc: 'Sign in to Kimi in the browser' },
    plan: { desc: 'Toggle plan mode on/off' },
    swarm: { desc: 'Toggle swarm mode; /swarm <task> runs a task in swarm' },
+diff --git a/apps/kimi-web/src/i18n/locales/en/model.ts b/apps/kimi-web/src/i18n/locales/en/model.ts
+index aeba44b..1ebcec0 100644
+--- a/apps/kimi-web/src/i18n/locales/en/model.ts
++++ b/apps/kimi-web/src/i18n/locales/en/model.ts
+@@ -12,5 +12,6 @@ export default {
+   emptyNoMatch: 'No matching models',
+   starTitle: 'Add to favorites',
+   unstarTitle: 'Remove from favorites',
++  agentSection: 'Agent',
+   footerHint: '↑↓ Navigate · Enter Select · Esc Close',
+ } as const;
 diff --git a/apps/kimi-web/src/i18n/locales/en/sidebar.ts b/apps/kimi-web/src/i18n/locales/en/sidebar.ts
 index 70a3f93..32f61fd 100644
 --- a/apps/kimi-web/src/i18n/locales/en/sidebar.ts
@@ -1256,6 +1335,17 @@ index c3b7530..d8830e5 100644
    login: { desc: '在浏览器中登录 Kimi' },
    plan: { desc: '切换计划模式 开/关' },
    swarm: { desc: '切换 swarm 模式；/swarm <任务> 直接在 swarm 下执行' },
+diff --git a/apps/kimi-web/src/i18n/locales/zh/model.ts b/apps/kimi-web/src/i18n/locales/zh/model.ts
+index f08ee5c..fd8ee45 100644
+--- a/apps/kimi-web/src/i18n/locales/zh/model.ts
++++ b/apps/kimi-web/src/i18n/locales/zh/model.ts
+@@ -12,5 +12,6 @@ export default {
+   emptyNoMatch: '无匹配模型',
+   starTitle: '添加到收藏',
+   unstarTitle: '取消收藏',
++  agentSection: '智能体',
+   footerHint: '↑↓ 导航 · Enter 选择 · Esc 关闭',
+ } as const;
 diff --git a/apps/kimi-web/src/i18n/locales/zh/sidebar.ts b/apps/kimi-web/src/i18n/locales/zh/sidebar.ts
 index 6600692..5ab16c0 100644
 --- a/apps/kimi-web/src/i18n/locales/zh/sidebar.ts
@@ -1270,13 +1360,14 @@ index 6600692..5ab16c0 100644
  };
 diff --git a/apps/kimi-web/src/lib/sessionProvider.ts b/apps/kimi-web/src/lib/sessionProvider.ts
 new file mode 100644
-index 0000000..10d13fa
+index 0000000..d38e7f7
 --- /dev/null
 +++ b/apps/kimi-web/src/lib/sessionProvider.ts
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,38 @@
 +// multi-agent-gateway:按会话 id 前缀识别提供方。
 +// 网关给 Codex/Claude 会话 id 加 codex_/claude_ 前缀;Kimi 会话无前缀(原生 id)。
 +import { ref } from 'vue';
++import { safeGetString, safeSetString, STORAGE_KEYS } from './storage';
 +
 +export type SessionProvider = 'kimi' | 'claude' | 'codex';
 +
@@ -1293,15 +1384,9 @@ index 0000000..10d13fa
 +// ---------------------------------------------------------------------------
 +export type ProviderFilter = 'all' | SessionProvider;
 +
-+const PROVIDER_FILTER_KEY = 'kimi-web.providerFilter';
-+
 +function loadProviderFilter(): ProviderFilter {
-+  try {
-+    const v = localStorage.getItem(PROVIDER_FILTER_KEY);
-+    if (v === 'kimi' || v === 'claude' || v === 'codex') return v;
-+  } catch {
-+    // ignore — private mode etc.
-+  }
++  const v = safeGetString(STORAGE_KEYS.providerFilter);
++  if (v === 'kimi' || v === 'claude' || v === 'codex') return v;
 +  return 'all';
 +}
 +
@@ -1310,11 +1395,7 @@ index 0000000..10d13fa
 +
 +export function setProviderFilter(v: ProviderFilter): void {
 +  providerFilter.value = v;
-+  try {
-+    localStorage.setItem(PROVIDER_FILTER_KEY, v);
-+  } catch {
-+    // ignore
-+  }
++  safeSetString(STORAGE_KEYS.providerFilter, v);
 +}
 +
 +/** 传给网关的 provider 参数;'all' 时不带参数。 */
@@ -1388,6 +1469,20 @@ index cbc080e..7ba653a 100644
  /**
   * Filter slash items by a query string. Matches are ranked so exact and prefix
   * matches come before arbitrary substring matches. If query is empty or just
+diff --git a/apps/kimi-web/src/lib/storage.ts b/apps/kimi-web/src/lib/storage.ts
+index 306cb84..b95a2b6 100644
+--- a/apps/kimi-web/src/lib/storage.ts
++++ b/apps/kimi-web/src/lib/storage.ts
+@@ -40,6 +40,9 @@ export const STORAGE_KEYS = {
+   openInLastTarget: 'kimi-web.open-in.last-target',
+   sidebarCollapsed: 'kimi-web.sidebar-collapsed',
+   sidebarWidth: 'kimi-web.sidebar-width',
++  // multi-agent-gateway additions
++  draftAgent: 'kimi-web.draftAgent',
++  providerFilter: 'kimi-web.providerFilter',
+   // deprecated cleanups (kept so the removals still fire for old users)
+   codeFont: 'kimi-web.code-font',
+   contentAlign: 'kimi-web.content-align',
 diff --git a/apps/kimi-web/test/slash-menu.test.ts b/apps/kimi-web/test/slash-menu.test.ts
 index 3569419..8f87cc5 100644
 --- a/apps/kimi-web/test/slash-menu.test.ts

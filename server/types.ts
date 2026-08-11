@@ -181,10 +181,28 @@ export interface QuestionPayload {
 // Turn 控制
 // ---------------------------------------------------------------------------
 
+/**
+ * 一次 prompt 携带的附件(网关上传单解析后的形态)。
+ * - localImage:   磁盘绝对路径,映射 codex turn/start 的 {type:'localImage'}。
+ * - imageDataUrl: data:<mime>;base64,... 内联图,映射 {type:'image',url}。
+ * - filePathText: 目标 provider 无对应输入项(文件/视频),按 kap-server
+ *   话术物化成路径文本交给模型自行 Read。
+ */
+export interface TurnAttachment {
+  kind: 'localImage' | 'imageDataUrl' | 'filePathText';
+  path?: string;
+  dataUrl?: string;
+  name?: string;
+  mediaType?: string;
+  size?: number;
+}
+
 export interface StartTurnInput {
   sessionId: string;
   /** 用户输入:纯文本给 string,富内容给分块数组。 */
   input: string | MessageContentPart[];
+  /** 随 prompt 的附件;adapter 按自家输入模型翻译(不认识的 kind 忽略)。 */
+  attachments?: TurnAttachment[];
   /** 新建 turn 的显示标题(可选)。 */
   title?: string;
   metadata?: Record<string, unknown>;
@@ -387,6 +405,9 @@ export interface ProviderAdapter {
 
   /** 会话累计 token 用量(最近一次已知值;无来源返回 undefined)。 */
   getUsage?(sessionId: string): SessionUsage | undefined;
+
+  /** 会话工作目录(新建/列表时记录;未知返回 undefined)。 */
+  getCwd?(sessionId: string): string | undefined;
 
   /** MCP 服务器状态(渲染 /mcp 命令输出用)。 */
   listMcpServers?(sessionId?: string): Promise<Array<Record<string, unknown>>>;

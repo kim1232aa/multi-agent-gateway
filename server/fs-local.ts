@@ -28,6 +28,19 @@ export function resolveInCwd(cwd: string, p?: string): string {
   return target;
 }
 
+/**
+ * realpath 二次校验:symlink 目标也必须落在 cwd 内(词法校验拦不住
+ * `cwd/evil -> /etc` 这种;审查实测 fsRead/fsList 曾跟随 symlink 读出沙箱)。
+ * 路径不存在(如 diff 已删文件)时 realpath 失败,退化为只信词法校验。
+ */
+export async function assertRealInCwd(cwd: string, abs: string): Promise<void> {
+  const realBase = await fsp.realpath(path.resolve(cwd)).catch(() => path.resolve(cwd));
+  const realTarget = await fsp.realpath(abs).catch(() => null);
+  if (realTarget && realTarget !== realBase && !realTarget.startsWith(realBase + path.sep)) {
+    throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+  }
+}
+
 /** 请求里的相对路径原样回给前端(前端按 cwd 相对路径展示);绝对路径转相对。 */
 function displayPath(cwd: string, abs: string): string {
   const base = path.resolve(cwd);
@@ -39,7 +52,7 @@ function displayPath(cwd: string, abs: string): string {
 const SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'dist', '.next', 'target']);
 const LIST_MAX_ENTRIES = 500;
 const WALK_MAX_ENTRIES = 5000;
-const READ_MAX_BYTES = 1024 * 1024; // 1MB
+const READ_MAX_BYTES = 10 * 1024 * 1024; // 10MB,与前端 IMAGE_READ_MAX_BYTES 对齐(审查发现 1MB 会截断图片)
 const GREP_MAX_FILE_BYTES = 512 * 1024;
 const GREP_MAX_FILES = 2000;
 const GREP_MAX_MATCHES_PER_FILE = 50;
@@ -117,9 +130,9 @@ async function entryWire(cwd: string, abs: string, gitMap?: Map<string, string>)
   };
   if (st.isSymbolicLink()) {
     wire.is_symlink_to = await fsp.readlink(abs).catch(() => undefined);
-    // symlink 指向的类型尽量解析;失败按 file 处理。
-    const real = await fsp.stat(abs).catch(() => null);
-    if (real?.isDirectory()) wire.kind = 'directory';
+    // 安全:不再把指向目录的 symlink 升级成 'directory'——否则 BFS 会跟进
+    // 链接目录,resolveInCwd 的词法校验被绕过(审查实测逃逸)。symlink 保持
+    // 'symlink' 展示,不展开、不计 child_count。
   }
   if (wire.kind === 'file') {
     wire.size = st.size;
@@ -150,15 +163,29 @@ async function entryWire(cwd: string, abs: string, gitMap?: Map<string, string>)
 function parsePorcelain(out: string): Map<string, string> {
   const map = new Map<string, string>();
   const entries = out.split('\0').filter(Boolean);
-  for (const e of entries) {
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i];
     if (e.length < 4) continue;
     if (e.startsWith('##')) continue; // --branch 的头部行,不是文件条目。
     const xy = e.slice(0, 2);
-    let p = e.slice(3);
-    // rename/copy: "XY old\0new" —— -z 模式下新路径是下一个 \0 段,这里只标旧路径。
+    const p = e.slice(3);
     map.set(p, xy.trim() || '??');
+    // rename/copy 在 -z 下是 "XY new\0old\0" 两段:下一个裸段是旧路径,
+    // 必须跳过——否则被当成独立条目解析出乱码(审查实测 map['txt']='a.')。
+    if (xy.includes('R') || xy.includes('C')) i += 1;
   }
   return map;
+}
+
+/** cwd 在 repo 内的相对前缀(如 'sub/');非仓库或就在仓库根回 ''。 */
+async function repoPrefix(cwd: string): Promise<string> {
+  return (await runGit(cwd, ['rev-parse', '--show-prefix']).catch(() => '')).trim();
+}
+
+/** porcelain/numstat 路径是 repo-root 相对;换算成 cwd 相对(entryWire/前端
+ *  都按 cwd 相对路径查状态)。cwd 外的条目保留 repo-root 路径,不碍匹配。 */
+function toCwdRelative(prefix: string, p: string): string {
+  return prefix && p.startsWith(prefix) ? p.slice(prefix.length) : p;
 }
 
 function runGit(cwd: string, args: string[], timeoutMs = 10000): Promise<string> {
@@ -187,8 +214,15 @@ function runGit(cwd: string, args: string[], timeoutMs = 10000): Promise<string>
 
 async function gitStatusMap(cwd: string): Promise<Map<string, string> | null> {
   try {
-    const out = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=normal']);
-    return parsePorcelain(out);
+    const [out, prefix] = await Promise.all([
+      runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=normal']),
+      repoPrefix(cwd),
+    ]);
+    const raw = parsePorcelain(out);
+    if (!prefix) return raw;
+    const map = new Map<string, string>();
+    for (const [k, v] of raw) map.set(toCwdRelative(prefix, k), v);
+    return map;
   } catch {
     return null; // 非 git 仓库:不带状态,不报错。
   }
@@ -199,6 +233,7 @@ export async function fsList(
   input: { path?: string; depth?: number; include_git_status?: boolean },
 ): Promise<{ items: FsEntryWire[]; children_by_path?: Record<string, FsEntryWire[]>; truncated: boolean }> {
   const abs = resolveInCwd(cwd, input.path);
+  await assertRealInCwd(cwd, abs);
   const st = await fsp.stat(abs).catch(() => null);
   if (!st) throw new FsError(404, 40404, `目录不存在: ${input.path ?? '.'}`);
   if (!st.isDirectory()) throw new FsError(400, 40003, `不是目录: ${input.path ?? '.'}`);
@@ -257,6 +292,7 @@ export async function fsRead(
 }> {
   if (!input.path) throw new FsError(400, 40001, '缺少 path');
   const abs = resolveInCwd(cwd, input.path);
+  await assertRealInCwd(cwd, abs);
   const st = await fsp.stat(abs).catch(() => null);
   if (!st) throw new FsError(404, 40404, `文件不存在: ${input.path}`);
   if (!st.isFile()) throw new FsError(400, 40003, `不是文件: ${input.path}`);
@@ -452,20 +488,26 @@ export async function fsGitStatus(
   cwd: string,
   _paths?: string[],
 ): Promise<{ branch: string; ahead: number; behind: number; entries: Record<string, string>; additions: number; deletions: number; pullRequest: null }> {
+  const statusOut = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--branch']).catch(() => '');
   // 非 git 仓库:如实回空状态而不是报错(前端文件树在非 git 目录也要能用)。
-  const branchOut = await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '');
-  const branch = branchOut.trim();
-  if (!branch) {
+  if (!statusOut) {
     return { branch: '', ahead: 0, behind: 0, entries: {}, additions: 0, deletions: 0, pullRequest: null };
   }
-  const statusOut = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--branch']);
+  const header = statusOut.split('\0')[0] ?? '';
+  // branch:rev-parse 在 unborn HEAD(仓库无提交)会失败,从 ## 头兜底;
+  // unborn 时 status 本身可用,不能因此回全空(审查发现)。
+  let branch = (await runGit(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => '')).trim();
+  if (!branch || branch === 'HEAD') {
+    const m = /^## (?:No commits yet on )?(\S+)/.exec(header);
+    branch = m?.[1] ?? '';
+  }
+  const prefix = await repoPrefix(cwd);
   const map = parsePorcelain(statusOut);
   const entries: Record<string, string> = {};
-  for (const [k, v] of map) entries[k] = v;
+  for (const [k, v] of map) entries[toCwdRelative(prefix, k)] = v;
   // ahead/behind:## branch...origin/branch [ahead N, behind M]
   let ahead = 0;
   let behind = 0;
-  const header = statusOut.split('\0')[0] ?? '';
   const aheadMatch = /ahead (\d+)/.exec(header);
   const behindMatch = /behind (\d+)/.exec(header);
   if (aheadMatch) ahead = Number(aheadMatch[1]);
@@ -494,8 +536,13 @@ export async function fsDiff(cwd: string, input: { path: string }): Promise<{ pa
     const diff = await runGit(cwd, ['diff', 'HEAD', '--', rel]);
     return { path: rel, diff };
   }
+  await assertRealInCwd(cwd, abs);
   const st = await fsp.stat(abs).catch(() => null);
   if (!st || !st.isFile()) throw new FsError(404, 40404, `文件不存在: ${input.path}`);
+  // 大文件上限:未跟踪文件要整读拼 diff,无 cap 会把 GB 级文件读进内存(审查发现)。
+  if (st.size > READ_MAX_BYTES) {
+    return { path: rel, diff: `# 文件过大(${(st.size / 1024 / 1024).toFixed(1)}MB),超过 ${READ_MAX_BYTES / 1024 / 1024}MB 上限,不生成 diff\n` };
+  }
   const buf = await fsp.readFile(abs);
   if (buf.includes(0)) return { path: rel, diff: `Binary file ${rel} (untracked)\n` };
   const lines = buf.toString('utf8').split('\n');

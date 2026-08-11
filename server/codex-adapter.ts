@@ -911,6 +911,24 @@ export class CodexAdapter {
   async compact(threadId: string): Promise<void> {
     await this.connect();
     await this.withThreadRetry(threadId, () => this.request('thread/compact/start', { threadId }));
+    // thread/compact/start 立即返回 {};真完成信号是 item/completed 且
+    // item.type==='contextCompaction'(0.147.0 schema 复核)。等到再返回,
+    // 网关才能把 compaction.completed 广播在真实完成点。超时兜底不卡死。
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.listeners.delete(onEvent);
+        resolve();
+      }, 180_000);
+      const onEvent: CodexEventHandler = (ev) => {
+        if (ev.type !== 'item-completed') return;
+        const e = ev as { threadId?: string; item?: Record<string, unknown> };
+        if (e.threadId !== threadId || e.item?.type !== 'contextCompaction') return;
+        clearTimeout(timer);
+        this.listeners.delete(onEvent);
+        resolve();
+      };
+      this.listeners.add(onEvent);
+    });
   }
 
   /** 归档/取消归档(thread/archive|unarchive)。 */

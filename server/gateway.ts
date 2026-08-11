@@ -32,6 +32,7 @@ import {
   type ProviderName,
   type Session,
   type SessionUsage,
+  type TurnAttachment,
   type TurnHandle,
 } from './types.js';
 
@@ -145,6 +146,8 @@ interface ActiveTurn {
 interface QueuedPrompt {
   promptId: string;
   text: string;
+  /** 随 prompt 的附件(网关解析后的形态;接力时一并交给 adapter)。 */
+  attachments?: TurnAttachment[];
   createdAt: string;
 }
 
@@ -384,7 +387,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
 
     // --- sessions ---
     if (sub === '/sessions' && req.method === 'GET') {
-      return ok(res, await listSessions(adapters, kimiFetch, url, provider), requestId);
+      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid)), requestId);
     }
     if (sub === '/sessions' && req.method === 'POST') {
       return ok(res, await createSession(adapters, kimiFetch, await readBody(req), provider), requestId);
@@ -402,7 +405,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       const adapter = adapters[sp];
 
       if (tail === '' && req.method === 'GET') {
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId)), requestId);
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
       if (tail === '' && req.method === 'DELETE') {
         if (!adapter.delete) throw new ProviderError('unsupported', `${sp} 不支持删除会话`, 400);
@@ -420,7 +423,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       if (tail === ':restore' && req.method === 'POST') {
         if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持恢复归档`, 400);
         await adapter.setArchived(nativeId, false);
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId)), requestId);
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
       if (tail === ':undo' && req.method === 'POST') {
         // 撤销最近 count 轮。codex:thread/rollback(0.147.0 实测历史真消失,
@@ -435,17 +438,26 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
       if (tail === ':compact' && req.method === 'POST') {
         const body = (await readBody(req).catch(() => ({}))) as { instruction?: string };
         const sid = prefixedId(sp, nativeId);
+        // busy 时压缩会排队/互串,直接 409(与网关代执行命令同一 guard);
+        // 否则会假 started(审查发现)。
+        if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再压缩', 409);
         hub.broadcast(sid, frame(sid, hub, 'compaction.started', { trigger: 'manual', ...(body.instruction ? { instruction: body.instruction } : {}) }));
         if (adapter.compact) {
-          // codex:thread/compact/start,压缩过程走 item 通知,这里立即收尾。
+          // codex:adapter.compact 等到 contextCompaction item 完成才返回
+          // (0.147.0 复核:item/completed + type==='contextCompaction' 是真完成
+          // 信号),completed 广播在真实完成点(对齐 kap-server worker 尾部)。
           await adapter.compact(nativeId);
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
           return ok(res, { compacted: true }, requestId);
         }
-        // claude:CLI 在 stream-json 下原生执行 /compact(2.1.226 实测),
-        // 作为真 prompt 发出,输出即压缩结果。
-        hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
-        return ok(res, await submitPrompt(adapter, sp, nativeId, { content: [{ type: 'text', text: `/compact${body.instruction ? ` ${body.instruction}` : ''}` }] }, hub), requestId);
+        // claude:CLI 在 stream-json 下原生执行 /compact(2.1.226 实测),作为真
+        // turn 发出;turn 终态 = 压缩完成,completed 由 onSettled 在终态广播后
+        // 发出——不再是"还没跑就先报完成"(审查发现)。
+        const text = `/compact${body.instruction ? ` ${body.instruction}` : ''}`;
+        const result = await driveTurn(adapter, sp, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text }), hub, randomUUID(), (reason) => {
+          hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: { reason } }));
+        });
+        return ok(res, result, requestId);
       }
       if (tail === ':fork' && req.method === 'POST') {
         // codex:thread/fork(0.147.0 实测);claude 的 --fork-session 要新 spawn
@@ -578,13 +590,21 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         if (typeof cfg.goal_control === 'string' && adapter.controlGoal) {
           await adapter.controlGoal(nativeId, cfg.goal_control);
         }
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId)), requestId);
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
       if (tail === '/status' && req.method === 'GET') {
         // 前端 refreshSessionStatus 的唯一回读通道:live model/thinking/permission/
         // plan/上下文占用。usage 来自 adapter 的会话级累计(codex tokenUsage
         // 通知 / claude result.usage)。
         const usage = adapter.getUsage?.(nativeId);
+        // 上下文窗口回退(审查发现首轮前恒 0):claude 按模型名启发式(与 facade
+        // 的 done 事件口径一致);codex 只信 tokenUsage 下发的 modelContextWindow,
+        // 没有就诚实 0——不编造窗口值。
+        let contextLimit = usage?.context_limit ?? 0;
+        if (contextLimit <= 0 && sp === 'claude') {
+          const m = adapter.getModel?.(nativeId) ?? '';
+          if (m) contextLimit = m.includes('[1m]') ? 1_000_000 : 200_000;
+        }
         return ok(res, {
           model: adapter.getModel?.(nativeId) ?? '',
           thinking_level: adapter.getThinking?.(nativeId) ?? '',
@@ -592,9 +612,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
           plan_mode: adapter.getPlanMode?.(nativeId) ?? false,
           swarm_mode: false,
           context_tokens: usage?.context_tokens ?? 0,
-          max_context_tokens: usage?.context_limit ?? 0,
+          max_context_tokens: contextLimit,
           context_usage:
-            usage && usage.context_limit > 0 ? Math.min(1, usage.context_tokens / usage.context_limit) : 0,
+            usage && contextLimit > 0 ? Math.min(1, usage.context_tokens / contextLimit) : 0,
         }, requestId);
       }
       if (tail === '/commands' && req.method === 'GET') {
@@ -608,7 +628,26 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
         return ok(res, listPrompts(prefixedId(sp, nativeId), hub), requestId);
       }
       if (tail === '/prompts' && req.method === 'POST') {
-        const body = (await readBody(req)) as { content: { type: string; text?: string }[] };
+        const body = (await readBody(req)) as {
+          content: { type: string; text?: string }[];
+          model?: string; thinking?: string; permission_mode?: string; plan_mode?: boolean;
+        };
+        // 前端每条 prompt 都带全套控制字段(mappers.toWirePromptSubmission),
+        // 设计上以 prompt 为本 turn 权威——此前网关只读 content,草稿态开 Plan
+        // 发首条消息实际不是 plan 跑的(审查发现)。apply-if-changed,避免每
+        // 条 prompt 都白打一遍 RPC。
+        if (body.model && adapter.setModel && adapter.getModel?.(nativeId) !== body.model) {
+          await adapter.setModel(nativeId, body.model);
+        }
+        if (body.thinking && adapter.setThinking && adapter.getThinking?.(nativeId) !== body.thinking) {
+          await adapter.setThinking(nativeId, body.thinking);
+        }
+        if (body.permission_mode && adapter.setPermission && adapter.getPermission?.(nativeId) !== body.permission_mode) {
+          await adapter.setPermission(nativeId, body.permission_mode);
+        }
+        if (typeof body.plan_mode === 'boolean' && adapter.setPlanMode && adapter.getPlanMode?.(nativeId) !== body.plan_mode) {
+          await adapter.setPlanMode(nativeId, body.plan_mode);
+        }
         return ok(res, await submitPrompt(adapter, sp, nativeId, body, hub), requestId);
       }
       if (tail === ':abort' && req.method === 'POST') {
@@ -857,7 +896,11 @@ async function listWorkspaces(
   return { items: [...roots.values()] };
 }
 
-function sessionDto(s: Session, model?: string, usage?: SessionUsage): Record<string, unknown> {
+function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boolean): Record<string, unknown> {
+  // facade 的 Session.busy 是硬编码 false(三家适配器都不跟踪 live 状态);
+  // 真值只能从网关 hub(turn 登记处)拿,调用方有 hub 就传 busy 覆盖——否则
+  // 进行中的会话刷新后月亮熄灭、前端误判 turn 结束(审查实测)。
+  const isBusy = busy ?? s.busy;
   return {
     id: prefixedId(s.provider, s.id),
     // workspace_id 必须与 listWorkspaces 的 workspaceDto 同一规则生成,
@@ -866,8 +909,8 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage): Record<st
     title: s.title,
     created_at: s.created_at,
     updated_at: s.updated_at,
-    busy: s.busy,
-    main_turn_active: s.busy,
+    busy: isBusy,
+    main_turn_active: isBusy,
     pending_interaction: 'none',
     archived: s.archived ?? false,
     metadata: { ...s.metadata, provider: s.provider },
@@ -887,6 +930,7 @@ async function listSessions(
   kimiFetch: KimiFetch | null,
   url: URL,
   provider: ProviderName | undefined,
+  busyOf: (sid: string) => boolean,
 ): Promise<Record<string, unknown>> {
   const limit = Math.min(Number(url.searchParams.get('page_size') ?? 50) || 50, 100);
   const beforeId = url.searchParams.get('before_id') ?? undefined;
@@ -950,7 +994,7 @@ async function listSessions(
         const cwd = typeof s.metadata?.cwd === 'string' ? String(s.metadata.cwd) : '';
         if (cwd.replace(/\/+$/, '') !== rootNorm) continue;
       }
-      items.push(sessionDto(s, adapters[p].getModel?.(s.id), adapters[p].getUsage?.(s.id)));
+      items.push(sessionDto(s, adapters[p].getModel?.(s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id))));
     }
   }
   items.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
@@ -975,8 +1019,11 @@ async function createSession(
     (b.provider && isProviderName(b.provider) ? b.provider : provider) ?? 'kimi';
   if (target === 'kimi') {
     if (!kimiFetch) throw new ProviderError('unsupported', 'kimi provider is off', 400);
-    // 原样转发给上游 kap-server。
-    const created = (await kimiFetch('/sessions', { method: 'POST', body: JSON.stringify(b) })) as Record<string, unknown>;
+    // 原样转发给上游 kap-server,但剔除网关层的 provider 字段——它是本网关的
+    // 分流概念,上游 kap-server 不认识(UI 审查:严格 schema 会 400)。
+    const forward = { ...(b as Record<string, unknown>) };
+    delete forward.provider;
+    const created = (await kimiFetch('/sessions', { method: 'POST', body: JSON.stringify(forward) })) as Record<string, unknown>;
     // daemon 怪癖:create 不落地 agent_config.model,新会话 model 为空,
     // 直接发 prompt 会以 model.not_configured 失败。补一发 /profile 设模型
     // (请求体没指定就用上游 /auth 的 default_model)。实测验证过这条链。
@@ -1020,7 +1067,8 @@ async function getSession(
   const page = await adapter.list({ limit: 500 });
   const found = page.items.find((s) => s.id === nativeId);
   if (found) return found;
-  // Claude 新建但还没落盘的会话不在 list 里,造一个最小的。
+  // Claude 新建但还没落盘的会话不在 list 里,造一个最小的;cwd 优先取
+  // adapter 记录的(create 时写入),不伪造 HOME 假目录(审查发现)。
   return {
     id: nativeId,
     workspace_id: '',
@@ -1028,7 +1076,7 @@ async function getSession(
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     busy: false,
-    metadata: { cwd: process.env.HOME ?? '/home/ubuntu' },
+    metadata: { cwd: adapter.getCwd?.(nativeId) ?? process.env.HOME ?? '/home/ubuntu' },
     provider,
   };
 }
@@ -1052,7 +1100,7 @@ async function snapshot(
   return {
     as_of_seq: hub.nextSeq(),
     epoch: hub.epoch,
-    session: sessionDto(session, adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId)),
+    session: sessionDto(session, adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), active !== undefined),
     messages: { items: history.map((m) => messageDto(m, sid)), has_more: false },
     in_flight_turn: active
       ? {
@@ -1104,21 +1152,76 @@ function listPrompts(sid: string, hub: SessionHub): Record<string, unknown> {
   };
 }
 
+/**
+ * 解析 prompt 提交体:text 部分拼接;image/video/file 附件翻译成
+ * TurnAttachment(网关上传单 → 磁盘路径;base64 → data URL;http URL
+ * 诚实降级为文字引用——codex turn/start 的 image 项只收 data URL)。
+ * 上传单丢失(重启后内存元数据没了)时降级为文字说明,不让 prompt 整个失败。
+ */
+function extractAttachments(content: Array<Record<string, unknown>>): { text: string; attachments: TurnAttachment[] } {
+  const texts: string[] = [];
+  const attachments: TurnAttachment[] = [];
+  for (const c of content ?? []) {
+    const type = c.type as string | undefined;
+    if (type === 'text') {
+      const t = typeof c.text === 'string' ? c.text : '';
+      if (t) texts.push(t);
+      continue;
+    }
+    if (type === 'image' || type === 'video') {
+      const src = c.source as Record<string, unknown> | undefined;
+      const kind = src?.kind as string | undefined;
+      if (kind === 'file' && typeof src?.file_id === 'string') {
+        const meta = uploads.get(src.file_id);
+        if (!meta) {
+          texts.push(`[attached ${type} unavailable: upload expired]`);
+          continue;
+        }
+        const p = path.join(UPLOAD_DIR, meta.id);
+        // codex 有 localImage 没有 video 输入项:图片给路径,视频物化成文本。
+        attachments.push(
+          type === 'image'
+            ? { kind: 'localImage', path: p, name: meta.name, mediaType: meta.media_type, size: meta.size }
+            : { kind: 'filePathText', path: p, name: meta.name, mediaType: meta.media_type, size: meta.size },
+        );
+        continue;
+      }
+      if (kind === 'base64' && typeof src?.data === 'string' && type === 'image') {
+        const mime = typeof src.media_type === 'string' ? src.media_type : 'image/png';
+        attachments.push({ kind: 'imageDataUrl', dataUrl: `data:${mime};base64,${src.data}`, mediaType: mime });
+        continue;
+      }
+      if (kind === 'url' && typeof src?.url === 'string') {
+        texts.push(`[attached ${type}: ${src.url}]`);
+        continue;
+      }
+      continue;
+    }
+    if (type === 'file') {
+      const fileId = c.file_id as string | undefined;
+      const meta = fileId ? uploads.get(fileId) : undefined;
+      if (meta) {
+        attachments.push({ kind: 'filePathText', path: path.join(UPLOAD_DIR, meta.id), name: meta.name, mediaType: meta.media_type, size: meta.size });
+      } else {
+        texts.push(`[attached file unavailable: ${String(c.name ?? 'unknown')}]`);
+      }
+    }
+  }
+  return { text: texts.join('\n'), attachments };
+}
+
 async function submitPrompt(
   adapter: ProviderAdapter,
   provider: ProviderName,
   nativeId: string,
-  body: { content: { type: string; text?: string }[] },
+  body: { content: Array<Record<string, unknown>> },
   hub: SessionHub,
 ): Promise<Record<string, unknown>> {
   // hub 键统一用带 provider 前缀的 wire id:codex/claude 的原生 id 都是 UUID,
   // 只用 nativeId 会让同名会话跨 provider 互串 busy/广播(审查发现)。
   const sid = prefixedId(provider, nativeId);
-  const text = (body.content ?? [])
-    .filter((c) => c.type === 'text')
-    .map((c) => c.text ?? '')
-    .join('\n');
-  if (!text.trim()) throw new ProviderError('invalid_request', 'empty prompt', 400);
+  const { text, attachments } = extractAttachments(body.content ?? []);
+  if (!text.trim() && attachments.length === 0) throw new ProviderError('invalid_request', 'empty prompt', 400);
 
   // codex 网关代执行命令(/compact /fork /undo /status /usage /mcp /review):
   // app-server 没有 slash 概念,名字命中时映射到对应 RPC。/review 是真 turn,
@@ -1143,7 +1246,7 @@ async function submitPrompt(
   if (hub.busy.has(sid)) {
     const promptId = randomUUID();
     const q = hub.queued.get(sid) ?? [];
-    q.push({ promptId, text, createdAt: new Date().toISOString() });
+    q.push({ promptId, text, attachments, createdAt: new Date().toISOString() });
     hub.queued.set(sid, q);
     return {
       prompt_id: promptId,
@@ -1154,7 +1257,7 @@ async function submitPrompt(
     };
   }
 
-  return driveTurn(adapter, provider, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text }), hub);
+  return driveTurn(adapter, provider, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text, attachments }), hub);
 }
 
 /**
@@ -1169,6 +1272,7 @@ async function driveTurn(
   acquire: () => Promise<TurnHandle>,
   hub: SessionHub,
   promptId: string = randomUUID(),
+  onSettled?: (reason: 'completed' | 'failed') => void,
 ): Promise<Record<string, unknown>> {
   const sid = prefixedId(provider, nativeId);
   const turn = newActiveTurn(nativeId, promptId);
@@ -1251,6 +1355,9 @@ async function driveTurn(
         emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: pending, last_turn_reason: reason });
         // 接力:队列里的下一个 prompt 作为自己的 turn 启动(kap-server 语义)。
         drainQueue(adapter, provider, nativeId, hub);
+        // 终态广播后的收尾钩子(:compact 的 completed 帧在这发,时机对齐
+        // kap-server 的 worker 尾部)。
+        onSettled?.(reason);
       }
     }
   })();
@@ -1275,7 +1382,7 @@ function drainQueue(adapter: ProviderAdapter, provider: ProviderName, nativeId: 
   const next = hub.queued.get(sid)?.shift();
   if (!next) return;
   if ((hub.queued.get(sid)?.length ?? 0) === 0) hub.queued.delete(sid);
-  void driveTurn(adapter, provider, nativeId, next.text, () => adapter.startTurn({ sessionId: nativeId, input: next.text }), hub, next.promptId)
+  void driveTurn(adapter, provider, nativeId, next.text, () => adapter.startTurn({ sessionId: nativeId, input: next.text, attachments: next.attachments }), hub, next.promptId)
     .catch((err: unknown) => {
       console.error('[gateway] 队列 prompt 接力失败:', err instanceof Error ? err.message : err);
       drainQueue(adapter, provider, nativeId, hub);
@@ -1310,7 +1417,12 @@ async function runCodexLocalCommand(
     reason = 'failed';
     output = `✗ ${promptText} 执行失败:${err instanceof Error ? err.message : String(err)}`;
   }
+  // 投影器的 assistant.delta 要求 currentAssistantMsgId 已存在,而它只由
+  // turn.step.started 创建(审查实测:缺这一帧命令输出被静默丢弃,kap-server
+  // 原版也是 step.started 先于该 step 全部 delta)。
+  emit('turn.step.started', { turnId: 0, step: 0 });
   emit('assistant.delta', { turnId: 0, delta: output }, true);
+  emit('turn.step.completed', { turnId: 0, step: 0, usage: {} });
   emit('turn.ended', { turnId: 0, reason, durationMs: Date.now() - startedAt });
   emit('prompt.completed', { promptId, reason });
   return {
@@ -1546,10 +1658,13 @@ async function resolveApproval(
   provider: ProviderName,
   nativeId: string,
   approvalId: string,
-  body: { decision: string },
+  body: { decision: string; scope?: string },
   hub: SessionHub,
 ): Promise<void> {
-  const decision = body.decision === 'approved' ? 'approve' : body.decision === 'rejected' ? 'reject' : 'reject';
+  // 前端"允许本次会话"带 scope:'session'(ApprovalCard.vue),映射 approve_always
+  // → codex acceptForSession;此前网关只读 decision,该按钮实际只放行单次(审查发现)。
+  const base = body.decision === 'approved' ? 'approve' : 'reject';
+  const decision = base === 'approve' && body.scope === 'session' ? 'approve_always' : base;
   await adapter.resolveApproval(nativeId, approvalId, decision);
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
