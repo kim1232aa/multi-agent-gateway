@@ -789,18 +789,21 @@ index 85f2316..42b4cac 100644
    </div>
  </template>
 diff --git a/apps/kimi-web/src/composables/client/useModelProviderState.ts b/apps/kimi-web/src/composables/client/useModelProviderState.ts
-index 62d31af..77f6feb 100644
+index 62d31af..89927f5 100644
 --- a/apps/kimi-web/src/composables/client/useModelProviderState.ts
 +++ b/apps/kimi-web/src/composables/client/useModelProviderState.ts
-@@ -8,6 +8,7 @@
+@@ -7,7 +7,10 @@
+ 
  import { ref, watch, type ComputedRef } from 'vue';
  import { getKimiWebApi } from '../../api';
++import { SERVER_AUTH_UNAUTHORIZED_CODE } from '../../api/daemon/http';
++import { isDaemonApiError } from '../../api/errors';
  import type {
 +  AppCommand,
    AppMessage,
    AppModel,
    AppProvider,
-@@ -16,6 +17,8 @@ import type {
+@@ -16,6 +19,8 @@ import type {
    OAuthLoginStartResult,
    ThinkingLevel,
  } from '../../api/types';
@@ -809,7 +812,7 @@ index 62d31af..77f6feb 100644
  import { safeGetString, safeSetString, STORAGE_KEYS } from '../../lib/storage';
  import {
    defaultThinkingLevelFor,
-@@ -103,7 +106,20 @@ export function useModelProviderState(
+@@ -103,7 +108,20 @@ export function useModelProviderState(
    } = deps;
  
    // Models + Providers reactive state (lazy-loaded, cached)
@@ -830,7 +833,7 @@ index 62d31af..77f6feb 100644
    const starredModelIds = ref<string[]>(loadStarredModelsFromStorage());
  
    // Session-scoped skills (slash-invocable). Loaded lazily per session; the active
-@@ -250,7 +266,12 @@ export function useModelProviderState(
+@@ -250,7 +268,12 @@ export function useModelProviderState(
     *  created by other clients inherit it. Fire-and-forget: the session-level
     *  and local values have already been applied. Never called for derived
     *  values (e.g. the loadModels default pin) — only for user actions. */
@@ -844,7 +847,7 @@ index 62d31af..77f6feb 100644
      void getKimiWebApi()
        .setConfig({
          thinking: thinkingLevelToConfig(level, modelById(currentModelId())?.supportEfforts),
-@@ -280,11 +301,38 @@ export function useModelProviderState(
+@@ -280,11 +303,38 @@ export function useModelProviderState(
      }
    }
  
@@ -886,7 +889,7 @@ index 62d31af..77f6feb 100644
        // Resolve the active session's level: its own daemon-reported level when
        // still declared, else the model's catalog default. Always re-resolved
        // (not just when unset) so a level carried over from another model can't
-@@ -293,11 +341,42 @@ export function useModelProviderState(
+@@ -293,11 +343,48 @@ export function useModelProviderState(
        if (active !== undefined) {
          rawState.thinking = thinkingLevelForSession(rawState.activeSessionId, active);
        }
@@ -896,6 +899,10 @@ index 62d31af..77f6feb 100644
 +        draftModel.value = null;
 +      }
      } catch (err) {
++      // 未登录启动时 immediate catalog watch 就会打这个请求并撞上 401:静默,
++      // 恢复路径由 ServerAuthDialog 拥有(对齐 useWorkspaceState 的 401 惯例);
++      // 弹 toast 会让未登录页比原版多出一条「Unauthorized」报错(审查发现)。
++      if (isDaemonApiError(err) && (err.code === 401 || err.code === SERVER_AUTH_UNAUTHORIZED_CODE)) return;
        pushOperationFailure('loadModels', err);
      }
    }
@@ -920,16 +927,18 @@ index 62d31af..77f6feb 100644
 +    }
 +  }
 +
-+  /** 切 provider 时一次性同步模型目录 + 原生命令目录。 */
-+  async function loadCatalogForProvider(provider: SessionProvider, force = false): Promise<void> {
-+    providerCommands.value = commandsByProvider.get(provider) ?? [];
-+    await Promise.all([loadModels(provider, force), loadCommands(provider, force)]);
++  /** 切 provider 时一次性同步模型目录 + 原生命令目录。缺省按当前界面语境
++   *  (活动会话前缀 / 草稿 agent)解析——load() 启动同步走的就是这条。 */
++  async function loadCatalogForProvider(provider?: SessionProvider, force = false): Promise<void> {
++    const target = provider ?? activeProvider();
++    providerCommands.value = commandsByProvider.get(target) ?? [];
++    await Promise.all([loadModels(target, force), loadCommands(target, force)]);
 +  }
 +
    /** Load providers */
    async function loadProviders(): Promise<void> {
      try {
-@@ -321,6 +400,9 @@ export function useModelProviderState(
+@@ -321,6 +408,9 @@ export function useModelProviderState(
     */
    async function setModel(modelId: string): Promise<boolean> {
      const sid = rawState.activeSessionId;
@@ -939,7 +948,7 @@ index 62d31af..77f6feb 100644
      const targetModel = modelById(modelId);
      const prevThinking = rawState.thinking;
      const prevSessionModel = sid
-@@ -339,7 +421,7 @@ export function useModelProviderState(
+@@ -339,7 +429,7 @@ export function useModelProviderState(
        draftModel.value = modelId;
        rawState.thinking = nextThinking;
        if (nextThinking !== prevThinking && nextThinking !== undefined) {
@@ -948,7 +957,7 @@ index 62d31af..77f6feb 100644
        }
        return true;
      }
-@@ -377,7 +459,7 @@ export function useModelProviderState(
+@@ -377,7 +467,7 @@ export function useModelProviderState(
      // The switch reached the daemon: also persist the thinking pick as the
      // daemon-wide default (mirrors the TUI). Skipped on rollback above.
      if (nextThinking !== prevThinking && nextThinking !== undefined) {
@@ -957,7 +966,7 @@ index 62d31af..77f6feb 100644
      }
      // refreshSessionStatus folds the authoritative current model from /status
      // back into the session (the profile echo can return ''). Best-effort: a
-@@ -480,7 +562,9 @@ export function useModelProviderState(
+@@ -480,7 +570,9 @@ export function useModelProviderState(
      try {
        const api = getKimiWebApi();
        await api.addProvider(input);
@@ -968,7 +977,7 @@ index 62d31af..77f6feb 100644
      } catch (err) {
        pushOperationFailure('addProvider', err);
      }
-@@ -491,7 +575,9 @@ export function useModelProviderState(
+@@ -491,7 +583,9 @@ export function useModelProviderState(
      try {
        const api = getKimiWebApi();
        await api.deleteProvider(id);
@@ -979,7 +988,7 @@ index 62d31af..77f6feb 100644
      } catch (err) {
        pushOperationFailure('deleteProvider', err);
      }
-@@ -506,7 +592,9 @@ export function useModelProviderState(
+@@ -506,7 +600,9 @@ export function useModelProviderState(
            message: failure.provider,
          });
        }
@@ -990,7 +999,7 @@ index 62d31af..77f6feb 100644
      } catch (err) {
        pushOperationFailure('refreshProvider', err);
      }
-@@ -521,7 +609,9 @@ export function useModelProviderState(
+@@ -521,7 +617,9 @@ export function useModelProviderState(
            message: failure.provider,
          });
        }
@@ -1001,7 +1010,7 @@ index 62d31af..77f6feb 100644
      } catch (err) {
        pushOperationFailure('refreshAllProviders', err);
      }
-@@ -580,10 +670,14 @@ export function useModelProviderState(
+@@ -580,10 +678,14 @@ export function useModelProviderState(
      draftModel,
      skillsBySession,
      skillsByWorkspace,
@@ -1017,7 +1026,7 @@ index 62d31af..77f6feb 100644
      setModel,
      thinkingLevelForModelId,
 diff --git a/apps/kimi-web/src/composables/client/useWorkspaceState.ts b/apps/kimi-web/src/composables/client/useWorkspaceState.ts
-index 03a541f..8996bbd 100644
+index 03a541f..2100ace 100644
 --- a/apps/kimi-web/src/composables/client/useWorkspaceState.ts
 +++ b/apps/kimi-web/src/composables/client/useWorkspaceState.ts
 @@ -7,10 +7,12 @@
@@ -1058,7 +1067,22 @@ index 03a541f..8996bbd 100644
        });
        // Append de-duped against the latest list so a concurrently added/removed
        // session is respected.
-@@ -930,7 +935,7 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+@@ -856,11 +861,12 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+         return;
+       }
+       const api = getKimiWebApi();
+-      // Parallel: health + meta + models
++      // Parallel: health + meta + 当前 provider 的模型/命令目录(原版只拉 kimi
++      // 模型;网关语境下启动就要对齐到草稿 agent / 活动会话的那一家)。
+       await Promise.all([
+         api.getHealth().catch(() => null),
+         refreshServerMeta(),
+-        modelProvider.loadModels(),
++        modelProvider.loadCatalogForProvider(),
+       ]);
+ 
+       // Check auth readiness and global config (separate calls — defensive)
+@@ -930,7 +936,7 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
      try {
        const api = getKimiWebApi();
        const [list, home] = await Promise.all([
@@ -1067,7 +1091,7 @@ index 03a541f..8996bbd 100644
          api.getFsHome().catch(() => ({ home: '', recentRoots: [] })),
        ]);
        rawState.workspaces = applyWorkspaceNameOverrides(list);
-@@ -1084,6 +1089,13 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+@@ -1084,6 +1090,13 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
      // session's effort. Seeded into the new session's own entry below, the
      // first prompt/skill submits the pick and the daemon profile follows.
      const draftThinking = rawState.thinking;
@@ -1081,7 +1105,7 @@ index 03a541f..8996bbd 100644
      const api = getKimiWebApi();
      let workspaceIdForCreate: string | undefined;
      let cwdForCreate = ws.root;
-@@ -1095,13 +1107,17 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+@@ -1095,13 +1108,17 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
      } catch {
        // Older daemons may not have /workspaces.
      }
@@ -1101,7 +1125,7 @@ index 03a541f..8996bbd 100644
      // The create echo may return model as '' (same daemon quirk as /profile);
      // keep the user's pick so the status line doesn't snap back to the default.
      const created =
-@@ -1769,7 +1785,11 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+@@ -1769,7 +1786,11 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
    async function uploadImage(file: Blob, name?: string): Promise<{ fileId: string; name: string; mediaType: string } | null> {
      try {
        const api = getKimiWebApi();
@@ -1114,7 +1138,7 @@ index 03a541f..8996bbd 100644
        return { fileId: result.id, name: result.name, mediaType: result.mediaType };
      } catch (err) {
        pushOperationFailure('uploadImage', err);
-@@ -2748,6 +2768,20 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
+@@ -2748,6 +2769,20 @@ export function useWorkspaceState(rawState: ExtendedState, deps: UseWorkspaceSta
      }
    }
  
@@ -1174,7 +1198,7 @@ index 0000000..7840ed7
 +  };
 +}
 diff --git a/apps/kimi-web/src/composables/useKimiWebClient.ts b/apps/kimi-web/src/composables/useKimiWebClient.ts
-index f6e3f6a..f248354 100644
+index f6e3f6a..8ca4fbf 100644
 --- a/apps/kimi-web/src/composables/useKimiWebClient.ts
 +++ b/apps/kimi-web/src/composables/useKimiWebClient.ts
 @@ -18,6 +18,8 @@ import { workspaceRootKey } from '../lib/rootKey';
@@ -1196,7 +1220,7 @@ index f6e3f6a..f248354 100644
      void modelProvider.loadProviders();
    }
  
-@@ -2405,6 +2408,20 @@ watch(
+@@ -2405,6 +2408,23 @@ watch(
    { immediate: true },
  );
  
@@ -1204,6 +1228,10 @@ index f6e3f6a..f248354 100644
 +// 会话按会话 id 前缀(kimi 无前缀 / claude_ / codex_),空会话草稿按 draft
 +// agent。这样模型选择器和 `/` 菜单显示的永远是当前这家的原生内容,而不是
 +// 启动时拉的那一份 kimi 目录。
++// 不设 immediate:启动期的目录同步由 load()(鉴权通过后)负责。曾经 immediate
++// 在模块求值时就抢跑 /models——早于 initServerAuth 挂上凭证,401 响应经
++// markAuthRequired 把刚写入的凭证清掉,启动 URL 的 fragment token 直接失效,
++// 未登录页还多一条 Unauthorized toast(审查发现)。
 +const { draftAgent: catalogDraftAgent } = useDraftAgent();
 +watch(
 +  [() => rawState.activeSessionId, catalogDraftAgent],
@@ -1211,13 +1239,12 @@ index f6e3f6a..f248354 100644
 +    const provider = sid ? providerOfSessionId(sid) : agent;
 +    void modelProvider.loadCatalogForProvider(provider);
 +  },
-+  { immediate: true },
 +);
 +
  /** The active workspace as a sidebar view (or null when none). */
  const visibleWorkspace = computed<WorkspaceView | null>(() => {
    const id = activeWorkspaceId.value;
-@@ -2938,6 +2955,9 @@ export function useKimiWebClient() {
+@@ -2938,6 +2958,9 @@ export function useKimiWebClient() {
      loadModels: modelProvider.loadModels,
      loadProviders: modelProvider.loadProviders,
      skills,

@@ -261,6 +261,14 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{ url:
 
   const server = createServer((req, res) => {
     void (async () => {
+      // 鉴权先于一切路由和代理(审查发现:provider=kimi 透传曾在鉴权之前执行,
+      // 无凭证请求被重写 Authorization 后直达上游 = 完整鉴权绕过)。healthz 免鉴权;
+      // 与 route 内的检查并存(双保险),WS 握手走 upgrade 通道不受影响。
+      const preAuthUrl = new URL(req.url ?? '/', 'http://localhost');
+      if (preAuthUrl.pathname.startsWith(API) && preAuthUrl.pathname !== `${API}/healthz` && !authed(req, token)) {
+        fail(res, 401, 40101, 'Unauthorized', ulid());
+        return;
+      }
       // Kimi 会话(id 无前缀)的 REST → 无损代理到原版 kap-server。
       if (kimiHttp && shouldProxyToKimi(req)) {
         const handled = await kimiHttp(req, res);
