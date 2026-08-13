@@ -95,6 +95,10 @@ export function createKimiHttpProxy(options?: KimiProxyOptions) {
       const lower = name.toLowerCase();
       if (HOP_BY_HOP_HEADERS.has(lower)) continue;
       if (lower === 'host' || lower === 'content-length') continue;
+      // Host 被改写为上游地址,客户端的 Origin(隧道域名)对上游不再成立;
+      // kap-server 会做 Origin 校验,原样透传会被 403 —— 直接剥离,
+      // 让上游按非浏览器客户端处理。
+      if (lower === 'origin') continue;
       headers.append(name, value);
     }
     headers.set('host', upstreamAuthority);
@@ -194,6 +198,8 @@ export function createKimiWsUpgrader(options?: KimiProxyOptions) {
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         const name = req.rawHeaders[i];
         const lower = name.toLowerCase();
+        // 同 HTTP 路径:剥离 Origin,避免 kap-server 因 Origin/Host 不一致 403。
+        if (lower === 'origin') continue;
         if (lower === 'host') {
           lines.push(`${name}: ${upstreamAuthority}`);
         } else if (lower !== 'authorization' || !upstreamToken) {

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CodexAdapter, type CodexEvent } from './codex-adapter.js';
+import { ProviderError } from './types.js';
 
 function stubTransport(adapter: CodexAdapter): void {
   (adapter as any).connect = async () => undefined;
@@ -79,4 +80,28 @@ test('fails a review turn instead of hanging when the app-server exits mid-revie
   await assert.rejects(it.next(), /disconnected/);
   // 进程退出同时清掉 config 模型缓存,重连后必须重读。
   assert.equal((adapter as any).configModelCache, null);
+});
+
+test('translates "already has an active writer" into an actionable message', async () => {
+  // 另一个客户端(常见是 codex CLI resume 同一 thread)持有写入者时,
+  // app-server 回 -32600;适配器应对齐 kap-server 的 busy 模型(409+busy
+  // 子码),给可操作提示而不是原始 RPC 错误/500。
+  const adapter = new CodexAdapter();
+  (adapter as any).connect = async () => undefined;
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/resume') {
+      throw new Error("codex 'thread/resume' failed (-32600): thread th already has an active writer");
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(adapter.resume('th'), (err: unknown) => {
+    assert.ok(err instanceof ProviderError);
+    assert.equal(err.code, 'busy');
+    assert.equal(err.httpStatus, 409);
+    assert.match(err.message, /只允许一个写入者/);
+    return true;
+  });
+  // 非占用类错误不得被误翻译。
+  (adapter as any).request = async () => { throw new Error('thread not found'); };
+  await assert.rejects(adapter.resume('th'), /thread not found/);
 });

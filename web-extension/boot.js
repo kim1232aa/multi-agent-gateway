@@ -450,7 +450,13 @@
   });
   window.addEventListener('popstate', onRouteChange);
   if (document.addEventListener) {
-    document.addEventListener('click', closeMenu);
+    // 官方菜单(账号/模型)的触发按钮 stopPropagation,冒泡监听收不到 →
+    // 用捕获阶段关我们的菜单;点在自己 wrap(pill/菜单)内的交给行/toggle。
+    document.addEventListener('click', function (event) {
+      var target = event && event.target;
+      if (target && typeof target.closest === 'function' && target.closest('.multi-agent-provider-wrap')) return;
+      closeMenu();
+    }, true);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;

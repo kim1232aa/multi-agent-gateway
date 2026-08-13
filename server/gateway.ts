@@ -333,15 +333,28 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const kimiSockets = new Set<Duplex>();
   let refreshKimiInflight: Promise<void> | null = null;
   const refreshKimi = (): Promise<void> => {
-    if (kimiOpt !== 'spawn' || !kimiFallback) return Promise.resolve();
+    const standby = kimiFallback;
+    if (kimiOpt !== 'spawn' || !standby) return Promise.resolve();
     refreshKimiInflight ??= (async () => {
-      const followed = await followKimiServer(kimiFallback);
-      if (kimi?.url === followed.url && kimi.token === followed.token) return;
-      kimi = { url: followed.url, token: followed.token, child: followed };
+      let next = await followKimiServer(standby);
+      if (next === standby && !(await kimiAlive(next))) {
+        // 官方候选经 connectExisting 探活过;只有"无候选→沿用 standby"这条
+        // 没探。standby 崩溃/被杀时旧实现永远卡在死人身上(kimi WS 502、
+        // /auth 掉线、前端弹 WebSocket error),探死就重走 spawn:注册表有
+        // 活实例则复用;没有、或注册表卡住(多实例/残留误报)则强制新起。
+        try {
+          next = await spawnKimiServer();
+        } catch {
+          next = await spawnKimiServer({ reuseRegistered: false });
+        }
+        if (next.owned) kimiFallback = next;
+      }
+      if (kimi?.url === next.url && kimi.token === next.token) return;
+      kimi = { url: next.url, token: next.token, child: next };
       updateKimiProxy();
       for (const socket of kimiSockets) socket.destroy();
-      const label = followed.owned ? 'owned fallback' : 'official /web server';
-      console.error(`[gateway] Kimi upstream switched to ${label} at ${followed.url}`);
+      const label = next.owned ? 'owned fallback' : 'official /web server';
+      console.error(`[gateway] Kimi upstream switched to ${label} at ${next.url}`);
     })().finally(() => {
       refreshKimiInflight = null;
     });
@@ -2607,6 +2620,19 @@ function codeNumber(code: string): number {
     busy: 40901, unsupported: 40001, upstream_error: 50001,
   };
   return map[code] ?? 50001;
+}
+
+/** 探活 kap-server:/meta 返回 200 即活;1s 超时,断连立即判死。 */
+async function kimiAlive(candidate: { url: string; token: string }): Promise<boolean> {
+  try {
+    const res = await fetch(`${candidate.url}${API}/meta`, {
+      headers: { authorization: `Bearer ${candidate.token}` },
+      signal: AbortSignal.timeout(1_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 function ulid(): string {

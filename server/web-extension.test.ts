@@ -327,10 +327,11 @@ async function loadDomShim(options: {
   const appRoot = {
     __vue_app__: { _context: { provides: { [facadeSymbol]: facade } } },
   };
+  const docListeners: Record<string, (event: any) => void> = {};
   const documentObject: any = {
     readyState: 'complete',
     documentElement: fakeElement('html'),
-    addEventListener: () => {},
+    addEventListener: (name: string, fn: (event: any) => void) => { docListeners[name] = fn; },
     createElement: (tag: string) => fakeElement(tag),
     querySelector: (selector: string) => {
       queries.push(selector);
@@ -410,6 +411,7 @@ async function loadDomShim(options: {
   api.facade = facade;
   api.reloads = () => reloads;
   api.metaAuth = () => metaAuth;
+  api.docClick = (event: any) => docListeners.click?.(event);
   api.emitMutations = (records: any[]) => mutationCallback?.(records);
   return api;
 }
@@ -755,4 +757,31 @@ test('falls back to the stored server credential when the hash has no token', as
   const hashWins = await loadDomShim({ hash: '#token=hash-token', serverCredential: 'raw-token' });
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(hashWins.metaAuth(), 'Bearer hash-token');
+});
+
+test('closes the provider menu on outside clicks even when official buttons stop propagation', async () => {
+  // 回归:官方账号/模型菜单按钮 stopPropagation,冒泡监听收不到,两个菜单
+  // 曾同时打开。现在 document 捕获阶段先关(自己 wrap 内的点击除外)。
+  const anchor = makeAnchor();
+  const api = await loadDomShim({ getAnchor: () => anchor });
+  api.sidebar.appendChild(anchor);
+  api.emitMutations([{ type: 'childList', addedNodes: [anchor], removedNodes: [] }]);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const wrap = api.sidebar.children[0];
+  const pill = wrap.querySelector('.multi-agent-provider-pill');
+  pill.click();
+  const menu = () => wrap.querySelector('.multi-agent-provider-menu');
+  assert.equal(menu().hidden, false);
+
+  // 外部点击(官方账号按钮,无 closest):菜单关闭。
+  api.docClick({ target: anchor });
+  assert.equal(menu().hidden, true);
+  assert.equal(pill.getAttribute('aria-expanded'), 'false');
+
+  // 自己 wrap 内的点击:交给行/toggle,不被捕获监听误关。
+  pill.click();
+  assert.equal(menu().hidden, false);
+  api.docClick({ target: { closest: () => wrap } });
+  assert.equal(menu().hidden, false);
 });

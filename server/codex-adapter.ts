@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as readline from 'node:readline';
 import { z } from 'zod';
+import { ProviderError } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Wire schemas (loose on purpose: unknown fields are kept via catchall so the
@@ -834,16 +835,32 @@ export class CodexAdapter {
   /** Resume an existing thread (thread/resume) so turns can be sent to it. */
   async resume(threadId: string, options: ThreadStartOptions = {}): Promise<CodexThread> {
     await this.connect();
-    const raw = await this.request('thread/resume', {
-      threadId,
-      cwd: options.cwd ?? null,
-      model: options.model ?? null,
-      approvalPolicy: options.approvalPolicy ?? null,
-      sandbox: options.sandbox ?? null,
-      baseInstructions: options.baseInstructions ?? null,
-      developerInstructions: options.developerInstructions ?? null,
-      config: options.config ?? null,
-    });
+    let raw: unknown;
+    try {
+      raw = await this.request('thread/resume', {
+        threadId,
+        cwd: options.cwd ?? null,
+        model: options.model ?? null,
+        approvalPolicy: options.approvalPolicy ?? null,
+        sandbox: options.sandbox ?? null,
+        baseInstructions: options.baseInstructions ?? null,
+        developerInstructions: options.developerInstructions ?? null,
+        config: options.config ?? null,
+      });
+    } catch (err) {
+      // codex 单写者语义:另一个客户端(常见是 codex CLI resume 了同一
+      // thread)持有写入者时,app-server 报 -32600 already has an active
+      // writer。对齐 kap-server 的 busy 模型(409 + busy 子码):这是"会话
+      // 正忙"而非服务器故障,前端可按 busy 形态展示并提示稍后再试。
+      if (err instanceof Error && /already has an active writer/i.test(err.message)) {
+        throw new ProviderError(
+          'busy',
+          '会话正忙：该 codex 会话被另一个客户端占用(codex 同一时间只允许一个写入者,通常是 codex CLI 里 resume 了同一会话)。请先退出占用方,或稍后再试。',
+          409,
+        );
+      }
+      throw err;
+    }
     const thread = ThreadResumeResponseSchema.parse(raw).thread;
     this.liveThreads.add(threadId);
     if (options.model) this.threadModels.set(threadId, options.model);

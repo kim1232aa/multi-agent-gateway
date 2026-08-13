@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
@@ -6,6 +7,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 import type { ProviderAdapter, ProviderCapabilities, NativeModel, NativeCommand, Session, SessionPage, Message, StartTurnInput, TurnHandle, ApprovalDecision, HistoryQuery, ListSessionsQuery, CreateSessionInput } from './types.js';
 import { detectAvailableProviders, startGateway } from './gateway.js';
 
@@ -552,6 +554,76 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
   }
 });
 
+test('respawns the owned Kimi fallback when the standby process is killed', async () => {
+  // 回归:standby kap 崩溃/被杀时,旧实现的 1s follow 只会返回死人(注册表
+  // 无候选 → ?? current),代理永远卡在尸体上——前端 kimi WS 502、/auth
+  // 掉线弹 WebSocket error。现在 refreshKimi 探死就重走 spawn 自愈。
+  const root = await mkdtemp(join(tmpdir(), 'multi-agent-kimi-respawn-'));
+  const fakeKimi = join(root, 'kimi');
+  await mkdir(join(root, 'server', 'instances'), { recursive: true });
+  await writeFile(join(root, 'server.token'), 'shared-token\n', { mode: 0o600 });
+  await writeFile(fakeKimi, `#!/usr/bin/env node
+const http = require('node:http');
+const index = process.argv.indexOf('--port');
+const port = Number(process.argv[index + 1]);
+const server = http.createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ code: 0, msg: 'success', data: { source: 'fallback' } }));
+});
+server.listen(port, '127.0.0.1', () => console.log('Kimi server: http://127.0.0.1:' + port + '/#token=shared-token'));
+`);
+  await chmod(fakeKimi, 0o755);
+
+  const previousHome = process.env.KIMI_CODE_HOME;
+  const previousBin = process.env.KIMI_BIN;
+  process.env.KIMI_CODE_HOME = root;
+  process.env.KIMI_BIN = fakeKimi;
+  let gateway: Awaited<ReturnType<typeof startGateway>> | undefined;
+  const source = async (): Promise<string | undefined> => {
+    const response = await fetch(`${gateway?.url}/api/v1/meta`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    if (!response.ok) return undefined;
+    return ((await response.json()) as { data?: { source?: string } }).data?.source;
+  };
+  const waitForSource = async (expected: string, ms = 10_000): Promise<void> => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await source().catch(() => undefined) === expected) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(await source().catch(() => undefined), expected);
+  };
+
+  try {
+    gateway = await startGateway({
+      port: 0,
+      token: 'gateway-token',
+      codex: fakeAdapter('codex') as any,
+      claude: fakeAdapter('claude') as any,
+    });
+    await waitForSource('fallback');
+
+    // SIGKILL 掉 standby(模拟 kap 崩溃):假二进制路径含唯一 tmp 目录,
+    // pgrep -f 不会误匹配其它进程。
+    const execFileP = promisify(execFile);
+    const { stdout } = await execFileP('pgrep', ['-f', fakeKimi]);
+    const pids = stdout.trim().split('\n').filter(Boolean).map(Number);
+    assert.ok(pids.length > 0, 'expected a running standby kimi process');
+    for (const pid of pids) process.kill(pid, 'SIGKILL');
+
+    // 下一个 1s follow tick 探死 → 重新 spawn → 服务自愈(不允许永久 502)。
+    await waitForSource('fallback');
+  } finally {
+    await gateway?.close();
+    if (previousHome === undefined) delete process.env.KIMI_CODE_HOME;
+    else process.env.KIMI_CODE_HOME = previousHome;
+    if (previousBin === undefined) delete process.env.KIMI_BIN;
+    else process.env.KIMI_BIN = previousBin;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('tunnels Kimi WebSocket upgrade with upstream authorization and the browser protocol', async () => {
   let upgrade:
     | { path: string; authorization: string | undefined; protocol: string | undefined }
@@ -629,6 +701,80 @@ test('tunnels Kimi WebSocket upgrade with upstream authorization and the browser
       (frames[0]?.payload as { server_id?: string } | undefined)?.server_id,
       'official-upstream',
     );
+  } finally {
+    await gateway.close();
+    await upstream.close();
+  }
+});
+
+test('strips Origin on Kimi WebSocket tunnel so kap-server does not 403 the handshake', async () => {
+  let upgrade: { origin: string | undefined; host: string | undefined } | undefined;
+  const upstreamServer = createServer((_req, res) => {
+    res.writeHead(404).end();
+  });
+  upstreamServer.on('upgrade', (req, socket) => {
+    upgrade = { origin: req.headers.origin, host: req.headers.host };
+    const key = String(req.headers['sec-websocket-key'] ?? '');
+    const protocol = String(req.headers['sec-websocket-protocol'] ?? '');
+    socket.write([
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${wsAccept(key)}`,
+      `Sec-WebSocket-Protocol: ${protocol}`,
+      '',
+      '',
+    ].join('\r\n'));
+    setTimeout(() => socket.destroy(), 50);
+  });
+  const upstream = await listen(upstreamServer);
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+  });
+  try {
+    const gatewayUrl = new URL(gateway.url);
+    // 模拟过 cloudflare 隧道的浏览器握手:Origin 是隧道域名,与上游 Host 不一致。
+    const statusLine = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection(Number(gatewayUrl.port), '127.0.0.1', () => {
+        socket.write([
+          'GET /api/v1/ws?client_id=browser&provider=kimi HTTP/1.1',
+          `Host: ${gatewayUrl.host}`,
+          'Upgrade: websocket',
+          'Connection: Upgrade',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Protocol: kimi-code.bearer.gateway-token',
+          'Origin: https://kimi.example-tunnel.invalid',
+          '',
+          '',
+        ].join('\r\n'));
+      });
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error('Kimi WebSocket origin-strip handshake timed out'));
+      }, 2_000);
+      let buf = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx !== -1) {
+          clearTimeout(timer);
+          resolve(buf.subarray(0, idx).toString().split('\r\n')[0]);
+          socket.destroy();
+        }
+      });
+      socket.on('error', (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    assert.equal(statusLine, 'HTTP/1.1 101 Switching Protocols');
+    assert.equal(upgrade?.origin, undefined);
+    assert.equal(upgrade?.host, new URL(upstream.url).host);
   } finally {
     await gateway.close();
     await upstream.close();
