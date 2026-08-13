@@ -113,8 +113,22 @@
 
   function tokenFromHash() {
     var match = /(?:^|[#&])token=([^&]+)/.exec(window.location.hash || '');
-    if (!match) return null;
-    try { return decodeURIComponent(match[1]); } catch (_) { return match[1]; }
+    if (match) {
+      try { return decodeURIComponent(match[1]); } catch (_) { return match[1]; }
+    }
+    // hash 没带 token 时回退官方前端存的服务凭证(登录后写入;JSON 或裸串)。
+    try {
+      var stored = localStorage.getItem('kimi-web.server-credential');
+      if (!stored) return null;
+      try {
+        var parsed = JSON.parse(stored);
+        return parsed && typeof parsed.token === 'string' ? parsed.token : null;
+      } catch (_) {
+        return stored;
+      }
+    } catch (_) {
+      return null;
+    }
   }
 
   // 没装 codex/claude 的机器不该在选择器里看到它们。网关 /meta 的 providers
@@ -168,7 +182,7 @@
 
   // 官方应用把上一次选择原样带到新 provider(实测 Claude 页显示 Kimi 的 k3)。
   // 目录里没有当前选择时:优先回本 provider 上次记住的选择,否则用目录第一项。
-  function reconcileModel(facade) {
+  function reconcileModel(facade, provider) {
     if (!facade || typeof facade.setModel !== 'function') return;
     var catalog = unwrapRef(facade.models);
     if (!Array.isArray(catalog) || catalog.length === 0) return;
@@ -178,7 +192,7 @@
     if (ids.length === 0) return;
     var current = unwrapRef(facade.defaultModel);
     if (current && ids.indexOf(current) !== -1) return;
-    var saved = modelMemory()[selectedProvider()];
+    var saved = modelMemory()[provider];
     var pick = saved && ids.indexOf(saved) !== -1 ? saved : ids[0];
     try {
       facade.setModel(pick);
@@ -245,13 +259,19 @@
       return;
     }
     closeProviderSockets();
+    // 入队时捕获 provider:慢 provider 的 load 落地时选择可能已变,旧 provider
+    // 的目录不能用新 provider 的记忆/默认值去校正。
+    var provider = selectedProvider();
     // facade.load() 是官方应用自己的完整引导(工作区+会话+模型,实测不弹
     // 全屏 splash);loadAllSessions 只服务搜索且有 sessionsFullyLoaded 早退,
     // 不能用它刷新侧边栏。引导完成后把模型选择校正到当前 provider 的目录。
     refreshChain = refreshChain.then(function () {
       return Promise.resolve(facade.load()).catch(function () {});
     }).then(function () {
-      reconcileModel(facade);
+      if (provider !== selectedProvider()) return;
+      reconcileModel(facade, provider);
+    }).then(undefined, function () {
+      // 自愈:facade.load 同步抛错曾让链永久 rejected,后续刷新全部静默失效。
     });
   }
 

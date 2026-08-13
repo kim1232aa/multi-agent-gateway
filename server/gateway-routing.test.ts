@@ -1840,3 +1840,138 @@ test('surfaces provider model catalog errors instead of faking an empty list', a
     await gateway.close();
   }
 });
+
+test('keeps a running turn visible when the first history fetch fails but a later one succeeds', async () => {
+  // 回归:首轮 getHistory 失败曾把 historyObserved 提前固化,之后历史成功
+  // 回灌时运行中 turn 与同号持久化 turn 撞号,REST 页静默丢 live turn。
+  const claude = fakeAdapter('claude');
+  let historyCalls = 0;
+  claude.getHistory = async (): Promise<Message[]> => {
+    historyCalls += 1;
+    if (historyCalls === 1) throw new Error('transient history failure');
+    return [
+      { id: 'u1', session_id: 'claude-native', role: 'user', content: [{ type: 'text', text: 'old one' }], created_at: '2026-01-01T00:00:00.000Z' },
+      { id: 'a1', session_id: 'claude-native', role: 'assistant', content: [{ type: 'text', text: 'old reply' }], created_at: '2026-01-01T00:00:01.000Z' },
+      { id: 'u2', session_id: 'claude-native', role: 'user', content: [{ type: 'text', text: 'old two' }], created_at: '2026-01-01T00:00:02.000Z' },
+    ];
+  };
+  claude.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'stuck-turn',
+    // 永不结束的事件流:turn 一直保持 running。
+    events: (async function* () { await new Promise<never>(() => {}); })() as AsyncGenerator<never>,
+  });
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: 'live prompt' }] }),
+    });
+    assert.equal(response.status, 200);
+
+    let page: any;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const res = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/transcript?agent_id=main&page_size=20`, {
+        headers: { authorization: 'Bearer gateway-token' },
+      });
+      page = (await res.json() as any).data;
+      if (page.items.some((item: any) => item.state === 'running')) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.deepEqual(
+      page.items.map((item: any) => [item.turnId, item.state]),
+      [['t1', 'completed'], ['t2', 'completed'], ['t3', 'running']],
+    );
+    assert.equal(page.items[2].prompt, 'live prompt');
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('surfaces provider DTO catalog errors instead of faking an empty list', async () => {
+  const claude = fakeAdapter('claude');
+  claude.listModels = async () => { throw new Error('handshake failed'); };
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/providers?provider=claude`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.notEqual(response.status, 200);
+    const body = (await response.json()) as { code?: number; msg?: string };
+    assert.notEqual(body.code, 0);
+    assert.match(body.msg ?? '', /handshake failed/);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('lets unauthenticated CORS preflight through to the OPTIONS handler', async () => {
+  // preflight 浏览器不附带 Authorization;若在 pre-auth 被 401,跨域页面直接残废。
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`, { method: 'OPTIONS' });
+    assert.equal(response.status, 200);
+    // 非 OPTIONS 无凭据仍必须 401(鉴权绕过修复不回退)。
+    const denied = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`);
+    assert.equal(denied.status, 401);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('rejects oversized request bodies instead of buffering unbounded memory', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: 'x'.repeat(10 * 1024 * 1024 + 1),
+    });
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { msg?: string };
+    assert.match(body.msg ?? '', /too large/);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('disposes both provider adapters on gateway close', async () => {
+  const disposed: string[] = [];
+  const claude = fakeAdapter('claude');
+  const codex = fakeAdapter('codex');
+  claude.dispose = async () => { disposed.push('claude'); };
+  codex.dispose = async () => { disposed.push('codex'); };
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: claude as any,
+  });
+  await gateway.close();
+  assert.deepEqual(disposed.sort(), ['claude', 'codex']);
+});

@@ -116,7 +116,10 @@ export function createStaticServer(root: string, shell?: WebShell): (req: Incomi
       res.writeHead(200, headers).end(body);
     } else {
       res.writeHead(200, headers);
-      createReadStream(target).pipe(res);
+      const stream = createReadStream(target);
+      // 读取中途出错(权限/IO)不能挂着响应:毁掉连接,让客户端如实失败。
+      stream.on('error', () => res.destroy());
+      stream.pipe(res);
     }
     return true;
   };

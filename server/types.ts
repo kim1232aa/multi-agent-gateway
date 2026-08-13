@@ -337,6 +337,9 @@ export interface ProviderAdapter {
    */
   close(sessionId: string): Promise<void>;
 
+  /** 网关关停时释放整个 provider 的资源(子进程组等)。可选;幂等。 */
+  dispose?(): Promise<void>;
+
   /** 原生模型目录(可选)。kimi 由上游代理,不实现此方法。 */
   listModels?(): Promise<NativeModel[]>;
 

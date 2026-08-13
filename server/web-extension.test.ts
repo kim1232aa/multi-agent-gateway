@@ -296,22 +296,26 @@ async function loadDomShim(options: {
   metaProviders?: string[];
   metaFails?: boolean;
   storedProvider?: string;
+  hash?: string;
+  serverCredential?: string;
 } = {}): Promise<any> {
   const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
   const storage = new Map<string, string>();
   if (options.storedProvider) storage.set('multi-agent-gateway.provider.v1', options.storedProvider);
+  if (options.serverCredential) storage.set('kimi-web.server-credential', options.serverCredential);
   const queries: string[] = [];
   const dispatched: string[] = [];
   const pushes: any[][] = [];
   const wsInstances: any[] = [];
   const facadeCalls: Record<string, number> = {};
   let reloads = 0;
+  let metaAuth: string | undefined;
   let mutationCallback: ((records: any[]) => void) | undefined;
   const location: any = {
     origin: 'http://localhost:58630',
     pathname: options.pathname ?? '/',
     search: '',
-    hash: '',
+    hash: options.hash ?? '',
     reload: () => { reloads += 1; },
   };
   const sidebar = fakeElement('div');
@@ -379,10 +383,11 @@ async function loadDomShim(options: {
       observe() {}
       disconnect() {}
     },
-    fetch: async (input: unknown) => {
+    fetch: async (input: unknown, init?: { headers?: { authorization?: string } }) => {
       if (options.metaFails) throw new Error('meta unreachable');
       const url = String((input as { url?: string })?.url ?? input);
       if (url.includes('/api/v1/meta')) {
+        metaAuth = init?.headers?.authorization;
         return new Response(JSON.stringify({
           code: 0,
           data: { providers: options.metaProviders ?? ['kimi', 'claude', 'codex'] },
@@ -404,6 +409,7 @@ async function loadDomShim(options: {
   api.facadeCalls = facadeCalls;
   api.facade = facade;
   api.reloads = () => reloads;
+  api.metaAuth = () => metaAuth;
   api.emitMutations = (records: any[]) => mutationCallback?.(records);
   return api;
 }
@@ -677,4 +683,76 @@ test('resyncs when the official account row is mounted', async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.ok(queryCount > initialQueryCount);
+});
+
+test('skips the stale reconcile when the selection changes during a slow load', async () => {
+  // 回归:慢 provider(claude)的 load 挂起期间切到 codex,旧链落地时曾用
+  // selectedProvider()(codex)去校正 claude 目录,把 draft 模型误设成
+  // claude 目录第一项('default'),随后才被 codex 刷新盖掉。
+  const api = await loadDomShim({ pathname: '/', getAnchor: () => null });
+  const setModelCalls: string[] = [];
+  api.facade.defaultModel = 'kimi-code/k3';
+  api.facade.models = [{ model: 'kimi-code/k3' }];
+  api.facade.setModel = (model: string) => { setModelCalls.push(model); api.facade.defaultModel = model; };
+  let releaseFirst!: () => void;
+  const first = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let call = 0;
+  api.facade.load = () => {
+    call += 1;
+    const provider = api.selectedProvider();
+    api.facade.models = provider === 'claude'
+      ? [{ model: 'default' }, { model: 'sonnet' }]
+      : [{ model: 'gpt-5.6-sol' }];
+    return (call === 1 ? first : Promise.resolve());
+  };
+
+  api.switchProvider('claude');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  api.switchProvider('codex');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  releaseFirst();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  // claude 链的 reconcile 被跳过:只有 codex 的校正发生。
+  assert.deepEqual(setModelCalls, ['gpt-5.6-sol']);
+});
+
+test('recovers the refresh chain after a synchronous facade.load throw', async () => {
+  // 回归:facade.load 同步抛错曾让 refreshChain 永久 rejected,之后的
+  // provider 切换全部静默失效(列表再也不刷新)。
+  const api = await loadDomShim({ pathname: '/', getAnchor: () => null });
+  const setModelCalls: string[] = [];
+  api.facade.defaultModel = 'kimi-code/k3';
+  api.facade.models = [{ model: 'kimi-code/k3' }];
+  api.facade.setModel = (model: string) => { setModelCalls.push(model); api.facade.defaultModel = model; };
+  let calls = 0;
+  api.facade.load = () => {
+    calls += 1;
+    if (calls === 1) throw new Error('sync boom');
+    api.facade.models = [{ model: 'gpt-5.6-sol' }];
+    return Promise.resolve();
+  };
+
+  api.switchProvider('claude');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  api.switchProvider('codex');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(calls, 2);
+  assert.deepEqual(setModelCalls, ['gpt-5.6-sol']);
+});
+
+test('falls back to the stored server credential when the hash has no token', async () => {
+  const json = await loadDomShim({ serverCredential: JSON.stringify({ token: 'stored-token' }) });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(json.metaAuth(), 'Bearer stored-token');
+
+  const raw = await loadDomShim({ serverCredential: 'raw-token' });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(raw.metaAuth(), 'Bearer raw-token');
+
+  // hash 里的 token 优先于存储凭证。
+  const hashWins = await loadDomShim({ hash: '#token=hash-token', serverCredential: 'raw-token' });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(hashWins.metaAuth(), 'Bearer hash-token');
 });

@@ -170,6 +170,9 @@ const DEFAULT_ENV: Record<string, string> = {
 
 const DEFAULT_CLAUDE_BIN = path.join(os.homedir(), ".local", "bin", "claude");
 
+/** Claude transcript 会话 id 是 UUID;列表/路径拼接统一用它把关。 */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // ---------------------------------------------------------------------------
 // Adapter
 // ---------------------------------------------------------------------------
@@ -182,11 +185,43 @@ export class ClaudeAdapter {
   private readonly running = new Map<string, ChildProcess>();
   /** Sessions whose current turn was interrupted via interrupt(). */
   private readonly interruptRequested = new Set<string>();
+  /** startTurn 的中断窗口等待者:旧进程退出时唤醒(见 startTurn/waitForExit)。 */
+  private readonly exitWaiters = new Map<string, Array<() => void>>();
 
   constructor(options: ClaudeAdapterOptions = {}) {
     this.claudeBin = options.claudeBin ?? DEFAULT_CLAUDE_BIN;
     this.env = { ...DEFAULT_ENV, ...(options.env ?? {}) };
     this.projectsDir = options.projectsDir ?? path.join(os.homedir(), ".claude", "projects");
+  }
+
+  /** 等某会话的 running 进程退出;超时返回(不抛错,调用方自行判活)。 */
+  private waitForExit(sessionId: string, timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const waiters = this.exitWaiters.get(sessionId);
+        if (waiters) {
+          const index = waiters.indexOf(done);
+          if (index >= 0) waiters.splice(index, 1);
+          if (waiters.length === 0) this.exitWaiters.delete(sessionId);
+        }
+        resolve();
+      }, timeoutMs);
+      timer.unref();
+      const done = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const waiters = this.exitWaiters.get(sessionId) ?? [];
+      waiters.push(done);
+      this.exitWaiters.set(sessionId, waiters);
+    });
+  }
+
+  private resolveExitWaiters(sessionId: string): void {
+    const waiters = this.exitWaiters.get(sessionId);
+    if (!waiters) return;
+    this.exitWaiters.delete(sessionId);
+    for (const done of waiters) done();
   }
 
   // -- capability surface ---------------------------------------------------
@@ -236,6 +271,9 @@ export class ClaudeAdapter {
       for (const file of files) {
         if (!file.endsWith(".jsonl")) continue;
         const sessionId = file.slice(0, -".jsonl".length);
+        // 只收 UUID 会话(对齐原生 claude resume):非 UUID 的 .jsonl(用户误放/
+        // 未来新命名)会进列表但 findSessionFile 打不开——点不开的条目不如不列。
+        if (!UUID_RE.test(sessionId)) continue;
         const filePath = path.join(dirPath, file);
         tasks.push(async () => {
           try {
@@ -309,7 +347,12 @@ export class ClaudeAdapter {
   async startTurn(opts: StartTurnOptions): Promise<void> {
     const { sessionId, prompt, onEvent } = opts;
     if (this.running.has(sessionId)) {
-      throw new Error(`claude-adapter: a turn is already running for session ${sessionId}`);
+      // 中断后旧进程还没退出(SIGINT→SIGKILL 最长 5s)就接到新 turn:
+      // 等它退干净再起,而不是直接失败(审查实测:abort 后立刻重提 100% 撞此)。
+      await this.waitForExit(sessionId, 8_000);
+      if (this.running.has(sessionId)) {
+        throw new Error(`claude-adapter: a turn is already running for session ${sessionId}`);
+      }
     }
     const cwd = opts.cwd ?? os.homedir();
 
@@ -334,6 +377,9 @@ export class ClaudeAdapter {
       cwd,
       env: { ...process.env, ...this.env },
       stdio: ["pipe", "pipe", "pipe"],
+      // 独立进程组:SIGKILL 升级/close 时整组收割,CLI 跑工具spawn的孙进程
+      // 不成孤儿(此前只杀主 pid,孙子活下来继续写文件/占资源)。
+      detached: true,
     });
     this.running.set(sessionId, child);
 
@@ -362,12 +408,14 @@ export class ClaudeAdapter {
 
       child.on("error", (err) => {
         this.running.delete(sessionId);
+        this.resolveExitWaiters(sessionId);
         onEvent({ type: "error", message: `spawn failed: ${err.message}` });
         reject(err);
       });
 
       child.on("close", (code, signal) => {
         this.running.delete(sessionId);
+        this.resolveExitWaiters(sessionId);
         // The CLI handles SIGINT gracefully and exits code=0/signal=null
         // without a result event — so key off our own interrupt request flag,
         // not the exit signal.
@@ -397,6 +445,9 @@ export class ClaudeAdapter {
       type: "user",
       message: { role: "user", content: opts.contentBlocks ?? [{ type: "text", text: prompt }] },
     });
+    // CLI 秒退时 stdin 写会异步 EPIPE,没有监听就是 uncaught;失败由 close
+    // 事件如实上报(见 child.on("close"))。
+    child.stdin!.on("error", () => undefined);
     child.stdin!.write(userLine + "\n");
     child.stdin!.end();
 
@@ -417,10 +468,20 @@ export class ClaudeAdapter {
     const ref = setTimeout(() => {
       // child.killed 只表示信号已发出(调用即置 true),不代表进程已退出;
       // 判活要用 exitCode/signalCode,否则 SIGKILL 升级永远不生效。
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      if (child.exitCode === null && child.signalCode === null) this.killGroup(child, "SIGKILL");
     }, 5000);
     ref.unref?.();
     return true;
+  }
+
+  /** 整组收割(detached spawn 的组 id = 主 pid);组不在时兜底单发。 */
+  private killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, signal);
+      else child.kill(signal);
+    } catch {
+      child.kill(signal);
+    }
   }
 
   // -- approvals / questions (unsupported, verified) -------------------------
@@ -463,8 +524,12 @@ export class ClaudeAdapter {
           argumentHint: typeof c.argumentHint === "string" ? c.argumentHint : "",
           aliases: Array.isArray(c.aliases) ? c.aliases.filter((a: any) => typeof a === "string") : [],
         }));
-    }).catch(() => null);
-    if (!commands) return hit?.commands ?? [];
+    });
+    // 与 listBuiltinModels 同一口径:握手失败如实抛错,不吞成空目录——
+    // 空目录会让前端把"CLI 坏了"显示成"没有命令"(错误就报错,不掩盖)。
+    if (!commands) {
+      throw new Error("claude-adapter: initialize handshake returned no commands (CLI missing, broken, or too old)");
+    }
     this.commandsCache.set(key, { ts: Date.now(), commands });
     return commands;
   }
@@ -525,7 +590,11 @@ export class ClaudeAdapter {
         resolve(value);
       };
       const timer = setTimeout(() => finish(null), 20_000);
+      timer.unref();
       child.on("error", () => finish(null));
+      // spawn 成功但 CLI 启动即退(二进制损坏/缺库)不会触发 error——
+      // 此前只能等满 20s 超时,且失败不进缓存,每次请求都重新卡 20s。
+      child.on("exit", () => finish(null));
       const rl = readline.createInterface({ input: child.stdout! });
       rl.on("line", (line) => {
         if (!line.trim()) return;
@@ -538,6 +607,8 @@ export class ClaudeAdapter {
         if (ev.type !== "control_response") return;
         finish(pick(ev.response?.response));
       });
+      // CLI 秒退时 stdin 写会异步 EPIPE——没有监听就是 uncaught(网关直接崩)。
+      child.stdin!.on("error", () => undefined);
       child.stdin!.write(
         JSON.stringify({ type: "control_request", request_id: "gw_init", request: { subtype: "initialize" } }) + "\n",
       );
@@ -549,8 +620,9 @@ export class ClaudeAdapter {
   /** Kill all running turn processes. */
   async close(): Promise<void> {
     for (const [sessionId, child] of this.running) {
-      child.kill("SIGTERM");
+      this.killGroup(child, "SIGTERM");
       this.running.delete(sessionId);
+      this.resolveExitWaiters(sessionId);
     }
   }
 
@@ -558,7 +630,7 @@ export class ClaudeAdapter {
 
   private findSessionFile(sessionId: string): string | null {
     // Claude transcript ids are UUIDs; reject separators before constructing a path.
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) {
+    if (!UUID_RE.test(sessionId)) {
       return null;
     }
     let projectDirs: fs.Dirent[];
@@ -573,6 +645,11 @@ export class ClaudeAdapter {
       if (fs.existsSync(candidate)) return candidate;
     }
     return null;
+  }
+
+  /** 该会话的 transcript 文件是否已落盘——facade 据此决定 --session-id 还是 --resume。 */
+  hasSessionFile(sessionId: string): boolean {
+    return this.findSessionFile(sessionId) !== null;
   }
 
   private summarizeCache = new Map<string, { mtimeMs: number; size: number; summary: ClaudeSessionSummary }>();

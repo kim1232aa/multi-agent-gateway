@@ -314,6 +314,11 @@ export class CodexAdapter {
   private pendingServer = new Map<string, PendingServerRequest>(); // 键统一 String(requestId)
   private listeners = new Set<CodexEventHandler>();
   private turnQueues = new Map<string, TurnEventQueue>(); // key: `${threadId}:${turnId}`
+  // queue 注册前到达的 turn 事件缓冲:startTurn 的 queue 注册在 request 响应
+  // 之后(多个微任务跳),app-server 同一 chunk 内"响应行之后"的通知在那之前
+  // 就派发,直接路由会静默丢掉(turn/completed 丢失挂死消费方)。注册时按序
+  // drain;永不注册的外部 turn 由 FIFO/单 key 上限兜底,内存有界。
+  private pendingTurnEvents = new Map<string, CodexEvent[]>();
   private seenTurnStarts = new Set<string>(); // dedupe synthesized vs server turn-started
   /**
    * 本进程内已激活的 thread(thread/start|resume 过)。app-server 是有状态的:
@@ -408,22 +413,38 @@ export class CodexAdapter {
   }
 
   private emit(event: CodexEvent): void {
+    this.notifyListeners(event);
+    const key = this.eventTurnKey(event);
+    if (!key) return;
+    const q = this.turnQueues.get(key);
+    if (q) {
+      q.push(event);
+      if (event.type === 'turn-completed') {
+        q.close();
+        this.turnQueues.delete(key);
+      }
+      return;
+    }
+    // queue 还没注册(startTurn 的响应 continuation 还没跑完):缓冲,注册时 drain。
+    let pending = this.pendingTurnEvents.get(key);
+    if (!pending) {
+      pending = [];
+      this.pendingTurnEvents.set(key, pending);
+      // 外部 client 的 turn 永远不会注册:淘汰最旧 key,防缓慢泄漏。
+      if (this.pendingTurnEvents.size > 50) {
+        const oldest = this.pendingTurnEvents.keys().next().value;
+        if (oldest !== undefined) this.pendingTurnEvents.delete(oldest);
+      }
+    }
+    if (pending.length < 500) pending.push(event);
+  }
+
+  private notifyListeners(event: CodexEvent): void {
     for (const l of [...this.listeners]) {
       try {
         l(event);
       } catch {
         // listener errors must not break the dispatch loop
-      }
-    }
-    const key = this.eventTurnKey(event);
-    if (key) {
-      const q = this.turnQueues.get(key);
-      if (q) {
-        q.push(event);
-        if (event.type === 'turn-completed') {
-          q.close();
-          this.turnQueues.delete(key);
-        }
       }
     }
   }
@@ -753,9 +774,12 @@ export class CodexAdapter {
     this.pendingServer.clear();
     for (const q of this.turnQueues.values()) q.fail(reason);
     this.turnQueues.clear();
+    this.pendingTurnEvents.clear();
     // 进程死了,内存里的激活 thread 一并失效;下次 connect 后需重新 resume。
     this.liveThreads.clear();
     this.seenTurnStarts.clear();
+    // config/read 的模型缓存属于旧进程语境,重连后必须重读。
+    this.configModelCache = null;
     if (this.readyPromise) {
       this.readyPromise = null;
       this.emit({ type: 'disconnected', code, signal });
@@ -886,7 +910,24 @@ export class CodexAdapter {
     const queue = new TurnEventQueue();
     this.turnQueues.set(key, queue);
     this.seenTurnStarts.add(key);
-    this.emit({ type: 'turn-started', threadId, turnId: turn.id, turn });
+    // 合成的 turn-started 必须先进 queue:缓冲 drain 的事件才能按真实到达序跟在后面。
+    const started: CodexEvent = { type: 'turn-started', threadId, turnId: turn.id, turn };
+    queue.push(started);
+    this.notifyListeners(started);
+    // 注册前到达的同 chunk 事件(含可能的 turn/completed)按序补进 queue。
+    const pending = this.pendingTurnEvents.get(key);
+    if (pending) {
+      this.pendingTurnEvents.delete(key);
+      for (const ev of pending) {
+        if (ev.type === 'turn-started') continue; // 服务器通知与合成事件重复
+        queue.push(ev);
+        if (ev.type === 'turn-completed') {
+          this.seenTurnStarts.delete(key);
+          queue.close();
+          this.turnQueues.delete(key);
+        }
+      }
+    }
     return { threadId, turnId: turn.id, events: queue };
   }
 
@@ -933,7 +974,15 @@ export class CodexAdapter {
         this.listeners.delete(onEvent);
         resolve();
       }, 180_000);
+      timer.unref?.();
       const onEvent: CodexEventHandler = (ev) => {
+        // 进程死亡:compaction 的完成事件永不到达,直接收口而不是等 180s。
+        if (ev.type === 'disconnected') {
+          clearTimeout(timer);
+          this.listeners.delete(onEvent);
+          resolve();
+          return;
+        }
         if (ev.type !== 'item-completed') return;
         const e = ev as { threadId?: string; item?: Record<string, unknown> };
         if (e.threadId !== threadId || e.item?.type !== 'contextCompaction') return;
@@ -1086,7 +1135,19 @@ export class CodexAdapter {
         off();
         reject(new Error('review turn did not start within 30s'));
       }, 30_000);
+      timer.unref?.();
       off = this.onEvent((ev) => {
+        // 进程死亡(handleProcessExit 广播):turn-started 前后都必须收口——
+        // review 的 queue 不在 turnQueues 里,不收口则监听器/队列永久泄漏,
+        // 消费方永久挂起(审查实测)。
+        if (ev.type === 'disconnected') {
+          clearTimeout(timer);
+          off();
+          const error = new Error('codex app-server disconnected during review turn');
+          reject(error); // 已 resolve 时是 no-op
+          queue.fail(error);
+          return;
+        }
         if (!('threadId' in ev) || ev.threadId !== threadId) return;
         if (ev.type === 'turn-started') {
           if (!firstTurnId) {

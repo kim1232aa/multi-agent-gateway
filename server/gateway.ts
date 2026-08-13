@@ -158,7 +158,15 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).byteLength;
+    // 无上限累积会把网关内存打爆;正常 body(会话/设置)远小于此。
+    if (size > 10 * 1024 * 1024) {
+      throw new ProviderError('invalid_request', 'request body too large', 400);
+    }
+    chunks.push(c as Buffer);
+  }
   if (chunks.length === 0) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -378,7 +386,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 无凭证请求被重写 Authorization 后直达上游 = 完整鉴权绕过)。healthz 免鉴权;
       // 与 route 内的检查并存(双保险),WS 握手走 upgrade 通道不受影响。
       const preAuthUrl = new URL(req.url ?? '/', 'http://localhost');
-      if (preAuthUrl.pathname.startsWith(API) && preAuthUrl.pathname !== `${API}/healthz` && !authed(req, token)) {
+      // CORS preflight(OPTIONS)不含凭据,必须放行到 route 的 OPTIONS 处理器。
+      if (req.method !== 'OPTIONS' && preAuthUrl.pathname.startsWith(API) && preAuthUrl.pathname !== `${API}/healthz` && !authed(req, token)) {
         fail(res, 401, 40101, 'Unauthorized', ulid());
         return;
       }
@@ -785,9 +794,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (!agentId) throw new ProviderError('invalid_request', 'agent_id is required', 400);
         const pageSize = Number(url.searchParams.get('page_size') ?? 20);
         const sid = prefixedId(sp, nativeId);
-        const history = await adapter.getHistory(nativeId).catch(() => [] as Message[]);
-        hub.transcript.observeHistory(sid, history);
-        return ok(res, buildLocalTranscriptPage(history, {
+        const history = await adapter.getHistory(nativeId).catch(() => null);
+        // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
+        if (history) hub.transcript.observeHistory(sid, history);
+        return ok(res, buildLocalTranscriptPage(history ?? [], {
           agentId,
           beforeTurn: url.searchParams.get('before_turn') ?? undefined,
           afterTurn: url.searchParams.get('after_turn') ?? undefined,
@@ -1016,8 +1026,15 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (kimiFollowTimer) clearInterval(kimiFollowTimer);
         for (const socket of gatewaySockets) socket.destroy();
         server.close(() => {
-          void (kimiFallback?.close() ?? kimi?.child?.close() ?? Promise.resolve()).then(() => resolveClose());
+          // 关停也要释放 provider 子进程;allSettled 保证一个挂了不拖住整体。
+          void Promise.allSettled([
+            kimiFallback?.close() ?? kimi?.child?.close() ?? Promise.resolve(),
+            adapters.claude.dispose?.() ?? Promise.resolve(),
+            adapters.codex.dispose?.() ?? Promise.resolve(),
+          ]).then(() => resolveClose());
         });
+        // 流式/长连接会挡住 server.close 的回调,主动掐掉空闲 keep-alive。
+        server.closeAllConnections?.();
       }),
   };
 }
@@ -1086,7 +1103,8 @@ function isProviderRefreshRoute(sub: string): boolean {
 }
 
 async function providerDto(provider: Exclude<ProviderName, 'kimi'>, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
-  const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
+  // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
+  const models = adapter.listModels ? await adapter.listModels() : [];
   return {
     id: provider,
     type: provider,
@@ -1104,7 +1122,8 @@ async function providerConfigView(
   patch: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const base = (await kimiFetch('/config').catch(() => ({ providers: {} }))) as Record<string, unknown>;
-  const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
+  // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
+  const models = adapter.listModels ? await adapter.listModels() : [];
   const requestedModel = typeof patch.default_model === 'string' ? patch.default_model : undefined;
   const defaultModel = requestedModel ?? models[0]?.model ?? '';
   const baseProviders = base.providers && typeof base.providers === 'object'
@@ -1669,8 +1688,10 @@ async function driveTurn(
     (error: unknown) => ({ ok: false as const, error }),
   );
   if (!hub.transcript.hasObservedHistory(sid)) {
-    const history = await adapter.getHistory(nativeId).catch(() => [] as Message[]);
-    hub.transcript.observeHistory(sid, history);
+    // 拉取失败不能当成"空历史"落进 hub——historyObserved 被提前固化后,
+    // 真实历史回灌时会与运行中 turn 撞号(审查实测会静默丢 live turn)。
+    const history = await adapter.getHistory(nativeId).catch(() => null);
+    if (history) hub.transcript.observeHistory(sid, history);
   }
   const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
     hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));

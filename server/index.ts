@@ -22,7 +22,15 @@ if (web) {
 }
 
 const shutdown = (): void => {
-  void close().then(() => process.exit(0));
+  // 兜底:close 内部任何一步挂住都不能拖死进程,5s 后硬退。
+  const hardExit = setTimeout(() => process.exit(0), 5_000);
+  hardExit.unref?.();
+  void close()
+    .catch(() => undefined)
+    .then(() => {
+      clearTimeout(hardExit);
+      process.exit(0);
+    });
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

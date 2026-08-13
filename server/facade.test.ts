@@ -297,3 +297,30 @@ test('keeps env-derived Claude models when a custom endpoint is configured', asy
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('decides Claude --session-id vs --resume from transcript file presence', async () => {
+  // 回归:isNew 曾是一次性内存标记(created.delete)——首轮失败/网关重启后
+  // 重试走 --resume 不存在的会话必败。现在只看 transcript 文件是否落盘。
+  const adapter = new ClaudeProviderAdapter();
+  const isNewSeen: boolean[] = [];
+  let hasFile = false;
+  (adapter as any).inner.hasSessionFile = () => hasFile;
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    isNewSeen.push(opts.isNew);
+    opts.onEvent({ type: 'done', usage: null, isError: false, result: '' });
+  };
+  const sessionId = '123e4567-e89b-12d3-a456-426614174002';
+  const drain = async (input: string): Promise<void> => {
+    const handle = await adapter.startTurn({ sessionId, input });
+    for await (const _ of handle.events) { /* consume to stream end */ }
+  };
+
+  hasFile = false;
+  await drain('one'); // 文件未落盘 → --session-id 建档
+  hasFile = true;
+  await drain('two'); // 文件在 → --resume
+  hasFile = false;
+  await drain('three'); // 首轮失败后重试(文件仍不在)→ 继续建档,不能 --resume 必败
+
+  assert.deepEqual(isNewSeen, [true, false, true]);
+});

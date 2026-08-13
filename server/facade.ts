@@ -532,6 +532,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
     // Codex 进程常驻;会话级 close 为空操作(进程由进程级 close 管理)。
   }
 
+  /** 进程级清理:杀 codex app-server。网关 shutdown 时调用(此前无调用方,
+   *  预热拉起的常驻进程在网关退出后成孤儿)。 */
+  async dispose(): Promise<void> {
+    await this.inner.close();
+  }
+
   private toSession(thread: Record<string, unknown>, cwdOverride?: string): Session {
     const cwd = cwdOverride ?? (thread.cwd as string) ?? process.cwd();
     const id = thread.id as string;
@@ -700,7 +706,6 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly inner: ClaudeAdapter;
   /** 记录每个会话最近一次 turn 的 cwd,供 resume 时复用。 */
   private readonly sessionCwd = new Map<string, string>();
-  private readonly created = new Set<string>();
 
   constructor(options?: ConstructorParameters<typeof ClaudeAdapter>[0]) {
     this.inner = new ClaudeAdapter(options);
@@ -736,7 +741,6 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   async create(input: CreateSessionInput): Promise<Session> {
     const { sessionId } = await this.inner.create();
     const cwd = input.cwd ?? (input.metadata?.cwd as string | undefined) ?? process.cwd();
-    this.created.add(sessionId);
     this.sessionCwd.set(sessionId, cwd);
     return {
       id: sessionId,
@@ -795,9 +799,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       }
     }
     if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
-    // isNew 是一次性的:首轮用 --session-id 建档,之后必须 --resume,
-    // 否则 CLI 以 "session id 已存在" 直接退出(实测,turn 静默空转)。
-    const isNew = this.created.delete(sessionId);
+    // isNew 看 transcript 文件是否已落盘,而不是一次性内存标记(审查发现:
+    // 首轮 spawn 失败/网关重启后标记已丢,重试走 --resume 不存在的会话必败)。
+    // 文件不在 → --session-id 建档;文件在 → --resume(重复 --session-id 会被
+    // CLI 以 "session id 已存在" 直接退出,实测 turn 静默空转)。
+    const isNew = !this.inner.hasSessionFile(sessionId);
     const cwd = this.sessionCwd.get(sessionId);
     const model = this.sessionModels.get(sessionId);
     // thinking 'off' = 用户显式关闭 → 不传 --effort(CLI 无 off 档)。
@@ -982,6 +988,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     // Claude 每 turn 独立进程;会话级 close 为空操作。
   }
 
+  /** 进程级清理:杀所有 running turn 进程。网关 shutdown 时调用。 */
+  async dispose(): Promise<void> {
+    await this.inner.close();
+  }
+
   // -- 原生目录与模型选择 ----------------------------------------------------
 
   private readonly sessionModels = new Map<string, string>();
@@ -1093,7 +1104,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     }
     // 权威目录 = CLI initialize 握手回包(154 条:插件命令 + skills +
     // 内置 compact/usage/mcp 等,2.1.226 实测),短命进程带 5 分钟缓存。
-    const catalog = await this.inner.listSlashCommands(cwd).catch(() => []);
+    // 握手失败如实抛错(/commands 500),不吞成空目录冒充"没有命令"。
+    const catalog = await this.inner.listSlashCommands(cwd);
     return listClaudeCommands(catalog);
   }
 

@@ -77,6 +77,9 @@ interface TranscriptSessionState {
   subscribers: Set<TranscriptSubscriber>;
   activeTurns: Map<string, TranscriptTurn>;
   recentTurns: Map<string, TranscriptTurn>;
+  /** 首次历史观察前(beginTurn 时 historyObserved=false)分配了 ordinal 的 turnId。
+   *  这些 ordinal 可能与持久化历史撞号,首次成功观察时要重编号(见 rebase)。 */
+  unbasedTurns: Set<string>;
   interactions: Map<string, TranscriptInteraction>;
   prompts: Map<string, TranscriptPrompt>;
 }
@@ -116,13 +119,101 @@ export class LocalTranscriptHub {
     const persistedTurns = historyTurns(messages);
     state.nextOrdinal = Math.max(state.nextOrdinal, persistedTurns.length + 1);
     for (const [turnId, turn] of state.recentTurns) {
-      if (turn.ordinal <= persistedTurns.length) state.recentTurns.delete(turnId);
+      // 未基准的 turn 不能按 ordinal 驱逐——它的 ordinal 是在历史未知时分配的,
+      // 撞号不代表是同一个 turn;重编号后自然落到 persisted 之后。
+      if (turn.ordinal <= persistedTurns.length && !state.unbasedTurns.has(turnId)) state.recentTurns.delete(turnId);
     }
+    if (state.unbasedTurns.size > 0) this.rebaseUnbasedTurns(state);
   }
 
   activeItems(sessionId: string): TranscriptTurn[] {
     const state = this.state(sessionId);
     return cloneTurns([...state.recentTurns.values(), ...state.activeTurns.values()]);
+  }
+
+  /**
+   * 首次成功观察历史时,把历史未知期间分配了 ordinal 的 turn(可能撞号)
+   * 就地改号到持久化历史之后,恢复 live.ordinal > persisted 不变量。
+   * 就地改而不换对象:driveTurn 持有的 LocalTranscriptTurn 引用后续 op
+   * 会自动用上新 turnId;journal 里已发布的旧号 op 同步重写,保证
+   * catchup/seed 重放不出现旧号幽灵 turn。
+   */
+  private rebaseUnbasedTurns(state: TranscriptSessionState): void {
+    const turnRemap = new Map<string, string>();
+    const stepRemap = new Map<string, string>();
+    const rebaseFrom = (map: Map<string, TranscriptTurn>): void => {
+      const targets = [...map.values()]
+        .filter((turn) => state.unbasedTurns.has(turn.turnId))
+        .sort((a, b) => a.ordinal - b.ordinal);
+      for (const turn of targets) {
+        map.delete(turn.turnId);
+        const oldTurnId = turn.turnId;
+        turn.ordinal = state.nextOrdinal++;
+        turn.turnId = `t${turn.ordinal}`;
+        for (const step of turn.steps) {
+          const oldStepId = step.stepId;
+          step.turnId = turn.turnId;
+          step.stepId = `${turn.turnId}.${step.ordinal}`;
+          stepRemap.set(oldStepId, step.stepId);
+          for (const frame of step.frames) {
+            if (frame.frameId.startsWith(`${oldStepId}.`)) {
+              frame.frameId = step.stepId + frame.frameId.slice(oldStepId.length);
+            }
+          }
+        }
+        turnRemap.set(oldTurnId, turn.turnId);
+        map.set(turn.turnId, turn);
+      }
+    };
+    rebaseFrom(state.activeTurns);
+    rebaseFrom(state.recentTurns);
+    state.unbasedTurns.clear();
+    if (turnRemap.size > 0) this.rewriteJournalIds(state, turnRemap, stepRemap);
+  }
+
+  /** 重编号后把 journal 里旧 turnId/stepId 的 op 改写到新号,重放不产生幽灵。 */
+  private rewriteJournalIds(
+    state: TranscriptSessionState,
+    turnRemap: Map<string, string>,
+    stepRemap: Map<string, string>,
+  ): void {
+    const mapFrameId = (frameId: string): string => {
+      for (const [oldStepId, newStepId] of stepRemap) {
+        if (frameId.startsWith(`${oldStepId}.`)) return newStepId + frameId.slice(oldStepId.length);
+      }
+      return frameId;
+    };
+    for (const batch of state.journal) {
+      for (const op of batch.ops) {
+        if (typeof op.turnId === 'string' && turnRemap.has(op.turnId)) op.turnId = turnRemap.get(op.turnId);
+        if (typeof op.stepId === 'string' && stepRemap.has(op.stepId)) op.stepId = stepRemap.get(op.stepId);
+        // append op 的 id 在 target 里({type:'frame', turnId, stepId, frameId})。
+        const target = op.target as { turnId?: unknown; stepId?: unknown; frameId?: unknown } | undefined;
+        if (target) {
+          if (typeof target.turnId === 'string' && turnRemap.has(target.turnId)) target.turnId = turnRemap.get(target.turnId);
+          if (typeof target.stepId === 'string' && stepRemap.has(target.stepId)) target.stepId = stepRemap.get(target.stepId);
+          if (typeof target.frameId === 'string') target.frameId = mapFrameId(target.frameId);
+        }
+        const turn = op.turn as TranscriptTurn | undefined;
+        if (turn && typeof turn.turnId === 'string' && turnRemap.has(turn.turnId)) {
+          turn.turnId = turnRemap.get(turn.turnId) as string;
+          turn.ordinal = Number.parseInt(turn.turnId.slice(1), 10);
+          for (const step of turn.steps ?? []) {
+            if (stepRemap.has(step.stepId)) {
+              step.turnId = turn.turnId;
+              step.stepId = stepRemap.get(step.stepId) as string;
+            }
+          }
+        }
+        const step = op.step as TranscriptStep | undefined;
+        if (step && typeof step.stepId === 'string' && stepRemap.has(step.stepId)) {
+          if (typeof step.turnId === 'string' && turnRemap.has(step.turnId)) step.turnId = turnRemap.get(step.turnId) as string;
+          step.stepId = stepRemap.get(step.stepId) as string;
+        }
+        const frame = op.frame as TranscriptFrame | undefined;
+        if (frame && typeof frame.frameId === 'string') frame.frameId = mapFrameId(frame.frameId);
+      }
+    }
   }
 
   currentInteractions(sessionId: string): TranscriptInteraction[] {
@@ -305,6 +396,9 @@ export class LocalTranscriptHub {
       steps: [],
       startedAt,
     };
+    // 历史还没观察到就分配 ordinal(首次拉取失败窗口):与持久化历史撞号
+    // 的风险记入 unbasedTurns,首次成功观察时重编号。
+    if (!state.historyObserved) state.unbasedTurns.add(turn.turnId);
     state.activeTurns.set(turn.turnId, turn);
     this.publish(sessionId, [{ op: 'meta.merge', meta: { activity: 'turn' } }]);
     this.publish(sessionId, [{ op: 'turn.upsert', turn: turnHeader(turn) }]);
@@ -354,6 +448,7 @@ export class LocalTranscriptHub {
         subscribers: new Set(),
         activeTurns: new Map(),
         recentTurns: new Map(),
+        unbasedTurns: new Set(),
         interactions: new Map(),
         prompts: new Map(),
       };
