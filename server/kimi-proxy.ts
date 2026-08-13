@@ -174,6 +174,7 @@ export function createKimiWsUpgrader(options?: KimiProxyOptions) {
   const upstreamHost = upstream.hostname;
   const upstreamPort = Number(upstream.port || (upstream.protocol === 'https:' ? 443 : 80));
   const upstreamAuthority = upstream.host;
+  const upstreamToken = options?.upstreamToken;
 
   return function proxyKimiWsUpgrade(
     req: IncomingMessage,
@@ -187,16 +188,19 @@ export function createKimiWsUpgrader(options?: KimiProxyOptions) {
 
     upstreamSocket.on('connect', () => {
       established = true;
-      // 逐字节重建 Upgrade 请求:方法 + 原始 target(含 client_id 查询串)。
-      const lines = [`${req.method ?? 'GET'} ${req.url ?? '/api/v1/ws'} HTTP/1.1`];
-      // rawHeaders 保留原始大小写与顺序;Host 改写为上游地址以通过上游
-      // host 校验,其余头(含 sec-websocket-protocol 携带的 token)原样透传。
+      const target = new URL(req.url ?? '/api/v1/ws', upstream);
+      for (const name of options?.stripQueryParams ?? []) target.searchParams.delete(name);
+      const lines = [`${req.method ?? 'GET'} ${target.pathname}${target.search} HTTP/1.1`];
       for (let i = 0; i < req.rawHeaders.length; i += 2) {
         const name = req.rawHeaders[i];
-        const value =
-          name.toLowerCase() === 'host' ? upstreamAuthority : req.rawHeaders[i + 1];
-        lines.push(`${name}: ${value}`);
+        const lower = name.toLowerCase();
+        if (lower === 'host') {
+          lines.push(`${name}: ${upstreamAuthority}`);
+        } else if (lower !== 'authorization' || !upstreamToken) {
+          lines.push(`${name}: ${req.rawHeaders[i + 1]}`);
+        }
       }
+      if (upstreamToken) lines.push(`Authorization: Bearer ${upstreamToken}`);
       upstreamSocket.write(`${lines.join('\r\n')}\r\n\r\n`);
       if (head.length > 0) upstreamSocket.write(head);
       upstreamSocket.pipe(socket);

@@ -1,13 +1,70 @@
-.multi-agent-provider-pill {
+/* Agent 选择器:挂在侧边栏账号行正上方,视觉对齐官方 user-menu 组件。 */
+
+.multi-agent-provider-wrap {
+  position: relative;
   flex: none;
 }
 
-.multi-agent-provider-menu .md-name {
-  flex: 1;
+.multi-agent-provider-avatar {
+  font-size: 11px;
+  font-weight: var(--weight-semibold, 600);
 }
 
-@media (max-width: 640px) {
-  .multi-agent-provider-pill .mp-name {
-    max-width: 64px;
-  }
+.multi-agent-provider-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  min-width: 160px;
+  z-index: var(--z-dropdown);
+  background: var(--color-menu-bg);
+  -webkit-backdrop-filter: var(--p-menu-backdrop);
+  backdrop-filter: var(--p-menu-backdrop);
+  border: 0.5px solid var(--color-line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-menu);
+  padding: var(--space-1);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-family: var(--font-ui);
+  transform-origin: bottom left;
+}
+
+.multi-agent-provider-menu[hidden] {
+  display: none;
+}
+
+.multi-agent-provider-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--ui-font-size);
+  color: var(--color-text);
+  padding: 5px 9px;
+  border-radius: 6px;
+  text-align: left;
+  transition: background var(--duration-base) var(--ease-out);
+}
+
+.multi-agent-provider-row:hover,
+.multi-agent-provider-row.is-current {
+  background: var(--color-surface-sunken);
+}
+
+.multi-agent-provider-check {
+  width: 14px;
+  flex: none;
+}
+
+.multi-agent-provider-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

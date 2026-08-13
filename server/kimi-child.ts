@@ -1,40 +1,66 @@
 /**
- * kimi-child:网关自管的 kap-server 子进程。
+ * kimi-child:复用唯一的官方 kap-server,没有可确认实例时才自起子进程。
  *
- * 为什么不代理用户已在跑的 58627:那个实例的 token 网关拿不到,
- * 代理过去必然 401。网关改为自己 spawn 一个 `kimi web --no-open`
- * (loopback),从它 stdout 的 `Kimi server: ...#token=<tok>` 行解析出
- * token,之后 HTTP 转发时重写 Authorization、WS  relay 时用它建上游连接。
- * 会话存储在 ~/.kimi-code 下,与用户既有实例共享同一份数据。
+ * Kimi 会把活动 server 登记在 `<KIMI_CODE_HOME>/server/instances/*.json`,
+ * 并复用 `<KIMI_CODE_HOME>/server.token`。复用同一个 `/web` 实例才能收到
+ * 该 shell 当前 turn 的实时 transcript;多实例时不猜,要求显式选择端口。
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 export interface KimiChild {
   /** 例如 http://127.0.0.1:58731 */
   url: string;
   port: number;
   token: string;
-  process: ChildProcess;
+  version?: string;
+  owned: boolean;
+  process?: ChildProcess;
   close: () => Promise<void>;
 }
 
 export interface SpawnKimiOptions {
   /** kimi 二进制路径,默认 ~/.kimi-code/bin/kimi,可用 KIMI_BIN 覆盖。 */
   bin?: string;
-  /** 起始端口,默认 58731;被占用时往后试,最多 10 个。 */
+  /** 显式端口只复用同端口实例;否则作为新进程起始端口。 */
   port?: number;
+  /** false 时跳过 registry 复用,专门启动网关 standby Core。 */
+  reuseRegistered?: boolean;
   /** 额外环境变量(合入子进程 env)。 */
   env?: Record<string, string>;
+}
+
+interface KimiInstance {
+  pid: number;
+  host: string;
+  port: number;
+  host_version?: string;
 }
 
 const TOKEN_LINE = /#token=([A-Za-z0-9_\-]+)/;
 
 export async function spawnKimiServer(options: SpawnKimiOptions = {}): Promise<KimiChild> {
-  const bin = options.bin ?? process.env.KIMI_BIN ?? `${homedir()}/.kimi-code/bin/kimi`;
-  const basePort = options.port ?? Number(process.env.KIMI_PORT ?? 58731);
+  const setting = (name: string): string | undefined => options.env?.[name] ?? process.env[name];
+  const home = setting('KIMI_CODE_HOME') ?? `${homedir()}/.kimi-code`;
+  const explicitUrl = setting('KIMI_UPSTREAM_URL');
+  if (explicitUrl) {
+    const token = setting('KIMI_UPSTREAM_TOKEN')
+      ?? (await readFile(join(home, 'server.token'), 'utf8').catch(() => '')).trim();
+    if (!token) throw new Error('KIMI_UPSTREAM_URL requires KIMI_UPSTREAM_TOKEN or a non-empty server.token');
+    return connectExisting(explicitUrl, token, 'configured Kimi upstream');
+  }
 
+  const requestedPort = options.port ?? numberEnv(setting('KIMI_UPSTREAM_PORT') ?? setting('KIMI_PORT'));
+  if (options.reuseRegistered !== false) {
+    const reusable = await findReusableServer(home, requestedPort);
+    if (reusable) return reusable;
+  }
+
+  const bin = options.bin ?? setting('KIMI_BIN') ?? `${homedir()}/.kimi-code/bin/kimi`;
+  const basePort = requestedPort ?? 58731;
   let lastError: unknown = null;
   for (let port = basePort; port < basePort + 10; port++) {
     try {
@@ -46,6 +72,117 @@ export async function spawnKimiServer(options: SpawnKimiOptions = {}): Promise<K
   throw new Error(`spawn kimi kap-server failed after 10 ports from ${basePort}: ${String(lastError)}`);
 }
 
+/** Prefer a later official `/web` handoff over this gateway's owned fallback. */
+export async function followKimiServer(
+  current: KimiChild,
+  options: SpawnKimiOptions = {},
+): Promise<KimiChild> {
+  if (!current.owned) return current;
+  const setting = (name: string): string | undefined => options.env?.[name] ?? process.env[name];
+  if (setting('KIMI_UPSTREAM_URL') || setting('KIMI_UPSTREAM_PORT') || setting('KIMI_PORT')) return current;
+  const home = setting('KIMI_CODE_HOME') ?? `${homedir()}/.kimi-code`;
+  const ownPid = current.process?.pid;
+  return (await findReusableServer(home, undefined, ownPid === undefined ? undefined : new Set([ownPid]))) ?? current;
+}
+
+async function findReusableServer(
+  home: string,
+  requestedPort?: number,
+  excludedPids: ReadonlySet<number> = new Set(),
+): Promise<KimiChild | null> {
+  const dir = join(home, 'server', 'instances');
+  const names = await readdir(dir).catch(() => [] as string[]);
+  const instances: KimiInstance[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const value = JSON.parse(await readFile(join(dir, name), 'utf8')) as Partial<KimiInstance>;
+      if (
+        typeof value.pid === 'number' && !excludedPids.has(value.pid) && pidAlive(value.pid) &&
+        typeof value.host === 'string' && isLoopback(value.host) &&
+        typeof value.port === 'number' && value.port > 0 && value.port <= 65535 &&
+        (requestedPort === undefined || value.port === requestedPort)
+      ) {
+        instances.push(value as KimiInstance);
+      }
+    } catch {
+      // Registry files are atomically replaced; ignore a transient/incomplete read.
+    }
+  }
+  if (instances.length === 0) return null;
+  if (instances.length > 1) {
+    const ports = instances.map((instance) => instance.port).sort((a, b) => a - b).join(', ');
+    throw new Error(`multiple live Kimi servers found on ports ${ports}; set KIMI_PORT to select one`);
+  }
+
+  const token = (await readFile(join(home, 'server.token'), 'utf8').catch(() => '')).trim();
+  if (!token) throw new Error(`registered Kimi server found but ${join(home, 'server.token')} is missing or empty`);
+  const instance = instances[0];
+  const host = instance.host.includes(':') ? `[${instance.host}]` : instance.host;
+  return connectExisting(
+    `http://${host}:${instance.port}`,
+    token,
+    'registered Kimi server',
+    instance.host_version,
+  );
+}
+
+async function connectExisting(
+  rawUrl: string,
+  token: string,
+  label: string,
+  versionHint?: string,
+): Promise<KimiChild> {
+  const upstream = new URL(rawUrl);
+  if (upstream.protocol !== 'http:' || !isLoopback(upstream.hostname)) {
+    throw new Error(`${label} must use an http loopback URL`);
+  }
+  if (upstream.username || upstream.password || upstream.pathname !== '/' || upstream.search || upstream.hash) {
+    throw new Error(`${label} URL must contain only scheme, loopback host, and port`);
+  }
+  const url = upstream.origin;
+  let version = versionHint;
+  try {
+    const response = await fetch(`${url}/api/v1/meta`, {
+      headers: { authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(1_000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json() as { code?: number; data?: { server_version?: unknown } };
+    if (body.code !== undefined && body.code !== 0) throw new Error(`response code ${body.code}`);
+    if (typeof body.data?.server_version === 'string') version = body.data.server_version;
+  } catch (error) {
+    throw new Error(`${label} at ${url} is unreachable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return {
+    url,
+    port: Number(upstream.port || 80),
+    token,
+    version,
+    owned: false,
+    close: async () => {},
+  };
+}
+
+function numberEnv(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : undefined;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function isLoopback(host: string): boolean {
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+}
+
 function trySpawn(bin: string, port: number, extraEnv?: Record<string, string>): Promise<KimiChild> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, ['web', '--port', String(port), '--no-open'], {
@@ -54,7 +191,6 @@ function trySpawn(bin: string, port: number, extraEnv?: Record<string, string>):
     });
 
     let settled = false;
-    let token = '';
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
@@ -63,32 +199,38 @@ function trySpawn(bin: string, port: number, extraEnv?: Record<string, string>):
       }
     }, 15_000);
 
-    const onData = (chunk: Buffer): void => {
-      const match = TOKEN_LINE.exec(chunk.toString('utf8'));
-      if (match && !settled) {
-        settled = true;
-        clearTimeout(timer);
-        token = match[1];
-        resolve({
-          url: `http://127.0.0.1:${port}`,
-          port,
-          token,
-          process: child,
-          close: () =>
-            new Promise((done) => {
-              child.once('exit', () => done());
-              child.kill('SIGTERM');
-              // 兜底:3 秒不退就 SIGKILL。
-              setTimeout(() => {
-                if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-                done();
-              }, 3_000).unref();
-            }),
-        });
+    const finish = (token: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        url: `http://127.0.0.1:${port}`,
+        port,
+        token,
+        owned: true,
+        process: child,
+        close: () =>
+          new Promise((done) => {
+            child.once('exit', () => done());
+            child.kill('SIGTERM');
+            setTimeout(() => {
+              if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+              done();
+            }, 3_000).unref();
+          }),
+      });
+    };
+    const buffers = { stdout: '', stderr: '' };
+    const onData = (source: keyof typeof buffers, chunk: Buffer): void => {
+      const lines = `${buffers[source]}${chunk.toString('utf8')}`.split(/\r?\n/);
+      buffers[source] = lines.pop() ?? '';
+      for (const line of lines) {
+        const match = TOKEN_LINE.exec(line);
+        if (match) finish(match[1]);
       }
     };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
+    child.stdout.on('data', (chunk: Buffer) => onData('stdout', chunk));
+    child.stderr.on('data', (chunk: Buffer) => onData('stderr', chunk));
 
     child.once('error', (error) => {
       if (!settled) {

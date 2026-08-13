@@ -15,15 +15,22 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import type { Duplex } from 'node:stream';
 import * as fsp from 'node:fs/promises';
+import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadWebShell, type WebShell } from './web-assets.js';
-import { createKimiHttpProxy } from './kimi-proxy.js';
-import { spawnKimiServer, type KimiChild } from './kimi-child.js';
+import { createKimiHttpProxy, createKimiWsUpgrader } from './kimi-proxy.js';
+import { followKimiServer, spawnKimiServer, type KimiChild } from './kimi-child.js';
 import { createStaticServer } from './static.js';
 import { CodexProviderAdapter, ClaudeProviderAdapter } from './facade.js';
 import { codexGatewayCommandNames } from './native-commands.js';
 import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsSearch } from './fs-local.js';
+import {
+  buildLocalTranscriptPage,
+  LocalTranscriptHub,
+  type LocalTranscriptTurn,
+  type TranscriptEmission,
+} from './local-transcript.js';
 import {
   ProviderError,
   isProviderName,
@@ -33,6 +40,7 @@ import {
   type ProviderAdapter,
   type ProviderName,
   type Session,
+  type SessionPage,
   type SessionUsage,
   type TurnAttachment,
   type TurnHandle,
@@ -62,6 +70,34 @@ export interface GatewayOptions {
   extensionDir?: string;
   /** 官方资产 manifest;默认仓库 web-origin-manifest.json。 */
   manifestPath?: string;
+  /**
+   * 对外展示的可用 provider(默认按本机二进制探测:claude/codex 没装就不出现
+   * 在选择器里,避免用户点了才发现不存在)。测试可显式覆盖。
+   */
+  availableProviders?: ProviderName[];
+}
+
+/** 探测本机实际安装的 provider:只做一次 fs 检查,不起进程(开销)。 */
+export function detectAvailableProviders(env: NodeJS.ProcessEnv = process.env): ProviderName[] {
+  const providers: ProviderName[] = ['kimi'];
+  const claudeBin = env.CLAUDE_BIN ?? path.join(os.homedir(), '.local', 'bin', 'claude');
+  if (existsSync(claudeBin)) providers.push('claude');
+  const codexPath = env.CODEX_PATH;
+  if (codexPath ? existsSync(codexPath) : onPath('codex', env.PATH)) providers.push('codex');
+  return providers;
+}
+
+function onPath(bin: string, pathEnv: string | undefined): boolean {
+  for (const dir of (pathEnv ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      accessSync(path.join(dir, bin), fsConstants.X_OK);
+      return true;
+    } catch {
+      // 不在该目录,继续。
+    }
+  }
+  return false;
 }
 
 /** 已解析的 Kimi 上游;token 必存在(spawn 模式一定能解析到)。 */
@@ -146,6 +182,7 @@ interface ActiveTurn {
   runningTools: Map<string, { name: string; args?: unknown }>;
   pendingApprovals: Map<string, { tool: string; input?: unknown; itemId?: string }>;
   pendingQuestions: Map<string, { prompt: string; rawQuestions?: unknown[] }>;
+  transcript?: LocalTranscriptTurn;
 }
 
 /** 排队中的 prompt(busy 时提交;对齐 kap-server 的 queued 语义)。 */
@@ -160,7 +197,9 @@ interface QueuedPrompt {
 class SessionHub {
   readonly busy = new Map<string, ActiveTurn>();
   readonly queued = new Map<string, QueuedPrompt[]>();
+  readonly transcript = new LocalTranscriptHub();
   private readonly listeners = new Map<string, Set<(ev: Record<string, unknown>) => void>>();
+  private readonly globalListeners = new Set<(ev: Record<string, unknown>) => void>();
   /**
    * 每会话的非 volatile 帧环形缓冲(WS 断线重连后按 cursor 重放)。
    * volatile 帧(assistant/thinking delta)是瞬态拼字,重放会重复文本,
@@ -177,6 +216,10 @@ class SessionHub {
     return ++this.seq;
   }
 
+  currentSeq(): number {
+    return this.seq;
+  }
+
   subscribe(sessionId: string, fn: (ev: Record<string, unknown>) => void): () => void {
     let set = this.listeners.get(sessionId);
     if (!set) {
@@ -189,6 +232,11 @@ class SessionHub {
     };
   }
 
+  subscribeGlobal(fn: (ev: Record<string, unknown>) => void): () => void {
+    this.globalListeners.add(fn);
+    return () => this.globalListeners.delete(fn);
+  }
+
   broadcast(sessionId: string, frame: Record<string, unknown>): void {
     if (frame.volatile !== true && typeof frame.seq === 'number') {
       const buf = this.replay.get(sessionId) ?? [];
@@ -199,7 +247,12 @@ class SessionHub {
       }
       this.replay.set(sessionId, buf);
     }
-    for (const fn of this.listeners.get(sessionId) ?? []) fn(frame);
+    const type = typeof frame.type === 'string' ? frame.type : '';
+    const targets = new Set(this.listeners.get(sessionId) ?? []);
+    if (type === 'session.meta.updated' || type.startsWith('event.session.') || type.startsWith('event.workspace.') || type.startsWith('event.config.')) {
+      for (const fn of this.globalListeners) targets.add(fn);
+    }
+    for (const fn of targets) fn(frame);
   }
 
   /**
@@ -217,6 +270,7 @@ class SessionHub {
     this.queued.delete(sessionId);
     this.replay.delete(sessionId);
     this.evictedSeq.delete(sessionId);
+    this.transcript.drop(sessionId);
   }
 }
 
@@ -236,24 +290,59 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     codex: options.codex ?? new CodexProviderAdapter(),
     claude: options.claude ?? new ClaudeProviderAdapter(),
   };
+  const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
+  const sessionPageCursors = new Map<string, string>();
 
-  // 解析 Kimi 上游:默认自起 kap-server 子进程(token 从它 stdout 解析)。
+  // 解析 Kimi 上游:没有官方 `/web` 实例时才自起 fallback Core。
+  // owned fallback 始终作为 standby 保留；当前 shell 执行 `/web` 后改接该
+  // 官方实例，实例退出后再自动回切，旧 WS 隧道由浏览器重连。
   let kimi: KimiUpstream | null = null;
+  let kimiFallback: KimiChild | null = null;
+  let kimiHttp: ReturnType<typeof createKimiHttpProxy> | null = null;
+  let kimiWs: ReturnType<typeof createKimiWsUpgrader> | null = null;
   const kimiOpt = options.kimi ?? 'spawn';
   if (kimiOpt === 'spawn') {
     const child = await spawnKimiServer();
+    if (child.owned) {
+      kimiFallback = child;
+    } else if (!process.env.KIMI_UPSTREAM_URL && !process.env.KIMI_UPSTREAM_PORT && !process.env.KIMI_PORT) {
+      kimiFallback = await spawnKimiServer({ reuseRegistered: false });
+    }
     kimi = { url: child.url, token: child.token, child };
   } else if (kimiOpt !== 'off') {
     if (!kimiOpt.token) throw new Error('external kimi upstream requires a token');
     kimi = { url: kimiOpt.upstream, token: kimiOpt.token };
   }
-
-  // Kimi 路径的 HTTP 代理:命中 Kimi 专属请求时换票转发到 kap-server。
-  // provider 是网关内部的分流参数,上游不认识,转发前删除。
-  const kimiHttp = kimi
-    ? createKimiHttpProxy({ upstream: kimi.url, upstreamToken: kimi.token, stripQueryParams: ['provider', 'token'] })
+  const updateKimiProxy = (): void => {
+    const proxyOptions = kimi
+      ? { upstream: kimi.url, upstreamToken: kimi.token, stripQueryParams: ['provider', 'token'] }
+      : null;
+    kimiHttp = proxyOptions ? createKimiHttpProxy(proxyOptions) : null;
+    kimiWs = proxyOptions ? createKimiWsUpgrader(proxyOptions) : null;
+  };
+  updateKimiProxy();
+  const kimiSockets = new Set<Duplex>();
+  let refreshKimiInflight: Promise<void> | null = null;
+  const refreshKimi = (): Promise<void> => {
+    if (kimiOpt !== 'spawn' || !kimiFallback) return Promise.resolve();
+    refreshKimiInflight ??= (async () => {
+      const followed = await followKimiServer(kimiFallback);
+      if (kimi?.url === followed.url && kimi.token === followed.token) return;
+      kimi = { url: followed.url, token: followed.token, child: followed };
+      updateKimiProxy();
+      for (const socket of kimiSockets) socket.destroy();
+      const label = followed.owned ? 'owned fallback' : 'official /web server';
+      console.error(`[gateway] Kimi upstream switched to ${label} at ${followed.url}`);
+    })().finally(() => {
+      refreshKimiInflight = null;
+    });
+    return refreshKimiInflight;
+  };
+  const kimiFollowTimer = kimiOpt === 'spawn'
+    ? setInterval(() => { void refreshKimi().catch(() => undefined); }, 1_000)
     : null;
+  kimiFollowTimer?.unref();
 
   // SPA 静态托管:校验官方 0.33 资产后只在 index 响应内存中注入扩展。
   const staticDir = options.staticDir;
@@ -270,6 +359,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
   // 直接向上游发 REST(聚合列表 / 建 Kimi 会话时用)。
   const kimiFetch = async (path: string, init?: RequestInit): Promise<unknown> => {
+    await refreshKimi();
     if (!kimi) throw new ProviderError('unsupported', 'kimi provider is off', 400);
     const res = await fetch(`${kimi.url}${API}${path}`, {
       ...init,
@@ -293,9 +383,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         return;
       }
       // Kimi 会话(id 无前缀)的 REST → 无损代理到原版 kap-server。
-      if (kimiHttp && shouldProxyToKimi(req)) {
-        const handled = await kimiHttp(req, res);
-        if (handled) return;
+      if (shouldProxyToKimi(req)) {
+        await refreshKimi();
+        if (kimiHttp) {
+          const handled = await kimiHttp(req, res);
+          if (handled) return;
+        }
       }
       await route(req, res);
     })().catch((err: unknown) => {
@@ -338,6 +431,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     // --- 元信息 ---
     if (sub === '/healthz') return ok(res, { ok: true }, requestId);
     if (sub === '/meta') {
+      // 官方字段从 Kimi 上游合并(版本/能力展示不受影响),providers 是本机
+      // 实际安装的 provider——前端选择器只显示这些。
+      const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
       return ok(res, {
         server_version: 'multi-agent-gateway/0.1 (Kimi 0.33.0 compatible)',
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
@@ -346,20 +442,16 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         open_in_apps: [],
         dangerous_bypass_auth: false,
         backend: 'v2',
-        providers: ['kimi', 'claude', 'codex'],
+        ...(upstream ?? {}),
+        providers: availableProviders,
       }, requestId);
     }
     if (sub === '/auth') {
-      if (provider && provider !== 'kimi') {
-        const models = adapters[provider].listModels ? await adapters[provider].listModels().catch(() => []) : [];
-        const defaultModel = models[0]?.model ?? null;
-        return ok(res, {
-          ready: defaultModel !== null,
-          providers_count: 1,
-          default_model: defaultModel,
-          managed_provider: null,
-        }, requestId);
-      }
+      // 登录态永远以 Kimi 上游为准,即使 URL 带了 provider=claude/codex:
+      // 这两家是本地 CLI provider,不在网关伪造各自的 ready——否则模型目录
+      // 为空时会被前端误显示成"未登录"(实测复现)。
+      const data = (await kimiFetch('/auth').catch(() => null)) as Record<string, unknown> | null;
+      if (data) return ok(res, data, requestId);
       return ok(res, { ready: true, providers_count: 1, default_model: null, managed_provider: null }, requestId);
     }
 
@@ -387,11 +479,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
     }
     if (sub === '/models' && req.method === 'GET') {
-      // claude/codex → 各自 adapter 的原生目录;kimi(或未指定)→ 代理上游,
-      // 失败给空列表。
+      // claude/codex → 各自 adapter 的原生目录。失败必须如实报错(500),
+      // 不能吞成空列表——空目录会让前端把"没装好/握手失败"显示成"没有模型"。
       if (provider && provider !== 'kimi') {
         const adapter = adapters[provider];
-        const items = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
+        const items = adapter.listModels ? await adapter.listModels() : [];
         return ok(res, { items }, requestId);
       }
       const data = kimiFetch ? ((await kimiFetch('/models').catch(() => null)) as Record<string, unknown> | null) : null;
@@ -457,10 +549,13 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
     // --- sessions ---
     if (sub === '/sessions' && req.method === 'GET') {
-      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid)), requestId);
+      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid), sessionPageCursors), requestId);
     }
     if (sub === '/sessions' && req.method === 'POST') {
-      return ok(res, await createSession(adapters, kimiFetch, await readBody(req), provider), requestId);
+      if (!provider || provider === 'kimi') {
+        throw new ProviderError('upstream_error', 'Kimi session creation must be handled by the transparent proxy', 500);
+      }
+      return ok(res, await createLocalSession(adapters, await readBody(req), provider), requestId);
     }
 
     const sessMatch = /^\/sessions\/([^/:]+)(.*)$/.exec(sub);
@@ -685,6 +780,34 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (tail === '/messages' && req.method === 'GET') {
         return ok(res, await listAdapterMessages(adapter, sp, nativeId, url), requestId);
       }
+      if (tail === '/transcript' && req.method === 'GET') {
+        const agentId = url.searchParams.get('agent_id');
+        if (!agentId) throw new ProviderError('invalid_request', 'agent_id is required', 400);
+        const pageSize = Number(url.searchParams.get('page_size') ?? 20);
+        const sid = prefixedId(sp, nativeId);
+        const history = await adapter.getHistory(nativeId).catch(() => [] as Message[]);
+        hub.transcript.observeHistory(sid, history);
+        return ok(res, buildLocalTranscriptPage(history, {
+          agentId,
+          beforeTurn: url.searchParams.get('before_turn') ?? undefined,
+          afterTurn: url.searchParams.get('after_turn') ?? undefined,
+          pageSize,
+        }, hub.busy.has(sid) ? 'turn' : 'idle', hub.transcript.currentSeq(sid), hub.transcript.activeItems(sid), hub.transcript.currentInteractions(sid), hub.transcript.currentPrompts(sid)), requestId);
+      }
+      if (tail === '/transcript/ops' && req.method === 'GET') {
+        const agentId = url.searchParams.get('agent_id');
+        const since = Number(url.searchParams.get('since_seq'));
+        if (!agentId || !Number.isInteger(since) || since < 0) {
+          throw new ProviderError('invalid_request', 'agent_id and non-negative since_seq are required', 400);
+        }
+        const catchup = hub.transcript.getOpsSince(prefixedId(sp, nativeId), since);
+        return ok(res, {
+          agent_id: agentId,
+          batches: catchup.batches,
+          latest_seq: catchup.latestSeq,
+          complete: catchup.complete,
+        }, requestId);
+      }
       if (tail === '/transcript/plan' && req.method === 'GET') {
         return ok(res, {
           agent_id: url.searchParams.get('agent_id') ?? 'main',
@@ -737,6 +860,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           if (queue.length === 0) hub.queued.delete(sid);
           // 排队 prompt 从未开 turn:发 prompt.aborted(不是 prompt.completed),
           // 前端投影器靠它清 in-flight 状态。
+          hub.transcript.finishPrompt(sid, pid, 'aborted');
           hub.broadcast(sid, frame(sid, hub, 'prompt.aborted', { promptId: pid, abortedAt: new Date().toISOString() }));
           return ok(res, { aborted: true }, requestId);
         }
@@ -772,6 +896,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         await adapter.resolveQuestion(nativeId, qid, {}).catch(() => undefined);
         const sid = prefixedId(sp, nativeId);
         hub.busy.get(sid)?.pendingQuestions.delete(qid);
+        hub.transcript.resolveInteraction(sid, qid, 'dismissed', null);
         hub.broadcast(sid, frame(sid, hub, 'event.question.dismissed', {
           question_id: qid, dismissed_at: new Date().toISOString(),
         }));
@@ -802,6 +927,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }
         const queue = hub.queued.get(sid) ?? [];
         const steered: string[] = [];
+        const steeredContent: Array<{ type: 'text'; text: string }> = [];
         for (const id of ids) {
           const idx = queue.findIndex((q) => q.promptId === id);
           if (idx === -1) continue;
@@ -810,6 +936,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           await adapter.steer(nativeId, active.turnId, queue[idx].text);
           const [q] = queue.splice(idx, 1);
           steered.push(id);
+          steeredContent.push({ type: 'text', text: q.text });
           // 用户消息回显:前端靠 messageCreated(prompt_id 匹配)落乐观气泡。
           hub.broadcast(sid, frame(sid, hub, 'event.message.created', {
             message: {
@@ -818,6 +945,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
             },
           }));
         }
+        if (steered.length > 0) hub.transcript.steerPrompts(sid, active.promptId, steered, steeredContent);
         if (queue.length === 0) hub.queued.delete(sid);
         return ok(res, { steered: steered.length > 0, prompt_ids: steered }, requestId);
       }
@@ -845,9 +973,20 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     return fail(res, 404, 40400, `unknown route ${sub}`, requestId);
   }
 
-  // WebSocket:单连接,按订阅的会话 id 前缀分流(Kimi → relay 上游,Codex/Claude → 本地 hub)。
+  // Kimi 走官方 WebSocket 字节流;Claude/Codex 保留本地协议适配。
   const gatewaySockets = new Set<Duplex>();
-  attachGatewayWebSocket(server, token, hub, kimi, gatewaySockets);
+  attachGatewayWebSocket(
+    server,
+    token,
+    hub,
+    adapters,
+    async () => {
+      await refreshKimi();
+      return kimiWs;
+    },
+    gatewaySockets,
+    kimiSockets,
+  );
 
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once('error', rejectListen);
@@ -874,9 +1013,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       : null,
     close: () =>
       new Promise((resolveClose) => {
+        if (kimiFollowTimer) clearInterval(kimiFollowTimer);
         for (const socket of gatewaySockets) socket.destroy();
         server.close(() => {
-          void (kimi?.child?.close() ?? Promise.resolve()).then(() => resolveClose());
+          void (kimiFallback?.close() ?? kimi?.child?.close() ?? Promise.resolve()).then(() => resolveClose());
         });
       }),
   };
@@ -903,17 +1043,14 @@ function authed(req: IncomingMessage, token: string): boolean {
 function shouldProxyToKimi(req: IncomingMessage): boolean {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (!url.pathname.startsWith(API)) return false;
-  if (url.pathname === `${API}/ws`) return false; // WS 一律由网关终止,按订阅分流
-  const provider = url.searchParams.get('provider');
-  // 显式 Kimi 视图全部透明代理。只有创建会话需要网关补 profile/model。
-  if (provider === 'kimi') {
-    return !(url.pathname === `${API}/sessions` && req.method === 'POST');
-  }
-  if (provider && provider !== 'kimi') return false;
+  if (url.pathname === `${API}/ws`) return false;
+  // /meta 本地合并:官方字段照传,追加实际安装的 provider 列表(选择器过滤用)。
+  if (url.pathname === `${API}/meta`) return false;
 
-  // 官方 Kimi 新建会话也经过网关，以便补齐 daemon 不会落地的模型配置；
-  // GET /sessions 仍保持原版上游分页语义。
-  if (!provider && url.pathname === `${API}/sessions` && req.method === 'POST') return false;
+  const provider = url.searchParams.get('provider');
+  if (provider === 'kimi') return true;
+  if (provider === 'claude' || provider === 'codex') return false;
+  if (provider !== null) return false;
 
   const sessMatch = /^\/api\/v1\/sessions\/([^/:]+)/.exec(url.pathname);
   if (sessMatch) {
@@ -921,8 +1058,8 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
     return !id.startsWith('codex_') && !id.startsWith('claude_');
   }
 
-  // 官方客户端的文件预览 URL 不带 provider。扩展会给新请求补上 provider；
-  // 对遗留的本地上传 id 仍留在网关，其余文件请求交给 Kimi 保持原生语义。
+  // Official file preview URLs do not carry provider. Keep only gateway-owned
+  // upload ids local; every other file route belongs to Kimi.
   if (url.pathname.startsWith(`${API}/files/`)) {
     let id = '';
     try {
@@ -933,16 +1070,9 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
     return !uploads.has(id);
   }
 
-  // 没有 provider 参数时就是纯官方 Kimi Web 语义。只保留网关自身必须终止
-  // 的基础路由，其余原生/未来路由默认透明代理，避免升级后被 unknown route
-  // 打断。扩展模式的列表/模型/config/files 请求都会显式附 provider。
-  const gatewayOwned = new Set([
-    `${API}/healthz`,
-    `${API}/meta`,
-    `${API}/fs:browse`,
-    `${API}/fs:home`,
-  ]);
-  return !gatewayOwned.has(url.pathname);
+  // No provider is the unmodified official Kimi client. Keep only the gateway
+  // liveness probe local and proxy every present or future Kimi API route.
+  return url.pathname !== `${API}/healthz`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1178,19 @@ function workspaceDto(root: string, name?: string): Record<string, unknown> {
   };
 }
 
+async function listAllSessions(adapter: ProviderAdapter): Promise<Session[]> {
+  const items: Session[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await adapter.list({ limit: 100, cursor });
+    items.push(...page.items);
+    if (!page.next_cursor || seen.has(page.next_cursor)) return items;
+    seen.add(page.next_cursor);
+    cursor = page.next_cursor;
+  }
+}
+
 async function listWorkspaces(
   adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
@@ -1062,28 +1205,26 @@ async function listWorkspaces(
       if (root) roots.set(root, w);
     }
   }
-  // Codex/Claude:从会话的 cwd 聚合。工作区集合只取最近 50 条(老线程的临时
-  // cwd 不造空工作区);session_count 用全量列表统计——前端"加载更多 N 个
-  // 对话"按 session_count - 已加载数渲染,缺了会显示 NaN(实测)。
+  // Codex/Claude:沿各自原生 cursor 聚合全部主会话。固定上限会漏掉老项目,
+  // 还会让前端的 session_count 与“加载更多”不一致。
   const targets: ProviderName[] = provider && provider !== 'kimi' ? [provider] : ['codex', 'claude'];
   for (const p of targets) {
     const adapter = adapters[p as Exclude<ProviderName, 'kimi'>];
-    const recent = await adapter.list({ limit: 50 }).catch((err) => {
+    const sessions = await listAllSessions(adapter).catch((err) => {
       console.error(`[gateway] listWorkspaces: ${p}.list 失败:`, err instanceof Error ? err.message : err);
-      return { items: [] as Session[] };
+      return [] as Session[];
     });
-    for (const s of recent.items) {
-      const cwd = s.metadata.cwd;
-      if (!roots.has(cwd)) roots.set(cwd, workspaceDto(cwd));
-    }
-    const all = await adapter.list({ limit: 500 }).catch(() => ({ items: [] as Session[] }));
     const counts = new Map<string, number>();
-    for (const s of all.items) {
-      counts.set(s.metadata.cwd, (counts.get(s.metadata.cwd) ?? 0) + 1);
+    for (const session of sessions) {
+      const cwd = session.metadata.cwd;
+      if (!roots.has(cwd)) roots.set(cwd, workspaceDto(cwd));
+      counts.set(cwd, (counts.get(cwd) ?? 0) + 1);
     }
-    for (const [cwd, n] of counts) {
-      const w = roots.get(cwd);
-      if (w) w.session_count = (typeof w.session_count === 'number' ? w.session_count : 0) + n;
+    for (const [cwd, count] of counts) {
+      const workspace = roots.get(cwd);
+      if (workspace) {
+        workspace.session_count = (typeof workspace.session_count === 'number' ? workspace.session_count : 0) + count;
+      }
     }
   }
   return { items: [...roots.values()] };
@@ -1124,6 +1265,7 @@ async function listSessions(
   url: URL,
   provider: ProviderName | undefined,
   busyOf: (sid: string) => boolean,
+  pageCursors: Map<string, string>,
 ): Promise<Record<string, unknown>> {
   const limit = Math.min(Number(url.searchParams.get('page_size') ?? 50) || 50, 100);
   const beforeId = url.searchParams.get('before_id') ?? undefined;
@@ -1148,6 +1290,37 @@ async function listSessions(
     workspaceRoot = typeof hit?.root === 'string' && hit.root ? hit.root : undefined;
   }
   const rootNorm = workspaceRoot?.replace(/\/+$/, '');
+  if (provider && provider !== 'kimi') {
+    const adapter = adapters[provider];
+    const cursorKey = (id: string): string => `${provider}\u0000${workspaceId ?? ''}\u0000${id}`;
+    let cursor: string | undefined;
+    if (beforeId) {
+      cursor = pageCursors.get(cursorKey(beforeId));
+      if (!cursor && provider === 'claude' && beforeId.startsWith('claude_')) {
+        cursor = beforeId.slice('claude_'.length);
+      }
+      if (!cursor) return { items: [], has_more: false };
+    }
+    let page: SessionPage = await adapter.list({ limit, cursor, cwd: rootNorm }).catch((err) => {
+      console.error(`[gateway] listSessions: ${provider}.list 失败:`, err instanceof Error ? err.message : err);
+      return { items: [] as Session[] };
+    });
+    // Codex 原始页可能只有子 agent;adapter 过滤后为空时沿原生 cursor 前进,
+    // 避免 UI 因拿不到 before_id 而卡在空页。
+    for (let skipped = 0; page.items.length === 0 && page.next_cursor && skipped < 20; skipped += 1) {
+      page = await adapter.list({ limit, cursor: page.next_cursor, cwd: rootNorm });
+    }
+    const localItems = page.items.map((session) => sessionDto(
+      session,
+      adapter.getModel?.(session.id),
+      adapter.getUsage?.(session.id),
+      busyOf(prefixedId(provider, session.id)),
+    ));
+    if (page.next_cursor && localItems.length > 0) {
+      pageCursors.set(cursorKey(String(localItems[localItems.length - 1].id)), page.next_cursor);
+    }
+    return { items: localItems, has_more: Boolean(page.next_cursor) };
+  }
   // Kimi 会话:上游原样条目(id 无前缀 = kimi);跟随上游分页拉全量。
   if (kimiFetch && (!provider || provider === 'kimi') && (!workspaceId || rootNorm)) {
     let upstreamBefore: string | undefined;
@@ -1201,47 +1374,17 @@ async function listSessions(
   return { items: items.slice(start, start + limit), has_more: start + limit < items.length };
 }
 
-async function createSession(
+async function createLocalSession(
   adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
-  kimiFetch: KimiFetch | null,
   body: unknown,
-  provider: ProviderName | undefined,
+  provider: Exclude<ProviderName, 'kimi'>,
 ): Promise<Record<string, unknown>> {
-  const b = body as { provider?: string; metadata?: { cwd?: string }; cwd?: string; title?: string };
-  const target: ProviderName =
-    (b.provider && isProviderName(b.provider) ? b.provider : provider) ?? 'kimi';
-  if (target === 'kimi') {
-    if (!kimiFetch) throw new ProviderError('unsupported', 'kimi provider is off', 400);
-    // 原样转发给上游 kap-server,但剔除网关层的 provider 字段——它是本网关的
-    // 分流概念,上游 kap-server 不认识(UI 审查:严格 schema 会 400)。
-    const forward = { ...(b as Record<string, unknown>) };
-    delete forward.provider;
-    const created = (await kimiFetch('/sessions', { method: 'POST', body: JSON.stringify(forward) })) as Record<string, unknown>;
-    // daemon 怪癖:create 不落地 agent_config.model,新会话 model 为空,
-    // 直接发 prompt 会以 model.not_configured 失败。补一发 /profile 设模型
-    // (请求体没指定就用上游 /auth 的 default_model)。实测验证过这条链。
-    const id = typeof created.id === 'string' ? created.id : '';
-    if (id) {
-      const requested = (b as { agent_config?: { model?: string } }).agent_config?.model;
-      const model =
-        requested ??
-        ((await kimiFetch('/auth').catch(() => null)) as { default_model?: string } | null)?.default_model;
-      if (model) {
-        await kimiFetch(`/sessions/${encodeURIComponent(id)}/profile`, {
-          method: 'POST',
-          // plan_mode:false 对齐官方 UI 空 composer 的默认;否则 API 建会话
-          // daemon 默认 plan_mode:true,简单一句 PONG 也要先跑几十秒计划。
-          body: JSON.stringify({ agent_config: { model, plan_mode: false } }),
-        }).catch(() => null);
-      }
-    }
-    return created;
-  }
+  const b = body as { metadata?: { cwd?: string }; cwd?: string; title?: string };
   const cwd = b.metadata?.cwd ?? b.cwd ?? process.env.HOME ?? '/home/ubuntu';
-  const session = await adapters[target].create({ provider: target, cwd, title: b.title, metadata: b.metadata });
+  const session = await adapters[provider].create({ provider, cwd, title: b.title, metadata: b.metadata });
   // 新建会话时前端已让用户选了模型/thinking(composer 的 pick 随 create 一起
   // 来);不应用的话首轮 turn 会跑在默认模型上,UI 却显示用户的选择(审查发现)。
-  const adapter = adapters[target];
+  const adapter = adapters[provider];
   const createCfg = (b as {
     agent_config?: {
       model?: string;
@@ -1268,13 +1411,22 @@ async function getSession(
   provider: ProviderName,
   nativeId: string,
 ): Promise<Session> {
-  // 全量查(本地适配器缓存服务大 limit):只查前 100 条会把较老的真实会话
-  // 误判成"新建未落盘",伪造成 HOME 下的假会话(审查发现)。
-  const page = await adapter.list({ limit: 500 });
-  const found = page.items.find((s) => s.id === nativeId);
-  if (found) return found;
-  // Claude 新建但还没落盘的会话不在 list 里,造一个最小的;cwd 优先取
-  // adapter 记录的(create 时写入),不伪造 HOME 假目录(审查发现)。
+  // 沿 provider 原生 cursor 查找,不能只看第一页或用固定 500 截断,
+  // 否则较老的真实会话会被伪造成新会话。
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  for (;;) {
+    const page = await adapter.list({ limit: 100, cursor });
+    const found = page.items.find((session) => session.id === nativeId);
+    if (found) return found;
+    if (!page.next_cursor || seen.has(page.next_cursor)) break;
+    seen.add(page.next_cursor);
+    cursor = page.next_cursor;
+  }
+  // 新建但尚未落盘的会话只存在于 adapter 内存态；有真实 cwd 才能造
+  // 最小 DTO。未知/已删除 id 必须 404，不能伪造成 HOME 下的空会话。
+  const cwd = adapter.getCwd?.(nativeId);
+  if (!cwd) throw new ProviderError('not_found', `${provider} session not found: ${nativeId}`, 404);
   return {
     id: nativeId,
     workspace_id: '',
@@ -1282,7 +1434,7 @@ async function getSession(
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     busy: false,
-    metadata: { cwd: adapter.getCwd?.(nativeId) ?? process.env.HOME ?? '/home/ubuntu' },
+    metadata: { cwd },
     provider,
   };
 }
@@ -1365,24 +1517,18 @@ async function listAdapterMessages(
 }
 
 function listPrompts(sid: string, hub: SessionHub): Record<string, unknown> {
-  const active = hub.busy.get(sid);
+  const prompts = hub.transcript.currentPrompts(sid);
+  const toWire = (prompt: (typeof prompts)[number]) => ({
+    prompt_id: prompt.promptId,
+    user_message_id: prompt.userMessageId ?? prompt.promptId,
+    status: prompt.status,
+    content: prompt.content,
+    created_at: prompt.createdAt,
+  });
+  const active = prompts.find((prompt) => prompt.status === 'running' || prompt.status === 'blocked');
   return {
-    active: active
-      ? {
-          prompt_id: active.promptId,
-          user_message_id: active.promptId,
-          status: 'running',
-          content: [{ type: 'text', text: '' }],
-          created_at: new Date().toISOString(),
-        }
-      : null,
-    queued: (hub.queued.get(sid) ?? []).map((q) => ({
-      prompt_id: q.promptId,
-      user_message_id: q.promptId,
-      status: 'queued',
-      content: [{ type: 'text', text: q.text }],
-      created_at: q.createdAt,
-    })),
+    active: active ? toWire(active) : null,
+    queued: prompts.filter((prompt) => prompt.status === 'queued').map(toWire),
   };
 }
 
@@ -1479,15 +1625,17 @@ async function submitPrompt(
   // 的 prompt 在当前 turn 结束后自动开自己的 turn,或被 prompts:steer 注入)。
   if (hub.busy.has(sid)) {
     const promptId = randomUUID();
+    const createdAt = new Date().toISOString();
     const q = hub.queued.get(sid) ?? [];
-    q.push({ promptId, text, attachments, createdAt: new Date().toISOString() });
+    q.push({ promptId, text, attachments, createdAt });
     hub.queued.set(sid, q);
+    hub.transcript.submitPrompt(sid, promptId, 'queued', [{ type: 'text', text }], createdAt);
     return {
       prompt_id: promptId,
       user_message_id: promptId,
       status: 'queued',
       content: [{ type: 'text', text }],
-      created_at: new Date().toISOString(),
+      created_at: createdAt,
     };
   }
 
@@ -1512,29 +1660,53 @@ async function driveTurn(
   const turn = newActiveTurn(nativeId, promptId);
   hub.busy.set(sid, turn);
   const startedAt = Date.now();
-  const emit = (type: string, payload: Record<string, unknown>, volatile = false): void =>
-    hub.broadcast(sid, frame(sid, hub, type, payload, volatile));
+  const createdAt = new Date(startedAt).toISOString();
+  hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text }], createdAt);
+  // startTurn 与历史读取并行。用 settled 结果承接 rejection，避免历史较慢时
+  // acquire 的拒绝先变成未处理 Promise。
+  const acquired = acquire().then(
+    (handle) => ({ ok: true as const, handle }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+  if (!hub.transcript.hasObservedHistory(sid)) {
+    const history = await adapter.getHistory(nativeId).catch(() => [] as Message[]);
+    hub.transcript.observeHistory(sid, history);
+  }
+  const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
+    hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));
 
-  // 事件序列对齐 kap-server:前端 agentEventProjector 只认这组帧。
-  emit('session.meta.updated', { patch: { lastPrompt: text } });
-  emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
-  emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: text });
+  // abort 可能在历史读取窗口先清掉 busy。此时不能再创建一个永远 running
+  // 的 transcript turn，也不能重新广播 turn.started。
+  if (!turn.cancelled && hub.busy.get(sid) === turn) {
+    turn.transcript = hub.transcript.beginTurn(sid, text, createdAt);
+    // 事件序列对齐 kap-server:legacy 与 transcript v2 同时投影同一真实事件流。
+    emit('session.meta.updated', { patch: { lastPrompt: text } });
+    emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
+    emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: text });
+  }
 
-  const handle = await acquire().catch((err) => {
-    // startTurn 失败必须清 busy 并广播终态——否则会话永久 409(审查实测)。
-    hub.busy.delete(sid);
-    emit('turn.ended', { turnId: 0, reason: 'failed', durationMs: Date.now() - startedAt });
-    emit('prompt.completed', { promptId, reason: 'failed' });
-    emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: 'failed' });
-    // 队列里还有等着的 prompt:busy 已清,接力给下一个(审查实测会卡死)。
-    drainQueue(adapter, provider, nativeId, hub);
-    throw err;
-  });
+  const acquireResult = await acquired;
+  if (!acquireResult.ok) {
+    // abort/后继 turn 已经接管时不能用迟到的 startTurn 失败覆盖其状态。
+    if (hub.busy.get(sid) === turn) {
+      hub.busy.delete(sid);
+      const durationMs = Date.now() - startedAt;
+      turn.transcript?.end('failed', durationMs);
+      hub.transcript.finishPrompt(sid, promptId, 'failed');
+      emit('turn.ended', { turnId: 0, reason: 'failed', durationMs });
+      emit('prompt.completed', { promptId, reason: 'failed' });
+      emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: 'failed' });
+      // 队列里还有等着的 prompt:busy 已清,接力给下一个(审查实测会卡死)。
+      drainQueue(adapter, provider, nativeId, hub);
+    }
+    throw acquireResult.error;
+  }
+  const handle = acquireResult.handle;
   turn.turnId = handle.turnId;
 
-  // abort 在 acquire 窗口(turnId 还没拿到)到达:abortTurn 已广播终态,
-  // 这里用真实 turnId 补一刀 interrupt,然后直接返回,不消费事件流。
-  if (turn.cancelled) {
+  // abort 在 acquire/历史窗口到达:abortTurn 已广播终态,这里用真实
+  // turnId 补一刀 interrupt,然后直接返回,不消费事件流。
+  if (turn.cancelled || hub.busy.get(sid) !== turn) {
     await adapter.interrupt(nativeId, handle.turnId).catch(() => undefined);
     return {
       prompt_id: promptId,
@@ -1550,12 +1722,15 @@ async function driveTurn(
   let step = 0;
   const ensureStep = (): void => {
     if (!stepActive) {
+      turn.assistantText = '';
+      turn.thinkingText = '';
       emit('turn.step.started', { turnId: 0, step });
       stepActive = true;
     }
   };
-  const completeStep = (): void => {
+  const completeStep = (state: 'completed' | 'failed' = 'completed'): void => {
     if (stepActive) {
+      turn.transcript?.completeStep(state);
       emit('turn.step.completed', { turnId: 0, step, usage: {} });
       stepActive = false;
       step += 1;
@@ -1572,17 +1747,19 @@ async function driveTurn(
         // 适配器层的失败(如 CLI 无 result 退出)以 turn/failed 事件上来,
         // 必须传导到终态,否则 UI 显示假成功。
         if (ev.kind === 'turn' && ev.status === 'failed') reason = 'failed';
-        consumeEvent(ev, turn, emit, ensureStep, completeStep, sid);
+        consumeEvent(ev, turn, emit, ensureStep, completeStep, sid, hub);
       }
     } catch {
       reason = 'failed';
     } finally {
-      completeStep();
+      completeStep(reason === 'failed' ? 'failed' : 'completed');
       // 只有自己仍是当前 turn 时才清理+广播终态。abort 路径由 abortTurn
       // 广播;若新 turn 已占位,旧流静默退出,避免误删新 turn 的 busy。
       if (hub.busy.get(sid) === turn) {
         hub.busy.delete(sid);
         const durationMs = Date.now() - startedAt;
+        turn.transcript?.end(reason, durationMs);
+        hub.transcript.finishPrompt(sid, promptId, reason);
         emit('turn.ended', { turnId: 0, reason, durationMs });
         emit('prompt.completed', { promptId, reason });
         const pending = turn.pendingApprovals.size > 0 ? 'approval' : turn.pendingQuestions.size > 0 ? 'question' : 'none';
@@ -1601,7 +1778,7 @@ async function driveTurn(
     user_message_id: promptId,
     status: 'running',
     content: [{ type: 'text', text }],
-    created_at: new Date().toISOString(),
+    created_at: createdAt,
   };
 }
 
@@ -1639,9 +1816,12 @@ async function runCodexLocalCommand(
   const sid = prefixedId(provider, nativeId);
   const promptId = randomUUID();
   const promptText = `/${name}${argsText ? ` ${argsText}` : ''}`;
-  const emit = (type: string, payload: Record<string, unknown>, volatile = false): void =>
-    hub.broadcast(sid, frame(sid, hub, type, payload, volatile));
+  const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
+    hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));
   const startedAt = Date.now();
+  const createdAt = new Date(startedAt).toISOString();
+  hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text: promptText }], createdAt);
+  const transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
   emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: promptText });
   let output: string;
   let reason: 'completed' | 'failed' = 'completed';
@@ -1655,16 +1835,21 @@ async function runCodexLocalCommand(
   // turn.step.started 创建(审查实测:缺这一帧命令输出被静默丢弃,kap-server
   // 原版也是 step.started 先于该 step 全部 delta)。
   emit('turn.step.started', { turnId: 0, step: 0 });
-  emit('assistant.delta', { turnId: 0, delta: output }, true);
+  transcript.append('assistant', output);
+  emit('assistant.delta', { turnId: 0, delta: output }, true, 0);
+  transcript.completeStep(reason === 'completed' ? 'completed' : 'failed');
   emit('turn.step.completed', { turnId: 0, step: 0, usage: {} });
-  emit('turn.ended', { turnId: 0, reason, durationMs: Date.now() - startedAt });
+  const durationMs = Date.now() - startedAt;
+  transcript.end(reason, durationMs);
+  hub.transcript.finishPrompt(sid, promptId, reason);
+  emit('turn.ended', { turnId: 0, reason, durationMs });
   emit('prompt.completed', { promptId, reason });
   return {
     prompt_id: promptId,
     user_message_id: promptId,
-    status: 'completed',
+    status: 'running',
     content: [{ type: 'text', text: promptText }],
-    created_at: new Date().toISOString(),
+    created_at: createdAt,
   };
 }
 
@@ -1745,7 +1930,7 @@ function newActiveTurn(sessionId: string, promptId: string): ActiveTurn {
   };
 }
 
-type Emit = (type: string, payload: Record<string, unknown>, volatile?: boolean) => void;
+type Emit = (type: string, payload: Record<string, unknown>, volatile?: boolean, offset?: number) => void;
 
 function consumeEvent(
   ev: GatewayEvent,
@@ -1754,41 +1939,64 @@ function consumeEvent(
   ensureStep: () => void,
   completeStep: () => void,
   sid: string,
+  hub: SessionHub,
 ): void {
   if (ev.kind === 'message' && ev.status === 'delta') {
     const delta = (ev.payload as { delta?: string }).delta ?? '';
     if (!delta) return;
     ensureStep();
+    const offset = turn.assistantText.length;
     turn.assistantText += delta;
-    emit('assistant.delta', { turnId: 0, delta }, true);
+    turn.transcript?.append('assistant', delta);
+    emit('assistant.delta', { turnId: 0, delta }, true, offset);
   } else if (ev.kind === 'thinking' && ev.status === 'delta') {
     const delta = (ev.payload as { delta?: string }).delta ?? '';
     if (!delta) return;
     ensureStep();
+    const offset = turn.thinkingText.length;
     turn.thinkingText += delta;
-    emit('thinking.delta', { turnId: 0, delta }, true);
+    turn.transcript?.append('thinking', delta);
+    emit('thinking.delta', { turnId: 0, delta }, true, offset);
   } else if (ev.kind === 'tool') {
     const p = ev.payload as { toolCallId: string; name: string; input?: unknown; output?: string; isError?: boolean; is_error?: boolean };
     if (ev.status === 'started') {
       ensureStep();
       turn.runningTools.set(p.toolCallId, { name: p.name, args: p.input });
+      turn.transcript?.toolStarted(p.toolCallId, p.name, p.input ?? {});
       emit('tool.call.started', { turnId: 0, toolCallId: p.toolCallId, name: p.name, args: p.input ?? {} });
     } else {
       turn.runningTools.delete(p.toolCallId);
+      const isError = p.isError ?? p.is_error ?? false;
+      turn.transcript?.toolResult(p.toolCallId, p.output ?? '', isError);
       // 适配器层统一用 snake_case(审查发现 camel 读取落空,失败被投影为成功)。
-      emit('tool.result', { turnId: 0, toolCallId: p.toolCallId, output: p.output ?? '', isError: p.isError ?? p.is_error ?? false });
+      emit('tool.result', { turnId: 0, toolCallId: p.toolCallId, output: p.output ?? '', isError });
       // 前端在 tool.result 后重置 assistant 跟踪 —— 一个 step 到此为止。
       completeStep();
     }
   } else if (ev.kind === 'approval') {
     const p = ev.payload as { approvalId: string; tool: string; input?: unknown; itemId?: string };
     turn.pendingApprovals.set(p.approvalId, { tool: p.tool, input: p.input, itemId: p.itemId });
+    hub.transcript.requestInteraction(sid, {
+      interactionId: p.approvalId,
+      interactionKind: 'approval',
+      ...(p.itemId ? { toolCallId: p.itemId } : {}),
+      state: 'pending',
+      request: approvalDto(sid, p.approvalId, turn),
+    });
     emit('event.approval.requested', approvalDto(sid, p.approvalId, turn));
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'approval' });
   } else if (ev.kind === 'question') {
-    const p = ev.payload as { questionId: string; prompt: string; rawQuestions?: unknown[] };
+    const p = ev.payload as { questionId: string; prompt: string; rawQuestions?: unknown[]; itemId?: string };
     turn.pendingQuestions.set(p.questionId, { prompt: p.prompt, rawQuestions: p.rawQuestions });
-    emit('event.question.requested', questionDto(sid, p.questionId, { prompt: p.prompt, rawQuestions: p.rawQuestions }));
+    const request = questionDto(sid, p.questionId, { prompt: p.prompt, rawQuestions: p.rawQuestions });
+    hub.transcript.requestInteraction(sid, {
+      interactionId: p.questionId,
+      interactionKind: 'question',
+      ...(p.itemId ? { toolCallId: p.itemId } : {}),
+      state: 'pending',
+      request,
+    });
+    emit('event.question.requested', request);
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'question' });
   } else if (ev.kind === 'turn') {
     // 终态由 submitPrompt 的 finally 统一广播。
@@ -1808,6 +2016,8 @@ async function abortTurn(adapter: ProviderAdapter, provider: ProviderName, nativ
   active.cancelled = true;
   await adapter.interrupt(nativeId, active.turnId || undefined);
   hub.busy.delete(sid);
+  active.transcript?.end('cancelled', 0);
+  hub.transcript.finishPrompt(sid, active.promptId, 'aborted');
   // 事件流循环发现占位消失后会静默退出(见 driveTurn 的 break),终态在
   // 此广播,前端才能从 busy 恢复。
   hub.broadcast(sid, frame(sid, hub, 'turn.ended', { turnId: 0, reason: 'cancelled', durationMs: 0 }));
@@ -1903,6 +2113,12 @@ async function resolveApproval(
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
   active?.pendingApprovals.delete(approvalId);
+  hub.transcript.resolveInteraction(
+    sid,
+    approvalId,
+    body.decision === 'approved' ? 'approved' : 'rejected',
+    { decision: body.decision, scope: body.scope },
+  );
   hub.broadcast(sid, frame(sid, hub, 'event.approval.resolved', {
     approval_id: approvalId,
     decision: body.decision,
@@ -1935,6 +2151,7 @@ async function resolveQuestion(
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
   active?.pendingQuestions.delete(questionId);
+  hub.transcript.resolveInteraction(sid, questionId, 'answered', payload);
   // 帧名对齐 kap-server:前端 projector 只认 event.question.answered/dismissed,
   // 发 resolved 会落进 "Unhandled event"(审查实测)。
   hub.broadcast(sid, frame(sid, hub, 'event.question.answered', {
@@ -1971,15 +2188,84 @@ function wireAnswerStrings(ans: unknown): string[] {
 // WebSocket
 // ---------------------------------------------------------------------------
 
-function frame(sessionId: string, hub: SessionHub, type: string, payload: unknown, volatile = false): Record<string, unknown> {
+function frame(sessionId: string, hub: SessionHub, type: string, payload: unknown, volatile = false, offset?: number): Record<string, unknown> {
   return {
     type,
     seq: hub.nextSeq(),
     epoch: hub.epoch,
     volatile,
+    ...(offset === undefined ? {} : { offset }),
     session_id: sessionId,
     timestamp: new Date().toISOString(),
     payload: { ...(payload as Record<string, unknown>), sessionId, agentId: 'main' },
+  };
+}
+
+const TRANSCRIPT_PROJECTED_EVENT_TYPES = new Set([
+  'turn.started', 'turn.ended', 'turn.step.started', 'turn.step.completed',
+  'turn.step.interrupted', 'assistant.delta', 'thinking.delta',
+  'tool.call.started', 'tool.result', 'prompt.completed', 'prompt.aborted',
+  'event.question.requested', 'event.question.dismissed', 'event.question.answered',
+  'event.approval.requested', 'event.approval.resolved',
+]);
+
+type LocalTranscriptGrade = 'off' | 'turn' | 'block' | 'delta';
+
+function transcriptGrade(spec: Record<string, unknown> | undefined): LocalTranscriptGrade {
+  const value = spec?.main ?? spec?.['*'] ?? 'off';
+  return value === 'turn' || value === 'block' || value === 'delta' ? value : 'off';
+}
+
+function validTranscriptSpec(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return Object.values(value).every((grade) =>
+    grade === 'off' || grade === 'turn' || grade === 'block' || grade === 'delta');
+}
+
+function globalSessionEvent(type: string): boolean {
+  return type === 'session.meta.updated'
+    || type.startsWith('event.session.')
+    || type.startsWith('event.workspace.')
+    || type.startsWith('event.config.');
+}
+
+function transcriptSuppressesLegacy(event: Record<string, unknown>, spec: Record<string, unknown> | undefined): boolean {
+  const type = typeof event.type === 'string' ? event.type : '';
+  if (globalSessionEvent(type) || transcriptGrade(spec) === 'off') return false;
+  const payload = event.payload as { agentId?: unknown } | undefined;
+  if (payload && payload.agentId !== undefined && payload.agentId !== 'main') return false;
+  return TRANSCRIPT_PROJECTED_EVENT_TYPES.has(type);
+}
+
+function filterTranscriptEmission(
+  emission: TranscriptEmission,
+  grade: LocalTranscriptGrade,
+): TranscriptEmission | null {
+  if (grade === 'off') return null;
+  if (emission.type === 'transcript.reset' || grade === 'delta') return emission;
+  const ops = Array.isArray(emission.payload.ops)
+    ? (emission.payload.ops as Array<Record<string, unknown>>).filter((op) => {
+        if (grade === 'block') return op.op !== 'append';
+        return op.op !== 'step.upsert' && op.op !== 'frame.upsert' && op.op !== 'append';
+      })
+    : [];
+  if (ops.length === 0) return null;
+  return { ...emission, payload: { ...emission.payload, ops } };
+}
+
+function transcriptEnvelope(
+  sessionId: string,
+  hub: SessionHub,
+  emission: TranscriptEmission,
+): Record<string, unknown> {
+  return {
+    type: emission.type,
+    seq: hub.currentSeq(),
+    epoch: hub.epoch,
+    volatile: true,
+    session_id: sessionId,
+    timestamp: new Date().toISOString(),
+    payload: emission.payload,
   };
 }
 
@@ -1987,8 +2273,10 @@ function attachGatewayWebSocket(
   server: ReturnType<typeof createServer>,
   token: string,
   hub: SessionHub,
-  kimi: KimiUpstream | null,
+  adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
+  resolveKimiWs: () => Promise<ReturnType<typeof createKimiWsUpgrader> | null>,
   gatewaySockets: Set<Duplex>,
+  kimiSockets: Set<Duplex>,
 ): void {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -2001,7 +2289,33 @@ function attachGatewayWebSocket(
       socket.destroy();
       return;
     }
-    // 握手:回显客户端提供的子协议(里面是网关 token,与上游 token 无关)。
+    const provider = url.searchParams.get('provider');
+    if (provider !== 'claude' && provider !== 'codex') {
+      socket.pause();
+      void resolveKimiWs().then((kimiWs) => {
+        if (socket.destroyed) return;
+        if (!kimiWs) {
+          socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        gatewaySockets.add(socket);
+        kimiSockets.add(socket);
+        socket.once('close', () => {
+          gatewaySockets.delete(socket);
+          kimiSockets.delete(socket);
+        });
+        if (!kimiWs(req, socket, head)) socket.destroy();
+        else socket.resume();
+      }, () => {
+        if (!socket.destroyed) {
+          socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+          socket.destroy();
+        }
+      });
+      return;
+    }
+    // 本地 provider 握手:回显客户端提供的网关 token 子协议。
     const proto = req.headers['sec-websocket-protocol'];
     const acceptKey = wsAccept(req.headers['sec-websocket-key'] as string);
     const headers = [
@@ -2017,9 +2331,6 @@ function attachGatewayWebSocket(
     const sendObj = (obj: Record<string, unknown>): void => {
       if (!socket.destroyed) wsSendText(socket, JSON.stringify(obj));
     };
-    const sendRaw = (text: string): void => {
-      if (!socket.destroyed) wsSendText(socket, text);
-    };
     sendObj({
       type: 'server_hello',
       timestamp: new Date().toISOString(),
@@ -2030,83 +2341,88 @@ function attachGatewayWebSocket(
       },
     });
 
-    // ---- 上游(Kimi kap-server)WS relay:懒连接,按订阅转发 ----
-    let upstream: WebSocket | null = null;
-    let upstreamOpen = false;
-    const upstreamQueue: string[] = [];
-    const sendUpstream = (frame: Record<string, unknown>): void => {
-      if (!kimi) return;
-      const text = JSON.stringify(frame);
-      if (upstream && upstreamOpen) {
-        upstream.send(text);
-        return;
-      }
-      upstreamQueue.push(text);
-      if (upstream) return; // 正在连接
-      const wsUrl = `${kimi.url.replace(/^http/, 'ws')}${API}/ws?client_id=gw_${randomUUID()}`;
-      const up = new WebSocket(wsUrl, [`kimi-code.bearer.${kimi.token}`]);
-      upstream = up;
-      up.onopen = () => {
-        upstreamOpen = true;
-        for (const queued of upstreamQueue.splice(0)) up.send(queued);
-      };
-      up.onmessage = (ev: MessageEvent) => {
-        const text = String(ev.data);
-        try {
-          const frame = JSON.parse(text) as { type?: string; payload?: { nonce?: string } };
-          // 上游的控制帧(hello/ack)吞掉 —— 客户端只认网关的握手与 ack。
-          if (frame.type === 'server_hello' || frame.type === 'ack') return;
-          if (frame.type === 'ping') {
-            up.send(JSON.stringify({ type: 'pong', payload: { nonce: frame.payload?.nonce ?? '' } }));
-            return;
-          }
-        } catch { /* 非 JSON 也透传 */ }
-        sendRaw(text);
-      };
-      up.onclose = () => {
-        // 上游断了:断开客户端,SPA 的重连逻辑会重新订阅,届时再懒连上游。
-        socket.destroy();
-      };
-      up.onerror = () => {
-        socket.destroy();
-      };
+    const transcriptSpecs = new Map<string, Record<string, unknown>>();
+    const transcriptOffs = new Map<string, () => void>();
+    const sendFrame = (event: Record<string, unknown>): void => {
+      const sid = typeof event.session_id === 'string' ? event.session_id : '';
+      if (!transcriptSuppressesLegacy(event, transcriptSpecs.get(sid))) sendObj(event);
     };
+    const offGlobal = hub.subscribeGlobal(sendFrame);
 
-    // ---- 客户端帧处理:按会话 id 前缀拆分订阅 ----
+    // ---- 客户端帧处理:legacy 事件与 transcript v2 是两条独立订阅 ----
     const localOffs = new Map<string, () => void>();
-    const handleFrame = (msg: {
+    const handleFrame = async (msg: {
       type?: string;
       id?: string;
       payload?: {
         client_id?: string;
         subscriptions?: string[];
         session_ids?: string[];
+        session_id?: string;
+        agent_ids?: string[];
         cursors?: Record<string, unknown>;
+        transcript?: unknown;
+        transcript_since?: Record<string, unknown>;
       };
-    }): void => {
+    }): Promise<void> => {
+      if (msg.type === 'subscribe_v2') {
+        const sid = msg.payload?.session_id;
+        const split = sid ? providerFromSessionId(sid) : null;
+        const spec = msg.payload?.transcript;
+        const rawSince = msg.payload?.transcript_since?.main ?? msg.payload?.transcript_since?.['*'];
+        if (
+          !sid
+          || !split
+          || split.provider !== provider
+          || !validTranscriptSpec(spec)
+          || (rawSince !== undefined && (!Number.isInteger(rawSince) || Number(rawSince) < 0))
+        ) {
+          sendObj({ type: 'ack', id: msg.id, code: 1, msg: 'invalid subscribe_v2 payload', payload: {} });
+          return;
+        }
+
+        transcriptOffs.get(sid)?.();
+        transcriptSpecs.set(sid, spec);
+        const grade = transcriptGrade(spec);
+        const subscription = hub.transcript.subscribe(sid, (emission) => {
+          const filtered = filterTranscriptEmission(emission, grade);
+          if (filtered) sendObj(transcriptEnvelope(sid, hub, filtered));
+        });
+        transcriptOffs.set(sid, subscription.close);
+        const history = await adapters[provider].getHistory(split.nativeId).catch(() => [] as Message[]);
+        subscription.seed(history, hub.busy.has(sid) ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
+        sendObj({
+          type: 'ack', id: msg.id, code: 0, msg: 'success',
+          payload: { accepted: [sid], not_found: [], resync_required: [], cursors: {} },
+        });
+        return;
+      }
+      if (msg.type === 'unsubscribe_v2') {
+        const sid = msg.payload?.session_id;
+        const agentIds = msg.payload?.agent_ids;
+        if (!sid || (agentIds !== undefined && (!Array.isArray(agentIds) || agentIds.length === 0))) {
+          sendObj({ type: 'ack', id: msg.id, code: 1, msg: 'invalid unsubscribe_v2 payload', payload: {} });
+          return;
+        }
+        if (agentIds === undefined || agentIds.includes('main')) {
+          transcriptOffs.get(sid)?.();
+          transcriptOffs.delete(sid);
+          if (agentIds === undefined) transcriptSpecs.delete(sid);
+          else transcriptSpecs.set(sid, { ...(transcriptSpecs.get(sid) ?? {}), main: 'off' });
+        }
+        sendObj({
+          type: 'ack', id: msg.id, code: 0, msg: 'success',
+          payload: { accepted: [sid], not_found: [], resync_required: [] },
+        });
+        return;
+      }
       if (msg.type === 'client_hello' || msg.type === 'subscribe') {
         const ids = msg.type === 'client_hello' ? msg.payload?.subscriptions ?? [] : msg.payload?.session_ids ?? [];
-        const kimiIds = ids.filter((id) => providerFromSessionId(id).provider === 'kimi');
-        const localIds = ids.filter((id) => providerFromSessionId(id).provider !== 'kimi');
+        const localIds = ids.filter((id) => providerFromSessionId(id).provider === provider);
         const cursors = msg.payload?.cursors ?? {};
-        const pickCursors = (keep: string[]): Record<string, unknown> =>
-          Object.fromEntries(Object.entries(cursors).filter(([key]) => keep.includes(key)));
-        if (kimiIds.length > 0) {
-          sendUpstream(
-            msg.type === 'client_hello'
-              ? { type: 'client_hello', id: msg.id, payload: { client_id: msg.payload?.client_id ?? 'gateway', subscriptions: kimiIds, cursors: pickCursors(kimiIds) } }
-              : { type: 'subscribe', id: msg.id, payload: { session_ids: kimiIds, cursors: pickCursors(kimiIds) } },
-          );
-        }
         const resyncRequired: { sid: string; reason: 'buffer_overflow' | 'epoch_changed' }[] = [];
         for (const sid of localIds) {
-          if (!localOffs.has(sid)) {
-            localOffs.set(sid, hub.subscribe(sid, (ev) => sendObj(ev)));
-          }
-          // 带 cursor 的重连:先订阅再重放缓冲里 cursor 之后的非瞬态帧
-          // (先订阅防丢新帧;缓冲有缺口/epoch 不符时发顶层 resync_required
-          // 帧——前端 ws.ts 只认这种帧,不认 ack.payload 里的列表)。
-          // 前端 cursor 形状是 {seq, epoch}(wire.ts WireSessionCursor),兼容裸数字。
+          if (!localOffs.has(sid)) localOffs.set(sid, hub.subscribe(sid, sendFrame));
           const raw = cursors[sid] as { seq?: unknown; epoch?: unknown } | number | undefined;
           const cursorSeq = typeof raw === 'number' ? raw : Number(raw?.seq);
           const cursorEpoch = typeof raw === 'object' && raw !== null && typeof raw.epoch === 'string' ? raw.epoch : undefined;
@@ -2114,31 +2430,35 @@ function attachGatewayWebSocket(
             resyncRequired.push({ sid, reason: 'epoch_changed' });
           } else if (Number.isFinite(cursorSeq) && cursorSeq > 0) {
             const replayed = hub.replaySince(sid, cursorSeq);
-            if (replayed.resync) {
-              resyncRequired.push({ sid, reason: 'buffer_overflow' });
-            } else {
-              for (const f of replayed.frames) sendObj(f);
-            }
+            if (replayed.resync) resyncRequired.push({ sid, reason: 'buffer_overflow' });
+            else for (const replayedFrame of replayed.frames) sendFrame(replayedFrame);
           }
         }
-        // 每个需要 resync 的会话发一条顶层控制帧(前端收到后重拉 snapshot)。
         for (const { sid, reason } of resyncRequired) {
           sendObj({
             type: 'resync_required',
             timestamp: new Date().toISOString(),
-            payload: { session_id: sid, reason, current_seq: hub.nextSeq(), epoch: hub.epoch },
+            payload: { session_id: sid, reason, current_seq: hub.currentSeq(), epoch: hub.epoch },
           });
         }
-        sendObj({ type: 'ack', id: msg.id, code: 0, msg: 'success', payload: { accepted_subscriptions: ids, resync_required: resyncRequired.map((r) => r.sid), cursors: {} } });
+        sendObj({
+          type: 'ack', id: msg.id, code: 0, msg: 'success',
+          payload: {
+            accepted_subscriptions: localIds,
+            resync_required: resyncRequired.map((entry) => entry.sid),
+            cursors: {},
+          },
+        });
         return;
       }
       if (msg.type === 'unsubscribe') {
         const ids = msg.payload?.session_ids ?? [];
-        const kimiIds = ids.filter((id) => providerFromSessionId(id).provider === 'kimi');
-        if (kimiIds.length > 0) sendUpstream({ type: 'unsubscribe', id: msg.id, payload: { session_ids: kimiIds } });
         for (const sid of ids) {
           localOffs.get(sid)?.();
           localOffs.delete(sid);
+          transcriptOffs.get(sid)?.();
+          transcriptOffs.delete(sid);
+          transcriptSpecs.delete(sid);
         }
         sendObj({ type: 'ack', id: msg.id, code: 0, msg: 'success', payload: {} });
         return;
@@ -2147,19 +2467,34 @@ function attachGatewayWebSocket(
     };
 
     const parser = new WsFrameParser();
+    let controlQueue = Promise.resolve();
     socket.on('data', (chunk: Buffer) => {
-      for (const text of parser.push(chunk)) {
+      for (const wsFrame of parser.push(chunk)) {
+        if (!wsFrame.fin) continue;
+        if (wsFrame.opcode === 0x8) {
+          wsSendFrame(socket, 0x8, wsFrame.payload);
+          socket.end();
+          return;
+        }
+        if (wsFrame.opcode === 0x9) {
+          wsSendFrame(socket, 0xa, wsFrame.payload);
+          continue;
+        }
+        if (wsFrame.opcode !== 0x1) continue;
         try {
-          handleFrame(JSON.parse(text) as Parameters<typeof handleFrame>[0]);
+          const message = JSON.parse(wsFrame.payload.toString('utf8')) as Parameters<typeof handleFrame>[0];
+          controlQueue = controlQueue.then(() => handleFrame(message)).catch(() => undefined);
         } catch { /* 忽略坏帧 */ }
       }
     });
     const cleanup = (): void => {
       gatewaySockets.delete(socket);
+      offGlobal();
       for (const off of localOffs.values()) off();
       localOffs.clear();
-      upstream?.close();
-      upstream = null;
+      for (const off of transcriptOffs.values()) off();
+      transcriptOffs.clear();
+      transcriptSpecs.clear();
     };
     socket.on('close', cleanup);
     socket.on('error', cleanup);
@@ -2170,40 +2505,48 @@ function wsAccept(key: string): string {
   return createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
 }
 
-/** 发送一个 text WS 帧(服务端→客户端,不掩码)。 */
-function wsSendText(socket: NodeJS.WritableStream, text: string): void {
-  const payload = Buffer.from(text);
+function wsSendFrame(socket: NodeJS.WritableStream, opcode: number, payload: Buffer): void {
   const len = payload.byteLength;
   let header: Buffer;
   if (len < 126) {
-    header = Buffer.from([0x81, len]);
+    header = Buffer.from([0x80 | opcode, len]);
   } else if (len < 65536) {
     header = Buffer.alloc(4);
-    header[0] = 0x81; header[1] = 126; header.writeUInt16BE(len, 2);
+    header[0] = 0x80 | opcode; header[1] = 126; header.writeUInt16BE(len, 2);
   } else {
     header = Buffer.alloc(10);
-    header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
+    header[0] = 0x80 | opcode; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
   }
   socket.write(Buffer.concat([header, payload]));
 }
 
-/** 带跨 chunk 缓冲的 WS 帧解析器:产出完整 text 帧的字符串。 */
+/** 发送一个 text WS 帧(服务端→客户端,不掩码)。 */
+function wsSendText(socket: NodeJS.WritableStream, text: string): void {
+  wsSendFrame(socket, 0x1, Buffer.from(text));
+}
+
+interface ParsedWsFrame {
+  fin: boolean;
+  opcode: number;
+  payload: Buffer;
+}
+
+/** 带跨 chunk 缓冲的 WS 帧解析器。 */
 class WsFrameParser {
   private buf: Buffer = Buffer.alloc(0);
 
-  push(chunk: Buffer): string[] {
+  push(chunk: Buffer): ParsedWsFrame[] {
     this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
-    const out: string[] = [];
+    const out: ParsedWsFrame[] = [];
     for (;;) {
       const frame = this.tryParse();
       if (!frame) break;
-      if (frame.fin && frame.opcode === 0x1) out.push(frame.payload.toString('utf8'));
-      // close/ping/pong 与分片帧:浏览器侧基本不发,v1 忽略(socket 层兜底)。
+      out.push(frame);
     }
     return out;
   }
 
-  private tryParse(): { fin: boolean; opcode: number; payload: Buffer } | null {
+  private tryParse(): ParsedWsFrame | null {
     const b = this.buf;
     if (b.byteLength < 2) return null;
     const fin = (b[0] & 0x80) !== 0;

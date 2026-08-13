@@ -55,6 +55,8 @@ export interface SessionPage {
 
 export interface ListSessionsQuery {
   workspace_id?: string;
+  /** adapter 内部按真实工作目录过滤,不从 workspace id 反推路径。 */
+  cwd?: string;
   /** 只列某个 provider;缺省由 facade 聚合全部。 */
   provider?: ProviderName;
   limit?: number;

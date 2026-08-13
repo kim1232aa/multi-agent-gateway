@@ -161,17 +161,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private static readonly LIST_TTL_MS = 30_000;
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
-    const want = query.limit ?? 50;
-    if (query.cursor == null && query.archived == null) {
-      const full = await this.cachedFullPage();
-      // limit>100(如网关聚合用的 500)也能由缓存服务,只要缓存页是完整页
-      // (next_cursor 为空)。本机 ~73 线程 < 100,一次扫描后所有 limit 全命中,
-      // 否则 /sessions 聚合每次都要 2-3 次 ~4s 的 RPC 全扫(实测 15-20s)。
-      if (want <= 100 || !full.next_cursor) {
-        const page: SessionPage = { items: full.items.slice(0, want) };
-        if (want >= full.items.length && full.next_cursor) page.next_cursor = full.next_cursor;
-        return page;
-      }
+    if (query.limit === 100 && query.cursor == null && query.archived == null && query.cwd == null) {
+      return this.cachedFullPage();
     }
     return this.fetchPage(query);
   }
@@ -211,8 +202,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const { threads, nextCursor } = await this.inner.list({
       cursor: query.cursor,
       limit: query.limit,
-      cwd: undefined,
+      cwd: query.cwd,
       archived: query.archived,
+      sourceKinds: ['cli'],
     });
     // 只列主会话,对齐 `codex resume` 的行为:parentThreadId 非空的是子 agent
     // 线程,ephemeral 是临时线程,都不应出现在列表里(字段名来自 thread/list
@@ -376,6 +368,13 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   async delete(sessionId: string): Promise<void> {
     await this.inner.deleteThread(sessionId);
+    this.renames.delete(sessionId);
+    this.threadCwd.delete(sessionId);
+    this.sessionModels.delete(sessionId);
+    this.sessionThinking.delete(sessionId);
+    this.sessionPermission.delete(sessionId);
+    this.sessionUsage.delete(sessionId);
+    this.sessionPlan.delete(sessionId);
     this.invalidateListCache();
   }
 
@@ -720,9 +719,18 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
-    const sessions = await this.inner.list();
-    const items = sessions.map((s) => this.toSession(s));
-    return { items };
+    const sessions = (await this.inner.list()).filter((session) => !query.cwd || session.cwd === query.cwd);
+    const start = query.cursor ? sessions.findIndex((session) => session.sessionId === query.cursor) + 1 : 0;
+    if (query.cursor && start === 0) return { items: [] };
+    const limit = query.limit ?? 50;
+    const page = sessions.slice(start, start + limit);
+    const items = page.map((session) => this.toSession(session));
+    return {
+      items,
+      ...(start + limit < sessions.length && page.length > 0
+        ? { next_cursor: page[page.length - 1].sessionId }
+        : {}),
+    };
   }
 
   async create(input: CreateSessionInput): Promise<Session> {
@@ -753,7 +761,12 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       role: m.role,
       content: [{ type: 'text', text: m.text }],
       created_at: m.timestamp ?? nowIso(),
-      ...(m.model ? { metadata: { model: m.model } } : {}),
+      ...(m.model || m.isError ? {
+        metadata: {
+          ...(m.model ? { model: m.model } : {}),
+          ...(m.isError ? { is_error: true } : {}),
+        },
+      } : {}),
     }));
   }
 
@@ -1025,12 +1038,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   /**
-   * 原生模型目录:claude TUI 的 /model 选择器在本环境变量下实际会用的模型
-   * —— ANTHROPIC_MODEL + OPUS/SONNET/HAIKU 别名解析后的原始模型 id
-   * (2.1.226 产物里 _wu/vwu/Awu 三个 picker 行的取证结论)。同一模型被多个
-   * 别名指向时合并成一行,display_name 标注别名来源。
+   * 原生模型目录,两种真实情形:
+   * - 配了自定义端点(ANTHROPIC_MODEL 等):env 里的模型就是该端点实际可用的,
+   *   同一模型被多个别名指向时合并成一行,display_name 标注别名来源。
+   * - 没配(未登录/官方默认):展示 CLI initialize 握手返回的内置目录
+   *   (default/opus/fable/sonnet/haiku,2.1.226 实测);握手失败如实抛错,
+   *   不伪造空目录,也不进缓存。
    */
-  listModels(): Promise<NativeModel[]> {
+  async listModels(): Promise<NativeModel[]> {
     const rows: Array<[string, string | undefined]> = [
       ['default', process.env.ANTHROPIC_MODEL],
       ['opus', process.env.ANTHROPIC_DEFAULT_OPUS_MODEL],
@@ -1044,18 +1059,28 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       aliases.push(alias);
       byModel.set(model, aliases);
     }
-    const items = [...byModel.entries()].map(([model, aliases]) => ({
+    if (byModel.size > 0) {
+      return [...byModel.entries()].map(([model, aliases]) => ({
+        provider: 'claude',
+        model,
+        display_name: `${model}(${aliases.join('/')})`,
+        // [1m] 后缀是该接入方约定的一百万上下文命名;否则按 200K 展示。
+        max_context_size: model.includes('[1m]') ? 1_000_000 : 200_000,
+        capabilities: ['thinking'],
+        support_efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      }));
+    }
+
+    const builtin = await this.inner.listBuiltinModels();
+    return builtin.map((model) => ({
       provider: 'claude',
-      model,
-      display_name: `${model}(${aliases.join('/')})`,
-      // [1m] 后缀是该接入方约定的一百万上下文命名;否则按 200K 展示。
-      max_context_size: model.includes('[1m]') ? 1_000_000 : 200_000,
-      // CLI --effort choices 实测 low/medium/high/xhigh/max(2.1.226);
-      // 上游是否真按档位推理取决于接入方,这里如实暴露 CLI 能力面。
-      capabilities: ['thinking'],
-      support_efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+      model: model.value,
+      display_name: model.displayName ?? model.value,
+      // resolvedModel 的 [1m] 后缀 = 一百万上下文变体;否则按 200K 展示。
+      max_context_size: (model.resolvedModel ?? model.value).includes('[1m]') ? 1_000_000 : 200_000,
+      capabilities: model.supportsEffort ? ['thinking'] : [],
+      ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
     }));
-    return Promise.resolve(items);
   }
 
   async listCommands(sessionId?: string): Promise<NativeCommand[]> {

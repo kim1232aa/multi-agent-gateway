@@ -180,12 +180,25 @@ export interface CodexAdapterOptions {
   onStderr?: (line: string) => void;
 }
 
+export type ThreadSourceKind =
+  | 'cli'
+  | 'vscode'
+  | 'exec'
+  | 'appServer'
+  | 'subAgent'
+  | 'subAgentReview'
+  | 'subAgentCompact'
+  | 'subAgentThreadSpawn'
+  | 'subAgentOther'
+  | 'unknown';
+
 export interface ThreadListOptions {
   cursor?: string;
   limit?: number;
   cwd?: string;
   archived?: boolean;
   searchTerm?: string;
+  sourceKinds?: ThreadSourceKind[];
 }
 
 export interface ThreadStartOptions {
@@ -764,6 +777,7 @@ export class CodexAdapter {
       cwd: options.cwd ?? null,
       archived: options.archived ?? null,
       searchTerm: options.searchTerm ?? null,
+      sourceKinds: options.sourceKinds ?? null,
     });
     const parsed = ThreadListResponseSchema.parse(raw);
     return {

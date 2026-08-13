@@ -60,12 +60,23 @@ export interface ClaudeSlashCommand {
   aliases: string[];
 }
 
+/** initialize 握手回包里的单条内置模型描述(CLI 权威目录,无需登录即可获取)。 */
+export interface ClaudeBuiltinModel {
+  value: string;
+  resolvedModel?: string;
+  displayName?: string;
+  description?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+}
+
 export interface ClaudeHistoryMessage {
   role: "user" | "assistant";
   /** Concatenated text blocks (tool_use/tool_result blocks are skipped). */
   text: string;
   timestamp?: string;
   model?: string;
+  isError?: boolean;
 }
 
 export type ClaudeAdapterEvent =
@@ -283,6 +294,7 @@ export class ClaudeAdapter {
         text,
         timestamp: entry.timestamp,
         model: type === "assistant" ? msg.model : undefined,
+        isError: type === "assistant" && entry.isApiErrorMessage === true,
       });
     }
     return messages;
@@ -440,13 +452,64 @@ export class ClaudeAdapter {
     const key = cwd ?? "";
     const hit = this.commandsCache.get(key);
     if (hit && Date.now() - hit.ts < ClaudeAdapter.COMMANDS_TTL_MS) return hit.commands;
-    const commands = await this.fetchSlashCommands(cwd).catch(() => null);
+    const commands = await this.initializeHandshake(cwd, (response) => {
+      const list = response?.commands;
+      if (!Array.isArray(list)) return null;
+      return list
+        .filter((c: any) => c && typeof c.name === "string")
+        .map((c: any) => ({
+          name: c.name as string,
+          description: typeof c.description === "string" ? c.description : (c.name as string),
+          argumentHint: typeof c.argumentHint === "string" ? c.argumentHint : "",
+          aliases: Array.isArray(c.aliases) ? c.aliases.filter((a: any) => typeof a === "string") : [],
+        }));
+    }).catch(() => null);
     if (!commands) return hit?.commands ?? [];
     this.commandsCache.set(key, { ts: Date.now(), commands });
     return commands;
   }
 
-  private fetchSlashCommands(cwd?: string): Promise<ClaudeSlashCommand[] | null> {
+  // -- 内置模型目录(initialize 握手) ------------------------------------------
+
+  /**
+   * 权威的 claude 内置模型目录 = CLI initialize 握手回包的 models 字段
+   * (2.1.226 实测:default/opus[1m]/fable/sonnet/haiku,带 displayName、
+   * description、supportedEffortLevels;握手不需要登录态)。未配置自定义
+   * 端点时,Web 选择器必须展示这个目录,而不是拿环境变量拼占位模型。
+   *
+   * 只缓存成功结果(5 分钟);失败如实抛错且不进缓存,下次调用真实重试。
+   */
+  private modelsCache: { ts: number; models: ClaudeBuiltinModel[] } | null = null;
+
+  async listBuiltinModels(): Promise<ClaudeBuiltinModel[]> {
+    if (this.modelsCache && Date.now() - this.modelsCache.ts < ClaudeAdapter.COMMANDS_TTL_MS) {
+      return this.modelsCache.models;
+    }
+    const models = await this.initializeHandshake(undefined, (response) => {
+      const list = response?.models;
+      if (!Array.isArray(list) || list.length === 0) return null;
+      return list
+        .filter((m: any) => m && typeof m.value === "string")
+        .map((m: any) => ({
+          value: m.value as string,
+          resolvedModel: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
+          displayName: typeof m.displayName === "string" ? m.displayName : undefined,
+          description: typeof m.description === "string" ? m.description : undefined,
+          supportsEffort: m.supportsEffort === true,
+          supportedEffortLevels: Array.isArray(m.supportedEffortLevels)
+            ? m.supportedEffortLevels.filter((e: any) => typeof e === "string")
+            : undefined,
+        }));
+    });
+    if (!models) {
+      throw new Error("claude-adapter: initialize handshake returned no models (CLI missing, broken, or too old)");
+    }
+    this.modelsCache = { ts: Date.now(), models };
+    return models;
+  }
+
+  /** initialize 控制握手:起一个短命进程(不跑模型),取 response 里的指定字段。 */
+  private initializeHandshake<T>(cwd: string | undefined, pick: (response: any) => T | null): Promise<T | null> {
     return new Promise((resolve) => {
       const child = spawn(
         this.claudeBin,
@@ -454,7 +517,7 @@ export class ClaudeAdapter {
         { cwd: cwd ?? os.homedir(), env: { ...process.env, ...this.env }, stdio: ["pipe", "pipe", "pipe"] },
       );
       let settled = false;
-      const finish = (value: ClaudeSlashCommand[] | null): void => {
+      const finish = (value: T | null): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -473,20 +536,7 @@ export class ClaudeAdapter {
           return;
         }
         if (ev.type !== "control_response") return;
-        const resp = ev.response;
-        const list = resp?.response?.commands;
-        if (Array.isArray(list)) {
-          finish(
-            list
-              .filter((c: any) => c && typeof c.name === "string")
-              .map((c: any) => ({
-                name: c.name as string,
-                description: typeof c.description === "string" ? c.description : (c.name as string),
-                argumentHint: typeof c.argumentHint === "string" ? c.argumentHint : "",
-                aliases: Array.isArray(c.aliases) ? c.aliases.filter((a: any) => typeof a === "string") : [],
-              })),
-          );
-        }
+        finish(pick(ev.response?.response));
       });
       child.stdin!.write(
         JSON.stringify({ type: "control_request", request_id: "gw_init", request: { subtype: "initialize" } }) + "\n",
