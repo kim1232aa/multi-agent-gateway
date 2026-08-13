@@ -71,6 +71,11 @@ export interface GatewayOptions {
   /** 官方资产 manifest;默认仓库 web-origin-manifest.json。 */
   manifestPath?: string;
   /**
+   * 会话级设置(model/thinking/permission/plan)的持久化目录;
+   * 默认 $GATEWAY_SETTINGS_DIR 或 ~/.config/multi-agent-gateway。
+   */
+  settingsDir?: string;
+  /**
    * 对外展示的可用 provider(默认按本机二进制探测:claude/codex 没装就不出现
    * 在选择器里,避免用户点了才发现不存在)。测试可显式覆盖。
    */
@@ -294,9 +299,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const port = options.port ?? 58629;
   const host = options.host ?? '127.0.0.1';
   const token = options.token ?? randomBytes(24).toString('base64url');
+  const settingsDir = options.settingsDir
+    ?? process.env.GATEWAY_SETTINGS_DIR
+    ?? path.join(os.homedir(), '.config', 'multi-agent-gateway');
   const adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter> = {
-    codex: options.codex ?? new CodexProviderAdapter(),
-    claude: options.claude ?? new ClaudeProviderAdapter(),
+    codex: options.codex ?? new CodexProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.codex.json') }),
+    claude: options.claude ?? new ClaudeProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.claude.json') }),
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
@@ -1475,6 +1483,9 @@ async function getSession(
 // snapshot / prompts
 // ---------------------------------------------------------------------------
 
+/** 快照只带最后一页消息(前端 load-older 页大小=50);更早的走 /messages?before_id 翻页。 */
+const SNAPSHOT_MESSAGE_PAGE = 50;
+
 async function snapshot(
   adapter: ProviderAdapter,
   provider: ProviderName,
@@ -1491,7 +1502,12 @@ async function snapshot(
     as_of_seq: hub.nextSeq(),
     epoch: hub.epoch,
     session: sessionDto(session, adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), active !== undefined),
-    messages: { items: history.map((m) => messageDto(m, sid)), has_more: false },
+    // 对齐 kap-server:快照=最后一页 + has_more。全量塞进来会让大会话
+    // (几千条)首屏传输/渲染爆炸,前端表现为"会话无响应"。
+    messages: {
+      items: history.slice(-SNAPSHOT_MESSAGE_PAGE).map((m) => messageDto(m, sid)),
+      has_more: history.length > SNAPSHOT_MESSAGE_PAGE,
+    },
     in_flight_turn: active
       ? {
           turn_id: active.turnId,
@@ -2349,8 +2365,13 @@ function attachGatewayWebSocket(
       });
       return;
     }
-    // 本地 provider 握手:回显客户端提供的网关 token 子协议。
-    const proto = req.headers['sec-websocket-protocol'];
+    // 本地 provider 握手:从客户端提议里选一个子协议回显(RFC 6455 要求恰好
+    // 一个;原样回显整个逗号分隔列表是非法响应,浏览器会拒绝握手)。
+    const protos = (req.headers['sec-websocket-protocol'] ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const chosenProto = protos.find((p) => p.startsWith('kimi-code.'));
     const acceptKey = wsAccept(req.headers['sec-websocket-key'] as string);
     const headers = [
       'HTTP/1.1 101 Switching Protocols',
@@ -2358,12 +2379,16 @@ function attachGatewayWebSocket(
       'Connection: Upgrade',
       `Sec-WebSocket-Accept: ${acceptKey}`,
     ];
-    if (proto) headers.push(`Sec-WebSocket-Protocol: ${proto}`);
+    if (chosenProto) headers.push(`Sec-WebSocket-Protocol: ${chosenProto}`);
     socket.write(headers.concat('\r\n').join('\r\n'));
     gatewaySockets.add(socket);
 
     const sendObj = (obj: Record<string, unknown>): void => {
-      if (!socket.destroyed) wsSendText(socket, JSON.stringify(obj));
+      if (socket.destroyed) return;
+      wsSendText(socket, JSON.stringify(obj));
+      // 背压熔断:慢客户端(手机/隧道)消费不过来时写缓冲会无界增长拖垮
+      // 进程。超阈值直接断开,客户端重连后走 snapshot+resync 恢复。
+      if (socket.writableLength > 8 * 1024 * 1024) socket.destroy();
     };
     sendObj({
       type: 'server_hello',
@@ -2502,9 +2527,18 @@ function attachGatewayWebSocket(
 
     const parser = new WsFrameParser();
     let controlQueue = Promise.resolve();
+    // 分片重组:首帧(opcode 0x1)fin=false 时缓存,续帧(opcode 0x0)追加到
+    // fin=true 再整体 JSON.parse。此前直接丢弃非 fin 帧,CF 边缘或浏览器一旦
+    // 分片,subscribe 等控制消息静默丢失。
+    let fragments: Buffer[] | null = null;
+    const handleText = (payload: Buffer): void => {
+      try {
+        const message = JSON.parse(payload.toString('utf8')) as Parameters<typeof handleFrame>[0];
+        controlQueue = controlQueue.then(() => handleFrame(message)).catch(() => undefined);
+      } catch { /* 忽略坏帧 */ }
+    };
     socket.on('data', (chunk: Buffer) => {
       for (const wsFrame of parser.push(chunk)) {
-        if (!wsFrame.fin) continue;
         if (wsFrame.opcode === 0x8) {
           wsSendFrame(socket, 0x8, wsFrame.payload);
           socket.end();
@@ -2514,11 +2548,17 @@ function attachGatewayWebSocket(
           wsSendFrame(socket, 0xa, wsFrame.payload);
           continue;
         }
-        if (wsFrame.opcode !== 0x1) continue;
-        try {
-          const message = JSON.parse(wsFrame.payload.toString('utf8')) as Parameters<typeof handleFrame>[0];
-          controlQueue = controlQueue.then(() => handleFrame(message)).catch(() => undefined);
-        } catch { /* 忽略坏帧 */ }
+        if (wsFrame.opcode === 0x1) {
+          fragments = [wsFrame.payload]; // 新消息首帧(上一段未完则丢弃)
+        } else if (wsFrame.opcode === 0x0 && fragments) {
+          fragments.push(wsFrame.payload);
+        } else {
+          continue; // pong/binary/无首帧的续帧:忽略
+        }
+        if (wsFrame.fin) {
+          handleText(Buffer.concat(fragments));
+          fragments = null;
+        }
       }
     });
     const cleanup = (): void => {

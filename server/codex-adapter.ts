@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as readline from 'node:readline';
 import { z } from 'zod';
+import { findCodexRollout } from './local-transcript.js';
 import { ProviderError } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -172,6 +173,13 @@ export interface CodexAdapterOptions {
   /** Timeout for individual JSON-RPC requests (ms). Default 120_000. */
   requestTimeoutMs?: number;
   /**
+   * Recycle the app-server after this much idle time (ms). thread/resume
+   * acquires codex's single-writer lock and only process exit releases it;
+   * without recycling, viewing a session in the web UI blocks `codex resume`
+   * in the CLI until the gateway restarts. Default 60_000; 0 disables.
+   */
+  recycleGraceMs?: number;
+  /**
    * When true, approval requests are answered immediately with 'accept' and
    * user-input questions with empty answers instead of being parked until
    * resolveApproval/resolveQuestion is called. Default false (park + emit).
@@ -306,8 +314,10 @@ class TurnEventQueue implements AsyncIterable<CodexEvent> {
 
 export class CodexAdapter {
   readonly provider = 'codex' as const;
+  /** 未落盘线程的回收保护期:覆盖"新建会话→想一下→发首条消息"的正常间隔。 */
+  private static readonly UNPERSISTED_PROTECT_MS = 15 * 60_000;
 
-  private opts: Required<Pick<CodexAdapterOptions, 'requestTimeoutMs'>> & CodexAdapterOptions;
+  private opts: Required<Pick<CodexAdapterOptions, 'requestTimeoutMs' | 'recycleGraceMs'>> & CodexAdapterOptions;
   private child: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
   private nextId = 1;
@@ -332,9 +342,18 @@ export class CodexAdapter {
   private configModelCache: string | null = null;
   private readyPromise: Promise<void> | null = null;
   private closed = false;
+  private recycleTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * thread/start 创建但未落盘的线程(codex 要等首个 turn 才写 rollout)及其
+   * 创建时间。回收会杀掉 app-server,这类线程随之蒸发("no rollout found",
+   * 且从会话列表消失)——保护期内禁止回收;首个 turn 后 rollout 出现,
+   * recycleIfIdle 自查文件并移出。超过保护期(用户建了就走)放弃保护,
+   * 否则一个废弃草稿线程会把回收永久钉死,CLI 锁又回不来。
+   */
+  private unpersistedThreads = new Map<string, number>();
 
   constructor(options: CodexAdapterOptions = {}) {
-    this.opts = { requestTimeoutMs: 120_000, ...options };
+    this.opts = { requestTimeoutMs: 120_000, recycleGraceMs: 60_000, ...options };
   }
 
   // -- lifecycle ------------------------------------------------------------
@@ -386,6 +405,10 @@ export class CodexAdapter {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    if (this.recycleTimer) {
+      clearTimeout(this.recycleTimer);
+      this.recycleTimer = null;
+    }
     this.rl?.close();
     const child = this.child;
     this.child = null;
@@ -417,6 +440,7 @@ export class CodexAdapter {
     this.notifyListeners(event);
     const key = this.eventTurnKey(event);
     if (!key) return;
+    this.lastTurnActivityAt = Date.now();
     const q = this.turnQueues.get(key);
     if (q) {
       q.push(event);
@@ -469,13 +493,14 @@ export class CodexAdapter {
     this.write(params === undefined ? { method } : { method, params });
   }
 
-  private request(method: string, params?: unknown): Promise<unknown> {
+  private request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
+    const budget = timeoutMs ?? this.opts.requestTimeoutMs;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingClient.delete(id);
-        reject(new Error(`codex request '${method}' timed out after ${this.opts.requestTimeoutMs}ms`));
-      }, this.opts.requestTimeoutMs);
+        reject(new Error(`codex request '${method}' timed out after ${budget}ms`));
+      }, budget);
       this.pendingClient.set(id, { method, resolve, reject, timer });
       try {
         this.write(params === undefined ? { id, method } : { id, method, params });
@@ -527,6 +552,8 @@ export class CodexAdapter {
     } else {
       pending.resolve(msg.result);
     }
+    // 任何请求落定都是潜在空闲点(thread/resume 也会占写手锁,不能只看 turn)。
+    this.scheduleRecycleWhenIdle();
   }
 
   // -- server → client reverse requests ----------------------------------------
@@ -673,6 +700,7 @@ export class CodexAdapter {
           // turn 结束,去重记录一并清掉,防 seenTurnStarts 无限增长。
           this.seenTurnStarts.delete(`${p.threadId}:${turn.data.id}`);
           this.emit({ type: 'turn-completed', threadId: p.threadId, turnId: turn.data.id, turn: turn.data });
+          this.scheduleRecycleWhenIdle();
         }
         break;
       }
@@ -779,12 +807,150 @@ export class CodexAdapter {
     // 进程死了,内存里的激活 thread 一并失效;下次 connect 后需重新 resume。
     this.liveThreads.clear();
     this.seenTurnStarts.clear();
+    // 未落盘线程随进程蒸发,保护记录一并清掉(它们已不可恢复)。
+    this.unpersistedThreads.clear();
     // config/read 的模型缓存属于旧进程语境,重连后必须重读。
     this.configModelCache = null;
     if (this.readyPromise) {
       this.readyPromise = null;
       this.emit({ type: 'disconnected', code, signal });
     }
+  }
+
+  // -- idle recycle --------------------------------------------------------------
+  // thread/resume 会拿下 codex 的单写者锁,只有进程退出才释放(codex 0.147 无
+  // unload/release RPC)。不回收的话,web 端看一眼会话,CLI 的 codex resume 就被
+  // 锁到网关重启。回收走既有 'exit' → handleProcessExit 路径;重连由下次请求的
+  // connect()/ensureLive 惰性完成(进程退出重连已有测试覆盖)。
+
+  private scheduleRecycleWhenIdle(): void {
+    const grace = this.opts.recycleGraceMs;
+    if (grace <= 0 || this.closed || !this.child) return;
+    if (this.recycleTimer) clearTimeout(this.recycleTimer);
+    this.recycleTimer = setTimeout(() => {
+      this.recycleTimer = null;
+      this.recycleIfIdle();
+    }, grace);
+    this.recycleTimer.unref?.();
+  }
+
+  /** turn 静默超过该时长就主动探活(实测慢上游 TTFT 71s,阈值须远大于它)。 */
+  private static readonly TURN_STALL_MS = 5 * 60_000;
+  /** 看门狗 thread/read 探测的预算(901MB 大会话正常 ~9s,wedged 会挂死)。 */
+  private static readonly STALL_PROBE_TIMEOUT_MS = 45_000;
+
+  private lastTurnActivityAt = 0;
+  private stallProbeInflight = false;
+
+  private recycleIfIdle(): void {
+    if (this.closed || !this.child || this.child.exitCode !== null) return;
+    // pendingServer(parked 审批/提问)也算 busy:审批是 turn 中段的反向请求,
+    // 用户在斟酌的 60s 里进程被回收,审批会静默蒸发。
+    const busy =
+      this.pendingClient.size > 0 ||
+      this.pendingServer.size > 0 ||
+      this.turnQueues.size > 0 ||
+      this.pendingTurnEvents.size > 0;
+    if (busy) {
+      // turn 流长期静默:可能 app-server  wedge(实测:rollout 已写
+      // task_complete,但 turn/completed 始终不上线,写者锁被一直占着,
+      // CLI resume 被拒)。探活区分"慢但活着"与"卡死"。
+      if (this.turnQueues.size > 0 && Date.now() - this.lastTurnActivityAt > CodexAdapter.TURN_STALL_MS) {
+        void this.probeStalledTurn().catch((err) => {
+          this.emit({ type: 'log', line: `stall probe failed: ${err}` });
+        });
+      }
+      // 有在途请求/活跃 turn 流,过个 grace 再看(不 cancel 只 re-check)。
+      this.scheduleRecycleWhenIdle();
+      return;
+    }
+    void this.guardUnpersistedThenKill().catch((err) => {
+      this.emit({ type: 'log', line: `recycle guard failed: ${err}` });
+    });
+  }
+
+  /**
+   * 卡死 turn 探活:用短预算 thread/read 问 app-server 该 turn 的真实状态。
+   * - 服务端已终态但通知没到 → 补发 turn-completed(走正常通知路径收口,
+   *   前端拿到终帧,busy 清除,下个 grace 可回收)。
+   * - 读不动/超时 → 判定 wedge,杀进程(handleProcessExit 会让队列以
+   *   disconnected 失败收尾,是响亮错误而非静默挂起,同时释放写者锁)。
+   * - 仍在跑 → 更新活动时间,下个周期再看。
+   */
+  private async probeStalledTurn(): Promise<void> {
+    if (this.stallProbeInflight) return;
+    this.stallProbeInflight = true;
+    try {
+      const key = this.turnQueues.keys().next().value;
+      if (!key) return;
+      const sep = key.indexOf(':');
+      const threadId = key.slice(0, sep);
+      const turnId = key.slice(sep + 1);
+      const raw = await this.request(
+        'thread/read',
+        { threadId, includeTurns: true },
+        CodexAdapter.STALL_PROBE_TIMEOUT_MS,
+      ).catch(() => null);
+      if (raw === null) {
+        // 探测本身失败:进程 wedge 或已死。死进程由 exit 路径收尾;活着才杀。
+        if (this.child && this.child.exitCode === null) {
+          this.emit({ type: 'log', line: `turn ${turnId} stalled and probe unreadable; killing wedged app-server` });
+          this.terminateChild();
+        }
+        return;
+      }
+      const turn = (ThreadReadResponseSchema.parse(raw).thread.turns ?? []).find((t) => t.id === turnId);
+      if (turn && turn.status !== 'inProgress') {
+        this.emit({ type: 'log', line: `turn ${turnId} terminal on server (${turn.status}) but notification never arrived; synthesizing turn-completed` });
+        this.handleNotification('turn/completed', { threadId, turn });
+      } else {
+        // 服务端确认还在跑:不是 wedge,是慢。重置活动时间,避免误杀。
+        this.lastTurnActivityAt = Date.now();
+      }
+    } finally {
+      this.stallProbeInflight = false;
+    }
+  }
+
+  /** 未落盘线程保护 + 杀进程;文件检查是异步的,单独拆出来。 */
+  private async guardUnpersistedThenKill(): Promise<void> {
+    const now = Date.now();
+    for (const [id, createdAt] of this.unpersistedThreads) {
+      if (now - createdAt > CodexAdapter.UNPERSISTED_PROTECT_MS) {
+        this.unpersistedThreads.delete(id); // 废弃草稿,放弃保护
+      } else if (await findCodexRollout(id)) {
+        this.unpersistedThreads.delete(id); // 首个 turn 已落盘
+      }
+    }
+    if (this.closed || !this.child || this.child.exitCode !== null) return;
+    // await 窗口内可能来了新请求:杀之前按与 recycleIfIdle 相同的口径重检,
+    // 否则在飞请求会被无谓杀掉(虽能 reject 兜底,但用户看到的是偶发失败)。
+    const busy =
+      this.pendingClient.size > 0 ||
+      this.pendingServer.size > 0 ||
+      this.turnQueues.size > 0 ||
+      this.pendingTurnEvents.size > 0;
+    if (busy) {
+      this.scheduleRecycleWhenIdle();
+      return;
+    }
+    if (this.unpersistedThreads.size > 0) {
+      // 有新建未落盘的线程,回收会让它蒸发;顺延。
+      this.scheduleRecycleWhenIdle();
+      return;
+    }
+    this.emit({ type: 'log', line: `codex app-server idle ${this.opts.recycleGraceMs}ms, recycling to release writer lock` });
+    this.terminateChild();
+  }
+
+  /** 杀 app-server:SIGTERM,3s 不退升级 SIGKILL(close 的同款兜底,回收/wedge 共用)。 */
+  private terminateChild(): void {
+    const child = this.child;
+    if (!child || child.exitCode !== null) return;
+    child.kill('SIGTERM');
+    setTimeout(() => {
+      if (child.exitCode === null) child.kill('SIGKILL');
+    }, 3_000).unref?.();
   }
 
   // -- public API: threads & turns -------------------------------------------------
@@ -828,6 +994,7 @@ export class CodexAdapter {
     });
     const thread = ThreadStartResponseSchema.parse(raw).thread;
     this.liveThreads.add(thread.id);
+    this.unpersistedThreads.set(thread.id, Date.now());
     if (options.model) this.threadModels.set(thread.id, options.model);
     return thread;
   }
@@ -882,6 +1049,16 @@ export class CodexAdapter {
     try {
       return await fn();
     } catch (err) {
+      // codex 线程级串行:上一个操作(rollback/turn/compact)没做完时,-32600
+      // "X already in progress"。对齐 kap-server 的 busy 模型(409+子码),
+      // 别当 500 服务器故障抛给前端。
+      if (err instanceof Error && /already in progress/i.test(err.message)) {
+        throw new ProviderError(
+          'busy',
+          '会话正忙：该 codex 会话上有操作仍在执行(codex 同一线程的操作是串行的,常见是上一次撤销/压缩还没完成)。请等它完成后再试。',
+          409,
+        );
+      }
       if (!(err instanceof Error) || !/thread not found/i.test(err.message)) throw err;
       this.liveThreads.delete(threadId);
       await this.ensureLive(threadId);
@@ -931,6 +1108,7 @@ export class CodexAdapter {
     const started: CodexEvent = { type: 'turn-started', threadId, turnId: turn.id, turn };
     queue.push(started);
     this.notifyListeners(started);
+    this.lastTurnActivityAt = Date.now();
     // 注册前到达的同 chunk 事件(含可能的 turn/completed)按序补进 queue。
     const pending = this.pendingTurnEvents.get(key);
     if (pending) {
@@ -986,18 +1164,19 @@ export class CodexAdapter {
     // thread/compact/start 立即返回 {};真完成信号是 item/completed 且
     // item.type==='contextCompaction'(0.147.0 schema 复核)。等到再返回,
     // 网关才能把 compaction.completed 广播在真实完成点。超时兜底不卡死。
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.listeners.delete(onEvent);
         resolve();
       }, 180_000);
       timer.unref?.();
       const onEvent: CodexEventHandler = (ev) => {
-        // 进程死亡:compaction 的完成事件永不到达,直接收口而不是等 180s。
+        // 进程死亡:compaction 的完成事件永不到达。假报成功会让用户以为
+        // 上下文已压缩,实际没有——必须响亮失败(审查实测)。
         if (ev.type === 'disconnected') {
           clearTimeout(timer);
           this.listeners.delete(onEvent);
-          resolve();
+          reject(new Error('codex app-server disconnected during thread compact'));
           return;
         }
         if (ev.type !== 'item-completed') return;

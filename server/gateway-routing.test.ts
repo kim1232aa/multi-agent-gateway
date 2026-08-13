@@ -624,6 +624,51 @@ server.listen(port, '127.0.0.1', () => console.log('Kimi server: http://127.0.0.
   }
 });
 
+test('snapshot returns only the latest message page and pages older via /messages', async () => {
+  // 大会话全量快照=首屏传输/渲染爆炸(实测某 codex 会话 2238 条/1.1MB,
+  // 前端像死机)。对齐 kap-server:快照只带最后一页(50)+has_more,
+  // 更早的走 /messages?before_id 翻页。
+  const codex = fakeAdapter('codex');
+  const many: Message[] = Array.from({ length: 120 }, (_, i) => ({
+    id: `m${String(i).padStart(3, '0')}`,
+    session_id: 'codex-native',
+    role: i % 2 === 0 ? 'user' : 'assistant',
+    content: [{ type: 'text', text: `msg ${i}` }],
+    created_at: new Date(1_700_000_000_000 + i * 1_000).toISOString(),
+  }));
+  codex.getHistory = async () => many;
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+  });
+  const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
+    headers: { authorization: 'Bearer gateway-token' },
+  });
+  try {
+    const snap = (await (await get('/sessions/codex_codex-native/snapshot')).json() as any).data;
+    assert.equal(snap.messages.items.length, 50);
+    assert.equal(snap.messages.has_more, true);
+    // 快照=时间线最后一页,时间正序。
+    assert.equal(snap.messages.items[0].id, 'm070');
+    assert.equal(snap.messages.items[49].id, 'm119');
+
+    // 向前翻页:before_id 之前的消息,新的在前。
+    const older = (await (await get('/sessions/codex_codex-native/messages?before_id=m070&page_size=50')).json() as any).data;
+    assert.equal(older.items.length, 50);
+    assert.equal(older.items[0].id, 'm069');
+    assert.equal(older.items[49].id, 'm020');
+    assert.equal(older.has_more, true);
+    const oldest = (await (await get('/sessions/codex_codex-native/messages?before_id=m020&page_size=50')).json() as any).data;
+    assert.equal(oldest.items.length, 20);
+    assert.equal(oldest.has_more, false);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('tunnels Kimi WebSocket upgrade with upstream authorization and the browser protocol', async () => {
   let upgrade:
     | { path: string; authorization: string | undefined; protocol: string | undefined }

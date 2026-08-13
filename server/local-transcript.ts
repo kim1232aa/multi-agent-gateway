@@ -1,3 +1,6 @@
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { Message, MessageContentPart } from './types.js';
 
 export type TranscriptActivity = 'idle' | 'turn';
@@ -818,4 +821,35 @@ function opsEmission(batch: TranscriptBatch): TranscriptEmission {
       seq: batch.seq,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// codex rollout 文件定位(回收保护/本地历史读取共用)
+// ---------------------------------------------------------------------------
+
+/**
+ * 按 threadId 找 rollout 文件:`~/.codex/sessions/YYYY/MM/DD/rollout-*<id>.jsonl`
+ * 及 archived_sessions/(归档会话会被移过去)。找不到返回 null(未落盘的新线程)。
+ */
+export async function findCodexRollout(threadId: string, codexHome?: string): Promise<string | null> {
+  const home = codexHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+  const matchIn = async (dir: string, depth: number): Promise<string | null> => {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory() && depth > 0) {
+        const hit = await matchIn(full, depth - 1);
+        if (hit) return hit;
+      } else if (e.isFile() && e.name.endsWith('.jsonl') && e.name.includes(threadId)) {
+        return full;
+      }
+    }
+    return null;
+  };
+  return (await matchIn(path.join(home, 'sessions'), 3)) ?? (await matchIn(path.join(home, 'archived_sessions'), 3));
 }

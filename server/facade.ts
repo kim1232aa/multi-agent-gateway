@@ -13,6 +13,8 @@ import * as fsp from 'node:fs/promises';
 import { CodexAdapter, type CodexEvent } from './codex-adapter.js';
 import { ClaudeAdapter, type ClaudeAdapterEvent } from './claude-adapter.js';
 import { expandCodexSkill, listClaudeCommands, listCodexCommands } from './native-commands.js';
+import { findCodexRollout } from './local-transcript.js';
+import { SettingsStore } from './settings-store.js';
 import {
   ProviderError,
   type ApprovalDecision,
@@ -132,9 +134,13 @@ function textOfInput(input: StartTurnInput['input']): string {
 export class CodexProviderAdapter implements ProviderAdapter {
   readonly name = 'codex' as const;
   private readonly inner: CodexAdapter;
+  /** 会话级设置持久化(重启不丢;只读路径回落 undefined = 未设置)。 */
+  private readonly settings: SettingsStore;
 
-  constructor(options?: ConstructorParameters<typeof CodexAdapter>[0]) {
-    this.inner = new CodexAdapter(options);
+  constructor(options?: ConstructorParameters<typeof CodexAdapter>[0] & { settingsPath?: string }) {
+    const { settingsPath, ...innerOptions } = options ?? {};
+    this.inner = new CodexAdapter(innerOptions);
+    this.settings = new SettingsStore(settingsPath);
   }
 
   capabilities(): ProviderCapabilities {
@@ -236,7 +242,27 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.threadCwd.get(sessionId);
   }
 
+  // thread/read 对大会话是秒级(901MB rollout 实测 9.4s),而页面加载会并发打
+  // 2-3 个 getHistory。rollout 文件是真相源:按 mtimeMs:size 做缓存键,没变就
+  // 复用同一个 Promise(并发合并),变了自然失效;失败删缓存不毒化。
+  private historyCache = new Map<string, { key: string; p: Promise<Message[]> }>();
+
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
+    const rollout = await findCodexRollout(sessionId);
+    const stat = rollout ? await fsp.stat(rollout).catch(() => null) : null;
+    if (!stat) return this.readCodexHistory(sessionId); // 未落盘新线程,不缓存
+    const key = `${stat.mtimeMs}:${stat.size}`;
+    const hit = this.historyCache.get(sessionId);
+    if (hit && hit.key === key) return hit.p;
+    const p = this.readCodexHistory(sessionId);
+    this.historyCache.set(sessionId, { key, p });
+    p.catch(() => {
+      if (this.historyCache.get(sessionId)?.p === p) this.historyCache.delete(sessionId);
+    });
+    return p;
+  }
+
+  private async readCodexHistory(sessionId: string): Promise<Message[]> {
     const turns = await this.inner.getHistory(sessionId);
     const messages: Message[] = [];
     for (const turn of turns) {
@@ -276,14 +302,14 @@ export class CodexProviderAdapter implements ProviderAdapter {
     }
     // 'off' = 用户显式关掉 thinking 控制;codex 没有"关闭推理"的概念,
     // 诚实做法是回落到服务端默认 effort(不传),而不是造假一个档位。
-    const thinking = this.sessionThinking.get(input.sessionId);
+    const thinking = this.settings.getString('thinking', input.sessionId);
     const attachments = input.attachments ?? [];
     const turnInput: string | Array<Record<string, unknown>> =
       attachments.length > 0 ? codexInputItems(prompt, attachments) : prompt;
     const handle = await this.inner.startTurn(input.sessionId, turnInput, {
-      model: this.sessionModels.get(input.sessionId),
+      model: this.settings.getString('model', input.sessionId),
       effort: thinking && thinking !== 'off' ? thinking : undefined,
-      approvalPolicy: codexApprovalPolicy(this.sessionPermission.get(input.sessionId)),
+      approvalPolicy: codexApprovalPolicy(this.settings.getString('permission', input.sessionId)),
     });
     this.invalidateListCache(); // turn 会改动 preview/updatedAt,列表缓存失效
     const events = this.mapCodexEvents(input.sessionId, handle.turnId, handle.events);
@@ -292,32 +318,29 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   // -- 原生目录与模型选择 ----------------------------------------------------
 
-  private readonly sessionModels = new Map<string, string>();
   /** model/list 的 isDefault 行,作为未显式选择时 DTO 的展示回退。 */
   private defaultModel: string | undefined;
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    this.sessionModels.set(sessionId, model);
+    this.settings.set('model', sessionId, model);
   }
 
   getModel(sessionId: string): string | undefined {
-    return this.sessionModels.get(sessionId) ?? this.defaultModel;
+    return this.settings.getString('model', sessionId) ?? this.defaultModel;
   }
 
   // -- thinking(effort)与改名 -------------------------------------------------
 
-  private readonly sessionThinking = new Map<string, string>();
   private readonly renames = new Map<string, string>();
   private readonly threadCwd = new Map<string, string>();
-  private readonly sessionPermission = new Map<string, string>();
   private readonly sessionUsage = new Map<string, SessionUsage>();
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
-    this.sessionThinking.set(sessionId, thinking);
+    this.settings.set('thinking', sessionId, thinking);
   }
 
   getThinking(sessionId: string): string | undefined {
-    return this.sessionThinking.get(sessionId);
+    return this.settings.getString('thinking', sessionId);
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
@@ -329,26 +352,24 @@ export class CodexProviderAdapter implements ProviderAdapter {
   }
 
   async setPermission(sessionId: string, mode: string): Promise<void> {
-    this.sessionPermission.set(sessionId, mode);
+    this.settings.set('permission', sessionId, mode);
   }
 
   getPermission(sessionId: string): string | undefined {
-    return this.sessionPermission.get(sessionId);
+    return this.settings.getString('permission', sessionId);
   }
 
   // -- plan 模式(collaborationMode,0.147.0 实测需 experimentalApi) --------------
 
-  private readonly sessionPlan = new Map<string, boolean>();
-
   async setPlanMode(sessionId: string, on: boolean): Promise<void> {
-    // 先落 RPC(失败不记内存态,UI 不会显示假开关)。
+    // 先落 RPC(失败不记持久态,UI 不会显示假开关)。
     await this.inner.setCollaborationMode(sessionId, on ? 'plan' : 'default');
-    if (on) this.sessionPlan.set(sessionId, true);
-    else this.sessionPlan.delete(sessionId);
+    if (on) this.settings.set('plan', sessionId, true);
+    else this.settings.delete('plan', sessionId);
   }
 
   getPlanMode(sessionId: string): boolean | undefined {
-    return this.sessionPlan.get(sessionId);
+    return this.settings.getBoolean('plan', sessionId);
   }
 
   // -- 会话操作(RPC 直通,全部 0.147.0 实测存在) --------------------------------
@@ -370,11 +391,11 @@ export class CodexProviderAdapter implements ProviderAdapter {
     await this.inner.deleteThread(sessionId);
     this.renames.delete(sessionId);
     this.threadCwd.delete(sessionId);
-    this.sessionModels.delete(sessionId);
-    this.sessionThinking.delete(sessionId);
-    this.sessionPermission.delete(sessionId);
+    this.settings.delete('model', sessionId);
+    this.settings.delete('thinking', sessionId);
+    this.settings.delete('permission', sessionId);
+    this.settings.delete('plan', sessionId);
     this.sessionUsage.delete(sessionId);
-    this.sessionPlan.delete(sessionId);
     this.invalidateListCache();
   }
 
@@ -706,9 +727,13 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly inner: ClaudeAdapter;
   /** 记录每个会话最近一次 turn 的 cwd,供 resume 时复用。 */
   private readonly sessionCwd = new Map<string, string>();
+  /** 会话级设置持久化(重启不丢;只读路径回落 undefined = 未设置)。 */
+  private readonly settings: SettingsStore;
 
-  constructor(options?: ConstructorParameters<typeof ClaudeAdapter>[0]) {
-    this.inner = new ClaudeAdapter(options);
+  constructor(options?: ConstructorParameters<typeof ClaudeAdapter>[0] & { settingsPath?: string }) {
+    const { settingsPath, ...innerOptions } = options ?? {};
+    this.inner = new ClaudeAdapter(innerOptions);
+    this.settings = new SettingsStore(settingsPath);
   }
 
   capabilities(): ProviderCapabilities {
@@ -805,15 +830,15 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     // CLI 以 "session id 已存在" 直接退出,实测 turn 静默空转)。
     const isNew = !this.inner.hasSessionFile(sessionId);
     const cwd = this.sessionCwd.get(sessionId);
-    const model = this.sessionModels.get(sessionId);
+    const model = this.settings.getString('model', sessionId);
     // thinking 'off' = 用户显式关闭 → 不传 --effort(CLI 无 off 档)。
-    const thinking = this.sessionThinking.get(sessionId);
+    const thinking = this.settings.getString('thinking', sessionId);
     const effort = thinking && thinking !== 'off' ? thinking : undefined;
     // plan 模式优先:CLI 的 plan 是 --permission-mode 的一个取值,与权限
     // 三档互斥,开启时直接覆盖。
-    const permissionMode = this.sessionPlan.get(sessionId)
+    const permissionMode = this.settings.getBoolean('plan', sessionId)
       ? 'plan'
-      : claudePermissionMode(this.sessionPermission.get(sessionId));
+      : claudePermissionMode(this.settings.getString('permission', sessionId));
     const turnId = randomUUID();
     const stream = new EventStream<GatewayEvent>();
 
@@ -995,47 +1020,43 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   // -- 原生目录与模型选择 ----------------------------------------------------
 
-  private readonly sessionModels = new Map<string, string>();
   private readonly renames = new Map<string, string>();
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    this.sessionModels.set(sessionId, model);
+    this.settings.set('model', sessionId, model);
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
     this.renames.set(sessionId, title);
   }
 
-  // -- thinking / permission / plan / usage(内存态,turn 启动时透传 CLI 旗标) --
+  // -- thinking / permission / plan / usage(持久态,turn 启动时透传 CLI 旗标) --
 
-  private readonly sessionThinking = new Map<string, string>();
-  private readonly sessionPermission = new Map<string, string>();
-  private readonly sessionPlan = new Map<string, boolean>();
   private readonly sessionUsage = new Map<string, SessionUsage>();
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
-    this.sessionThinking.set(sessionId, thinking);
+    this.settings.set('thinking', sessionId, thinking);
   }
 
   getThinking(sessionId: string): string | undefined {
-    return this.sessionThinking.get(sessionId);
+    return this.settings.getString('thinking', sessionId);
   }
 
   async setPermission(sessionId: string, mode: string): Promise<void> {
-    this.sessionPermission.set(sessionId, mode);
+    this.settings.set('permission', sessionId, mode);
   }
 
   getPermission(sessionId: string): string | undefined {
-    return this.sessionPermission.get(sessionId);
+    return this.settings.getString('permission', sessionId);
   }
 
   async setPlanMode(sessionId: string, on: boolean): Promise<void> {
-    if (on) this.sessionPlan.set(sessionId, true);
-    else this.sessionPlan.delete(sessionId);
+    if (on) this.settings.set('plan', sessionId, true);
+    else this.settings.delete('plan', sessionId);
   }
 
   getPlanMode(sessionId: string): boolean | undefined {
-    return this.sessionPlan.get(sessionId);
+    return this.settings.getBoolean('plan', sessionId);
   }
 
   getUsage(sessionId: string): SessionUsage | undefined {
@@ -1045,7 +1066,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   getModel(sessionId: string): string | undefined {
     // 未显式选择时,CLI 实际会用 ANTHROPIC_MODEL(优先级:CLI 参数 > 环境变量
     // > settings,2.1.226 产物取证),DTO 如实展示它。
-    return this.sessionModels.get(sessionId) ?? process.env.ANTHROPIC_MODEL;
+    return this.settings.getString('model', sessionId) ?? process.env.ANTHROPIC_MODEL;
   }
 
   /**
