@@ -408,7 +408,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 与 route 内的检查并存(双保险),WS 握手走 upgrade 通道不受影响。
       const preAuthUrl = new URL(req.url ?? '/', 'http://localhost');
       // CORS preflight(OPTIONS)不含凭据,必须放行到 route 的 OPTIONS 处理器。
-      if (req.method !== 'OPTIONS' && preAuthUrl.pathname.startsWith(API) && preAuthUrl.pathname !== `${API}/healthz` && !authed(req, token)) {
+      if (req.method !== 'OPTIONS' && (preAuthUrl.pathname.startsWith(API) || preAuthUrl.pathname.startsWith('/api/v2')) && preAuthUrl.pathname !== `${API}/healthz` && !authed(req, token)) {
         fail(res, 401, 40101, 'Unauthorized', ulid());
         return;
       }
@@ -1080,6 +1080,8 @@ function authed(req: IncomingMessage, token: string): boolean {
 
 function shouldProxyToKimi(req: IncomingMessage): boolean {
   const url = new URL(req.url ?? '/', 'http://localhost');
+  // 0.36+ /api/v2（flat-view 会话列表等）由 kap 原生支持,直接透传。
+  if (url.pathname.startsWith('/api/v2')) return true;
   if (!url.pathname.startsWith(API)) return false;
   if (url.pathname === `${API}/ws`) return false;
   // /meta 本地合并:官方字段照传,追加实际安装的 provider 列表(选择器过滤用)。
