@@ -614,7 +614,7 @@ export interface LocalTranscriptPage {
   seq: number;
 }
 
-/** Convert provider history into the turn-shaped transcript consumed by Kimi Web 0.33.0. */
+/** Convert provider history into the turn-shaped transcript consumed by Kimi Web 0.36.1. */
 export function buildLocalTranscriptPage(
   messages: readonly Message[],
   query: LocalTranscriptQuery,

@@ -465,7 +465,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 实际安装的 provider——前端选择器只显示这些。
       const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
       return ok(res, {
-        server_version: 'multi-agent-gateway/0.1 (Kimi 0.33.0 compatible)',
+        server_version: 'multi-agent-gateway/0.1 (Kimi 0.36.1 compatible)',
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
         server_id: 'multi-agent-gateway',
         started_at: new Date(0).toISOString(),

@@ -18,7 +18,7 @@ console.log(`multi-agent-gateway listening at ${url}`);
 console.log(`token: ${token}`);
 console.log(`前端入口: ${url}/#token=${token}`);
 if (web) {
-  console.log(`Kimi Web baseline: 0.33.0 (53c832d), injection=${web.injectionEnabled ? 'enabled' : `disabled (${web.reason})`}`);
+  console.log(`Kimi Web baseline: 0.36.1 (53c832d), injection=${web.injectionEnabled ? 'enabled' : `disabled (${web.reason})`}`);
 }
 
 const shutdown = (): void => {
