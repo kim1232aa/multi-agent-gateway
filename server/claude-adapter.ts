@@ -609,6 +609,9 @@ export class ClaudeAdapter {
       });
       // CLI 秒退时 stdin 写会异步 EPIPE——没有监听就是 uncaught(网关直接崩)。
       child.stdin!.on("error", () => undefined);
+      // stderr 不排空会在 --verbose 输出超 ~64KB 时阻塞子进程写端,导致
+      // control_response 永不到达(与 startTurn 的 stderr 消费对齐)。
+      child.stderr?.resume();
       child.stdin!.write(
         JSON.stringify({ type: "control_request", request_id: "gw_init", request: { subtype: "initialize" } }) + "\n",
       );

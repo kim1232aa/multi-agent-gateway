@@ -2374,7 +2374,13 @@ function attachGatewayWebSocket(
       .map((s) => s.trim())
       .filter(Boolean);
     const chosenProto = protos.find((p) => p.startsWith('kimi-code.'));
-    const acceptKey = wsAccept(req.headers['sec-websocket-key'] as string);
+    const key = req.headers['sec-websocket-key'];
+    if (!key) {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const acceptKey = wsAccept(key);
     const headers = [
       'HTTP/1.1 101 Switching Protocols',
       'Upgrade: websocket',
@@ -2450,8 +2456,8 @@ function attachGatewayWebSocket(
           if (filtered) sendObj(transcriptEnvelope(sid, hub, filtered));
         });
         transcriptOffs.set(sid, subscription.close);
-        const history = await adapters[provider].getHistory(split.nativeId).catch(() => [] as Message[]);
-        subscription.seed(history, hub.busy.has(sid) ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
+        const history = await adapters[provider].getHistory(split.nativeId).catch(() => null);
+        if (history) subscription.seed(history, hub.busy.has(sid) ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
         sendObj({
           type: 'ack', id: msg.id, code: 0, msg: 'success',
           payload: { accepted: [sid], not_found: [], resync_required: [], cursors: {} },

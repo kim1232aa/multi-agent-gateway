@@ -1339,6 +1339,7 @@ export class CodexAdapter {
         if (ev.type === 'disconnected') {
           clearTimeout(timer);
           off();
+          this.pendingTurnEvents.delete(`${threadId}:${firstTurnId}`);
           const error = new Error('codex app-server disconnected during review turn');
           reject(error); // 已 resolve 时是 no-op
           queue.fail(error);
@@ -1357,6 +1358,7 @@ export class CodexAdapter {
         if (firstTurnId) queue.push(ev);
         if (ev.type === 'turn-completed') {
           off();
+          this.pendingTurnEvents.delete(`${threadId}:${firstTurnId}`);
           queue.close();
         }
       });
