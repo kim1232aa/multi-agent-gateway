@@ -442,7 +442,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
 
     // 非 API 路径 → SPA 静态托管;没配静态目录则 404。
-    if (!url.pathname.startsWith(API)) {
+    if (!url.pathname.startsWith(API) && url.pathname !== '/api/v2/sessions') {
       if (serveStatic && serveStatic(req, res)) return;
       fail(res, 404, 40400, 'not an api route', requestId);
       return;
@@ -454,9 +454,19 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       return;
     }
 
-    const sub = url.pathname.slice(API.length);
+    const sub = url.pathname.startsWith(API) ? url.pathname.slice(API.length) : url.pathname;
     const providerParam = url.searchParams.get('provider');
     const provider: ProviderName | undefined = providerParam && isProviderName(providerParam) ? providerParam : undefined;
+
+    if (url.pathname === '/api/v2/sessions' && req.method === 'GET') {
+      const archived = url.searchParams.get('meta.archived') === 'true';
+      const v1 = new URL(url.href);
+      v1.searchParams.set('page_size', url.searchParams.get('page_size') || '50');
+      if (archived) v1.searchParams.set('archived_only', 'true');
+      const data = await listSessions(adapters, kimiFetch, v1, provider, (sid) => hub.busy.has(sid), sessionPageCursors);
+      const items = ((data.items ?? []) as Record<string, unknown>[]).map((item) => sessionV2Dto(item, Boolean(item.busy)));
+      return ok(res, { items, has_more: Boolean(data.has_more), next_page_token: data.has_more ? String(items[items.length - 1]?.id ?? '') : null }, requestId);
+    }
 
     // --- 元信息 ---
     if (sub === '/healthz') return ok(res, { ok: true }, requestId);
@@ -1080,8 +1090,13 @@ function authed(req: IncomingMessage, token: string): boolean {
 
 function shouldProxyToKimi(req: IncomingMessage): boolean {
   const url = new URL(req.url ?? '/', 'http://localhost');
-  // 0.36+ /api/v2（flat-view 会话列表等）由 kap 原生支持,直接透传。
-  if (url.pathname.startsWith('/api/v2')) return true;
+  // 0.36+ /api/v2：Kimi 会话列表仍走 kap;claude/codex 必须留在本网关,
+  // 否则平铺视图/搜索/已归档只看得到 Kimi。
+  if (url.pathname.startsWith('/api/v2')) {
+    const v2Provider = url.searchParams.get('provider');
+    if (v2Provider === 'claude' || v2Provider === 'codex') return false;
+    return true;
+  }
   if (!url.pathname.startsWith(API)) return false;
   if (url.pathname === `${API}/ws`) return false;
   // /meta 本地合并:官方字段照传,追加实际安装的 provider 列表(选择器过滤用)。
@@ -1283,6 +1298,7 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boo
     // 否则前端把会话挂不到聚合工作区树上(facade 内部另有一套 id 规则,在此覆盖)。
     workspace_id: s.metadata?.cwd ? (workspaceDto(String(s.metadata.cwd)).id as string) : s.workspace_id,
     title: s.title,
+    last_prompt: s.extras?.last_prompt ?? s.title,
     created_at: s.created_at,
     updated_at: s.updated_at,
     busy: isBusy,
@@ -1301,6 +1317,30 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boo
   };
 }
 
+function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<string, unknown> {
+  const metadata = (item.metadata && typeof item.metadata === 'object')
+    ? item.metadata as Record<string, unknown>
+    : {};
+  const created = Date.parse(String(item.created_at ?? '')) || 0;
+  const updated = Date.parse(String(item.updated_at ?? '')) || created;
+  return {
+    id: item.id,
+    workspace: {
+      id: item.workspace_id ?? '',
+      cwd: typeof metadata.cwd === 'string' ? metadata.cwd : '',
+    },
+    meta: {
+      title: item.title ?? '',
+      last_prompt: item.last_prompt ?? item.title ?? '',
+      created_at: created,
+      updated_at: updated,
+      archived: Boolean(item.archived),
+      archived_at: null,
+    },
+    activity: { status: busy ? 'running' : 'idle' },
+  };
+}
+
 async function listSessions(
   adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
@@ -1312,6 +1352,7 @@ async function listSessions(
   const limit = Math.min(Number(url.searchParams.get('page_size') ?? 50) || 50, 100);
   const beforeId = url.searchParams.get('before_id') ?? undefined;
   const excludeEmpty = url.searchParams.get('exclude_empty') === 'true';
+  const archivedOnly = url.searchParams.get('archived_only') === 'true';
   // 前端按工作区逐组拉首页(page_size 很小)并用 before_id 翻页:kimi 透传
   // workspace_id 给上游;codex/claude 由本网关按 cwd 派生的工作区 id 过滤。
   // 本地适配器有缓存,直接拉全量合并后在网关侧分页(before_id 语义对齐上游:
@@ -1343,7 +1384,7 @@ async function listSessions(
       }
       if (!cursor) return { items: [], has_more: false };
     }
-    let page: SessionPage = await adapter.list({ limit, cursor, cwd: rootNorm }).catch((err) => {
+    let page: SessionPage = await adapter.list({ limit, cursor, cwd: rootNorm, archived: archivedOnly || undefined }).catch((err) => {
       console.error(`[gateway] listSessions: ${provider}.list 失败:`, err instanceof Error ? err.message : err);
       return { items: [] as Session[] };
     });

@@ -53,15 +53,16 @@
     // /api/v1/auth 永不带 provider:登录是 Kimi 的全局状态,切 Agent 只切
     // 会话/模型/命令来源,不切登录体系(否则 Claude/Codex 会被误显示成未登录)。
     if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta') return true;
-    if (pathname === '/api/v1/sessions' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || /^\/api\/v1\/files\//.test(pathname)) return true;
-    if (/^\/api\/v1\/providers(?:$|[:/])/.test(pathname)) return true;
+    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || /^\/api\/v1\/files\//.test(pathname)) return true;
+    // /providers 和 /catalog/providers 是 Kimi 的供应商目录(设置页),不跟 Agent 切换走。
     return /^\/api\/v1\/workspaces\/[^/]+\/skills$/.test(pathname);
   }
 
   function rewriteApiUrl(input) {
     var raw = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
     var url = new URL(raw, window.location.origin);
-    if (url.origin !== window.location.origin || (url.pathname !== '/api/v1' && url.pathname.indexOf('/api/v1/') !== 0)) return url;
+    if (url.origin !== window.location.origin) return url;
+    if (url.pathname !== '/api/v1' && url.pathname.indexOf('/api/v1/') !== 0 && url.pathname.indexOf('/api/v2/') !== 0) return url;
     if (needsProvider(url.pathname) && !url.searchParams.has('provider')) {
       url.searchParams.set('provider', selectedProvider());
     }

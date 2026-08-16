@@ -127,6 +127,10 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   api.setProvider('claude');
   assert.equal(api.selectedProvider(), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v1/sessions').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v2/sessions').searchParams.get('provider'), 'claude');
+  // 设置页供应商目录是 Kimi 全局态,不跟 Agent 切换走。
+  assert.equal(api.rewriteApiUrl('/api/v1/providers').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/catalog/providers').searchParams.has('provider'), false);
   // 登录是全局 Kimi 状态:/auth 永不带 provider,UI 只显示 Kimi 的登录态。
   assert.equal(api.rewriteApiUrl('/api/v1/auth').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/sessions/codex_abc/snapshot').searchParams.has('provider'), false);
