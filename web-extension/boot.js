@@ -35,12 +35,20 @@
     return 'kimi';
   }
 
+  // 首页(新建会话草稿)不沿用 localStorage 里的 provider:官方默认是 kimi,
+  // 带 codex 会让输入区显示 codex 模型并藏掉 Swarm(实测复现)。
+  // 侧边栏选择器显式切换后写入 runtimeProvider,覆盖默认值。
+  var runtimeProvider = null;
+
   function selectedProvider() {
-    return providerFromPath(window.location.pathname) || storedProvider();
+    var fromPath = providerFromPath(window.location.pathname);
+    if (fromPath) return fromPath;
+    return runtimeProvider || 'kimi';
   }
 
   function setProvider(provider) {
     if (!isProvider(provider)) return;
+    runtimeProvider = provider;
     try {
       localStorage.setItem(STORAGE_KEY, provider);
     } catch (_) {
