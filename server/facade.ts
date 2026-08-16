@@ -49,6 +49,16 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function isCodexToolItem(type: unknown): boolean {
+  return type === 'commandExecution'
+    || type === 'mcpToolCall'
+    || type === 'fileChange'
+    || type === 'webSearch'
+    || type === 'dynamicToolCall'
+    || type === 'imageView'
+    || type === 'collabToolCall';
+}
+
 /**
  * kap-server 的附件物化话术:目标 provider 没有对应输入项时(文件/视频),
  * 以路径文本交给模型,让它自己用 Read 工具打开。
@@ -326,7 +336,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
   }
 
   getModel(sessionId: string): string | undefined {
-    return this.settings.getString('model', sessionId) ?? this.defaultModel;
+    return this.settings.getString('model', sessionId)
+      ?? this.settings.getString('model', '__default__')
+      ?? this.defaultModel;
   }
 
   // -- thinking(effort)与改名 -------------------------------------------------
@@ -611,9 +623,19 @@ export class CodexProviderAdapter implements ProviderAdapter {
             payload: { text: '', delta: ev.delta },
           };
           break;
+        case 'command-output-delta':
+          yield {
+            kind: 'tool',
+            status: 'delta',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: { toolCallId: ev.itemId, name: 'commandExecution', output: ev.delta },
+          };
+          break;
         case 'item-started': {
           const item = ev.item as Record<string, unknown>;
-          if (item.type === 'commandExecution' || item.type === 'mcpToolCall') {
+          if (isCodexToolItem(item.type)) {
             yield {
               kind: 'tool',
               status: 'started',
@@ -623,7 +645,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
               payload: {
                 toolCallId: (item.id as string) ?? '',
                 name: item.type as string,
-                input: item.command ?? item.arguments,
+                input: item.command ?? item.arguments ?? item.query ?? item.changes ?? item,
               },
             };
           }
@@ -631,7 +653,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
         }
         case 'item-completed': {
           const item = ev.item as Record<string, unknown>;
-          if (item.type === 'commandExecution' || item.type === 'mcpToolCall') {
+          if (isCodexToolItem(item.type)) {
+            const output = (item.aggregatedOutput as string)
+              ?? (typeof item.result === 'string' ? item.result : '')
+              ?? (typeof item.output === 'string' ? item.output : '');
             yield {
               kind: 'tool',
               status: 'completed',
@@ -641,7 +666,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
               payload: {
                 toolCallId: (item.id as string) ?? '',
                 name: item.type as string,
-                output: (item.aggregatedOutput as string) ?? '',
+                output,
                 is_error: (item.exitCode as number) !== 0 && item.exitCode !== undefined,
               },
             };
@@ -1071,7 +1096,9 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   getModel(sessionId: string): string | undefined {
     // 未显式选择时,CLI 实际会用 ANTHROPIC_MODEL(优先级:CLI 参数 > 环境变量
     // > settings,2.1.226 产物取证),DTO 如实展示它。
-    return this.settings.getString('model', sessionId) ?? process.env.ANTHROPIC_MODEL;
+    return this.settings.getString('model', sessionId)
+      ?? this.settings.getString('model', '__default__')
+      ?? process.env.ANTHROPIC_MODEL;
   }
 
   /**

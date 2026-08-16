@@ -388,26 +388,30 @@
   function gateModes() {
     if (!document.querySelectorAll) return;
     var provider = selectedProvider();
-    document.querySelectorAll('.modes-menu').forEach(function (menu) {
-      var rows = Array.from(menu.children).filter(function (node) {
-        return node.classList && node.classList.contains('mode-row');
-      });
-      rows.forEach(function (row) {
-        var labelNode = row.querySelector('.mode-row-name');
-        var label = labelNode ? String(labelNode.textContent || '').trim().toLowerCase() : '';
-        var isSwarm = label === 'swarm';
-        var isGoal = label === 'goal' || label === '目标';
-        var hide = provider === 'claude' ? isSwarm || isGoal : provider === 'codex' ? isSwarm : false;
-        if (hide) {
-          row.hidden = true;
-          row.style.display = 'none';
-          row.setAttribute('data-multi-agent-hidden', '');
-        } else if (row.hasAttribute('data-multi-agent-hidden')) {
-          row.hidden = false;
-          row.style.display = '';
-          row.removeAttribute('data-multi-agent-hidden');
-        }
-      });
+    document.querySelectorAll('.am-row').forEach(function (row) {
+      var id = row.getAttribute ? String(row.getAttribute('data-mode-id') || '') : '';
+      if (!id && row.querySelector) {
+        var labelNode = row.querySelector('[data-icon], .am-row-name, .mode-row-name');
+        var raw = labelNode ? String(labelNode.getAttribute && labelNode.getAttribute('name') || labelNode.textContent || '').trim().toLowerCase() : '';
+        if (!raw) raw = String(row.textContent || '').trim().toLowerCase();
+        if (raw.indexOf('swarm') !== -1) id = 'swarm';
+        else if (raw.indexOf('goal') !== -1 || raw.indexOf('目标') !== -1) id = 'goal';
+        else if (raw.indexOf('plan') !== -1 || raw.indexOf('计划') !== -1) id = 'plan';
+        else if (raw.indexOf('file') !== -1 || raw.indexOf('附件') !== -1) id = 'files';
+        if (id && row.setAttribute) row.setAttribute('data-mode-id', id);
+      }
+      var isSwarm = id === 'swarm' || id.indexOf('swarm') !== -1;
+      var isGoal = id === 'goal' || id.indexOf('goal') !== -1 || id.indexOf('目标') !== -1;
+      var hide = provider === 'claude' ? isSwarm || isGoal : provider === 'codex' ? isSwarm : false;
+      if (hide) {
+        row.hidden = true;
+        row.style.display = 'none';
+        row.setAttribute('data-multi-agent-hidden', '');
+      } else if (row.hasAttribute('data-multi-agent-hidden')) {
+        row.hidden = false;
+        row.style.display = '';
+        row.removeAttribute('data-multi-agent-hidden');
+      }
     });
   }
 
@@ -461,7 +465,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-menu, .modes-menu';
+  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-menu, .am-row';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {

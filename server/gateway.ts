@@ -463,6 +463,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const v1 = new URL(url.href);
       v1.searchParams.set('page_size', url.searchParams.get('page_size') || '50');
       if (archived) v1.searchParams.set('archived_only', 'true');
+      const pageToken = url.searchParams.get('page_token');
+      if (pageToken) v1.searchParams.set('before_id', pageToken);
       const data = await listSessions(adapters, kimiFetch, v1, provider, (sid) => hub.busy.has(sid), sessionPageCursors);
       const items = ((data.items ?? []) as Record<string, unknown>[]).map((item) => sessionV2Dto(item, Boolean(item.busy)));
       return ok(res, { items, has_more: Boolean(data.has_more), next_page_token: data.has_more ? String(items[items.length - 1]?.id ?? '') : null }, requestId);
@@ -1161,17 +1163,22 @@ async function providerConfigView(
 ): Promise<Record<string, unknown>> {
   const base = (await kimiFetch('/config').catch(() => ({ providers: {} }))) as Record<string, unknown>;
   // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
-  const models = adapter.listModels ? await adapter.listModels() : [];
+  const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
   const requestedModel = typeof patch.default_model === 'string' ? patch.default_model : undefined;
-  const defaultModel = requestedModel ?? models[0]?.model ?? '';
+  if (requestedModel && adapter.setModel) await adapter.setModel('__default__', requestedModel);
+  const defaultModel = requestedModel ?? adapter.getModel?.('__default__') ?? models[0]?.model ?? '';
   const baseProviders = base.providers && typeof base.providers === 'object'
     ? (base.providers as Record<string, unknown>)
     : {};
   return {
     ...base,
     ...patch,
+    models: models.map((model) => ({
+      id: model.model,
+      display_name: model.display_name ?? model.model,
+      provider,
+    })),
     providers: {
-      ...baseProviders,
       [provider]: {
         type: provider,
         default_model: defaultModel,
@@ -1298,7 +1305,7 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boo
     // 否则前端把会话挂不到聚合工作区树上(facade 内部另有一套 id 规则,在此覆盖)。
     workspace_id: s.metadata?.cwd ? (workspaceDto(String(s.metadata.cwd)).id as string) : s.workspace_id,
     title: s.title,
-    last_prompt: s.extras?.last_prompt ?? s.title,
+    last_prompt: typeof s.extras?.last_prompt === 'string' ? s.extras.last_prompt : '',
     created_at: s.created_at,
     updated_at: s.updated_at,
     busy: isBusy,
@@ -1331,7 +1338,7 @@ function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<stri
     },
     meta: {
       title: item.title ?? '',
-      last_prompt: item.last_prompt ?? item.title ?? '',
+      last_prompt: typeof item.last_prompt === 'string' ? item.last_prompt : '',
       created_at: created,
       updated_at: updated,
       archived: Boolean(item.archived),
@@ -1839,7 +1846,7 @@ async function driveTurn(
         if (hub.busy.get(sid) !== turn) break;
         // 适配器层的失败(如 CLI 无 result 退出)以 turn/failed 事件上来,
         // 必须传导到终态,否则 UI 显示假成功。
-        if (ev.kind === 'turn' && ev.status === 'failed') reason = 'failed';
+        if (ev.kind === 'turn' && (ev.status === 'failed' || ev.status === 'cancelled')) reason = 'failed';
         consumeEvent(ev, turn, emit, ensureStep, completeStep, sid, hub);
       }
     } catch {
@@ -2057,6 +2064,10 @@ function consumeEvent(
       turn.runningTools.set(p.toolCallId, { name: p.name, args: p.input });
       turn.transcript?.toolStarted(p.toolCallId, p.name, p.input ?? {});
       emit('tool.call.started', { turnId: 0, toolCallId: p.toolCallId, name: p.name, args: p.input ?? {} });
+    } else if (ev.status === 'delta') {
+      const delta = p.output ?? '';
+      if (!delta) return;
+      emit('tool.call.progress', { turnId: 0, toolCallId: p.toolCallId, output: delta });
     } else {
       turn.runningTools.delete(p.toolCallId);
       const isError = p.isError ?? p.is_error ?? false;

@@ -64,32 +64,33 @@ async function loadShim(pathname = '/', options: { readyState?: string; querySel
 
 async function loadModeShim(): Promise<{ api: any; rows: any[] }> {
   const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
-  const rows = ['Plan', 'Swarm', 'Goal'].map((label, index) => {
-    const attributes = new Map<string, string>();
-    const classes = new Set(index === 2 ? ['mode-row', 'mode-row-goal'] : ['mode-row']);
-    const labelNode = { textContent: label };
+  const rows = ['Plan', 'Swarm', 'Goal'].map((label) => {
+    const attributes = new Map<string, string>([['data-mode-id', label.toLowerCase()]]);
+    const classes = new Set(['am-row']);
+    const labelNode = { textContent: label, getAttribute: () => null };
     return {
       hidden: false,
       children: [],
       style: { display: '' },
+      textContent: label,
       classList: {
         contains: (name: string) => classes.has(name),
         toggle: (name: string, enabled: boolean) => enabled ? classes.add(name) : classes.delete(name),
       },
-      querySelector: (selector: string) => selector === '.mode-row-name' ? labelNode : null,
+      querySelector: () => labelNode,
+      getAttribute: (name: string) => attributes.get(name) ?? null,
       setAttribute: (name: string, value: string) => attributes.set(name, value),
       hasAttribute: (name: string) => attributes.has(name),
       removeAttribute: (name: string) => attributes.delete(name),
     };
   });
-  const menu = { children: rows };
   const storage = new Map<string, string>();
   const location = { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' };
   const documentObject: any = {
     readyState: 'complete',
     documentElement: {},
     querySelector: () => null,
-    querySelectorAll: (selector: string) => selector === '.modes-menu' ? [menu] : [],
+    querySelectorAll: (selector: string) => selector === '.am-row' ? rows : [],
     addEventListener: () => {},
     createElement: () => ({}),
   };
@@ -603,6 +604,10 @@ test('leaves unlabeled official mode rows unchanged', async () => {
   const { api, rows } = await loadModeShim();
   rows[1].querySelector = () => null;
   rows[2].querySelector = () => null;
+  rows[1].textContent = '';
+  rows[2].textContent = '';
+  rows[1].setAttribute('data-mode-id', '');
+  rows[2].setAttribute('data-mode-id', '');
 
   api.setProvider('claude');
 
