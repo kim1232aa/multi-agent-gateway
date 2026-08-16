@@ -259,7 +259,10 @@ interface PendingServerRequest {
 
 class TurnEventQueue implements AsyncIterable<CodexEvent> {
   private buffer: CodexEvent[] = [];
-  private waiter: ((r: IteratorResult<CodexEvent>) => void) | null = null;
+  private waiter: {
+    resolve: (r: IteratorResult<CodexEvent>) => void;
+    reject: (err: Error) => void;
+  } | null = null;
   private done = false;
   private failure: Error | null = null;
 
@@ -268,7 +271,7 @@ class TurnEventQueue implements AsyncIterable<CodexEvent> {
     if (this.waiter) {
       const w = this.waiter;
       this.waiter = null;
-      w({ value: event, done: false });
+      w.resolve({ value: event, done: false });
     } else {
       this.buffer.push(event);
     }
@@ -280,14 +283,21 @@ class TurnEventQueue implements AsyncIterable<CodexEvent> {
     if (this.waiter) {
       const w = this.waiter;
       this.waiter = null;
-      w({ value: undefined as unknown as CodexEvent, done: true });
+      w.resolve({ value: undefined as unknown as CodexEvent, done: true });
     }
   }
 
   fail(err: Error): void {
     if (this.done) return;
     this.failure = err;
-    this.close();
+    this.done = true;
+    // 有人在等下一帧时必须 reject,不能走 close() 的 done:true——
+    // 否则 driveTurn 会把进程崩溃收成假成功。
+    if (this.waiter) {
+      const w = this.waiter;
+      this.waiter = null;
+      w.reject(err);
+    }
   }
 
   [Symbol.asyncIterator](): AsyncIterator<CodexEvent> {
@@ -300,8 +310,8 @@ class TurnEventQueue implements AsyncIterable<CodexEvent> {
         if (this.done) {
           return Promise.resolve({ value: undefined as unknown as CodexEvent, done: true });
         }
-        return new Promise((res) => {
-          this.waiter = res;
+        return new Promise((resolve, reject) => {
+          this.waiter = { resolve, reject };
         });
       },
     };

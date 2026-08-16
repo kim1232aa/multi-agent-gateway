@@ -5,3 +5,5 @@ server/temp/
 kimi-web-src
 web/
 *.log
+.probe-tmp/
+probe-vendor.sh

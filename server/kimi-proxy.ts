@@ -1,5 +1,5 @@
 /**
- * Kimi 路径的无损代理:把进站的 `/api/v1/*` 请求原样转发到本机原版
+ * Kimi 路径的无损代理:把进站的 `/api/v1/*` 与 `/api/v2/*` 请求原样转发到本机原版
  * kap-server(默认 http://127.0.0.1:58627)。
  *
  * 设计要点:
@@ -51,10 +51,11 @@ function resolveUpstream(options?: KimiProxyOptions): URL {
   return new URL(raw);
 }
 
-/** 请求路径是否属于 kap-server 的 REST 面(`/api/v1`,不含 /ws)。 */
+/** 请求路径是否属于 kap-server 的 REST 面(`/api/v1` 与 0.36+ `/api/v2`,不含 /ws)。 */
 export function isKimiApiPath(url: string | undefined): boolean {
   if (url === undefined) return false;
   const path = url.split('?', 1)[0];
+  if (path === '/api/v2' || path.startsWith('/api/v2/')) return true;
   return path === '/api/v1' || (path.startsWith('/api/v1/') && !isKimiWsPath(url));
 }
 
@@ -71,7 +72,7 @@ export function isKimiWsPath(url: string | undefined): boolean {
 
 /**
  * 返回一个 `(req, res) => Promise<boolean>` 处理器:
- * 路径命中 `/api/v1/*` 时转发并返回 true;不命中时不碰响应、返回 false,
+ * 路径命中 `/api/v1/*` 或 `/api/v2/*` 时转发并返回 true;不命中时不碰响应、返回 false,
  * 让 facade 继续走自己的路由。
  */
 export function createKimiHttpProxy(options?: KimiProxyOptions) {

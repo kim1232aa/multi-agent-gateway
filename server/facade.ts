@@ -546,7 +546,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
   async resolveQuestion(_sessionId: string, questionId: string, answer: string | Record<string, string[]>): Promise<void> {
     // 简单文本答案走 q_0(单列提问);结构化答案的键就是 codex 提问的
     // question id(网关 questionDto 已按原样透出)。
-    this.inner.resolveQuestion(questionId, typeof answer === 'string' ? { q_0: [answer] } : answer);
+    try {
+      this.inner.resolveQuestion(questionId, typeof answer === 'string' ? { q_0: [answer] } : answer);
+    } catch (err) {
+      if (err instanceof Error && /no pending server request/.test(err.message)) return;
+      throw err;
+    }
   }
 
   async close(_sessionId: string): Promise<void> {

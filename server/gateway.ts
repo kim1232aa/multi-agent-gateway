@@ -2539,6 +2539,7 @@ function attachGatewayWebSocket(
     // fin=true 再整体 JSON.parse。此前直接丢弃非 fin 帧,CF 边缘或浏览器一旦
     // 分片,subscribe 等控制消息静默丢失。
     let fragments: Buffer[] | null = null;
+    let fragmentBytes = 0;
     const handleText = (payload: Buffer): void => {
       try {
         const message = JSON.parse(payload.toString('utf8')) as Parameters<typeof handleFrame>[0];
@@ -2546,7 +2547,14 @@ function attachGatewayWebSocket(
       } catch { /* 忽略坏帧 */ }
     };
     socket.on('data', (chunk: Buffer) => {
-      for (const wsFrame of parser.push(chunk)) {
+      let frames: ParsedWsFrame[];
+      try {
+        frames = parser.push(chunk);
+      } catch {
+        socket.destroy();
+        return;
+      }
+      for (const wsFrame of frames) {
         if (wsFrame.opcode === 0x8) {
           wsSendFrame(socket, 0x8, wsFrame.payload);
           socket.end();
@@ -2558,7 +2566,13 @@ function attachGatewayWebSocket(
         }
         if (wsFrame.opcode === 0x1) {
           fragments = [wsFrame.payload]; // 新消息首帧(上一段未完则丢弃)
+          fragmentBytes = wsFrame.payload.byteLength;
         } else if (wsFrame.opcode === 0x0 && fragments) {
+          fragmentBytes += wsFrame.payload.byteLength;
+          if (fragmentBytes > WS_MAX_MESSAGE_BYTES) {
+            socket.destroy();
+            return;
+          }
           fragments.push(wsFrame.payload);
         } else {
           continue; // pong/binary/无首帧的续帧:忽略
@@ -2566,6 +2580,7 @@ function attachGatewayWebSocket(
         if (wsFrame.fin) {
           handleText(Buffer.concat(fragments));
           fragments = null;
+          fragmentBytes = 0;
         }
       }
     });
@@ -2613,12 +2628,17 @@ interface ParsedWsFrame {
   payload: Buffer;
 }
 
+const WS_MAX_MESSAGE_BYTES = 1 * 1024 * 1024;
+
 /** 带跨 chunk 缓冲的 WS 帧解析器。 */
 class WsFrameParser {
   private buf: Buffer = Buffer.alloc(0);
 
   push(chunk: Buffer): ParsedWsFrame[] {
     this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+    if (this.buf.byteLength > WS_MAX_MESSAGE_BYTES * 2) {
+      throw new Error('websocket buffer too large');
+    }
     const out: ParsedWsFrame[] = [];
     for (;;) {
       const frame = this.tryParse();
@@ -2642,9 +2662,12 @@ class WsFrameParser {
       offset = 4;
     } else if (len === 127) {
       if (b.byteLength < 10) return null;
-      len = Number(b.readBigUInt64BE(2));
+      const n = b.readBigUInt64BE(2);
+      if (n > BigInt(WS_MAX_MESSAGE_BYTES)) throw new Error('websocket frame too large');
+      len = Number(n);
       offset = 10;
     }
+    if (len > WS_MAX_MESSAGE_BYTES) throw new Error('websocket frame too large');
     const maskOffset = offset;
     if (masked) offset += 4;
     if (b.byteLength < offset + len) return null;
@@ -2865,11 +2888,15 @@ async function readMultipart(req: IncomingMessage): Promise<{ filename: string; 
     throw new ProviderError('invalid_request', 'file too large (25MB max)', 400);
   }
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  const body = Buffer.concat(chunks);
-  if (body.byteLength > 25 * 1024 * 1024) {
-    throw new ProviderError('invalid_request', 'file too large (25MB max)', 400);
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).byteLength;
+    if (size > 25 * 1024 * 1024) {
+      throw new ProviderError('invalid_request', 'file too large (25MB max)', 400);
+    }
+    chunks.push(c as Buffer);
   }
+  const body = Buffer.concat(chunks);
   const delim = Buffer.from(`--${boundary}`);
   const start = body.indexOf(delim);
   if (start === -1) return null;
