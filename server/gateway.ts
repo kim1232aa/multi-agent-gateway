@@ -588,6 +588,28 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const body = (await readBody(req)) as { root: string; name?: string };
       return ok(res, workspaceDto(body.root, body.name), requestId);
     }
+    const workspaceIdMatch = /^\/workspaces\/([^/:]+)$/.exec(sub);
+    if (workspaceIdMatch && (req.method === 'PATCH' || req.method === 'DELETE')) {
+      const wid = decodeURIComponent(workspaceIdMatch[1]);
+      if (wid.startsWith('wd_codex_') || wid.startsWith('wd_claude_')) {
+        if (req.method === 'DELETE') {
+          return ok(res, { deleted: wid }, requestId);
+        }
+        const body = (await readBody(req).catch(() => ({}))) as { name?: string };
+        const all = await listWorkspaces(adapters, kimiFetch, provider);
+        const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
+        const hit = wsItems.find((w) => w.id === wid);
+        return ok(res, { ...(hit ?? { id: wid, root: '' }), name: body.name ?? '' }, requestId);
+      }
+    }
+    if (sub === '/workspace/fs:search' && req.method === 'POST' && provider && provider !== 'kimi') {
+      const body = (await readBody(req)) as { workspace?: string; query?: string; limit?: number };
+      const all = await listWorkspaces(adapters, kimiFetch, provider);
+      const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
+      const hit = wsItems.find((w) => w.id === body.workspace);
+      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : process.env.HOME ?? '/home/ubuntu';
+      return ok(res, await fsSearch(cwd, { query: body.query ?? '', limit: body.limit }), requestId);
+    }
 
     // --- sessions ---
     if (sub === '/sessions' && req.method === 'GET') {
@@ -640,6 +662,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         const body = (await readBody(req).catch(() => ({}))) as { count?: number };
         const count = Math.max(1, Math.min(50, Number(body.count ?? 1) || 1));
         await adapter.rollback(nativeId, count);
+        hub.transcript.invalidateHistory(prefixedId(sp, nativeId));
         return ok(res, { undone: true, count }, requestId);
       }
       if (tail === ':compact' && req.method === 'POST') {
@@ -654,6 +677,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           // (0.147.0 复核:item/completed + type==='contextCompaction' 是真完成
           // 信号),completed 广播在真实完成点(对齐 kap-server worker 尾部)。
           await adapter.compact(nativeId);
+          hub.transcript.invalidateHistory(sid);
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
           return ok(res, { compacted: true }, requestId);
         }

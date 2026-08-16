@@ -56,7 +56,23 @@ function isCodexToolItem(type: unknown): boolean {
     || type === 'webSearch'
     || type === 'dynamicToolCall'
     || type === 'imageView'
-    || type === 'collabToolCall';
+    || type === 'collabToolCall'
+    || type === 'custom_tool_call';
+}
+
+/** codex 历史 item 的输出文本:aggregatedOutput / result / output 数组拼文本。 */
+function extractCodexToolOutput(item: Record<string, unknown>): string | null {
+  if (typeof item.aggregatedOutput === 'string') return item.aggregatedOutput;
+  if (typeof item.result === 'string') return item.result;
+  if (typeof item.output === 'string') return item.output;
+  if (Array.isArray(item.output)) {
+    const text = (item.output as Array<Record<string, unknown>>)
+      .map((part) => (part.text as string) ?? '')
+      .filter(Boolean)
+      .join('\n');
+    return text || null;
+  }
+  return null;
 }
 
 /**
@@ -295,6 +311,48 @@ export class CodexProviderAdapter implements ProviderAdapter {
             content: [{ type: 'text', text: (it.text as string) ?? '' }],
             created_at: nowIso(),
           });
+        } else if (type === 'reasoning') {
+          // 思维链:summary 是分段数组,content 可能为 null(已加密)。
+          const summary = Array.isArray(it.summary)
+            ? (it.summary as Array<Record<string, unknown>>).map((s) => (s.text as string) ?? '').join('\n').trim()
+            : '';
+          if (!summary) continue;
+          messages.push({
+            id: (it.id as string) ?? randomUUID(),
+            session_id: sessionId,
+            role: 'assistant',
+            content: [{ type: 'thinking', text: summary }],
+            created_at: nowIso(),
+          });
+        } else if (isCodexToolItem(type)) {
+          // 工具卡:call 与 output 分属两个 item 时按 call_id 配对;单个 item 自带
+          // output/result 时直接成对(rollout 实测两种形态都有)。
+          const callId = (it.call_id as string) ?? (it.id as string) ?? randomUUID();
+          const name = (it.name as string) ?? (type as string);
+          const input = it.input ?? it.command ?? it.arguments ?? it.query ?? {};
+          messages.push({
+            id: `${callId}_call`,
+            session_id: sessionId,
+            role: 'assistant',
+            content: [{ type: 'tool_call', id: callId, name, input }],
+            created_at: nowIso(),
+          });
+          const outputText = extractCodexToolOutput(it);
+          if (outputText !== null) {
+            const exitCode = it.exitCode as number | undefined;
+            messages.push({
+              id: `${callId}_result`,
+              session_id: sessionId,
+              role: 'assistant',
+              content: [{
+                type: 'tool_result',
+                tool_call_id: callId,
+                content: outputText,
+                is_error: exitCode !== undefined && exitCode !== 0,
+              }],
+              created_at: nowIso(),
+            });
+          }
         }
       }
     }
@@ -811,22 +869,40 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
     const history = await this.inner.getHistory(sessionId);
-    return history.map((m, index) => ({
-      id: `msg_${createHash('sha256')
-        .update(JSON.stringify([sessionId, index, m.role, m.timestamp ?? '', m.text]))
-        .digest('hex')
-        .slice(0, 24)}`,
-      session_id: sessionId,
-      role: m.role,
-      content: [{ type: 'text', text: m.text }],
-      created_at: m.timestamp ?? nowIso(),
-      ...(m.model || m.isError ? {
-        metadata: {
-          ...(m.model ? { model: m.model } : {}),
-          ...(m.isError ? { is_error: true } : {}),
-        },
-      } : {}),
-    }));
+    return history.map((m, index) => {
+      // 优先用结构化块(thinking/tool_use/tool_result),没有才退化成纯文本。
+      const content: Message['content'] = m.blocks && m.blocks.length > 0
+        ? m.blocks.map((b) => {
+            if (b.type === 'thinking') return { type: 'thinking' as const, text: b.text };
+            if (b.type === 'tool_use') return { type: 'tool_call' as const, id: b.id, name: b.name, input: b.input };
+            if (b.type === 'tool_result') {
+              return {
+                type: 'tool_result' as const,
+                tool_call_id: b.tool_use_id,
+                content: b.content,
+                ...(b.is_error ? { is_error: true } : {}),
+              };
+            }
+            return { type: 'text' as const, text: b.text };
+          })
+        : [{ type: 'text' as const, text: m.text }];
+      return {
+        id: `msg_${createHash('sha256')
+          .update(JSON.stringify([sessionId, index, m.role, m.timestamp ?? '', m.text]))
+          .digest('hex')
+          .slice(0, 24)}`,
+        session_id: sessionId,
+        role: m.role,
+        content,
+        created_at: m.timestamp ?? nowIso(),
+        ...(m.model || m.isError ? {
+          metadata: {
+            ...(m.model ? { model: m.model } : {}),
+            ...(m.isError ? { is_error: true } : {}),
+          },
+        } : {}),
+      };
+    });
   }
 
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {

@@ -53,8 +53,9 @@
     // /api/v1/auth 永不带 provider:登录是 Kimi 的全局状态,切 Agent 只切
     // 会话/模型/命令来源,不切登录体系(否则 Claude/Codex 会被误显示成未登录)。
     if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta') return true;
-    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || /^\/api\/v1\/files\//.test(pathname)) return true;
+    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/workspace/fs:search' || /^\/api\/v1\/files\//.test(pathname)) return true;
     // /providers 和 /catalog/providers 是 Kimi 的供应商目录(设置页),不跟 Agent 切换走。
+    if (/^\/api\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
     return /^\/api\/v1\/workspaces\/[^/]+\/skills$/.test(pathname);
   }
 

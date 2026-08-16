@@ -74,6 +74,13 @@ export interface ClaudeHistoryMessage {
   role: "user" | "assistant";
   /** Concatenated text blocks (tool_use/tool_result blocks are skipped). */
   text: string;
+  /** 结构化内容块:thinking/tool_use/tool_result,刷新后重投影用。 */
+  blocks?: Array<
+    | { type: "text"; text: string }
+    | { type: "thinking"; text: string }
+    | { type: "tool_use"; id: string; name: string; input: unknown }
+    | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+  >;
   timestamp?: string;
   model?: string;
   isError?: boolean;
@@ -327,9 +334,35 @@ export class ClaudeAdapter {
       const text = extractText(msg.content);
       if (!text) continue; // tool_result-only user entries, empty thinking, etc.
       if (type === "user" && isLocalCommandText(text)) continue;
+      const blocks: NonNullable<ClaudeHistoryMessage["blocks"]> = [];
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (!block || typeof block !== "object") continue;
+          const b = block as Record<string, unknown>;
+          if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
+            blocks.push({ type: "thinking", text: b.thinking });
+          } else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
+            blocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
+          } else if (b.type === "tool_result") {
+            const raw = b.content;
+            const out = typeof raw === "string"
+              ? raw
+              : Array.isArray(raw)
+                ? (raw as Array<Record<string, unknown>>).map((x) => (x.text as string) ?? "").join("")
+                : "";
+            blocks.push({
+              type: "tool_result",
+              tool_use_id: (b.tool_use_id as string) ?? "",
+              content: out,
+              ...(b.is_error === true ? { is_error: true } : {}),
+            });
+          }
+        }
+      }
       messages.push({
         role: type,
         text,
+        ...(blocks.length > 0 ? { blocks } : {}),
         timestamp: entry.timestamp,
         model: type === "assistant" ? msg.model : undefined,
         isError: type === "assistant" && entry.isApiErrorMessage === true,

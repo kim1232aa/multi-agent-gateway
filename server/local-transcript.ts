@@ -440,6 +440,19 @@ export class LocalTranscriptHub {
     this.sessions.delete(sessionId);
   }
 
+  /** undo/compact 后让该会话回到未观察态;订阅方重新走 seed 拿真实历史,
+   *  否则已回滚的 turn 一直留在投影里。 */
+  invalidateHistory(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.historyObserved = false;
+    state.recentTurns.clear();
+    state.unbasedTurns.clear();
+    state.journal = [];
+    state.seq = 0;
+    state.nextOrdinal = 1;
+  }
+
   private state(sessionId: string): TranscriptSessionState {
     let state = this.sessions.get(sessionId);
     if (!state) {
