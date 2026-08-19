@@ -1,9 +1,7 @@
 # Kimi Web 基线说明
 
-`web-dist/` 现在严格保存官方 `@moonshot-ai/kimi-code@0.33.0` 的
-`apps/kimi-code/dist-web`，来源 commit 为
-`53c832dfdf9566afd59a8b3d54ebd36d3cb03d72`。关键文件的 SHA-256 记录在
-`web-origin-manifest.json`。
+`web-dist/` 现在严格保存官方 `@moonshot-ai/kimi-code@0.37.2` 的
+`dist-web`。关键文件的 SHA-256 记录在 `web-origin-manifest.json`。
 
 此前提交的 `c2d7beb` 实际对应 0.28.1 时代的公开源码，不是 0.33.0 的 Web
 源码；旧的 `kimi-web-gateway.patch` 已退役，不能再作为构建来源。官方 0.33

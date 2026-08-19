@@ -507,7 +507,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
       pid: process.pid,
       host: '127.0.0.1',
       port: Number(new URL(official.url).port),
-      host_version: '0.36.1',
+      host_version: '0.37.2',
     }));
   };
 

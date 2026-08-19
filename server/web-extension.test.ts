@@ -129,6 +129,8 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   assert.equal(api.selectedProvider(), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v1/sessions').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v2/sessions').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v2/sessions:archive').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v2/sessions:restore').searchParams.get('provider'), 'claude');
   // 设置页供应商目录是 Kimi 全局态,不跟 Agent 切换走。
   assert.equal(api.rewriteApiUrl('/api/v1/providers').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/catalog/providers').searchParams.has('provider'), false);
@@ -170,10 +172,12 @@ test('routes filesystem APIs through the selected provider', async () => {
   assert.equal(api.rewriteApiUrl('/api/v1/fs:browse?path=%2Ftmp').searchParams.get('provider'), 'codex');
 });
 
-test('updates provider menu aria state when it opens and closes', async () => {
+test('renders the Agent switcher as an official-style segmented control', async () => {
   const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
-  assert.match(source, /setAttribute\(['\"]aria-expanded['\"],\s*String\(!menu\.hidden\)\)/);
-  assert.match(source, /setAttribute\(['\"]aria-expanded['\"],\s*['\"]false['\"]\)/);
+  assert.match(source, /ui-seg ui-seg--sm multi-agent-provider-seg/);
+  assert.match(source, /role:\s*['\"]tablist['\"]|setAttribute\(['\"]role['\"],\s*['\"]tablist['\"]\)/);
+  assert.match(source, /setAttribute\(['\"]aria-selected['\"]/);
+  assert.match(source, /updateSegIndicator/);
 });
 
 test('leaves the official Kimi account controls unchanged', async () => {
@@ -247,6 +251,11 @@ function fakeElement(tag: string): any {
     type: '',
     isConnected: true,
     parentElement: null,
+    // SegmentedControl indicator 量宽需要这些几何字段;测试给稳定假值即可。
+    offsetWidth: 64,
+    offsetHeight: 24,
+    offsetLeft: 0,
+    offsetTop: 0,
   };
   const classes = (): string[] => String(el.className).split(/\s+/).filter(Boolean);
   el.classList = {
@@ -345,7 +354,11 @@ async function loadDomShim(options: {
       if (selector === '.multi-agent-provider-wrap') {
         return sidebar.children.find((c: any) => c.classList.contains('multi-agent-provider-wrap')) ?? null;
       }
-      if (selector === '.multi-agent-provider-name' || selector === '.multi-agent-provider-avatar' || selector === '.multi-agent-provider-pill') {
+      if (
+        selector === '.multi-agent-provider-seg'
+        || selector === '.multi-agent-provider-item'
+        || selector === '.ui-seg__indicator'
+      ) {
         return documentObject.querySelector('.multi-agent-provider-wrap')?.querySelector(selector) ?? null;
       }
       return null;
@@ -441,26 +454,28 @@ test('mounts the Agent selector directly above the sidebar account row', async (
   assert.equal(api.sidebar.children[1], anchor);
   assert.equal(wrap.classList.contains('multi-agent-provider-wrap'), true);
 
-  const row = wrap.querySelector('.multi-agent-provider-pill');
-  assert.ok(row.classList.contains('user-menu-trigger'));
-  assert.equal(row.getAttribute('aria-haspopup'), 'menu');
-  assert.equal(row.getAttribute('aria-expanded'), 'false');
-  assert.equal(wrap.querySelector('.multi-agent-provider-name').textContent, 'Kimi');
+  const seg = wrap.querySelector('.multi-agent-provider-seg');
+  assert.ok(seg);
+  assert.equal(seg.getAttribute('role'), 'tablist');
+  assert.ok(seg.classList.contains('ui-seg'));
+  const items = seg.querySelectorAll('.multi-agent-provider-item');
+  assert.equal(items.length, 3);
+  assert.equal(items[0].getAttribute('data-provider'), 'kimi');
+  assert.equal(items[0].classList.contains('is-on'), true);
+  assert.equal(items[0].getAttribute('aria-selected'), 'true');
+  assert.equal(items[0].querySelector('.ui-seg__label').textContent, 'Kimi');
 
   // 不动官方账号行本身,也不再探测 composer 的模型按钮。
   assert.equal(anchor.className, 'user-menu-trigger');
   assert.equal(anchor.children.length, 0);
   assert.equal(api.queries.some((q: string) => q.includes('.composer')), false);
 
-  row.click();
-  const menu = wrap.querySelector('.multi-agent-provider-menu');
-  assert.equal(menu.hidden, false);
-  assert.equal(row.getAttribute('aria-expanded'), 'true');
-
-  menu.querySelectorAll('.multi-agent-provider-row')[1].click();
+  items[1].click();
   assert.equal(api.selectedProvider(), 'claude');
   assert.equal(api.reloads(), 0);
-  assert.equal(wrap.querySelector('.multi-agent-provider-name').textContent, 'Claude');
+  assert.equal(items[1].classList.contains('is-on'), true);
+  assert.equal(items[0].classList.contains('is-on'), false);
+  assert.equal(items[1].getAttribute('aria-selected'), 'true');
 });
 
 test('switches providers without reloading the page', async () => {
@@ -598,6 +613,79 @@ test('shows only provider-supported modes', async () => {
   assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none']);
   api.setProvider('kimi');
   assert.deepEqual(rows.map((row) => row.style.display), ['', '', '']);
+});
+
+test('recognizes 0.37 composer mode rows from real zh/en labels without data-mode-id', async () => {
+  // 官方 .am-row 没有 data-mode-id,gateModes 只能靠文案识别;之前测试全预置了 id。
+  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const makeRow = (label: string) => {
+    const attributes = new Map<string, string>();
+    const labelNode = { textContent: label, getAttribute: () => null };
+    return {
+      hidden: false,
+      style: { display: '' },
+      textContent: label,
+      querySelector: () => labelNode,
+      getAttribute: (name: string) => attributes.get(name) ?? null,
+      setAttribute: (name: string, value: string) => attributes.set(name, value),
+      hasAttribute: (name: string) => attributes.has(name),
+      removeAttribute: (name: string) => attributes.delete(name),
+    };
+  };
+  const rowsZh = [
+    makeRow('文件'),
+    makeRow('启用 swarm 模式'),
+    makeRow('设定目标并持续推进'),
+    makeRow('计划'),
+  ];
+  const rowsEn = [
+    makeRow('Files'),
+    makeRow('Turn swarm mode on'),
+    makeRow('Set a goal and keep going'),
+    makeRow('Plan'),
+  ];
+  for (const rows of [rowsZh, rowsEn]) {
+    const storage = new Map<string, string>();
+    const location = { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' };
+    const documentObject: any = {
+      readyState: 'complete',
+      documentElement: {},
+      querySelector: () => null,
+      querySelectorAll: (selector: string) => selector === '.am-row' ? rows : [],
+      addEventListener: () => {},
+      createElement: () => ({}),
+    };
+    const windowObject: any = {
+      location,
+      localStorage: {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+      },
+      addEventListener: () => {},
+      history: { pushState() {}, replaceState() {} },
+    };
+    vm.runInNewContext(source, {
+      window: windowObject,
+      document: documentObject,
+      location,
+      localStorage: windowObject.localStorage,
+      URL,
+      Request,
+      MutationObserver: class { observe() {} disconnect() {} },
+      fetch: async () => new Response('{}'),
+      console,
+      setTimeout,
+      clearTimeout,
+    }, { filename: 'boot.js' });
+    const api = windowObject.__multiAgent;
+    api.setProvider('claude');
+    assert.equal(rows[0].style.display, '');
+    assert.equal(rows[1].style.display, 'none');
+    assert.equal(rows[2].style.display, 'none');
+    assert.equal(rows[3].style.display, '');
+    assert.equal(rows[1].getAttribute('data-mode-id'), 'swarm');
+    assert.equal(rows[2].getAttribute('data-mode-id'), 'goal');
+  }
 });
 
 test('leaves unlabeled official mode rows unchanged', async () => {
@@ -768,9 +856,7 @@ test('falls back to the stored server credential when the hash has no token', as
   assert.equal(hashWins.metaAuth(), 'Bearer hash-token');
 });
 
-test('closes the provider menu on outside clicks even when official buttons stop propagation', async () => {
-  // 回归:官方账号/模型菜单按钮 stopPropagation,冒泡监听收不到,两个菜单
-  // 曾同时打开。现在 document 捕获阶段先关(自己 wrap 内的点击除外)。
+test('keeps the segmented Agent switcher always visible without a popup menu', async () => {
   const anchor = makeAnchor();
   const api = await loadDomShim({ getAnchor: () => anchor });
   api.sidebar.appendChild(anchor);
@@ -778,19 +864,12 @@ test('closes the provider menu on outside clicks even when official buttons stop
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   const wrap = api.sidebar.children[0];
-  const pill = wrap.querySelector('.multi-agent-provider-pill');
-  pill.click();
-  const menu = () => wrap.querySelector('.multi-agent-provider-menu');
-  assert.equal(menu().hidden, false);
-
-  // 外部点击(官方账号按钮,无 closest):菜单关闭。
+  const seg = wrap.querySelector('.multi-agent-provider-seg');
+  assert.ok(seg);
+  assert.equal(wrap.querySelector('.multi-agent-provider-menu'), null);
+  assert.equal(wrap.querySelector('.multi-agent-provider-pill'), null);
+  // 分段条本身没有展开态;点官方账号行也不应拆掉选择器。
   api.docClick({ target: anchor });
-  assert.equal(menu().hidden, true);
-  assert.equal(pill.getAttribute('aria-expanded'), 'false');
-
-  // 自己 wrap 内的点击:交给行/toggle,不被捕获监听误关。
-  pill.click();
-  assert.equal(menu().hidden, false);
-  api.docClick({ target: { closest: () => wrap } });
-  assert.equal(menu().hidden, false);
+  assert.equal(api.sidebar.children[0], wrap);
+  assert.ok(wrap.querySelector('.multi-agent-provider-seg'));
 });

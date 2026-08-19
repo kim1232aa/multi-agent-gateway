@@ -61,7 +61,7 @@
     // /api/v1/auth 永不带 provider:登录是 Kimi 的全局状态,切 Agent 只切
     // 会话/模型/命令来源,不切登录体系(否则 Claude/Codex 会被误显示成未登录)。
     if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta') return true;
-    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/workspace/fs:search' || /^\/api\/v1\/files\//.test(pathname)) return true;
+    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/workspace/fs:search' || /^\/api\/v1\/files\//.test(pathname)) return true;
     // /providers 和 /catalog/providers 是 Kimi 的供应商目录(设置页),不跟 Agent 切换走。
     if (/^\/api\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
     return /^\/api\/v1\/workspaces\/[^/]+\/skills$/.test(pathname);
@@ -159,7 +159,8 @@
         if (window.__multiAgent) window.__multiAgent.providers = PROVIDERS;
         if (PROVIDERS.indexOf(selectedProvider()) === -1) setProvider('kimi');
         if (changed) {
-          if (providerMenu && providerMenu.isConnected) { providerMenu.remove(); providerMenu = null; }
+          var stale = document.querySelector && document.querySelector('.multi-agent-provider-wrap');
+          if (stale) stale.remove();
           syncUi();
         }
       })
@@ -211,23 +212,11 @@
     }
   }
 
-  var providerMenu = null;
-
   function copyScopeAttributes(source, target) {
     if (!source || !source.attributes) return;
     for (var i = 0; i < source.attributes.length; i += 1) {
       var attr = source.attributes[i];
       if (attr.name.indexOf('data-v-') === 0) target.setAttribute(attr.name, '');
-    }
-  }
-
-  function closeMenu() {
-    if (providerMenu && providerMenu.isConnected) providerMenu.hidden = true;
-    else providerMenu = null;
-    var pill = document.querySelector('.multi-agent-provider-pill');
-    if (pill) {
-      pill.classList.remove('open');
-      pill.setAttribute('aria-expanded', 'false');
     }
   }
 
@@ -286,15 +275,11 @@
   }
 
   function switchProvider(provider) {
-    if (!isProvider(provider) || provider === selectedProvider()) {
-      closeMenu();
-      return;
-    }
+    if (!isProvider(provider) || provider === selectedProvider()) return;
     var facadeBefore = findFacade();
     if (facadeBefore) rememberModel(selectedProvider(), unwrapRef(facadeBefore.defaultModel));
     var onSessionPage = /^\/sessions\//.test(window.location.pathname);
     setProvider(provider);
-    closeMenu();
     // 不整页 reload:在会话页先软导航回主页(官方路由监听 popstate),
     // 再让官方 facade 按新 provider 重取工作区/会话/模型。
     if (onSessionPage) {
@@ -304,42 +289,61 @@
     refreshProviderData();
   }
 
-  function buildMenu(wrap) {
-    var menu = document.createElement('div');
-    menu.className = 'multi-agent-provider-menu';
-    menu.setAttribute('role', 'menu');
-    menu.hidden = true;
+  function updateSegIndicator(seg) {
+    if (!seg || !seg.querySelector) return;
+    var indicator = seg.querySelector('.ui-seg__indicator');
+    var on = seg.querySelector('.ui-seg__item.is-on');
+    if (!indicator || !on) return;
+    indicator.style.width = on.offsetWidth + 'px';
+    indicator.style.height = on.offsetHeight + 'px';
+    indicator.style.transform = 'translate(' + on.offsetLeft + 'px, ' + on.offsetTop + 'px)';
+    indicator.classList.add('is-ready');
+  }
+
+  function buildSeg(wrap) {
+    var seg = document.createElement('div');
+    seg.className = 'ui-seg ui-seg--sm multi-agent-provider-seg status-seg';
+    seg.setAttribute('role', 'tablist');
+    seg.setAttribute('aria-label', 'Agent');
+
+    var indicator = document.createElement('span');
+    indicator.className = 'ui-seg__indicator';
+    indicator.setAttribute('aria-hidden', 'true');
+    seg.appendChild(indicator);
 
     PROVIDERS.forEach(function (provider) {
-      var row = document.createElement('button');
-      row.type = 'button';
-      row.className = 'multi-agent-provider-row';
-      row.setAttribute('role', 'menuitemradio');
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'ui-seg__item multi-agent-provider-item';
+      item.setAttribute('role', 'tab');
+      item.setAttribute('data-provider', provider);
+      item.setAttribute('aria-selected', String(provider === selectedProvider()));
+      if (provider === selectedProvider()) item.classList.add('is-on');
 
-      var check = document.createElement('span');
-      check.className = 'multi-agent-provider-check';
-      check.textContent = provider === selectedProvider() ? '✓' : '';
+      var label = document.createElement('span');
+      label.className = 'ui-seg__label';
+      label.textContent = LABELS[provider];
+      item.appendChild(label);
 
-      var name = document.createElement('span');
-      name.className = 'multi-agent-provider-label';
-      name.textContent = LABELS[provider];
-
-      row.appendChild(check);
-      row.appendChild(name);
-      row.addEventListener('click', function (event) {
+      item.addEventListener('click', function (event) {
         event.stopPropagation();
         switchProvider(provider);
       });
-      menu.appendChild(row);
+      seg.appendChild(item);
     });
 
-    wrap.appendChild(menu);
-    providerMenu = menu;
-    return menu;
+    wrap.appendChild(seg);
+    // 等布局完成后再量 indicator,避免首帧宽度为 0。
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(function () { updateSegIndicator(seg); });
+    } else {
+      setTimeout(function () { updateSegIndicator(seg); }, 0);
+    }
+    return seg;
   }
 
-  // 选择器挂在侧边栏底部、官方账号行正上方(用户指定位置):克隆账号行的
-  // 官方类名与 scoped-style 属性,视觉与原版侧边栏项一致;账号行本身不改。
+  // 选择器挂在侧边栏底部、官方账号行正上方:用官方 SegmentedControl
+  // (ui-seg) 同款分段条,视觉对齐「进行中 / 已完成 / 工作空间」。
   function installSelector() {
     if (!document.querySelector) return;
     var existing = document.querySelector('.multi-agent-provider-wrap');
@@ -347,50 +351,33 @@
     if (!anchor || !anchor.parentElement) {
       // 账号区未挂载(加载中/被官方重渲染拆掉):选择器一并移除,不留孤儿。
       if (existing) existing.remove();
-      if (providerMenu && providerMenu.isConnected) providerMenu.remove();
-      providerMenu = null;
       return;
     }
-    if (existing) return;
+    if (existing) {
+      // provider 列表变化时重建分段项(meta 探测后可能变短)。
+      var seg = existing.querySelector('.multi-agent-provider-seg');
+      if (seg) {
+        var buttons = seg.querySelectorAll('.multi-agent-provider-item');
+        var same = buttons.length === PROVIDERS.length;
+        if (same) {
+          for (var i = 0; i < buttons.length; i += 1) {
+            if (buttons[i].getAttribute('data-provider') !== PROVIDERS[i]) { same = false; break; }
+          }
+        }
+        if (!same) {
+          existing.remove();
+        } else {
+          return;
+        }
+      } else {
+        existing.remove();
+      }
+    }
 
     var wrap = document.createElement('div');
     wrap.className = 'multi-agent-provider-wrap';
-
-    var row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'user-menu-trigger multi-agent-provider-pill';
-    row.setAttribute('aria-label', 'Agent');
-    row.setAttribute('aria-haspopup', 'menu');
-    row.setAttribute('aria-expanded', 'false');
-    copyScopeAttributes(anchor, row);
-
-    var avatar = document.createElement('span');
-    avatar.className = 'user-menu-avatar multi-agent-provider-avatar';
-    avatar.textContent = LABELS[selectedProvider()].slice(0, 1);
-    copyScopeAttributes(anchor, avatar);
-    var name = document.createElement('span');
-    name.className = 'user-menu-name multi-agent-provider-name';
-    name.textContent = LABELS[selectedProvider()];
-    copyScopeAttributes(anchor, name);
-    row.appendChild(avatar);
-    row.appendChild(name);
-
-    row.addEventListener('click', function (event) {
-      event.stopPropagation();
-      if (providerMenu && !providerMenu.isConnected) providerMenu = null;
-      var menu = providerMenu || buildMenu(wrap);
-      menu.hidden = !menu.hidden;
-      row.classList.toggle('open', !menu.hidden);
-      row.setAttribute('aria-expanded', String(!menu.hidden));
-    });
-    row.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        row.click();
-      }
-    });
-
-    wrap.appendChild(row);
+    copyScopeAttributes(anchor, wrap);
+    buildSeg(wrap);
     anchor.parentElement.insertBefore(wrap, anchor);
   }
 
@@ -427,29 +414,21 @@
   function syncUi() {
     if (!document.querySelector) return;
     installSelector();
-    var name = document.querySelector('.multi-agent-provider-name');
-    if (name && name.textContent !== LABELS[selectedProvider()]) name.textContent = LABELS[selectedProvider()];
-    var avatar = document.querySelector('.multi-agent-provider-avatar');
-    var letter = LABELS[selectedProvider()].slice(0, 1);
-    if (avatar && avatar.textContent !== letter) avatar.textContent = letter;
-    if (providerMenu && providerMenu.isConnected) {
-      Array.from(providerMenu.querySelectorAll('.multi-agent-provider-row')).forEach(function (row, index) {
-        var active = PROVIDERS[index] === selectedProvider();
-        row.classList.toggle('is-current', active);
-        row.setAttribute('aria-checked', String(active));
-        var check = row.querySelector('.multi-agent-provider-check');
-        var mark = active ? '✓' : '';
-        if (check && check.textContent !== mark) check.textContent = mark;
+    var seg = document.querySelector('.multi-agent-provider-seg');
+    if (seg) {
+      var current = selectedProvider();
+      Array.from(seg.querySelectorAll('.multi-agent-provider-item')).forEach(function (item) {
+        var provider = item.getAttribute('data-provider');
+        var active = provider === current;
+        item.classList.toggle('is-on', active);
+        item.setAttribute('aria-selected', String(active));
       });
-    } else {
-      providerMenu = null;
+      updateSegIndicator(seg);
     }
     gateModes();
   }
 
   function onRouteChange() {
-    closeMenu();
-    providerMenu = null;
     syncUi();
   }
 
@@ -464,17 +443,10 @@
   });
   window.addEventListener('popstate', onRouteChange);
   if (document.addEventListener) {
-    // 官方菜单(账号/模型)的触发按钮 stopPropagation,冒泡监听收不到 →
-    // 用捕获阶段关我们的菜单;点在自己 wrap(pill/菜单)内的交给行/toggle。
-    document.addEventListener('click', function (event) {
-      var target = event && event.target;
-      if (target && typeof target.closest === 'function' && target.closest('.multi-agent-provider-wrap')) return;
-      closeMenu();
-    }, true);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-menu, .am-row';
+  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {

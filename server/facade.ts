@@ -182,19 +182,75 @@ export class CodexProviderAdapter implements ProviderAdapter {
   }
 
   /**
-   * thread/list 服务端每次全扫 rollout 文件,本机 73 线程实测 ~4s。
-   * 常见查询(无 cursor、limit≤100)共享同一份全量页缓存(10s TTL),
-   * 并合并并发冷调用;create/startTurn 使缓存失效。
+   * thread/list 服务端每次全扫 rollout 文件,本机实测 ~4.7s。
+   * 前端首页常用 page_size=50,工作区聚合用 100——以前缓存只认 limit===100,
+   * 导致切到 Codex 每次都冷扫。现在无 cursor/cwd/archived 的首屏请求
+   * (limit≤100)共用一份 limit=100 暖页,再按需切片;切片游标用 __slice__:N,
+   * 吃完暖页后再接原生 next_cursor。
    */
   private fullPage: { ts: number; page: SessionPage } | null = null;
   private fullPageInflight: Promise<SessionPage> | null = null;
   /** 缓存代际:create/startTurn 使缓存失效时递增,防止在飞旧请求写回过期页。 */
   private fullPageGen = 0;
   private static readonly LIST_TTL_MS = 30_000;
+  /** 切片游标格式:__slice__:{gen}:{offset} —— gen 对不上就回退原生翻页,避免漂移。 */
+  private static readonly SLICE_CURSOR_PREFIX = '__slice__:';
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
-    if (query.limit === 100 && query.cursor == null && query.archived == null && query.cwd == null) {
-      return this.cachedFullPage();
+    const limit = Math.min(Math.max(query.limit ?? 100, 1), 100);
+    let sliceOffset: number | null = null;
+    let sliceGen: number | null = null;
+    if (typeof query.cursor === 'string' && query.cursor.startsWith(CodexProviderAdapter.SLICE_CURSOR_PREFIX)) {
+      const parts = query.cursor.slice(CodexProviderAdapter.SLICE_CURSOR_PREFIX.length).split(':');
+      if (parts.length === 2) {
+        sliceGen = Number(parts[0]);
+        sliceOffset = Number(parts[1]);
+      } else if (parts.length === 1) {
+        // 兼容旧格式 __slice__:N(无代际):当作当前代。
+        sliceGen = this.fullPageGen;
+        sliceOffset = Number(parts[0]);
+      }
+    }
+
+    if (
+      query.archived == null
+      && query.cwd == null
+      && (query.limit ?? 100) <= 100
+      && (
+        query.cursor == null
+        || (
+          sliceOffset !== null
+          && sliceGen !== null
+          && Number.isFinite(sliceOffset)
+          && Number.isFinite(sliceGen)
+          && sliceOffset >= 0
+        )
+      )
+    ) {
+      // 代际不符:暖页已重建,旧偏移不可信 → 回退原生游标路径。
+      if (sliceGen !== null && sliceGen !== this.fullPageGen) {
+        return this.fetchPage({ ...query, cursor: undefined, limit });
+      }
+      const full = await this.cachedFullPage();
+      // cachedFullPage 可能在等待期间被 invalidate,再核一次代际。
+      if (sliceGen !== null && sliceGen !== this.fullPageGen) {
+        return this.fetchPage({ ...query, cursor: undefined, limit });
+      }
+      const offset = sliceOffset ?? 0;
+      if (offset >= full.items.length) {
+        // 暖页已耗尽:若还有原生游标,从原生继续;否则空页。
+        if (!full.next_cursor) return { items: [] };
+        return this.fetchPage({ ...query, cursor: full.next_cursor, limit });
+      }
+      const items = full.items.slice(offset, offset + limit);
+      const nextOffset = offset + items.length;
+      if (nextOffset < full.items.length) {
+        return {
+          items,
+          next_cursor: `${CodexProviderAdapter.SLICE_CURSOR_PREFIX}${this.fullPageGen}:${nextOffset}`,
+        };
+      }
+      return { items, ...(full.next_cursor ? { next_cursor: full.next_cursor } : {}) };
     }
     return this.fetchPage(query);
   }
@@ -203,11 +259,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
     if (this.fullPage && Date.now() - this.fullPage.ts < CodexProviderAdapter.LIST_TTL_MS) {
       return Promise.resolve(this.fullPage.page);
     }
+    if (this.fullPageInflight) return this.fullPageInflight;
     const gen = this.fullPageGen;
-    this.fullPageInflight ??= this.fetchPage({ limit: 100 }).then(
+    this.fullPageInflight = this.fetchPage({ limit: 100 }).then(
       (page) => {
         // 空页不入缓存:app-server 刚 spawn 时索引未就绪可能暂时返回 0 条
-        // (实测预热阶段出现过),缓存空页会把"没有会话"的假象扩散 10s。
+        // (实测预热阶段出现过),缓存空页会把"没有会话"的假象扩散 30s。
         // 代际已变(create/startTurn 失效过)的在飞结果同样不写回,否则过期
         // 页会再顶 30s(审查发现)。
         if (gen === this.fullPageGen && (page.items.length > 0 || page.next_cursor)) {
@@ -295,13 +352,19 @@ export class CodexProviderAdapter implements ProviderAdapter {
       for (const item of (turn as { items?: unknown[] }).items ?? []) {
         const it = item as Record<string, unknown>;
         const type = it.type as string;
+        // thread/read 的 turn 用 startedAt/completedAt;item 本身通常没时间戳。
+        // 一律 nowIso 会让整页时间戳坍成"打开瞬间"。
+        const turnRec = turn as { startedAt?: unknown; completedAt?: unknown };
+        const createdAt = isoFromCodexTime(
+          it.createdAt ?? it.updatedAt ?? turnRec.startedAt ?? turnRec.completedAt,
+        );
         if (type === 'userMessage') {
           messages.push({
             id: (it.id as string) ?? randomUUID(),
             session_id: sessionId,
             role: 'user',
             content: [{ type: 'text', text: extractCodexText(it) }],
-            created_at: nowIso(),
+            created_at: createdAt,
           });
         } else if (type === 'agentMessage') {
           messages.push({
@@ -309,7 +372,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             session_id: sessionId,
             role: 'assistant',
             content: [{ type: 'text', text: (it.text as string) ?? '' }],
-            created_at: nowIso(),
+            created_at: createdAt,
           });
         } else if (type === 'reasoning') {
           // 思维链:summary 是分段数组,content 可能为 null(已加密)。
@@ -322,7 +385,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             session_id: sessionId,
             role: 'assistant',
             content: [{ type: 'thinking', text: summary }],
-            created_at: nowIso(),
+            created_at: createdAt,
           });
         } else if (isCodexToolItem(type)) {
           // 工具卡:call 与 output 分属两个 item 时按 call_id 配对;单个 item 自带
@@ -335,7 +398,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             session_id: sessionId,
             role: 'assistant',
             content: [{ type: 'tool_call', id: callId, name, input }],
-            created_at: nowIso(),
+            created_at: createdAt,
           });
           const outputText = extractCodexToolOutput(it);
           if (outputText !== null) {
@@ -350,7 +413,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
                 content: outputText,
                 is_error: exitCode !== undefined && exitCode !== 0,
               }],
-              created_at: nowIso(),
+              created_at: createdAt,
             });
           }
         }
@@ -639,15 +702,21 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const id = thread.id as string;
     // 列表扫到的历史会话也回填 cwd,充实 getCwd 兜底。
     if (thread.cwd || cwdOverride) this.threadCwd.set(id, cwd);
+    const title =
+      this.renames.get(id) ??
+      (thread.name as string) ?? (thread.preview as string)?.slice(0, 60) ?? `Codex ${id.slice(0, 8)}`;
+    const preview = typeof thread.preview === 'string' ? thread.preview : '';
     return {
       id,
       workspace_id: workspaceIdFromCwd(cwd, 'codex'),
-      title:
-        this.renames.get(id) ??
-        (thread.name as string) ?? (thread.preview as string)?.slice(0, 60) ?? `Codex ${id.slice(0, 8)}`,
+      title,
       created_at: isoFromCodexTime(thread.createdAt),
       updated_at: isoFromCodexTime(thread.updatedAt),
       busy: false,
+      // thread/list 在 archived=true 时返回的条目本身就是已归档;字段名经 catchall 保留。
+      archived: thread.archived === true,
+      // 0.37 Done 页过滤空 last_prompt;preview/标题都能撑起一条可见项。
+      extras: { last_prompt: preview || title },
       metadata: { cwd },
       provider: 'codex',
     };
@@ -837,7 +906,13 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
-    const sessions = (await this.inner.list()).filter((session) => !query.cwd || session.cwd === query.cwd);
+    // Claude CLI 没有原生归档:本网关用 SettingsStore 记 archived 标记。
+    // query.archived=true → 只列已归档(Done 页);缺省/false → 排除已归档(进行中)。
+    const sessions = (await this.inner.list()).filter((session) => {
+      if (query.cwd && session.cwd !== query.cwd) return false;
+      const isArchived = this.settings.getBoolean('archived', session.sessionId) === true;
+      return query.archived === true ? isArchived : !isArchived;
+    });
     const start = query.cursor ? sessions.findIndex((session) => session.sessionId === query.cursor) + 1 : 0;
     if (query.cursor && start === 0) return { items: [] };
     const limit = query.limit ?? 50;
@@ -1238,6 +1313,12 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     return listClaudeCommands(catalog);
   }
 
+  async setArchived(sessionId: string, archived: boolean): Promise<void> {
+    // Claude 无原生 archive RPC;落本机 sidecar。true 写入,false 删除键。
+    if (archived) this.settings.set('archived', sessionId, true);
+    else this.settings.delete('archived', sessionId);
+  }
+
   private toSession(s: {
     sessionId: string;
     title: string;
@@ -1247,13 +1328,18 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     // 历史会话(transcript 扫描而来)也回填 cwd——否则 resume 时 startTurn
     // 只能退回 HOME 目录启动 CLI(审查发现),项目级命令发现同样依赖它。
     if (s.cwd) this.sessionCwd.set(s.sessionId, s.cwd);
+    const title = this.renames.get(s.sessionId) ?? (s.title || `Claude ${s.sessionId.slice(0, 8)}`);
+    const archived = this.settings.getBoolean('archived', s.sessionId) === true;
     return {
       id: s.sessionId,
       workspace_id: workspaceIdFromCwd(s.cwd, 'claude'),
-      title: this.renames.get(s.sessionId) ?? (s.title || `Claude ${s.sessionId.slice(0, 8)}`),
+      title,
       created_at: s.updatedAt,
       updated_at: s.updatedAt,
       busy: false,
+      archived,
+      // 0.37 Done 页会丢掉 last_prompt 为空的归档项;没有更准的预览时用标题顶上。
+      extras: { last_prompt: title },
       metadata: { cwd: s.cwd },
       provider: 'claude',
     };

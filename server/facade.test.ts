@@ -52,6 +52,72 @@ test('filters Codex child and ephemeral threads without merging duplicate main t
   }]);
 });
 
+test('reuses one Codex warm page for homepage limit=50 after limit=100 preload', async () => {
+  // 回归:缓存曾只认 limit===100,前端 page_size=50 每次都冷扫 thread/list(~4.7s)。
+  const adapter = new CodexProviderAdapter();
+  let calls = 0;
+  const threads = Array.from({ length: 12 }, (_, index) => ({
+    id: `main-${index}`,
+    name: `t${index}`,
+    cwd: '/tmp/project',
+    updatedAt: 100 - index,
+  }));
+  (adapter as any).inner.list = async (query: any) => {
+    calls += 1;
+    assert.equal(query.limit, 100);
+    assert.equal(query.cursor ?? null, null);
+    return { threads, nextCursor: 'native-next', backwardsCursor: null };
+  };
+
+  const warm = await adapter.list({ limit: 100 });
+  assert.equal(warm.items.length, 12);
+  assert.equal(calls, 1);
+
+  const home = await adapter.list({ limit: 50 });
+  assert.equal(calls, 1, 'homepage limit=50 must hit the warm page, not rescans');
+  assert.deepEqual(home.items.map((session) => session.id), threads.slice(0, 12).map((t) => t.id));
+  // 暖页已吃完但仍有原生 next → 直接透出原生游标。
+  assert.equal(home.next_cursor, 'native-next');
+
+  const again = await adapter.list({ limit: 50 });
+  assert.equal(calls, 1);
+  assert.deepEqual(again.items.map((session) => session.id), home.items.map((session) => session.id));
+});
+
+test('Codex slice cursors carry generation and reject stale offsets after invalidate', async () => {
+  const adapter = new CodexProviderAdapter();
+  let calls = 0;
+  const mk = (n: number, offset = 0) => Array.from({ length: n }, (_, index) => ({
+    id: `main-${offset + index}`,
+    name: `t${offset + index}`,
+    cwd: '/tmp/project',
+    updatedAt: 1000 - offset - index,
+  }));
+  (adapter as any).inner.list = async (query: any) => {
+    calls += 1;
+    if (query.cursor) {
+      return { threads: mk(4, 100), nextCursor: null, backwardsCursor: null };
+    }
+    return { threads: mk(8), nextCursor: 'native-next', backwardsCursor: null };
+  };
+
+  const page1 = await adapter.list({ limit: 3 });
+  assert.equal(calls, 1);
+  assert.match(String(page1.next_cursor), /^__slice__:\d+:3$/);
+
+  // 同代际切片继续吃暖页,不再打 RPC。
+  const page2 = await adapter.list({ limit: 3, cursor: page1.next_cursor });
+  assert.equal(calls, 1);
+  assert.deepEqual(page2.items.map((s) => s.id), ['main-3', 'main-4', 'main-5']);
+
+  // startTurn 会使缓存代际递增;旧切片游标必须失效并回退到原生首屏。
+  (adapter as any).invalidateListCache();
+  const stale = await adapter.list({ limit: 3, cursor: page1.next_cursor });
+  assert.equal(calls, 2, 'stale slice cursor must not reuse rebuilt warm page offsets');
+  assert.ok(stale.items.length >= 3);
+  assert.equal(stale.items[0]?.id, 'main-0');
+});
+
 test('forgets a Codex draft after deleting its thread', async () => {
   const adapter = new CodexProviderAdapter();
   (adapter as any).inner.create = async () => ({
@@ -110,6 +176,77 @@ test('lists only top-level Claude sessions and paginates without merging duplica
   } finally {
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test('archives Claude sessions via sidecar settings and filters Done lists', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-facade-archive-'));
+  const projectsDir = join(base, 'projects');
+  const projectDir = join(projectsDir, 'project');
+  const settingsPath = join(base, 'session-settings.claude.json');
+  const openId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const doneId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  try {
+    await mkdir(projectDir, { recursive: true });
+    for (const [id, title] of [[openId, 'still open'], [doneId, 'mark done']] as const) {
+      await writeFile(join(projectDir, `${id}.jsonl`), JSON.stringify({
+        type: 'ai-title',
+        aiTitle: title,
+        cwd: '/tmp/project',
+      }) + '\n');
+    }
+
+    const adapter = new ClaudeProviderAdapter({ projectsDir, settingsPath });
+    assert.ok(adapter.setArchived);
+
+    const before = await adapter.list({ limit: 10 });
+    assert.deepEqual(before.items.map((session) => session.id).sort(), [openId, doneId].sort());
+    assert.equal(before.items.every((session) => session.archived !== true), true);
+    assert.equal(before.items.every((session) => typeof session.extras?.last_prompt === 'string' && session.extras.last_prompt.length > 0), true);
+
+    await adapter.setArchived!(doneId, true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const open = await adapter.list({ limit: 10 });
+    assert.deepEqual(open.items.map((session) => session.id), [openId]);
+
+    const done = await adapter.list({ limit: 10, archived: true });
+    assert.deepEqual(done.items.map((session) => session.id), [doneId]);
+    assert.equal(done.items[0].archived, true);
+    assert.equal(done.items[0].extras?.last_prompt, 'mark done');
+
+    // 持久化到 sidecar,新实例也能看到 Done。
+    const restarted = new ClaudeProviderAdapter({ projectsDir, settingsPath });
+    const doneAgain = await restarted.list({ limit: 10, archived: true });
+    assert.deepEqual(doneAgain.items.map((session) => session.id), [doneId]);
+
+    await restarted.setArchived!(doneId, false);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const restored = await restarted.list({ limit: 10 });
+    assert.deepEqual(restored.items.map((session) => session.id).sort(), [openId, doneId].sort());
+    assert.deepEqual((await restarted.list({ limit: 10, archived: true })).items, []);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('surfaces Codex archived flag and last_prompt for Done filtering', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.list = async (query: any) => {
+    assert.equal(query.archived, true);
+    return {
+      threads: [
+        { id: 'archived-a', name: 'done title', preview: 'last user line', cwd: '/tmp/project', updatedAt: 2, archived: true },
+        { id: 'child', name: 'done title', cwd: '/tmp/project', updatedAt: 1, parentThreadId: 'archived-a', archived: true },
+      ],
+      nextCursor: null,
+      backwardsCursor: null,
+    };
+  };
+
+  const page = await adapter.list({ limit: 10, archived: true });
+  assert.deepEqual(page.items.map((session) => session.id), ['archived-a']);
+  assert.equal(page.items[0].archived, true);
+  assert.equal(page.items[0].extras?.last_prompt, 'last user line');
 });
 
 test('keeps Claude history message ids stable across repeated reads', async () => {
@@ -212,11 +349,12 @@ async function fakeClaudeBin(base: string, opts: { fail?: boolean } = {}): Promi
   const body = opts.fail
     ? 'process.exit(1);'
     : `const models = ${JSON.stringify(HANDSHAKE_MODELS)};
+const commands = [{ name: 'compact', description: 'Compact', argumentHint: '', aliases: [] }];
 process.stdin.on('data', (chunk) => {
   if (!chunk.toString().includes('control_request')) return;
   process.stdout.write(JSON.stringify({
     type: 'control_response',
-    response: { subtype: 'success', request_id: 'gw_init', response: { models } },
+    response: { subtype: 'success', request_id: 'gw_init', response: { models, commands } },
   }) + '\\n');
   process.exit(0);
 });`;
@@ -261,6 +399,71 @@ test('caches the Claude model handshake instead of spawning per call', async () 
     assert.equal((await readFile(marker, 'utf8')).length, 1);
   } finally {
     restoreAnthropicModelVars(saved);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('shares one Claude handshake spawn between models and commands', async () => {
+  // 回归:切到 Claude 时 /models 与 /commands 曾各自 spawn 一次(~1s×2)。
+  const saved = stashAnthropicModelVars();
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-shared-handshake-'));
+  try {
+    const { bin, marker } = await fakeClaudeBin(base);
+    const adapter = new ClaudeProviderAdapter({ claudeBin: bin } as any);
+    const models = await adapter.listModels();
+    const commands = await adapter.listCommands();
+    assert.ok(models.length >= 1);
+    assert.ok(commands.some((command) => command.name === 'compact'));
+    assert.equal((await readFile(marker, 'utf8')).length, 1);
+  } finally {
+    restoreAnthropicModelVars(saved);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('keeps Claude tool and thinking blocks even when text is empty', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-tools-history-'));
+  const projectsDir = join(base, 'projects');
+  const projectDir = join(projectsDir, 'project');
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, `${sessionId}.jsonl`), [
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-08-11T10:00:00.000Z',
+        message: { role: 'user', content: 'run tool' },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-08-11T10:00:01.000Z',
+        message: {
+          role: 'assistant',
+          model: 'claude-test',
+          content: [
+            { type: 'thinking', thinking: 'plan the call' },
+            { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'pwd' } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-08-11T10:00:02.000Z',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '/tmp/project' }],
+        },
+      }),
+    ].join('\n') + '\n');
+
+    const history = await new ClaudeProviderAdapter({ projectsDir }).getHistory(sessionId);
+    assert.equal(history.length, 3);
+    assert.deepEqual(
+      history[1]?.content.map((part) => part.type),
+      ['thinking', 'tool_call'],
+    );
+    assert.equal(history[2]?.content[0]?.type, 'tool_result');
+  } finally {
     await rm(base, { recursive: true, force: true });
   }
 });

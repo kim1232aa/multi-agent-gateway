@@ -136,6 +136,13 @@ function providerFromSessionId(id: string): { provider: ProviderName; nativeId: 
   return { provider: 'kimi', nativeId: id };
 }
 
+/** archive/restore/delete 后清掉该会话当过页尾时留下的翻页游标,避免 Open/Done 串页。 */
+function clearSessionPageCursors(pageCursors: Map<string, string>, sessionId: string): void {
+  for (const key of pageCursors.keys()) {
+    if (key.endsWith(`\u0000${sessionId}`)) pageCursors.delete(key);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // envelope
 // ---------------------------------------------------------------------------
@@ -373,7 +380,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     : null;
   kimiFollowTimer?.unref();
 
-  // SPA 静态托管:校验官方 0.33 资产后只在 index 响应内存中注入扩展。
+  // SPA 静态托管:校验官方 web-dist 资产后只在 index 响应内存中注入扩展。
   const staticDir = options.staticDir;
   let webShell: WebShell | null = null;
   if (staticDir) {
@@ -423,6 +430,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       await route(req, res);
     })().catch((err: unknown) => {
       const requestId = ulid();
+      // 以前零服务端日志:运维只能在浏览器看到 500,网关日志一片空白。
+      console.error(
+        `[gateway] request failed ${requestId} ${req.method} ${req.url}:`,
+        err instanceof Error ? err.stack ?? err.message : err,
+      );
       if (res.headersSent) return;
       if (err instanceof ProviderError) {
         fail(res, err.httpStatus, codeNumber(err.code), err.message, requestId);
@@ -442,7 +454,13 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
 
     // 非 API 路径 → SPA 静态托管;没配静态目录则 404。
-    if (!url.pathname.startsWith(API) && url.pathname !== '/api/v2/sessions') {
+    // /api/v2/sessions 及 :archive/:restore 是 0.37 Done/会话管理页用的本地路由。
+    if (
+      !url.pathname.startsWith(API)
+      && url.pathname !== '/api/v2/sessions'
+      && url.pathname !== '/api/v2/sessions:archive'
+      && url.pathname !== '/api/v2/sessions:restore'
+    ) {
       if (serveStatic && serveStatic(req, res)) return;
       fail(res, 404, 40400, 'not an api route', requestId);
       return;
@@ -470,6 +488,48 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       return ok(res, { items, has_more: Boolean(data.has_more), next_page_token: data.has_more ? String(items[items.length - 1]?.id ?? '') : null }, requestId);
     }
 
+    // 0.37 会话管理页批量归档/恢复。claude/codex 走本地 adapter;kimi 不该到这里
+    // (shouldProxyToKimi 已把无 provider 前缀的 /api/v2 交给上游)。
+    if (
+      (url.pathname === '/api/v2/sessions:archive' || url.pathname === '/api/v2/sessions:restore')
+      && req.method === 'POST'
+    ) {
+      const archived = url.pathname.endsWith(':archive');
+      const body = (await readBody(req).catch(() => ({}))) as { ids?: unknown };
+      const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === 'string' && id.length > 0) : [];
+      if (ids.length === 0) throw new ProviderError('invalid_request', 'ids required', 400);
+      // 先全量校验,避免中途抛错造成"前面已归档、响应却是失败"。
+      const planned: Array<{ id: string; provider: Exclude<ProviderName, 'kimi'>; nativeId: string }> = [];
+      for (const id of ids) {
+        const { provider: sp, nativeId } = providerFromSessionId(id);
+        if (sp === 'kimi') {
+          throw new ProviderError('unsupported', 'kimi bulk archive must go through upstream kap-server', 400);
+        }
+        if (!adapters[sp].setArchived) throw new ProviderError('unsupported', `${sp} 不支持归档`, 400);
+        planned.push({ id, provider: sp, nativeId });
+      }
+      const succeeded: string[] = [];
+      const failed: Array<{ id: string; reason: string }> = [];
+      for (const item of planned) {
+        try {
+          await adapters[item.provider].setArchived!(item.nativeId, archived);
+          // busy 会话保留 replay,避免归档瞬间把进行中 turn 的补帧清掉。
+          if (archived && !hub.busy.has(item.id)) hub.drop(item.id);
+          clearSessionPageCursors(sessionPageCursors, item.id);
+          succeeded.push(item.id);
+        } catch (err) {
+          failed.push({ id: item.id, reason: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      return ok(res, {
+        ok: failed.length === 0,
+        archived,
+        count: succeeded.length,
+        succeeded,
+        failed,
+      }, requestId);
+    }
+
     // --- 元信息 ---
     if (sub === '/healthz') return ok(res, { ok: true }, requestId);
     if (sub === '/meta') {
@@ -477,7 +537,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 实际安装的 provider——前端选择器只显示这些。
       const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
       return ok(res, {
-        server_version: 'multi-agent-gateway/0.1 (Kimi 0.36.1 compatible)',
+        server_version: 'multi-agent-gateway/0.1 (Kimi 0.37.2 compatible)',
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
         server_id: 'multi-agent-gateway',
         started_at: new Date(0).toISOString(),
@@ -492,12 +552,28 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 登录态永远以 Kimi 上游为准,即使 URL 带了 provider=claude/codex:
       // 这两家是本地 CLI provider,不在网关伪造各自的 ready——否则模型目录
       // 为空时会被前端误显示成"未登录"(实测复现)。
-      const data = (await kimiFetch('/auth').catch(() => null)) as Record<string, unknown> | null;
-      if (data) return ok(res, data, requestId);
-      return ok(res, { ready: true, providers_count: 1, default_model: null, managed_provider: null }, requestId);
+      // 但 kimi 上游本身挂了时,不能再假 ready:true 掩盖故障。
+      try {
+        const data = await kimiFetch('/auth') as Record<string, unknown>;
+        return ok(res, data, requestId);
+      } catch (err) {
+        if (provider && provider !== 'kimi') {
+          // Claude/Codex 选择器仍要能进主页;登录徽章只反映 Kimi。
+          return ok(res, {
+            ready: false,
+            providers_count: 0,
+            default_model: null,
+            managed_provider: null,
+            upstream_error: err instanceof Error ? err.message : String(err),
+          }, requestId);
+        }
+        throw err instanceof ProviderError
+          ? err
+          : new ProviderError('upstream_error', err instanceof Error ? err.message : String(err), 502);
+      }
     }
 
-    // 非 Kimi provider 复用官方 0.33 配置 UI，但配置只投影到当前 provider，
+    // 非 Kimi provider 复用官方配置 UI，但配置只投影到当前 provider，
     // 不把 Claude/Codex 模型写进 Kimi 的 config.toml。
     if (provider && provider !== 'kimi' && sub === '/config' && (req.method === 'GET' || req.method === 'POST')) {
       const patch = req.method === 'POST'
@@ -640,19 +716,29 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (!adapter.delete) throw new ProviderError('unsupported', `${sp} 不支持删除会话`, 400);
         await adapter.delete(nativeId);
         // 清掉 hub 里的残留态(队列/回放缓冲),避免删后重建同 id 会话串味。
-        hub.drop(prefixedId(sp, nativeId));
+        const sid = prefixedId(sp, nativeId);
+        hub.drop(sid);
+        clearSessionPageCursors(sessionPageCursors, sid);
         return ok(res, { deleted: true }, requestId);
       }
       if (tail === ':archive' && req.method === 'POST') {
         if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持归档`, 400);
         await adapter.setArchived(nativeId, true);
-        hub.drop(prefixedId(sp, nativeId));
+        const sid = prefixedId(sp, nativeId);
+        if (!hub.busy.has(sid)) hub.drop(sid);
+        clearSessionPageCursors(sessionPageCursors, sid);
         return ok(res, { archived: true }, requestId);
       }
       if (tail === ':restore' && req.method === 'POST') {
         if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持恢复归档`, 400);
         await adapter.setArchived(nativeId, false);
+        clearSessionPageCursors(sessionPageCursors, prefixedId(sp, nativeId));
         return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
+      }
+      if (tail === ':btw' && req.method === 'POST') {
+        // 0.37 侧边对话是 Kimi 原生能力;Claude/Codex 暂无等价通道。
+        // 明确 400,避免前端把裸 404 当成路由错误。
+        throw new ProviderError('unsupported', `${sp} 不支持侧边对话(:btw)`, 400);
       }
       if (tail === ':undo' && req.method === 'POST') {
         // 撤销最近 count 轮。codex:thread/rollback(0.147.0 实测历史真消失,
@@ -1060,6 +1146,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     server.listen(port, host, () => resolveListen());
   });
 
+  void hydrateUploadsFromDisk();
   // 预热列表缓存(codex thread/list 服务端全扫 ~4s),让首个页面请求落在暖缓存上。
   void Promise.allSettled([adapters.codex.list({ limit: 100 }), adapters.claude.list({ limit: 100 })]).then(
     (rs) => {
@@ -1120,6 +1207,8 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
   // 否则平铺视图/搜索/已归档只看得到 Kimi。
   if (url.pathname.startsWith('/api/v2')) {
     const v2Provider = url.searchParams.get('provider');
+    // 列表与批量归档/恢复:只有显式 claude/codex 才留在本网关;其余透传 kap。
+    // boot.js 会给这些路径补 ?provider=,所以 Claude/Codex 侧边栏操作不会误进上游。
     if (v2Provider === 'claude' || v2Provider === 'codex') return false;
     return true;
   }
@@ -1406,7 +1495,9 @@ async function listSessions(
   const rootNorm = workspaceRoot?.replace(/\/+$/, '');
   if (provider && provider !== 'kimi') {
     const adapter = adapters[provider];
-    const cursorKey = (id: string): string => `${provider}\u0000${workspaceId ?? ''}\u0000${id}`;
+    // Open/Done 翻页游标必须带 archived 维度,否则两边页尾 id 相同时会串用。
+    const archiveLane = archivedOnly ? 'ar' : 'op';
+    const cursorKey = (id: string): string => `${provider}\u0000${workspaceId ?? ''}\u0000${archiveLane}\u0000${id}`;
     let cursor: string | undefined;
     if (beforeId) {
       cursor = pageCursors.get(cursorKey(beforeId));
@@ -1420,9 +1511,15 @@ async function listSessions(
       return { items: [] as Session[] };
     });
     // Codex 原始页可能只有子 agent;adapter 过滤后为空时沿原生 cursor 前进,
-    // 避免 UI 因拿不到 before_id 而卡在空页。
+    // 避免 UI 因拿不到 before_id 而卡在空页。翻页必须继续带上 archived,
+    // 否则 Done 页会混进进行中会话。
     for (let skipped = 0; page.items.length === 0 && page.next_cursor && skipped < 20; skipped += 1) {
-      page = await adapter.list({ limit, cursor: page.next_cursor, cwd: rootNorm });
+      page = await adapter.list({
+        limit,
+        cursor: page.next_cursor,
+        cwd: rootNorm,
+        archived: archivedOnly || undefined,
+      });
     }
     const localItems = page.items.map((session) => sessionDto(
       session,
@@ -2466,6 +2563,21 @@ function attachGatewayWebSocket(
     if (chosenProto) headers.push(`Sec-WebSocket-Protocol: ${chosenProto}`);
     socket.write(headers.concat('\r\n').join('\r\n'));
     gatewaySockets.add(socket);
+    // TCP keepalive + WS ping:手机/隧道静默断连时尽快回收 socket/订阅。
+    try { (socket as import('node:net').Socket).setKeepAlive?.(true, 30_000); } catch { /* ignore */ }
+    let lastPongAt = Date.now();
+    const pingTimer = setInterval(() => {
+      if (socket.destroyed) {
+        clearInterval(pingTimer);
+        return;
+      }
+      if (Date.now() - lastPongAt > 90_000) {
+        socket.destroy();
+        return;
+      }
+      try { wsSendFrame(socket, 0x9, Buffer.alloc(0)); } catch { socket.destroy(); }
+    }, 30_000);
+    pingTimer.unref?.();
 
     const sendObj = (obj: Record<string, unknown>): void => {
       if (socket.destroyed) return;
@@ -2640,6 +2752,10 @@ function attachGatewayWebSocket(
           wsSendFrame(socket, 0xa, wsFrame.payload);
           continue;
         }
+        if (wsFrame.opcode === 0xa) {
+          lastPongAt = Date.now();
+          continue;
+        }
         if (wsFrame.opcode === 0x1) {
           fragments = [wsFrame.payload]; // 新消息首帧(上一段未完则丢弃)
           fragmentBytes = wsFrame.payload.byteLength;
@@ -2661,6 +2777,7 @@ function attachGatewayWebSocket(
       }
     });
     const cleanup = (): void => {
+      clearInterval(pingTimer);
       gatewaySockets.delete(socket);
       offGlobal();
       for (const off of localOffs.values()) off();
@@ -2939,7 +3056,12 @@ function buildStoreZip(files: Array<{ name: string; data: Buffer }>): Buffer {
 // 文件上传(multipart 解析 + 本地存储)
 // ---------------------------------------------------------------------------
 
-const UPLOAD_DIR = path.join(process.env.HOME ?? os.homedir(), 'multi-agent-gateway', 'server', 'temp', 'uploads');
+const UPLOAD_DIR = path.join(
+  process.env.GATEWAY_SETTINGS_DIR
+    ?? path.join(os.homedir(), '.config', 'multi-agent-gateway'),
+  'uploads',
+);
+const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
 
 interface UploadMeta {
   id: string;
@@ -2949,8 +3071,55 @@ interface UploadMeta {
   created_at: string;
 }
 
-/** 上传元数据(内存态;文件本体在 UPLOAD_DIR,重启后元数据丢失、文件孤儿,可接受——temp 目录)。 */
+/** 上传元数据(内存态;文件本体在 UPLOAD_DIR)。启动时扫盘重建,TTL 清扫孤儿。 */
 const uploads = new Map<string, UploadMeta>();
+
+async function ensureUploadDir(): Promise<void> {
+  await fsp.mkdir(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+}
+
+async function hydrateUploadsFromDisk(): Promise<void> {
+  try {
+    await ensureUploadDir();
+    const names = await fsp.readdir(UPLOAD_DIR);
+    const now = Date.now();
+    for (const name of names) {
+      if (!/^[\w-]+$/.test(name)) continue;
+      const full = path.join(UPLOAD_DIR, name);
+      const st = await fsp.stat(full).catch(() => null);
+      if (!st || !st.isFile()) continue;
+      if (now - st.mtimeMs > UPLOAD_TTL_MS) {
+        await fsp.unlink(full).catch(() => undefined);
+        continue;
+      }
+      if (!uploads.has(name)) {
+        uploads.set(name, {
+          id: name,
+          name,
+          media_type: 'application/octet-stream',
+          size: st.size,
+          created_at: new Date(st.mtimeMs).toISOString(),
+        });
+      }
+    }
+  } catch {
+    // 上传目录不可用时不阻塞启动。
+  }
+}
+
+function forgetUpload(id: string): void {
+  uploads.delete(id);
+  if (!/^[\w-]+$/.test(id)) return;
+  void fsp.unlink(path.join(UPLOAD_DIR, id)).catch(() => undefined);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, meta] of uploads) {
+    const created = Date.parse(meta.created_at);
+    if (!Number.isFinite(created) || now - created > UPLOAD_TTL_MS) forgetUpload(id);
+  }
+}, 15 * 60 * 1000).unref?.();
 
 /** 极简 multipart/form-data 解析:只取第一个带 filename 的段(前端 postForm 单文件)。 */
 async function readMultipart(req: IncomingMessage): Promise<{ filename: string; contentType: string; data: Buffer } | null> {
@@ -2993,8 +3162,8 @@ async function readMultipart(req: IncomingMessage): Promise<{ filename: string; 
 
 async function storeUpload(name: string, mediaType: string, data: Buffer): Promise<UploadMeta> {
   const id = randomUUID();
-  await fsp.mkdir(UPLOAD_DIR, { recursive: true });
-  await fsp.writeFile(path.join(UPLOAD_DIR, id), data);
+  await ensureUploadDir();
+  await fsp.writeFile(path.join(UPLOAD_DIR, id), data, { mode: 0o600 });
   const meta: UploadMeta = { id, name, media_type: mediaType, size: data.byteLength, created_at: new Date().toISOString() };
   uploads.set(id, meta);
   return meta;

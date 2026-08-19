@@ -461,6 +461,11 @@ export async function fsGrep(
     const lines = buf.toString('utf8').split('\n');
     const matches: Array<{ line: number; col: number; text: string; before: string[]; after: string[] }> = [];
     for (let i = 0; i < lines.length; i += 1) {
+      // 行内也查预算:灾难性回溯不能等到扫完整个文件才停。
+      if (Date.now() - started > GREP_TIME_BUDGET_MS) {
+        truncated = true;
+        break;
+      }
       re.lastIndex = 0;
       const m = re.exec(lines[i]);
       if (!m) continue;

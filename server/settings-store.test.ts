@@ -16,6 +16,7 @@ test('settings persist across store instances (gateway restart)', async () => {
     first.set('model', 's1', 'gpt-5.6-sol');
     first.set('thinking', 's1', 'high');
     first.set('plan', 's2', true);
+    first.flushNow();
 
     // 模拟重启:新实例从磁盘恢复。
     const second = new SettingsStore(path);
@@ -27,6 +28,7 @@ test('settings persist across store instances (gateway restart)', async () => {
 
     // delete 同样落盘。
     second.delete('plan', 's2');
+    second.flushNow();
     assert.equal(new SettingsStore(path).getBoolean('plan', 's2'), undefined);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -41,6 +43,7 @@ test('tolerates a corrupted settings file and stays writable', async () => {
     const store = new SettingsStore(path);
     assert.equal(store.getString('model', 's1'), undefined);
     store.set('model', 's1', 'm');
+    store.flushNow();
     assert.equal(new SettingsStore(path).getString('model', 's1'), 'm');
   } finally {
     await rm(dir, { recursive: true, force: true });

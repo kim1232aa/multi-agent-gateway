@@ -314,9 +314,21 @@ export class ClaudeAdapter {
   // -- getHistory -----------------------------------------------------------
 
   /** Parse the session transcript into user/assistant text messages. */
+  private historyCache = new Map<string, { mtimeMs: number; size: number; messages: ClaudeHistoryMessage[] }>();
+
   async getHistory(sessionId: string): Promise<ClaudeHistoryMessage[]> {
     const filePath = this.findSessionFile(sessionId);
     if (!filePath) throw new Error(`claude-adapter: session not found: ${sessionId}`);
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(filePath);
+    } catch {
+      throw new Error(`claude-adapter: session not found: ${sessionId}`);
+    }
+    const hit = this.historyCache.get(sessionId);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+      return hit.messages;
+    }
     const messages: ClaudeHistoryMessage[] = [];
     for (const line of fs.readFileSync(filePath, "utf8").split("\n")) {
       if (!line) continue;
@@ -331,9 +343,8 @@ export class ClaudeAdapter {
       if (type !== "user" && type !== "assistant") continue;
       const msg = entry.message;
       if (!msg || msg.role !== type) continue;
-      const text = extractText(msg.content);
-      if (!text) continue; // tool_result-only user entries, empty thinking, etc.
-      if (type === "user" && isLocalCommandText(text)) continue;
+      // 先收结构化块,再决定是否丢弃——原先 `if (!text) continue` 会把
+      // tool_use / tool_result / 纯 thinking 整条蒸发(刷新后工具卡全没)。
       const blocks: NonNullable<ClaudeHistoryMessage["blocks"]> = [];
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
@@ -359,6 +370,9 @@ export class ClaudeAdapter {
           }
         }
       }
+      const text = extractText(msg.content);
+      if (!text && blocks.length === 0) continue;
+      if (type === "user" && text && isLocalCommandText(text)) continue;
       messages.push({
         role: type,
         text,
@@ -368,6 +382,7 @@ export class ClaudeAdapter {
         isError: type === "assistant" && entry.isApiErrorMessage === true,
       });
     }
+    this.historyCache.set(sessionId, { mtimeMs: st.mtimeMs, size: st.size, messages });
     return messages;
   }
 
@@ -539,32 +554,27 @@ export class ClaudeAdapter {
    * 每次调用spawn一个短命进程只做握手(不跑模型),按 cwd 缓存 5 分钟
    * (项目级命令随 cwd 不同)。
    */
-  private commandsCache = new Map<string, { ts: number; commands: ClaudeSlashCommand[] }>();
   private static readonly COMMANDS_TTL_MS = 5 * 60_000;
+  /** initialize 握手整包缓存(按 cwd):commands/models 同一次 spawn 都能取到。 */
+  private handshakeCache = new Map<string, { ts: number; response: any }>();
+  private handshakeInflight = new Map<string, Promise<any | null>>();
 
   async listSlashCommands(cwd?: string): Promise<ClaudeSlashCommand[]> {
-    const key = cwd ?? "";
-    const hit = this.commandsCache.get(key);
-    if (hit && Date.now() - hit.ts < ClaudeAdapter.COMMANDS_TTL_MS) return hit.commands;
-    const commands = await this.initializeHandshake(cwd, (response) => {
-      const list = response?.commands;
-      if (!Array.isArray(list)) return null;
-      return list
-        .filter((c: any) => c && typeof c.name === "string")
-        .map((c: any) => ({
-          name: c.name as string,
-          description: typeof c.description === "string" ? c.description : (c.name as string),
-          argumentHint: typeof c.argumentHint === "string" ? c.argumentHint : "",
-          aliases: Array.isArray(c.aliases) ? c.aliases.filter((a: any) => typeof a === "string") : [],
-        }));
-    });
-    // 与 listBuiltinModels 同一口径:握手失败如实抛错,不吞成空目录——
-    // 空目录会让前端把"CLI 坏了"显示成"没有命令"(错误就报错,不掩盖)。
-    if (!commands) {
+    const response = await this.getHandshakeResponse(cwd);
+    const list = response?.commands;
+    if (!Array.isArray(list)) {
+      // 与 listBuiltinModels 同一口径:握手失败如实抛错,不吞成空目录——
+      // 空目录会让前端把"CLI 坏了"显示成"没有命令"(错误就报错,不掩盖)。
       throw new Error("claude-adapter: initialize handshake returned no commands (CLI missing, broken, or too old)");
     }
-    this.commandsCache.set(key, { ts: Date.now(), commands });
-    return commands;
+    return list
+      .filter((c: any) => c && typeof c.name === "string")
+      .map((c: any) => ({
+        name: c.name as string,
+        description: typeof c.description === "string" ? c.description : (c.name as string),
+        argumentHint: typeof c.argumentHint === "string" ? c.argumentHint : "",
+        aliases: Array.isArray(c.aliases) ? c.aliases.filter((a: any) => typeof a === "string") : [],
+      }));
   }
 
   // -- 内置模型目录(initialize 握手) ------------------------------------------
@@ -575,39 +585,49 @@ export class ClaudeAdapter {
    * description、supportedEffortLevels;握手不需要登录态)。未配置自定义
    * 端点时,Web 选择器必须展示这个目录,而不是拿环境变量拼占位模型。
    *
-   * 只缓存成功结果(5 分钟);失败如实抛错且不进缓存,下次调用真实重试。
+   * 与 listSlashCommands 共用握手整包缓存:切到 Claude 时 /models+/commands
+   * 只 spawn 一次,不再各起一个 ~1s 进程。
    */
-  private modelsCache: { ts: number; models: ClaudeBuiltinModel[] } | null = null;
-
   async listBuiltinModels(): Promise<ClaudeBuiltinModel[]> {
-    if (this.modelsCache && Date.now() - this.modelsCache.ts < ClaudeAdapter.COMMANDS_TTL_MS) {
-      return this.modelsCache.models;
-    }
-    const models = await this.initializeHandshake(undefined, (response) => {
-      const list = response?.models;
-      if (!Array.isArray(list) || list.length === 0) return null;
-      return list
-        .filter((m: any) => m && typeof m.value === "string")
-        .map((m: any) => ({
-          value: m.value as string,
-          resolvedModel: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
-          displayName: typeof m.displayName === "string" ? m.displayName : undefined,
-          description: typeof m.description === "string" ? m.description : undefined,
-          supportsEffort: m.supportsEffort === true,
-          supportedEffortLevels: Array.isArray(m.supportedEffortLevels)
-            ? m.supportedEffortLevels.filter((e: any) => typeof e === "string")
-            : undefined,
-        }));
-    });
-    if (!models) {
+    const response = await this.getHandshakeResponse(undefined);
+    const list = response?.models;
+    if (!Array.isArray(list) || list.length === 0) {
       throw new Error("claude-adapter: initialize handshake returned no models (CLI missing, broken, or too old)");
     }
-    this.modelsCache = { ts: Date.now(), models };
-    return models;
+    return list
+      .filter((m: any) => m && typeof m.value === "string")
+      .map((m: any) => ({
+        value: m.value as string,
+        resolvedModel: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
+        displayName: typeof m.displayName === "string" ? m.displayName : undefined,
+        description: typeof m.description === "string" ? m.description : undefined,
+        supportsEffort: m.supportsEffort === true,
+        supportedEffortLevels: Array.isArray(m.supportedEffortLevels)
+          ? m.supportedEffortLevels.filter((e: any) => typeof e === "string")
+          : undefined,
+      }));
   }
 
-  /** initialize 控制握手:起一个短命进程(不跑模型),取 response 里的指定字段。 */
-  private initializeHandshake<T>(cwd: string | undefined, pick: (response: any) => T | null): Promise<T | null> {
+  /** 取 initialize 整包(成功结果缓存 5 分钟;并发合并;失败不进缓存)。 */
+  private getHandshakeResponse(cwd?: string): Promise<any | null> {
+    const key = cwd ?? "";
+    const hit = this.handshakeCache.get(key);
+    if (hit && Date.now() - hit.ts < ClaudeAdapter.COMMANDS_TTL_MS) {
+      return Promise.resolve(hit.response);
+    }
+    const inflight = this.handshakeInflight.get(key);
+    if (inflight) return inflight;
+    const pending = this.spawnHandshake(cwd).then((response) => {
+      this.handshakeInflight.delete(key);
+      if (response) this.handshakeCache.set(key, { ts: Date.now(), response });
+      return response;
+    });
+    this.handshakeInflight.set(key, pending);
+    return pending;
+  }
+
+  /** initialize 控制握手:起一个短命进程(不跑模型),回整包 response。 */
+  private spawnHandshake(cwd: string | undefined): Promise<any | null> {
     return new Promise((resolve) => {
       const child = spawn(
         this.claudeBin,
@@ -615,7 +635,7 @@ export class ClaudeAdapter {
         { cwd: cwd ?? os.homedir(), env: { ...process.env, ...this.env }, stdio: ["pipe", "pipe", "pipe"] },
       );
       let settled = false;
-      const finish = (value: T | null): void => {
+      const finish = (value: any | null): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -638,7 +658,7 @@ export class ClaudeAdapter {
           return;
         }
         if (ev.type !== "control_response") return;
-        finish(pick(ev.response?.response));
+        finish(ev.response?.response ?? null);
       });
       // CLI 秒退时 stdin 写会异步 EPIPE——没有监听就是 uncaught(网关直接崩)。
       child.stdin!.on("error", () => undefined);

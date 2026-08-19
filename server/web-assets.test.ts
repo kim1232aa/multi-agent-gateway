@@ -26,8 +26,8 @@ async function fixture(): Promise<{ root: string; extension: string; manifest: s
   await writeFile(join(extension, 'boot.js'), 'window.__multiAgent = true;');
   await writeFile(join(extension, 'style.css'), '.multi-agent-provider-pill{}');
   const manifest = {
-    version: '0.36.1',
-    tag: '@moonshot-ai/kimi-code@0.36.1',
+    version: '0.37.2',
+    tag: '@moonshot-ai/kimi-code@0.37.2',
     commit: 'test',
     files: Object.fromEntries(Object.entries(files).map(([relative, content]) => [relative, sha256(content)])),
   };
