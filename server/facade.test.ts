@@ -21,6 +21,28 @@ test('passes Codex source kinds to thread/list', async () => {
   assert.deepEqual(request?.params.sourceKinds, ['cli']);
 });
 
+test('CodexProviderAdapter lists cli, vscode and app-server threads', async () => {
+  const adapter = new CodexProviderAdapter();
+  let request: { method: string; params: Record<string, unknown> } | undefined;
+  (adapter as any).inner.list = async (query: Record<string, unknown>) => {
+    request = { method: 'thread/list', params: query };
+    return {
+      threads: [
+        { id: 'cli-main', name: 'cli', cwd: '/tmp', updatedAt: 3, source: 'cli' },
+        { id: 'vscode-main', name: 'web', cwd: '/tmp', updatedAt: 2, source: 'vscode' },
+        { id: 'app-main', name: 'app', cwd: '/tmp', updatedAt: 1, source: 'appServer' },
+        { id: 'child', name: 'child', cwd: '/tmp', updatedAt: 1, parentThreadId: 'cli-main', source: 'cli' },
+      ],
+      nextCursor: null,
+      backwardsCursor: null,
+    };
+  };
+
+  const page = await adapter.list({ limit: 10 });
+  assert.deepEqual(request?.params.sourceKinds, ['cli', 'vscode', 'appServer']);
+  assert.deepEqual(page.items.map((session) => session.id), ['cli-main', 'vscode-main', 'app-main']);
+});
+
 test('filters Codex child and ephemeral threads without merging duplicate main titles', async () => {
   const adapter = new CodexProviderAdapter();
   const calls: any[] = [];
@@ -48,7 +70,7 @@ test('filters Codex child and ephemeral threads without merging duplicate main t
     limit: 4,
     cwd: '/tmp/project',
     archived: undefined,
-    sourceKinds: ['cli'],
+    sourceKinds: ['cli', 'vscode', 'appServer'],
   }]);
 });
 
@@ -249,6 +271,23 @@ test('surfaces Codex archived flag and last_prompt for Done filtering', async ()
   assert.equal(page.items[0].extras?.last_prompt, 'last user line');
 });
 
+test('marks Codex Done-list items archived even when thread/list omits the field', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.list = async (query: any) => {
+    assert.equal(query.archived, true);
+    return {
+      threads: [
+        { id: 'archived-b', name: 'done without flag', preview: 'bye', cwd: '/tmp/project', updatedAt: 1 },
+      ],
+      nextCursor: null,
+      backwardsCursor: null,
+    };
+  };
+
+  const page = await adapter.list({ limit: 10, archived: true });
+  assert.equal(page.items[0]?.archived, true);
+});
+
 test('keeps Claude history message ids stable across repeated reads', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-facade-'));
   const projectsDir = join(base, 'projects');
@@ -317,6 +356,7 @@ test('preserves Claude API error markers in history', async () => {
 const HANDSHAKE_MODELS = [
   { value: 'default', displayName: 'Default (recommended)', resolvedModel: 'claude-opus-5[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
   { value: 'sonnet', displayName: 'Sonnet', resolvedModel: 'claude-sonnet-5', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+  { value: 'claude-fable-5[1m]', displayName: 'Fable', resolvedModel: 'claude-fable-5', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
   { value: 'haiku', displayName: 'Haiku', resolvedModel: 'claude-haiku-4-5-20251001' },
 ];
 
@@ -375,11 +415,14 @@ test('lists Claude built-in models from the CLI handshake when no custom endpoin
     const { bin, marker } = await fakeClaudeBin(base);
     const models = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
 
-    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'haiku']);
+    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'claude-fable-5[1m]', 'haiku']);
     assert.equal(models[0]?.display_name, 'Default (recommended)');
     assert.deepEqual(models[0]?.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
     assert.equal(models[0]?.capabilities?.includes('thinking'), true);
-    assert.equal(models[2]?.support_efforts, undefined);
+    assert.equal(models[2]?.display_name, 'Fable');
+    assert.equal(models[2]?.max_context_size, 1_048_576);
+    assert.equal(models[1]?.max_context_size, 200_000);
+    assert.equal(models[3]?.support_efforts, undefined);
     assert.equal((await readFile(marker, 'utf8')).length, 1);
   } finally {
     restoreAnthropicModelVars(saved);
@@ -458,14 +501,58 @@ test('keeps Claude tool and thinking blocks even when text is empty', async () =
 
     const history = await new ClaudeProviderAdapter({ projectsDir }).getHistory(sessionId);
     assert.equal(history.length, 3);
-    assert.deepEqual(
-      history[1]?.content.map((part) => part.type),
-      ['thinking', 'tool_call'],
-    );
-    assert.equal(history[2]?.content[0]?.type, 'tool_result');
+    assert.equal(history[1]?.role, 'assistant');
+    assert.deepEqual(history[1]?.content, [
+      { type: 'thinking', thinking: 'plan the call' },
+      { type: 'tool_use', tool_call_id: 'toolu_1', tool_name: 'Bash', input: { command: 'pwd' } },
+    ]);
+    assert.equal(history[2]?.role, 'tool');
+    assert.deepEqual(history[2]?.content, [
+      { type: 'tool_result', tool_call_id: 'toolu_1', output: '/tmp/project', is_error: false },
+    ]);
   } finally {
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test('maps Codex history blocks to Kimi Web content fields', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.getHistory = async () => [{
+    startedAt: '2026-08-11T10:00:00.000Z',
+    items: [
+      { type: 'reasoning', id: 'reason-1', summary: [{ text: 'plan the call' }] },
+      {
+        type: 'commandExecution',
+        id: 'call-1',
+        command: 'pwd',
+        aggregatedOutput: '/tmp/project',
+        exitCode: 0,
+      },
+    ],
+  }];
+
+  const history = await adapter.getHistory('codex-wire-fields-test');
+
+  assert.deepEqual(history.map((message) => message.content), [
+    [{ type: 'thinking', thinking: 'plan the call' }],
+    [{ type: 'tool_use', tool_call_id: 'call-1', tool_name: 'commandExecution', input: 'pwd' }],
+    [{ type: 'tool_result', tool_call_id: 'call-1', output: '/tmp/project', is_error: false }],
+  ]);
+});
+
+test('surfaces unsupported Claude goal operations explicitly', async () => {
+  const adapter = new ClaudeProviderAdapter() as any;
+
+  assert.equal(typeof adapter.setGoal, 'function');
+  assert.equal(typeof adapter.controlGoal, 'function');
+  await assert.rejects(
+    adapter.setGoal('session-1', 'objective'),
+    (error: any) => error?.code === 'unsupported' && /goal/i.test(error.message),
+  );
+  await assert.rejects(
+    adapter.controlGoal('session-1', 'pause'),
+    (error: any) => error?.code === 'unsupported' && /goal/i.test(error.message),
+  );
 });
 
 test('surfaces Claude model handshake failure and retries next call', async () => {
@@ -494,6 +581,7 @@ test('keeps env-derived Claude models when a custom endpoint is configured', asy
     const models = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
 
     assert.deepEqual(models.map((m) => m.model), ['custom-endpoint-model']);
+    assert.equal(models[0]?.max_context_size, 200_000);
     assert.equal((await readFile(marker, 'utf8').catch(() => '')).length, 0);
   } finally {
     restoreAnthropicModelVars(saved);
@@ -526,4 +614,16 @@ test('decides Claude --session-id vs --resume from transcript file presence', as
   await drain('three'); // 首轮失败后重试(文件仍不在)→ 继续建档,不能 --resume 必败
 
   assert.deepEqual(isNewSeen, [true, false, true]);
+});
+
+test('ClaudeProviderAdapter.steer forwards to the inner adapter', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const calls: Array<{ sessionId: string; text: string }> = [];
+  (adapter as any).inner.steer = async (sessionId: string, text: string) => {
+    calls.push({ sessionId, text });
+  };
+
+  await adapter.steer!('sess-1', 'turn-1', 'please stop');
+
+  assert.deepEqual(calls, [{ sessionId: 'sess-1', text: 'please stop' }]);
 });

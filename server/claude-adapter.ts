@@ -5,8 +5,10 @@
  * Driving mechanism: each turn spawns
  *   claude -p --input-format stream-json --output-format stream-json \
  *          --include-partial-messages --verbose [--session-id <id> | --resume <id> [--fork-session]]
- * One user message (stream-json line) is written to stdin, then stdin closes;
- * the process exits after the turn. Multi-turn conversations are continued via
+ * The first user message (stream-json line) is written to stdin, which stays
+ * open so mid-turn 插话 can write another user line (steer). stdin closes on
+ * the terminal `result` event, interrupt, or process close/error — not right
+ * after the first prompt. Multi-turn conversations are continued via
  * --resume. Session transcripts live in ~/.claude/projects/<cwd-slug>/<sessionId>.jsonl.
  *
  * Verified behaviors (2.1.220, against the configured Anthropic-compatible endpoint):
@@ -16,13 +18,11 @@
  *  - `user` events carry tool_result blocks.
  *  - `result` is the terminal event: { subtype: "success"|..., result, is_error,
  *    usage, permission_denials[], session_id }.
- *  - Tools that require permission are AUTO-DENIED in this non-interactive mode:
- *    the turn continues with an error tool_result ("Claude requested permissions...")
- *    and the denial is listed in result.permission_denials. There is NO interactive
- *    approval/question channel over plain CLI stream-json — even after a successful
- *    control_request/initialize handshake, no can_use_tool control_request is
- *    emitted (verified 2.1.220). resolveApproval / resolveQuestion therefore throw
- *    UnsupportedCapability; denials are surfaced as `permission_denied` events.
+ *  - 2.1.239 实测(-p stream-json, permission-mode=manual 或缺省,stdin 开/关
+ *    两种):Bash 等工具会直接执行,result.permission_denials 为空,stdout 也
+ *    没有 can_use_tool control_request。因此仍无法做交互式审批/提问卡片;
+ *    resolveApproval / resolveQuestion 继续抛 UnsupportedCapability。若 CLI
+ *    仍拒绝某次工具,会以 permission_denied 事件上报。
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -32,6 +32,7 @@ import { promises as fsp } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import { ProviderError } from "./types.js";
 
 /** 会话列表只解析文件头这么多字节(ai-title/cwd/首条用户消息都在前 ~20 行)。 */
 const HEAD_BYTES = 256 * 1024;
@@ -449,12 +450,18 @@ export class ClaudeAdapter {
           return; // non-JSON noise
         }
         for (const mapped of mapStreamEvent(ev)) {
-          if (mapped.type === "done") sawResult = true;
+          if (mapped.type === "done") {
+            sawResult = true;
+            // Turn naturally finished: close stdin so the CLI can exit.
+            // Must not close earlier — steer needs the pipe during the turn.
+            endStdin(child);
+          }
           onEvent(mapped);
         }
       });
 
       child.on("error", (err) => {
+        endStdin(child);
         this.running.delete(sessionId);
         this.resolveExitWaiters(sessionId);
         onEvent({ type: "error", message: `spawn failed: ${err.message}` });
@@ -462,6 +469,7 @@ export class ClaudeAdapter {
       });
 
       child.on("close", (code, signal) => {
+        endStdin(child);
         this.running.delete(sessionId);
         this.resolveExitWaiters(sessionId);
         // The CLI handles SIGINT gracefully and exits code=0/signal=null
@@ -486,9 +494,9 @@ export class ClaudeAdapter {
       });
     });
 
-    // Send the single user message for this turn, then close stdin so the CLI
-    // finishes the turn and exits. contentBlocks carries image/document
-    // attachments (2.1.226 verified); otherwise a single text block.
+    // Send the first user message for this turn. Keep stdin open so steer()
+    // can inject another stream-json user line mid-turn. stdin is closed on
+    // result / interrupt / process close — not here.
     const userLine = JSON.stringify({
       type: "user",
       message: { role: "user", content: opts.contentBlocks ?? [{ type: "text", text: prompt }] },
@@ -497,9 +505,37 @@ export class ClaudeAdapter {
     // 事件如实上报(见 child.on("close"))。
     child.stdin!.on("error", () => undefined);
     child.stdin!.write(userLine + "\n");
-    child.stdin!.end();
 
     return done;
+  }
+
+  /**
+   * Inject another user stream-json line into the running turn (Kimi 插话).
+   * Requires a live child with writable stdin — never faked as interrupt+new turn.
+   * Resolves only after the write is flushed; EPIPE / write-after-end fail so
+   * the gateway can keep the prompt queued instead of marking it steered.
+   */
+  steer(sessionId: string, text: string): Promise<void> {
+    const child = this.running.get(sessionId);
+    const stdin = child?.stdin;
+    if (!child || !stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) {
+      return Promise.reject(
+        new ProviderError("not_found", `claude-adapter: no running turn for session ${sessionId}`, 404),
+      );
+    }
+    const line = JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text }] },
+    }) + "\n";
+    return new Promise((resolve, reject) => {
+      stdin.write(line, (err) => {
+        if (err) {
+          reject(new ProviderError("not_found", `claude-adapter: steer write failed: ${err.message}`, 404, err));
+          return;
+        }
+        resolve();
+      });
+    });
   }
 
   // -- interrupt ------------------------------------------------------------
@@ -512,6 +548,7 @@ export class ClaudeAdapter {
     const child = this.running.get(sessionId);
     if (!child) return false;
     this.interruptRequested.add(sessionId);
+    endStdin(child);
     child.kill("SIGINT");
     const ref = setTimeout(() => {
       // child.killed 只表示信号已发出(调用即置 true),不代表进程已退出;
@@ -676,6 +713,7 @@ export class ClaudeAdapter {
   /** Kill all running turn processes. */
   async close(): Promise<void> {
     for (const [sessionId, child] of this.running) {
+      endStdin(child);
       this.killGroup(child, "SIGTERM");
       this.running.delete(sessionId);
       this.resolveExitWaiters(sessionId);
@@ -809,6 +847,17 @@ export class ClaudeAdapter {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Close stdin if it is still open; safe on already-ended / destroyed pipes. */
+function endStdin(child: ChildProcess): void {
+  const stdin = child.stdin;
+  if (!stdin || stdin.destroyed || stdin.writableEnded) return;
+  try {
+    stdin.end();
+  } catch {
+    // already closed
+  }
+}
 
 /** Pull human-readable text out of a transcript message content field. */
 function extractText(content: unknown): string {

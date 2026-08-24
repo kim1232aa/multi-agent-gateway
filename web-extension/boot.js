@@ -1,8 +1,8 @@
 (function () {
   'use strict';
 
-  var PROVIDERS = ['kimi', 'claude', 'codex'];
-  var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex' };
+  var PROVIDERS = ['kimi', 'claude', 'codex', 'grok'];
+  var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok' };
   var STORAGE_KEY = 'multi-agent-gateway.provider.v1';
   var originalFetch = window.fetch || fetch;
   var OriginalWebSocket = window.WebSocket;
@@ -32,6 +32,7 @@
     }
     if (id.indexOf('codex_') === 0) return 'codex';
     if (id.indexOf('claude_') === 0) return 'claude';
+    if (id.indexOf('grok_') === 0) return 'grok';
     return 'kimi';
   }
 
@@ -398,7 +399,7 @@
       }
       var isSwarm = id === 'swarm' || id.indexOf('swarm') !== -1;
       var isGoal = id === 'goal' || id.indexOf('goal') !== -1 || id.indexOf('目标') !== -1;
-      var hide = provider === 'claude' ? isSwarm || isGoal : provider === 'codex' ? isSwarm : false;
+      var hide = (provider === 'claude' || provider === 'grok') ? isSwarm || isGoal : provider === 'codex' ? isSwarm : false;
       if (hide) {
         row.hidden = true;
         row.style.display = 'none';
@@ -407,6 +408,36 @@
         row.hidden = false;
         row.style.display = '';
         row.removeAttribute('data-multi-agent-hidden');
+      }
+    });
+  }
+
+  // 官方 0.38 SlashMenu 仍内置 /swarm /goal /btw,也可能列出 /compact /undo。
+  // Kimi 全部保留。Claude compact 是真 /compact prompt,但无 rewind,藏 /undo。
+  // Grok headless 不能 compact/rollback。Codex compact/undo/goal 由网关执行。
+  function blockedSlashNames(provider) {
+    if (provider === 'grok') return ['/swarm', '/goal', '/btw', '/compact', '/undo'];
+    if (provider === 'claude') return ['/swarm', '/goal', '/btw', '/undo'];
+    if (provider === 'codex') return ['/swarm', '/btw'];
+    return [];
+  }
+
+  function gateSlashMenu() {
+    if (!document.querySelectorAll) return;
+    var blocked = blockedSlashNames(selectedProvider());
+    document.querySelectorAll('.slash-menu .slash-name').forEach(function (nameEl) {
+      var label = String(nameEl.textContent || '').trim().split(/\s+/)[0].toLowerCase();
+      var hide = blocked.indexOf(label) !== -1;
+      var row = nameEl.parentElement;
+      if (!row || !row.style) return;
+      if (hide) {
+        row.hidden = true;
+        row.style.display = 'none';
+        if (row.setAttribute) row.setAttribute('data-multi-agent-slash-hidden', '');
+      } else if (row.hasAttribute && row.hasAttribute('data-multi-agent-slash-hidden')) {
+        row.hidden = false;
+        row.style.display = '';
+        if (row.removeAttribute) row.removeAttribute('data-multi-agent-slash-hidden');
       }
     });
   }
@@ -426,6 +457,7 @@
       updateSegIndicator(seg);
     }
     gateModes();
+    gateSlashMenu();
   }
 
   function onRouteChange() {
@@ -446,7 +478,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row';
+  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {

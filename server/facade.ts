@@ -49,6 +49,18 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** 前端 formatTokens 按 1024 进制:1_048_576 才显示 1M,1_000_000 会显示 977k。 */
+const CLAUDE_CONTEXT_1M = 1_048_576;
+const CLAUDE_CONTEXT_200K = 200_000;
+
+export function claudeContextWindow(...labels: Array<string | undefined>): number {
+  const text = labels.filter((part): part is string => Boolean(part)).join('\0').toLowerCase();
+  if (text.includes('[1m]') || text.includes('claude-fable') || /(^|\0)fable(\0|$)/.test(text)) {
+    return CLAUDE_CONTEXT_1M;
+  }
+  return CLAUDE_CONTEXT_200K;
+}
+
 function isCodexToolItem(type: unknown): boolean {
   return type === 'commandExecution'
     || type === 'mcpToolCall'
@@ -151,6 +163,16 @@ function textOfInput(input: StartTurnInput['input']): string {
     .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
     .map((p) => p.text)
     .join('\n');
+}
+
+/** 历史消息的内容字段按 Kimi Web wire 约定,与内部 adapter 类型不同。 */
+type KimiHistoryContentPart =
+  | { type: 'thinking'; thinking: string }
+  | { type: 'tool_use'; tool_call_id: string; tool_name: string; input: unknown }
+  | { type: 'tool_result'; tool_call_id: string; output: string; is_error: boolean };
+
+function kimiHistoryPart(part: KimiHistoryContentPart): MessageContentPart {
+  return part;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +315,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
       limit: query.limit,
       cwd: query.cwd,
       archived: query.archived,
-      sourceKinds: ['cli'],
+      // 网关 thread/start 走 app-server,source 实测是 vscode 而非 cli;
+      // 只滤 cli 会把本网关新建的会话从列表里藏掉。子 agent / ephemeral 仍丢弃。
+      sourceKinds: ['cli', 'vscode', 'appServer'],
     });
     // 只列主会话,对齐 `codex resume` 的行为:parentThreadId 非空的是子 agent
     // 线程,ephemeral 是临时线程,都不应出现在列表里(字段名来自 thread/list
@@ -303,7 +327,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
         const raw = t as Record<string, unknown>;
         return raw.parentThreadId == null && raw.ephemeral !== true;
       })
-      .map((t) => this.toSession(t));
+      .map((t) => this.toSession(t, undefined, query.archived === true));
     return { items, ...(nextCursor ? { next_cursor: nextCursor } : {}) };
   }
 
@@ -384,7 +408,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             id: (it.id as string) ?? randomUUID(),
             session_id: sessionId,
             role: 'assistant',
-            content: [{ type: 'thinking', text: summary }],
+            content: [kimiHistoryPart({ type: 'thinking', thinking: summary })],
             created_at: createdAt,
           });
         } else if (isCodexToolItem(type)) {
@@ -397,7 +421,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             id: `${callId}_call`,
             session_id: sessionId,
             role: 'assistant',
-            content: [{ type: 'tool_call', id: callId, name, input }],
+            content: [kimiHistoryPart({ type: 'tool_use', tool_call_id: callId, tool_name: name, input })],
             created_at: createdAt,
           });
           const outputText = extractCodexToolOutput(it);
@@ -407,12 +431,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
               id: `${callId}_result`,
               session_id: sessionId,
               role: 'assistant',
-              content: [{
+              content: [kimiHistoryPart({
                 type: 'tool_result',
                 tool_call_id: callId,
-                content: outputText,
+                output: outputText,
                 is_error: exitCode !== undefined && exitCode !== 0,
-              }],
+              })],
               created_at: createdAt,
             });
           }
@@ -697,7 +721,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     await this.inner.close();
   }
 
-  private toSession(thread: Record<string, unknown>, cwdOverride?: string): Session {
+  private toSession(thread: Record<string, unknown>, cwdOverride?: string, listedArchived = false): Session {
     const cwd = cwdOverride ?? (thread.cwd as string) ?? process.cwd();
     const id = thread.id as string;
     // 列表扫到的历史会话也回填 cwd,充实 getCwd 兜底。
@@ -713,8 +737,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
       created_at: isoFromCodexTime(thread.createdAt),
       updated_at: isoFromCodexTime(thread.updatedAt),
       busy: false,
-      // thread/list 在 archived=true 时返回的条目本身就是已归档;字段名经 catchall 保留。
-      archived: thread.archived === true,
+      // thread/list archived=true 的条目本身就是已归档,但响应经常不带 archived 字段。
+      archived: listedArchived || thread.archived === true,
       // 0.37 Done 页过滤空 last_prompt;preview/标题都能撑起一条可见项。
       extras: { last_prompt: preview || title },
       metadata: { cwd },
@@ -948,15 +972,17 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       // 优先用结构化块(thinking/tool_use/tool_result),没有才退化成纯文本。
       const content: Message['content'] = m.blocks && m.blocks.length > 0
         ? m.blocks.map((b) => {
-            if (b.type === 'thinking') return { type: 'thinking' as const, text: b.text };
-            if (b.type === 'tool_use') return { type: 'tool_call' as const, id: b.id, name: b.name, input: b.input };
+            if (b.type === 'thinking') return kimiHistoryPart({ type: 'thinking', thinking: b.text });
+            if (b.type === 'tool_use') {
+              return kimiHistoryPart({ type: 'tool_use', tool_call_id: b.id, tool_name: b.name, input: b.input });
+            }
             if (b.type === 'tool_result') {
-              return {
-                type: 'tool_result' as const,
+              return kimiHistoryPart({
+                type: 'tool_result',
                 tool_call_id: b.tool_use_id,
-                content: b.content,
-                ...(b.is_error ? { is_error: true } : {}),
-              };
+                output: b.content,
+                is_error: b.is_error === true,
+              });
             }
             return { type: 'text' as const, text: b.text };
           })
@@ -967,7 +993,9 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           .digest('hex')
           .slice(0, 24)}`,
         session_id: sessionId,
-        role: m.role,
+        // Claude JSONL 把 tool_result 记在 user 消息里;Kimi Web 只把 role=tool
+        // 的 toolResult 折进上一张工具卡。纯工具结果不能当用户气泡发出。
+        role: content.length > 0 && content.every((part) => part.type === 'tool_result') ? 'tool' : m.role,
         content,
         created_at: m.timestamp ?? nowIso(),
         ...(m.model || m.isError ? {
@@ -1116,7 +1144,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
               total_cost_usd: prev.total_cost_usd + num(u.total_cost_usd),
               // 上下文占用 = 本 turn 输入侧总量;窗口大小按模型目录约定。
               context_tokens: input + cacheRead + cacheCreate,
-              context_limit: model.includes('[1m]') ? 1_000_000 : 200_000,
+              context_limit: claudeContextWindow(model),
               turn_count: prev.turn_count + 1,
             });
           }
@@ -1182,12 +1210,28 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     this.inner.interrupt(sessionId);
   }
 
+  async steer(sessionId: string, _turnId: string, text: string): Promise<void> {
+    await this.inner.steer(sessionId, text);
+  }
+
   async resolveApproval(): Promise<void> {
     throw new ProviderError('unsupported', 'Claude 非交互模式不支持代答审批(实测)', 400);
   }
 
   async resolveQuestion(): Promise<void> {
     throw new ProviderError('unsupported', 'Claude 非交互模式不支持代答提问(实测)', 400);
+  }
+
+  async setGoal(): Promise<Record<string, unknown> | null> {
+    throw new ProviderError('unsupported', 'Claude 不支持 goal 能力', 400);
+  }
+
+  async getGoal(): Promise<Record<string, unknown> | null> {
+    throw new ProviderError('unsupported', 'Claude 不支持 goal 能力', 400);
+  }
+
+  async controlGoal(): Promise<Record<string, unknown> | null> {
+    throw new ProviderError('unsupported', 'Claude 不支持 goal 能力', 400);
   }
 
   async close(_sessionId: string): Promise<void> {
@@ -1279,8 +1323,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         provider: 'claude',
         model,
         display_name: `${model}(${aliases.join('/')})`,
-        // [1m] 后缀是该接入方约定的一百万上下文命名;否则按 200K 展示。
-        max_context_size: model.includes('[1m]') ? 1_000_000 : 200_000,
+        max_context_size: claudeContextWindow(model, ...aliases),
         capabilities: ['thinking'],
         support_efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
       }));
@@ -1291,8 +1334,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       provider: 'claude',
       model: model.value,
       display_name: model.displayName ?? model.value,
-      // resolvedModel 的 [1m] 后缀 = 一百万上下文变体;否则按 200K 展示。
-      max_context_size: (model.resolvedModel ?? model.value).includes('[1m]') ? 1_000_000 : 200_000,
+      max_context_size: claudeContextWindow(model.value, model.resolvedModel, model.displayName),
       capabilities: model.supportsEffort ? ['thinking'] : [],
       ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
     }));

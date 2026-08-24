@@ -2,8 +2,8 @@
  * 多 Agent 网关的统一 provider 抽象。
  *
  * gateway 对官方 kimi-web 前端讲 Kimi kap-server 协议(`/api/v1` REST + WS),
- * 内部按 provider 分流到 Kimi(无损代理)/ Codex(JSON-RPC)/ Claude(CLI stream-json)。
- * 本文件是三个 adapter 与 facade 共用的契约:类型形状贴近 Kimi wire 协议
+ * 内部按 provider 分流到 Kimi(无损代理)/ Codex(JSON-RPC)/ Claude(CLI stream-json)/ Grok(CLI)。
+ * 本文件是 adapter 与 facade 共用的契约:类型形状贴近 Kimi wire 协议
  * (snake_case 字段、ISO 时间戳),让 Kimi 路径可以几乎零映射透传,
  * 同时保留 Codex / Claude 能映射进来的最小扩展点(`provider`、`extras`)。
  */
@@ -12,12 +12,12 @@
 // Provider
 // ---------------------------------------------------------------------------
 
-export type ProviderName = 'kimi' | 'claude' | 'codex';
+export type ProviderName = 'kimi' | 'claude' | 'codex' | 'grok';
 
-export const PROVIDER_NAMES: readonly ProviderName[] = ['kimi', 'claude', 'codex'];
+export const PROVIDER_NAMES: readonly ProviderName[] = ['kimi', 'claude', 'codex', 'grok'];
 
 export function isProviderName(value: unknown): value is ProviderName {
-  return value === 'kimi' || value === 'claude' || value === 'codex';
+  return value === 'kimi' || value === 'claude' || value === 'codex' || value === 'grok';
 }
 
 // ---------------------------------------------------------------------------
@@ -81,9 +81,10 @@ export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 
 export type MessageContentPart =
   | { type: 'text'; text: string }
-  | { type: 'thinking'; text: string }
+  | { type: 'thinking'; text?: string; thinking?: string }
   | { type: 'tool_call'; id: string; name: string; input: unknown }
-  | { type: 'tool_result'; tool_call_id: string; content: string; is_error?: boolean }
+  | { type: 'tool_use'; tool_call_id: string; tool_name: string; input: unknown }
+  | { type: 'tool_result'; tool_call_id: string; content?: string; output?: string; is_error?: boolean }
   | { type: 'image'; mime_type: string; data: string };
 
 export interface Message {

@@ -13,7 +13,7 @@ import { detectAvailableProviders, startGateway } from './gateway.js';
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
 
-function fakeAdapter(name: 'claude' | 'codex'): ProviderAdapter {
+function fakeAdapter(name: 'claude' | 'codex' | 'grok'): ProviderAdapter {
   const session: Session = {
     id: `${name}-native`, workspace_id: '', title: `${name} test`, created_at: new Date(0).toISOString(), updated_at: new Date().toISOString(), busy: false, metadata: { cwd: '/tmp' }, provider: name,
   };
@@ -138,7 +138,7 @@ test('falls back to Kimi for native global routes and keeps non-Kimi config loca
     token: 'gateway-token',
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     availableProviders: ['kimi', 'claude', 'codex'],
   });
   const get = (path: string, init: RequestInit = {}) => fetch(`${gateway.url}/api/v1${path}`, { ...init, headers: { authorization: 'Bearer gateway-token', ...(init.headers ?? {}) } });
@@ -272,7 +272,7 @@ test('uses provider-native cursors for non-Kimi session pagination', async () =>
     token: 'gateway-token',
     kimi: 'off',
     codex: codex as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -316,7 +316,7 @@ test('builds local workspaces across all provider-native pages', async () => {
     token: 'gateway-token',
     kimi: 'off',
     codex: codex as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/workspaces?provider=codex`, {
@@ -355,7 +355,7 @@ test('finds an older local session through provider-native pages', async () => {
     token: 'gateway-token',
     kimi: 'off',
     codex: codex as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/codex_older`, {
@@ -392,7 +392,7 @@ test('forwards explicit Kimi session creation without follow-up mutation', async
     token: 'gateway-token',
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions?provider=kimi&token=internal`, {
@@ -435,7 +435,7 @@ test('forwards provider-less native Kimi routes to the official upstream', async
     token: 'gateway-token',
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -516,7 +516,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
       port: 0,
       token: 'gateway-token',
       codex: fakeAdapter('codex') as any,
-      claude: fakeAdapter('claude') as any,
+      claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     });
     await waitForSource('fallback');
 
@@ -535,7 +535,7 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
       port: 0,
       token: 'gateway-token',
       codex: fakeAdapter('codex') as any,
-      claude: fakeAdapter('claude') as any,
+      claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     });
     await waitForSource('official');
     await rm(registry);
@@ -600,7 +600,7 @@ server.listen(port, '127.0.0.1', () => console.log('Kimi server: http://127.0.0.
       port: 0,
       token: 'gateway-token',
       codex: fakeAdapter('codex') as any,
-      claude: fakeAdapter('claude') as any,
+      claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     });
     await waitForSource('fallback');
 
@@ -642,7 +642,7 @@ test('snapshot returns only the latest message page and pages older via /message
     token: 'gateway-token',
     kimi: 'off',
     codex: codex as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -664,6 +664,67 @@ test('snapshot returns only the latest message page and pages older via /message
     const oldest = (await (await get('/sessions/codex_codex-native/messages?before_id=m020&page_size=50')).json() as any).data;
     assert.equal(oldest.items.length, 20);
     assert.equal(oldest.has_more, false);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('maps local history blocks to the Kimi Web message wire', async () => {
+  const history = (provider: 'claude' | 'codex'): Message[] => [{
+    id: `${provider}-blocks`,
+    session_id: `${provider}-native`,
+    role: 'assistant',
+    content: [
+      { type: 'thinking', text: 'consider the command' },
+      { type: 'tool_call', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+      { type: 'tool_result', tool_call_id: 'tool-1', content: '/tmp', is_error: true },
+    ],
+    created_at: '2026-01-01T00:00:04.000Z',
+  }];
+  const claude = fakeAdapter('claude');
+  const codex = fakeAdapter('codex');
+  claude.getHistory = async () => history('claude');
+  codex.getHistory = async () => history('codex');
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: claude as any, grok: fakeAdapter('grok') as any,
+  });
+  try {
+    for (const provider of ['claude', 'codex'] as const) {
+      const response = await fetch(`${gateway.url}/api/v1/sessions/${provider}_${provider}-native/messages`, {
+        headers: { authorization: 'Bearer gateway-token' },
+      });
+      assert.equal(response.status, 200);
+      const item = ((await response.json() as any).data.items as any[])[0];
+      const wireContent = [
+        { type: 'thinking', thinking: 'consider the command' },
+        { type: 'tool_use', tool_call_id: 'tool-1', tool_name: 'Bash', input: { command: 'pwd' } },
+        { type: 'tool_result', tool_call_id: 'tool-1', output: '/tmp', is_error: true },
+      ];
+      assert.deepEqual(item.content, wireContent);
+
+      const snapshot = await fetch(`${gateway.url}/api/v1/sessions/${provider}_${provider}-native/snapshot`, {
+        headers: { authorization: 'Bearer gateway-token' },
+      });
+      assert.equal(snapshot.status, 200);
+      const snapshotItem = ((await snapshot.json() as any).data.messages.items as any[])[0];
+      assert.deepEqual(snapshotItem.content, wireContent);
+
+      const transcript = await fetch(`${gateway.url}/api/v1/sessions/${provider}_${provider}-native/transcript?agent_id=main`, {
+        headers: { authorization: 'Bearer gateway-token' },
+      });
+      assert.equal(transcript.status, 200);
+      const frames = ((await transcript.json() as any).data.items as any[])[0]?.steps?.[0]?.frames ?? [];
+      assert.deepEqual(frames.map((frame: any) => frame.kind), ['thinking', 'tool', 'tool']);
+      assert.equal(frames[0].text, 'consider the command');
+      assert.equal(frames[1].toolCallId, 'tool-1');
+      assert.equal(frames[1].name, 'Bash');
+      assert.equal(frames[2].output, '/tmp');
+      assert.equal(frames[2].state, 'error');
+    }
   } finally {
     await gateway.close();
   }
@@ -708,7 +769,7 @@ test('tunnels Kimi WebSocket upgrade with upstream authorization and the browser
     token: 'gateway-token',
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Record<string, unknown>[] = [];
   try {
@@ -778,7 +839,7 @@ test('strips Origin on Kimi WebSocket tunnel so kap-server does not 403 the hand
     token: 'gateway-token',
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const gatewayUrl = new URL(gateway.url);
@@ -838,7 +899,7 @@ test('unsubscribes transcript v2 and resumes legacy content for local providers'
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -913,6 +974,7 @@ test('streams local assistant deltas with official offsets reset for each step',
       yield { ...base, kind: 'thinking', status: 'delta', payload: { delta: 'de' } } as any;
       yield { ...base, kind: 'message', status: 'delta', payload: { delta: ' world' } } as any;
       yield { ...base, kind: 'tool', status: 'started', payload: { toolCallId: 'tool-1', name: 'Bash', input: {} } } as any;
+      yield { ...base, kind: 'tool', status: 'delta', payload: { toolCallId: 'tool-1', name: 'Bash', output: 'partial' } } as any;
       yield { ...base, kind: 'tool', status: 'completed', payload: { toolCallId: 'tool-1', name: 'Bash', output: 'done' } } as any;
       yield { ...base, kind: 'message', status: 'delta', payload: { delta: 'next' } } as any;
       yield { ...base, kind: 'turn', status: 'completed', payload: { reason: 'completed' } } as any;
@@ -924,7 +986,7 @@ test('streams local assistant deltas with official offsets reset for each step',
     token: 'test-token',
     kimi: 'off',
     codex: codex as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -972,6 +1034,11 @@ test('streams local assistant deltas with official offsets reset for each step',
     const thinking = frames.filter((frame) => frame.type === 'thinking.delta');
     assert.deepEqual(thinking.map((frame) => frame.offset), [0, 3]);
     assert.deepEqual(thinking.map((frame) => frame.payload.delta), ['abc', 'de']);
+    const toolProgress = frames.filter((frame) => frame.type === 'tool.progress');
+    assert.equal(toolProgress.length, 1);
+    assert.equal(toolProgress[0]?.payload.toolCallId, 'tool-1');
+    assert.equal(toolProgress[0]?.payload.output, 'partial');
+    assert.equal(frames.some((frame) => frame.type === 'tool.call.progress'), false);
   } finally {
     ws?.close();
     await gateway.close();
@@ -996,7 +1063,7 @@ test('streams local turns through transcript v2 without duplicate legacy content
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1111,7 +1178,7 @@ test('filters transcript v2 operations independently for turn, block, and delta 
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const grades = ['turn', 'block', 'delta'] as const;
   const sockets: WebSocket[] = [];
@@ -1189,7 +1256,7 @@ test('replays covered transcript cursors and resets incomplete cursors', async (
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const sockets: WebSocket[] = [];
   try {
@@ -1292,7 +1359,7 @@ test('replays covered transcript cursors and resets incomplete cursors', async (
 test('projects Codex local commands into transcript v2', async () => {
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: fakeAdapter('codex') as any, claude: fakeAdapter('claude') as any,
+    codex: fakeAdapter('codex') as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1376,7 +1443,7 @@ test('projects a queued prompt into transcript v2 while another turn is running'
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1480,7 +1547,7 @@ test('settles steered queued prompts without ending the active prompt', async ()
   codex.steer = async (_sessionId: string, _turnId: string, input: string) => { steeredTexts.push(input); };
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1557,7 +1624,7 @@ test('marks the active transcript step failed when a local turn fails', async ()
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1636,7 +1703,7 @@ test('streams a local turn without reloading transcript history after subscribe_
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1705,7 +1772,7 @@ test('settles an aborted active prompt in transcript v2', async () => {
   codex.interrupt = async () => { interrupted = true; };
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1782,7 +1849,7 @@ test('fans session global events to every local connection without leaking turn 
   });
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
-    codex: codex as any, claude: fakeAdapter('claude') as any,
+    codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const subscribedFrames: Array<Record<string, any>> = [];
   const observerFrames: Array<Record<string, any>> = [];
@@ -1848,6 +1915,46 @@ test('fans session global events to every local connection without leaking turn 
   }
 });
 
+test('keeps grok WebSocket local instead of tunneling to Kimi', async () => {
+  let tunneled = false;
+  const upstreamServer = createServer((_req, res) => {
+    res.writeHead(404).end();
+  });
+  upstreamServer.on('upgrade', (_req, socket) => {
+    tunneled = true;
+    socket.write('HTTP/1.1 500 Tunneled\r\n\r\n');
+    socket.destroy();
+  });
+  const upstream = await listen(upstreamServer);
+  const gateway = await startGateway({
+    host: '127.0.0.1',
+    port: 0,
+    token: 'test-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const ws = new WebSocket(
+    `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=grok`,
+    ['kimi-code.bearer.test-token'],
+  );
+  try {
+    await Promise.race([
+      new Promise<void>((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error('grok WebSocket failed to open locally'));
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('grok WebSocket open timed out')), 1_000)),
+    ]);
+    assert.equal(tunneled, false);
+  } finally {
+    ws.close();
+    await gateway.close();
+    await upstream.close();
+  }
+});
+
 test('acknowledges a local provider WebSocket close frame', async () => {
   const gateway = await startGateway({
     host: '127.0.0.1',
@@ -1855,7 +1962,7 @@ test('acknowledges a local provider WebSocket close frame', async () => {
     token: 'test-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const ws = new WebSocket(
     `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`,
@@ -1890,7 +1997,7 @@ test('closes the gateway while a WebSocket connection is still open', async () =
     token: 'test-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   const port = Number(new URL(gateway.url).port);
   const socket = createConnection(port, '127.0.0.1');
@@ -1933,7 +2040,7 @@ test('returns 404 for a missing local session instead of fabricating one', async
     token: 'test-token',
     kimi: 'off',
     codex: codex as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/codex_missing`, {
@@ -1957,7 +2064,7 @@ test('returns an empty message page before a Claude transcript is materialized',
     token: 'test-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: claude as any,
+    claude: claude as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/claude_new/messages`, {
@@ -1976,7 +2083,7 @@ test('reports only installed providers in /meta', async () => {
     token: 'gateway-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     availableProviders: ['kimi', 'codex'],
   });
   try {
@@ -1989,23 +2096,61 @@ test('reports only installed providers in /meta', async () => {
   }
 });
 
-test('detectAvailableProviders honors CLAUDE_BIN and CODEX_PATH presence', async () => {
+test('detectAvailableProviders honors CLAUDE_BIN, GROK_BIN and CODEX_PATH presence', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-avail-'));
   try {
     const claudeBin = join(base, 'claude');
     await writeFile(claudeBin, '#!/bin/sh\n');
 
-    const present = detectAvailableProviders({ CLAUDE_BIN: claudeBin, CODEX_PATH: '/bin/true', PATH: '' });
-    assert.deepEqual(present, ['kimi', 'claude', 'codex']);
+    const grokBin = join(base, 'grok');
+    await writeFile(grokBin, '#!/bin/sh\n');
+
+    const present = detectAvailableProviders({ CLAUDE_BIN: claudeBin, GROK_BIN: grokBin, CODEX_PATH: '/bin/true', PATH: '' });
+    assert.deepEqual(present, ['kimi', 'claude', 'grok', 'codex']);
 
     const missing = detectAvailableProviders({
       CLAUDE_BIN: join(base, 'missing-claude'),
+      GROK_BIN: join(base, 'missing-grok'),
       CODEX_PATH: join(base, 'missing-codex'),
       PATH: '',
     });
     assert.deepEqual(missing, ['kimi']);
   } finally {
     await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('rejects grok swarm and goal the same way as Claude', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const post = (path: string, body: unknown) => fetch(`${gateway.url}/api/v1${path}`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  try {
+    const swarm = await post('/sessions/grok_grok-native:swarm', {});
+    assert.equal(swarm.status, 400);
+    const goal = await post('/sessions/grok_grok-native/profile', { agent_config: { goal_objective: 'x' } });
+    assert.equal(goal.status, 400);
+    const btw = await post('/sessions/grok_grok-native:btw', {});
+    assert.equal(btw.status, 400);
+    const compact = await post('/sessions/grok_grok-native:compact', {});
+    assert.equal(compact.status, 400);
+    assert.match(((await compact.json()) as { msg?: string }).msg ?? '', /不支持压缩/);
+    const undo = await post('/sessions/grok_grok-native:undo', {});
+    assert.equal(undo.status, 400);
+    const undoMsg = ((await undo.json()) as { msg?: string }).msg ?? '';
+    assert.match(undoMsg, /不支持撤销/);
+    assert.doesNotMatch(undoMsg, /claude stream-json/);
+  } finally {
+    await gateway.close();
   }
 });
 
@@ -2017,7 +2162,7 @@ test('surfaces provider model catalog errors instead of faking an empty list', a
     token: 'gateway-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: claude as any,
+    claude: claude as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/models?provider=claude`, {
@@ -2056,7 +2201,7 @@ test('keeps a running turn visible when the first history fetch fails but a late
     token: 'gateway-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: claude as any,
+    claude: claude as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/prompts`, {
@@ -2093,7 +2238,7 @@ test('surfaces provider DTO catalog errors instead of faking an empty list', asy
     token: 'gateway-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: claude as any,
+    claude: claude as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/providers?provider=claude`, {
@@ -2108,6 +2253,128 @@ test('surfaces provider DTO catalog errors instead of faking an empty list', asy
   }
 });
 
+test('rejects unsupported Claude goal routes and profile controls', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+  });
+  const get = (path: string, init: RequestInit = {}) => fetch(`${gateway.url}/api/v1${path}`, {
+    ...init,
+    headers: { authorization: 'Bearer gateway-token', ...(init.headers ?? {}) },
+  });
+  try {
+    const goal = await get('/sessions/claude_claude-native/goal');
+    assert.equal(goal.status, 400);
+    const goalBody = (await goal.json()) as { code?: number; msg?: string };
+    assert.notEqual(goalBody.code, 0);
+    assert.match(goalBody.msg ?? '', /不支持.*goal/);
+
+    const objective = await get('/sessions/claude_claude-native/profile', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_config: { goal_objective: 'ship it' } }),
+    });
+    assert.equal(objective.status, 400);
+    const objectiveBody = (await objective.json()) as { code?: number; msg?: string };
+    assert.notEqual(objectiveBody.code, 0);
+    assert.match(objectiveBody.msg ?? '', /不支持.*goal/);
+
+    const control = await get('/sessions/claude_claude-native/profile', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_config: { goal_control: 'pause' } }),
+    });
+    assert.equal(control.status, 400);
+    const controlBody = (await control.json()) as { code?: number; msg?: string };
+    assert.notEqual(controlBody.code, 0);
+    assert.match(controlBody.msg ?? '', /不支持.*goal/);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('rejects swarm mode requests for local Claude and Codex providers', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+  });
+  try {
+    for (const provider of ['claude', 'codex'] as const) {
+      const response = await fetch(`${gateway.url}/api/v1/sessions/${provider}_${provider}-native/profile`, {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer gateway-token',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ agent_config: { swarm_mode: true } }),
+      });
+      assert.equal(response.status, 400);
+      const body = (await response.json()) as { code?: number; msg?: string };
+      assert.notEqual(body.code, 0);
+      assert.match(body.msg ?? '', /不支持.*swarm_mode/);
+
+      const swarmRoute = await fetch(`${gateway.url}/api/v1/sessions/${provider}_${provider}-native:swarm`, {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer gateway-token',
+          'content-type': 'application/json',
+        },
+        body: '{}',
+      });
+      assert.equal(swarmRoute.status, 400);
+      const swarmBody = (await swarmRoute.json()) as { code?: number; msg?: string };
+      assert.notEqual(swarmBody.code, 0);
+      assert.match(swarmBody.msg ?? '', /不支持.*[Ss]warm/);
+    }
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('rejects Kimi swarm/goal fields on local prompt submit', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+  });
+  const post = (path: string, body: Record<string, unknown>) => fetch(`${gateway.url}/api/v1${path}`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  try {
+    const swarm = await post('/sessions/claude_claude-native/prompts', {
+      content: [{ type: 'text', text: 'hi' }],
+      swarm_mode: true,
+    });
+    assert.equal(swarm.status, 400);
+    assert.match(((await swarm.json()) as { msg?: string }).msg ?? '', /不支持.*swarm_mode/);
+
+    const goal = await post('/sessions/claude_claude-native/prompts', {
+      content: [{ type: 'text', text: 'hi' }],
+      goal_objective: 'ship it',
+    });
+    assert.equal(goal.status, 400);
+    assert.match(((await goal.json()) as { msg?: string }).msg ?? '', /不支持.*goal/);
+
+    const okPrompt = await post('/sessions/claude_claude-native/prompts', {
+      content: [{ type: 'text', text: 'hi' }],
+      swarm_mode: false,
+    });
+    assert.equal(okPrompt.status, 200);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('lets unauthenticated CORS preflight through to the OPTIONS handler', async () => {
   // preflight 浏览器不附带 Authorization;若在 pre-auth 被 401,跨域页面直接残废。
   const gateway = await startGateway({
@@ -2115,7 +2382,7 @@ test('lets unauthenticated CORS preflight through to the OPTIONS handler', async
     token: 'gateway-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`, { method: 'OPTIONS' });
@@ -2134,7 +2401,7 @@ test('rejects oversized request bodies instead of buffering unbounded memory', a
     token: 'gateway-token',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
-    claude: fakeAdapter('claude') as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`, {
@@ -2150,19 +2417,304 @@ test('rejects oversized request bodies instead of buffering unbounded memory', a
   }
 });
 
-test('disposes both provider adapters on gateway close', async () => {
+test('disposes provider adapters on gateway close', async () => {
   const disposed: string[] = [];
   const claude = fakeAdapter('claude');
   const codex = fakeAdapter('codex');
+  const grok = fakeAdapter('grok');
   claude.dispose = async () => { disposed.push('claude'); };
   codex.dispose = async () => { disposed.push('codex'); };
+  grok.dispose = async () => { disposed.push('grok'); };
   const gateway = await startGateway({
     port: 0,
     token: 'gateway-token',
     kimi: 'off',
     codex: codex as any,
     claude: claude as any,
+    grok: grok as any,
   });
   await gateway.close();
-  assert.deepEqual(disposed.sort(), ['claude', 'codex']);
+  assert.deepEqual(disposed.sort(), ['claude', 'codex', 'grok']);
 });
+
+test('GET /models?provider=grok returns adapter items', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/models?provider=grok`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as any).data.items[0].model, 'grok-model');
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('session id grok_<id> is not proxied to kimi', async () => {
+  const seen: string[] = [];
+  const upstream = await listen(createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://upstream');
+    seen.push(`${url.pathname}${url.search}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(envelope({ upstream: true, path: url.pathname }));
+  }));
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions/grok_grok-native`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(response.status, 200);
+    const data = (await response.json() as any).data;
+    assert.equal(data.id, 'grok_grok-native');
+    assert.equal(data.upstream, undefined);
+    assert.equal(seen.some((path) => path.includes('grok_')), false);
+
+    const v2 = await fetch(`${gateway.url}/api/v2/sessions?provider=grok`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(v2.status, 200);
+    const v2Data = (await v2.json() as any).data;
+    assert.equal(v2Data.items[0].id, 'grok_grok-native');
+    assert.equal(seen.some((path) => path.startsWith('/api/v2')), false);
+  } finally {
+    await gateway.close();
+    await upstream.close();
+  }
+});
+
+test('meta providers includes grok when availableProviders includes it', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok'],
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/meta`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.deepEqual((await response.json() as any).data.providers, ['kimi', 'claude', 'codex', 'grok']);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('PATCH and DELETE local workspaces without wd_codex_/wd_claude_ prefixes stay local', async () => {
+  const seen: string[] = [];
+  const upstream = await listen(createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://upstream');
+    seen.push(`${req.method} ${url.pathname}${url.search}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(envelope({ upstream: true, path: url.pathname }));
+  }));
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const auth = { authorization: 'Bearer gateway-token', 'content-type': 'application/json' };
+  try {
+    const grokId = 'wd_tmp_anything';
+    const grokPatch = await fetch(`${gateway.url}/api/v1/workspaces/${grokId}?provider=grok`, {
+      method: 'PATCH',
+      headers: auth,
+      body: JSON.stringify({ name: 'tmp-grok' }),
+    });
+    assert.equal(grokPatch.status, 200);
+    const grokPatchData = (await grokPatch.json() as any).data;
+    assert.equal(grokPatchData.id, grokId);
+    assert.equal(grokPatchData.upstream, undefined);
+    assert.equal(grokPatchData.name, 'tmp-grok');
+
+    const grokDelete = await fetch(`${gateway.url}/api/v1/workspaces/${grokId}?provider=grok`, {
+      method: 'DELETE',
+      headers: auth,
+    });
+    assert.equal(grokDelete.status, 200);
+    assert.equal((await grokDelete.json() as any).data.deleted, grokId);
+
+    const claudeId = 'wd_home-ubuntu_deadbeef';
+    const claudePatch = await fetch(`${gateway.url}/api/v1/workspaces/${claudeId}?provider=claude`, {
+      method: 'PATCH',
+      headers: auth,
+      body: JSON.stringify({ name: 'home' }),
+    });
+    assert.equal(claudePatch.status, 200);
+    const claudePatchData = (await claudePatch.json() as any).data;
+    assert.equal(claudePatchData.id, claudeId);
+    assert.equal(claudePatchData.upstream, undefined);
+    assert.equal(claudePatchData.name, 'home');
+
+    const claudeDelete = await fetch(`${gateway.url}/api/v1/workspaces/${claudeId}?provider=claude`, {
+      method: 'DELETE',
+      headers: auth,
+    });
+    assert.equal(claudeDelete.status, 200);
+    assert.equal((await claudeDelete.json() as any).data.deleted, claudeId);
+
+    assert.equal(seen.some((path) => path.includes('/workspaces/')), false);
+
+    const kimiPatch = await fetch(`${gateway.url}/api/v1/workspaces/wd_kimi_noprovider`, {
+      method: 'PATCH',
+      headers: auth,
+      body: JSON.stringify({ name: 'kimi-ws' }),
+    });
+    assert.equal(kimiPatch.status, 200);
+    assert.equal((await kimiPatch.json() as any).data.upstream, true);
+    assert.equal(seen.some((path) => path.includes('/api/v1/workspaces/wd_kimi_noprovider')), true);
+  } finally {
+    await gateway.close();
+    await upstream.close();
+  }
+});
+
+test('GET grok session status fills max_context_tokens from grok window when usage is 0', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions/grok_grok-native/status`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as any).data.max_context_tokens, 500000);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('GET /api/v2/sessions?view=by_workspace returns groups for local providers', async () => {
+  const grok = fakeAdapter('grok');
+  grok.list = async () => ({
+    items: [
+      {
+        id: 'g-new',
+        workspace_id: '',
+        title: 'new in a',
+        created_at: '2026-08-24T01:00:00.000Z',
+        updated_at: '2026-08-24T03:00:00.000Z',
+        busy: false,
+        metadata: { cwd: '/tmp/a' },
+        extras: { last_prompt: 'new in a' },
+        provider: 'grok',
+      },
+      {
+        id: 'g-old',
+        workspace_id: '',
+        title: 'old in a',
+        created_at: '2026-08-23T01:00:00.000Z',
+        updated_at: '2026-08-23T03:00:00.000Z',
+        busy: false,
+        metadata: { cwd: '/tmp/a' },
+        extras: { last_prompt: 'old in a' },
+        provider: 'grok',
+      },
+      {
+        id: 'g-b',
+        workspace_id: '',
+        title: 'in b',
+        created_at: '2026-08-24T02:00:00.000Z',
+        updated_at: '2026-08-24T02:00:00.000Z',
+        busy: false,
+        metadata: { cwd: '/tmp/b' },
+        extras: { last_prompt: 'in b' },
+        provider: 'grok',
+      },
+      {
+        id: 'g-empty',
+        workspace_id: '',
+        title: 'empty prompt',
+        created_at: '2026-08-24T04:00:00.000Z',
+        updated_at: '2026-08-24T04:00:00.000Z',
+        busy: false,
+        metadata: { cwd: '/tmp/c' },
+        provider: 'grok',
+      },
+    ],
+  });
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: grok as any,
+  });
+  try {
+    const grouped = await fetch(
+      `${gateway.url}/api/v2/sessions?provider=grok&view=by_workspace&group.page_size=1&meta.has_prompt=true`,
+      { headers: { authorization: 'Bearer gateway-token' } },
+    );
+    assert.equal(grouped.status, 200);
+    const data = (await grouped.json() as any).data;
+    assert.ok(Array.isArray(data.groups), `expected groups array, got ${JSON.stringify(data)}`);
+    assert.equal(data.items, undefined);
+    assert.equal(data.groups.length, 2);
+    assert.equal(data.total, 2);
+    assert.equal(data.has_more, false);
+    assert.equal(data.groups[0].workspace.cwd, '/tmp/a');
+    assert.equal(data.groups[0].sessions.length, 1);
+    assert.equal(data.groups[0].sessions[0].id, 'grok_g-new');
+    assert.equal(data.groups[0].total, 2);
+    assert.equal(data.groups[1].workspace.cwd, '/tmp/b');
+    assert.equal(data.groups[1].sessions[0].id, 'grok_g-b');
+
+    const empty = fakeAdapter('codex');
+    empty.list = async () => ({ items: [] });
+    const gateway2 = await startGateway({
+      port: 0,
+      token: 'gateway-token',
+      kimi: 'off',
+      codex: empty as any,
+      claude: fakeAdapter('claude') as any,
+      grok: fakeAdapter('grok') as any,
+    });
+    try {
+      const response = await fetch(
+        `${gateway2.url}/api/v2/sessions?provider=codex&view=by_workspace`,
+        { headers: { authorization: 'Bearer gateway-token' } },
+      );
+      assert.equal(response.status, 200);
+      const emptyData = (await response.json() as any).data;
+      assert.deepEqual(emptyData.groups, []);
+    } finally {
+      await gateway2.close();
+    }
+
+    const flat = await fetch(`${gateway.url}/api/v2/sessions?provider=grok`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(flat.status, 200);
+    const flatData = (await flat.json() as any).data;
+    assert.ok(Array.isArray(flatData.items));
+    assert.equal(flatData.groups, undefined);
+  } finally {
+    await gateway.close();
+  }
+});
+

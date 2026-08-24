@@ -2,16 +2,17 @@
  * gateway:对外讲 Kimi kap-server 协议的 HTTP + WebSocket 服务。
  *
  * 路由规则:
- * - provider 通过 URL query `?provider=kimi|claude|codex` 显式指定,或由会话 id 前缀推断。
+ * - provider 通过 URL query `?provider=kimi|claude|codex|grok` 显式指定,或由会话 id 前缀推断。
  * - Kimi 会话(id 无前缀)→ 由 kimi-proxy 无损转发到 58627。
- * - Codex / Claude 会话 → facade 适配层,把三家协议翻译成 Kimi wire 格式。
+ * - Codex / Claude / Grok 会话 → facade 适配层,把各家协议翻译成 Kimi wire 格式。
  *
- * 只实现"能用三家会话"的最小 API 面:
+ * 只实现"能用 Kimi / Claude / Codex / Grok 会话"的最小 API 面:
  *   meta / auth / healthz / workspaces / sessions(CRUD+snapshot)/ prompts(提交/中止)
  *   / approvals / questions,加 /api/v1/ws 事件推送。
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createConnection } from 'node:net';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import type { Duplex } from 'node:stream';
 import * as fsp from 'node:fs/promises';
@@ -22,7 +23,8 @@ import { loadWebShell, type WebShell } from './web-assets.js';
 import { createKimiHttpProxy, createKimiWsUpgrader } from './kimi-proxy.js';
 import { followKimiServer, spawnKimiServer, type KimiChild } from './kimi-child.js';
 import { createStaticServer } from './static.js';
-import { CodexProviderAdapter, ClaudeProviderAdapter } from './facade.js';
+import { CodexProviderAdapter, ClaudeProviderAdapter, claudeContextWindow } from './facade.js';
+import { GrokProviderAdapter } from './grok-adapter.js';
 import { codexGatewayCommandNames } from './native-commands.js';
 import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsSearch } from './fs-local.js';
 import {
@@ -57,11 +59,12 @@ export interface GatewayOptions {
   token?: string;
   codex?: CodexProviderAdapter;
   claude?: ClaudeProviderAdapter;
+  grok?: ProviderAdapter;
   /**
    * Kimi 路径的上游来源:
    * - 'spawn'(默认):网关自起 `kimi web` 子进程并解析它的 token;
    * - { upstream, token }:用外部 kap-server(需调用方提供 token);
-   * - 'off':不提供 Kimi 路径(仅剩 Codex/Claude)。
+   * - 'off':不提供 Kimi 路径(仅剩 Codex/Claude/Grok)。
    */
   kimi?: 'spawn' | 'off' | { upstream: string; token?: string };
   /** kimi-web 构建产物目录(SPA 静态托管);默认仓库 web-dist。 */
@@ -76,7 +79,7 @@ export interface GatewayOptions {
    */
   settingsDir?: string;
   /**
-   * 对外展示的可用 provider(默认按本机二进制探测:claude/codex 没装就不出现
+   * 对外展示的可用 provider(默认按本机二进制探测:claude/codex/grok 没装就不出现
    * 在选择器里,避免用户点了才发现不存在)。测试可显式覆盖。
    */
   availableProviders?: ProviderName[];
@@ -87,6 +90,8 @@ export function detectAvailableProviders(env: NodeJS.ProcessEnv = process.env): 
   const providers: ProviderName[] = ['kimi'];
   const claudeBin = env.CLAUDE_BIN ?? path.join(os.homedir(), '.local', 'bin', 'claude');
   if (existsSync(claudeBin)) providers.push('claude');
+  const grokBin = env.GROK_BIN ?? path.join(os.homedir(), '.local', 'bin', 'grok');
+  if (existsSync(grokBin) || onPath('grok', env.PATH)) providers.push('grok');
   const codexPath = env.CODEX_PATH;
   if (codexPath ? existsSync(codexPath) : onPath('codex', env.PATH)) providers.push('codex');
   return providers;
@@ -121,7 +126,17 @@ const API = '/api/v1';
 const ID_PREFIX: Record<Exclude<ProviderName, 'kimi'>, string> = {
   codex: 'codex_',
   claude: 'claude_',
+  grok: 'grok_',
 };
+
+function isLocalProvider(value: string | null): value is Exclude<ProviderName, 'kimi'> {
+  return value === 'claude' || value === 'codex' || value === 'grok';
+}
+
+/** Official grok-4.6 / grok-4.5 window (https://docs.x.ai/developers/models/grok-4.6). */
+function grokStatusContextFallback(): number {
+  return 500_000;
+}
 
 function prefixedId(provider: ProviderName, nativeId: string): string {
   return provider === 'kimi' ? nativeId : `${ID_PREFIX[provider]}${nativeId}`;
@@ -312,6 +327,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter> = {
     codex: options.codex ?? new CodexProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.codex.json') }),
     claude: options.claude ?? new ClaudeProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.claude.json') }),
+    grok: options.grok ?? new GrokProviderAdapter({
+      settingsPath: path.join(settingsDir, 'session-settings.grok.json'),
+      grokBin: process.env.GROK_BIN,
+    }),
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
@@ -478,13 +497,18 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
     if (url.pathname === '/api/v2/sessions' && req.method === 'GET') {
       const archived = url.searchParams.get('meta.archived') === 'true';
+      const view = url.searchParams.get('view');
       const v1 = new URL(url.href);
-      v1.searchParams.set('page_size', url.searchParams.get('page_size') || '50');
+      // 侧栏 load 走 view=by_workspace,不带 page_size;分组需要全量会话,不能停在默认 50。
+      v1.searchParams.set('page_size', view === 'by_workspace' ? '500' : (url.searchParams.get('page_size') || '50'));
       if (archived) v1.searchParams.set('archived_only', 'true');
       const pageToken = url.searchParams.get('page_token');
       if (pageToken) v1.searchParams.set('before_id', pageToken);
       const data = await listSessions(adapters, kimiFetch, v1, provider, (sid) => hub.busy.has(sid), sessionPageCursors);
       const items = ((data.items ?? []) as Record<string, unknown>[]).map((item) => sessionV2Dto(item, Boolean(item.busy)));
+      if (view === 'by_workspace') {
+        return ok(res, sessionGroupsV2(items, url), requestId);
+      }
       return ok(res, { items, has_more: Boolean(data.has_more), next_page_token: data.has_more ? String(items[items.length - 1]?.id ?? '') : null }, requestId);
     }
 
@@ -537,7 +561,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 实际安装的 provider——前端选择器只显示这些。
       const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
       return ok(res, {
-        server_version: 'multi-agent-gateway/0.1 (Kimi 0.37.2 compatible)',
+        server_version: 'multi-agent-gateway/0.1 (Kimi 0.38.0 compatible)',
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
         server_id: 'multi-agent-gateway',
         started_at: new Date(0).toISOString(),
@@ -667,7 +691,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     const workspaceIdMatch = /^\/workspaces\/([^/:]+)$/.exec(sub);
     if (workspaceIdMatch && (req.method === 'PATCH' || req.method === 'DELETE')) {
       const wid = decodeURIComponent(workspaceIdMatch[1]);
-      if (wid.startsWith('wd_codex_') || wid.startsWith('wd_claude_')) {
+      // Local ids are `wd_${slug}_${hash}` (no provider infix). Prefix-gated
+      // no-ops never matched Claude/Codex/Grok workspaces from workspaceDto.
+      if (isLocalProvider(provider ?? null)) {
         if (req.method === 'DELETE') {
           return ok(res, { deleted: wid }, requestId);
         }
@@ -740,11 +766,14 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // 明确 400,避免前端把裸 404 当成路由错误。
         throw new ProviderError('unsupported', `${sp} 不支持侧边对话(:btw)`, 400);
       }
+      if (tail === ':swarm' && req.method === 'POST') {
+        throw new ProviderError('unsupported', `${sp} 不支持 Swarm`, 400);
+      }
       if (tail === ':undo' && req.method === 'POST') {
         // 撤销最近 count 轮。codex:thread/rollback(0.147.0 实测历史真消失,
         // 但官方已标 DEPRECATED)。claude:stream-json 下 /rewind 是 TUI 专用
         // (二进制注册表 supportsNonInteractive:false),无可用机制,如实 400。
-        if (!adapter.rollback) throw new ProviderError('unsupported', `${sp} 不支持撤销(claude stream-json 无 /rewind 机制)`, 400);
+        if (!adapter.rollback) throw new ProviderError('unsupported', `${sp} 不支持撤销`, 400);
         const body = (await readBody(req).catch(() => ({}))) as { count?: number };
         const count = Math.max(1, Math.min(50, Number(body.count ?? 1) || 1));
         await adapter.rollback(nativeId, count);
@@ -757,6 +786,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // busy 时压缩会排队/互串,直接 409(与网关代执行命令同一 guard);
         // 否则会假 started(审查发现)。
         if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再压缩', 409);
+        // grok headless 把 `/compact` 当普通 prompt 发给模型(本机 1.0.5 实测
+        // `-p /compact` 卡住 waiting_for_model)。没有 adapter.compact 且不是
+        // claude 的 /compact 回退时,必须在 compaction.started 之前 400。
+        if (!adapter.compact && sp !== 'claude') {
+          throw new ProviderError('unsupported', `${sp} 不支持压缩`, 400);
+        }
         hub.broadcast(sid, frame(sid, hub, 'compaction.started', { trigger: 'manual', ...(body.instruction ? { instruction: body.instruction } : {}) }));
         if (adapter.compact) {
           // codex:adapter.compact 等到 contextCompaction item 完成才返回
@@ -767,9 +802,6 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
           return ok(res, { compacted: true }, requestId);
         }
-        // claude:CLI 在 stream-json 下原生执行 /compact(2.1.226 实测),作为真
-        // turn 发出;turn 终态 = 压缩完成,completed 由 onSettled 在终态广播后
-        // 发出——不再是"还没跑就先报完成"(审查发现)。
         const text = `/compact${body.instruction ? ` ${body.instruction}` : ''}`;
         const result = await driveTurn(adapter, sp, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text }), hub, randomUUID(), (reason) => {
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: { reason } }));
@@ -843,7 +875,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         throw new ProviderError('unsupported', `${tail} 未实现(打开/下载在纯 web 端无意义)`, 400);
       }
       if (tail === '/goal' && req.method === 'GET') {
-        if (!adapter.getGoal) return ok(res, null, requestId);
+        if (!adapter.getGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
         return ok(res, codexGoalToWire(await adapter.getGoal(nativeId)), requestId);
       }
       if (tail === '/export' && req.method === 'POST') {
@@ -866,7 +898,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (tail === '/profile' && req.method === 'POST') {
         // 本地 provider 可落地的字段:model / thinking / title / permission /
         // plan_mode / goal(goal_objective 设目标,goal_control 暂停/恢复/取消)。
-        // swarm_mode 本地 provider 无机制,接受但忽略(前端对 codex/claude 不展示)。
+        // swarm_mode 本地 provider 无机制,明确 400,不能接受后忽略。
         const body = (await readBody(req)) as {
           title?: string;
           agent_config?: {
@@ -876,12 +908,16 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
             plan_mode?: boolean;
             goal_objective?: string;
             goal_control?: 'pause' | 'resume' | 'cancel';
+            swarm_mode?: boolean;
           };
         };
         if (typeof body?.title === 'string' && body.title.trim() && adapter.rename) {
           await adapter.rename(nativeId, body.title.trim());
         }
         const cfg = body?.agent_config ?? {};
+        if (cfg.swarm_mode === true) {
+          throw new ProviderError('unsupported', `${sp} 不支持 swarm_mode`, 400);
+        }
         if (cfg.model && adapter.setModel) await adapter.setModel(nativeId, cfg.model);
         if (typeof cfg.thinking === 'string' && adapter.setThinking) {
           await adapter.setThinking(nativeId, cfg.thinking);
@@ -892,10 +928,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (typeof cfg.plan_mode === 'boolean' && adapter.setPlanMode) {
           await adapter.setPlanMode(nativeId, cfg.plan_mode);
         }
-        if (typeof cfg.goal_objective === 'string' && adapter.setGoal) {
+        if (typeof cfg.goal_objective === 'string') {
+          if (!adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
           await adapter.setGoal(nativeId, cfg.goal_objective);
         }
-        if (typeof cfg.goal_control === 'string' && adapter.controlGoal) {
+        if (typeof cfg.goal_control === 'string') {
+          if (!adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
           await adapter.controlGoal(nativeId, cfg.goal_control);
         }
         return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
@@ -910,8 +948,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // 没有就诚实 0——不编造窗口值。
         let contextLimit = usage?.context_limit ?? 0;
         if (contextLimit <= 0 && sp === 'claude') {
-          const m = adapter.getModel?.(nativeId) ?? '';
-          if (m) contextLimit = m.includes('[1m]') ? 1_000_000 : 200_000;
+          const m = adapter.getModel?.(nativeId);
+          if (m) contextLimit = claudeContextWindow(m);
+        }
+        if (contextLimit <= 0 && sp === 'grok') {
+          contextLimit = grokStatusContextFallback();
         }
         return ok(res, {
           model: adapter.getModel?.(nativeId) ?? '',
@@ -977,7 +1018,23 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         const body = (await readBody(req)) as {
           content: { type: string; text?: string }[];
           model?: string; thinking?: string; permission_mode?: string; plan_mode?: boolean;
+          swarm_mode?: boolean;
+          goal_objective?: string;
+          goal_control?: 'pause' | 'resume' | 'cancel';
         };
+        // 前端 toWirePromptSubmission 会带 swarm/goal。Kimi 官方会当真;
+        // 本地 provider 没有对等物时必须 400,不能当普通 prompt 默默跑。
+        if (body.swarm_mode === true) {
+          throw new ProviderError('unsupported', `${sp} 不支持 swarm_mode`, 400);
+        }
+        if (typeof body.goal_objective === 'string') {
+          if (!adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+          await adapter.setGoal(nativeId, body.goal_objective);
+        }
+        if (typeof body.goal_control === 'string') {
+          if (!adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+          await adapter.controlGoal(nativeId, body.goal_control);
+        }
         // 前端每条 prompt 都带全套控制字段(mappers.toWirePromptSubmission),
         // 设计上以 prompt 为本 turn 权威——此前网关只读 content,草稿态开 Plan
         // 发首条消息实际不是 plan 跑的(审查发现)。apply-if-changed,避免每
@@ -1147,18 +1204,34 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   });
 
   void hydrateUploadsFromDisk();
-  // 预热列表缓存(codex thread/list 服务端全扫 ~4s),让首个页面请求落在暖缓存上。
-  void Promise.allSettled([adapters.codex.list({ limit: 100 }), adapters.claude.list({ limit: 100 })]).then(
-    (rs) => {
-      const [c, k] = rs;
-      console.error(
-        `[gateway] 列表预热: codex=${c.status === 'fulfilled' ? c.value.items.length + '条' : '失败:' + c.reason} claude=${k.status === 'fulfilled' ? k.value.items.length + '条' : '失败:' + k.reason}`,
-      );
-    },
-  );
+  // 预热列表 + 模型/命令目录。切 Agent 时官方 facade.load 会连打
+  // /sessions+/models+/commands;Claude initialize 冷启动实测约 0.9s。
+  void Promise.allSettled([
+    adapters.codex.list({ limit: 100 }),
+    adapters.claude.list({ limit: 100 }),
+    adapters.grok.list({ limit: 100 }),
+    adapters.claude.listModels?.() ?? Promise.resolve(null),
+    adapters.claude.listCommands?.() ?? Promise.resolve(null),
+    adapters.codex.listModels?.() ?? Promise.resolve(null),
+    adapters.codex.listCommands?.() ?? Promise.resolve(null),
+    adapters.grok.listModels?.() ?? Promise.resolve(null),
+    adapters.grok.listCommands?.() ?? Promise.resolve(null),
+  ]).then((rs) => {
+    const names = ['codex.list', 'claude.list', 'grok.list', 'claude.models', 'claude.cmds', 'codex.models', 'codex.cmds', 'grok.models', 'grok.cmds'];
+    const parts = rs.map((r, i) => {
+      if (r.status !== 'fulfilled') return `${names[i]}=失败`;
+      const value = r.value as { items?: unknown[] } | unknown[] | null;
+      if (Array.isArray(value)) return `${names[i]}=${value.length}`;
+      if (value && Array.isArray(value.items)) return `${names[i]}=${value.items.length}`;
+      return `${names[i]}=ok`;
+    });
+    console.error(`[gateway] 预热: ${parts.join(' ')}`);
+  });
 
   const address = server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
+  // listen 回调早于内核 accept 队列就绪时,立刻 fetch 会 ECONNREFUSED(本机 Node 24 复现)。
+  await waitUntilAccepting(host === '0.0.0.0' || host === '::' ? '127.0.0.1' : host, actualPort);
   const url = `http://${host}:${actualPort}`;
   return {
     url,
@@ -1175,6 +1248,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
             kimiFallback?.close() ?? kimi?.child?.close() ?? Promise.resolve(),
             adapters.claude.dispose?.() ?? Promise.resolve(),
             adapters.codex.dispose?.() ?? Promise.resolve(),
+            adapters.grok.dispose?.() ?? Promise.resolve(),
           ]).then(() => resolveClose());
         });
         // 流式/长连接会挡住 server.close 的回调,主动掐掉空闲 keep-alive。
@@ -1203,13 +1277,13 @@ function authed(req: IncomingMessage, token: string): boolean {
 
 function shouldProxyToKimi(req: IncomingMessage): boolean {
   const url = new URL(req.url ?? '/', 'http://localhost');
-  // 0.36+ /api/v2：Kimi 会话列表仍走 kap;claude/codex 必须留在本网关,
+  // 0.36+ /api/v2：Kimi 会话列表仍走 kap;claude/codex/grok 必须留在本网关,
   // 否则平铺视图/搜索/已归档只看得到 Kimi。
   if (url.pathname.startsWith('/api/v2')) {
     const v2Provider = url.searchParams.get('provider');
-    // 列表与批量归档/恢复:只有显式 claude/codex 才留在本网关;其余透传 kap。
-    // boot.js 会给这些路径补 ?provider=,所以 Claude/Codex 侧边栏操作不会误进上游。
-    if (v2Provider === 'claude' || v2Provider === 'codex') return false;
+    // 列表与批量归档/恢复:只有显式 claude/codex/grok 才留在本网关;其余透传 kap。
+    // boot.js 会给这些路径补 ?provider=,所以本地 provider 侧边栏操作不会误进上游。
+    if (isLocalProvider(v2Provider)) return false;
     return true;
   }
   if (!url.pathname.startsWith(API)) return false;
@@ -1219,13 +1293,13 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
 
   const provider = url.searchParams.get('provider');
   if (provider === 'kimi') return true;
-  if (provider === 'claude' || provider === 'codex') return false;
+  if (isLocalProvider(provider)) return false;
   if (provider !== null) return false;
 
   const sessMatch = /^\/api\/v1\/sessions\/([^/:]+)/.exec(url.pathname);
   if (sessMatch) {
     const id = decodeURIComponent(sessMatch[1]);
-    return !id.startsWith('codex_') && !id.startsWith('claude_');
+    return !id.startsWith('codex_') && !id.startsWith('claude_') && !id.startsWith('grok_');
   }
 
   // Official file preview URLs do not carry provider. Keep only gateway-owned
@@ -1384,7 +1458,7 @@ async function listWorkspaces(
   }
   // Codex/Claude:沿各自原生 cursor 聚合全部主会话。固定上限会漏掉老项目,
   // 还会让前端的 session_count 与“加载更多”不一致。
-  const targets: ProviderName[] = provider && provider !== 'kimi' ? [provider] : ['codex', 'claude'];
+  const targets: ProviderName[] = provider && provider !== 'kimi' ? [provider] : ['codex', 'claude', 'grok'];
   for (const p of targets) {
     const adapter = adapters[p as Exclude<ProviderName, 'kimi'>];
     const sessions = await listAllSessions(adapter).catch((err) => {
@@ -1435,6 +1509,50 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boo
     message_count: 0,
     last_seq: 0,
   };
+}
+
+/**
+ * 0.38 侧栏 load 调 listSessionGroupsV2: GET /api/v2/sessions?view=by_workspace,
+ * 解包 `groups` 再 `[...Ie.groups]`。本地 provider 以前只回 items,groups 缺失
+ * 直接 TypeError。Kimi 无 provider 仍走 shouldProxyToKimi,本函数只服务 claude/codex/grok。
+ */
+function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<string, unknown> {
+  const groupPageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('group.page_size') ?? 5) || 5));
+  const hasPrompt = url.searchParams.get('meta.has_prompt') === 'true';
+  const buckets = new Map<string, { workspace: { id: string; cwd: string }; sessions: Record<string, unknown>[] }>();
+  for (const item of items) {
+    const meta = item.meta && typeof item.meta === 'object' ? item.meta as Record<string, unknown> : {};
+    const lastPrompt = typeof meta.last_prompt === 'string' ? meta.last_prompt : '';
+    if (hasPrompt && lastPrompt.length === 0) continue;
+    const workspace = item.workspace && typeof item.workspace === 'object'
+      ? item.workspace as Record<string, unknown>
+      : {};
+    const id = String(workspace.id ?? '');
+    const cwd = typeof workspace.cwd === 'string' ? workspace.cwd : '';
+    const key = id || cwd;
+    if (!key) continue;
+    const bucket = buckets.get(key) ?? { workspace: { id, cwd }, sessions: [] };
+    bucket.sessions.push(item);
+    buckets.set(key, bucket);
+  }
+  const groups = [...buckets.values()].map((bucket) => {
+    const sessions = [...bucket.sessions].sort((a, b) => {
+      const au = Number((a.meta as Record<string, unknown> | undefined)?.updated_at ?? 0);
+      const bu = Number((b.meta as Record<string, unknown> | undefined)?.updated_at ?? 0);
+      return bu - au;
+    });
+    return {
+      workspace: bucket.workspace,
+      sessions: sessions.slice(0, groupPageSize),
+      total: sessions.length,
+    };
+  });
+  groups.sort((a, b) => {
+    const au = Number((a.sessions[0]?.meta as Record<string, unknown> | undefined)?.updated_at ?? 0);
+    const bu = Number((b.sessions[0]?.meta as Record<string, unknown> | undefined)?.updated_at ?? 0);
+    return bu - au;
+  });
+  return { groups, total: groups.length, has_more: false, next_page_token: null };
 }
 
 function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<string, unknown> {
@@ -1501,8 +1619,9 @@ async function listSessions(
     let cursor: string | undefined;
     if (beforeId) {
       cursor = pageCursors.get(cursorKey(beforeId));
-      if (!cursor && provider === 'claude' && beforeId.startsWith('claude_')) {
-        cursor = beforeId.slice('claude_'.length);
+      if (!cursor) {
+        const prefix = ID_PREFIX[provider];
+        if (prefix && beforeId.startsWith(prefix)) cursor = beforeId.slice(prefix.length);
       }
       if (!cursor) return { items: [], has_more: false };
     }
@@ -1558,7 +1677,7 @@ async function listSessions(
     }
   }
   const targets: Exclude<ProviderName, 'kimi'>[] =
-    provider && provider !== 'kimi' ? [provider] : ['codex', 'claude'];
+    provider && provider !== 'kimi' ? [provider] : ['codex', 'claude', 'grok'];
   for (const p of targets) {
     const page = await adapters[p].list({ limit: FETCH_ALL }).catch((err) => {
       console.error(`[gateway] listSessions: ${p}.list 失败:`, err instanceof Error ? err.message : err);
@@ -1701,10 +1820,32 @@ function messageDto(m: Message, sid: string): Record<string, unknown> {
     id: m.id,
     session_id: sid,
     role: m.role,
-    content: m.content,
+    content: m.content.map(toKimiMessageContent),
     created_at: m.created_at,
     ...(m.metadata ? { metadata: m.metadata } : {}),
   };
+}
+
+/** 历史 REST 必须发 Kimi Web wire 形状,内部 adapter 字段不能原样透传。 */
+function toKimiMessageContent(part: Message['content'][number]): Record<string, unknown> {
+  if (part.type === 'thinking') {
+    return { type: 'thinking', thinking: part.thinking ?? part.text ?? '' };
+  }
+  if (part.type === 'tool_call') {
+    return { type: 'tool_use', tool_call_id: part.id, tool_name: part.name, input: part.input };
+  }
+  if (part.type === 'tool_use') {
+    return { type: 'tool_use', tool_call_id: part.tool_call_id, tool_name: part.tool_name, input: part.input };
+  }
+  if (part.type === 'tool_result') {
+    return {
+      type: 'tool_result',
+      tool_call_id: part.tool_call_id,
+      output: part.output ?? part.content ?? '',
+      is_error: part.is_error === true,
+    };
+  }
+  return part;
 }
 
 async function listAdapterMessages(
@@ -2188,7 +2329,7 @@ function consumeEvent(
     } else if (ev.status === 'delta') {
       const delta = p.output ?? '';
       if (!delta) return;
-      emit('tool.call.progress', { turnId: 0, toolCallId: p.toolCallId, output: delta });
+      emit('tool.progress', { turnId: 0, toolCallId: p.toolCallId, output: delta });
     } else {
       turn.runningTools.delete(p.toolCallId);
       const isError = p.isError ?? p.is_error ?? false;
@@ -2515,7 +2656,7 @@ function attachGatewayWebSocket(
       return;
     }
     const provider = url.searchParams.get('provider');
-    if (provider !== 'claude' && provider !== 'codex') {
+    if (!isLocalProvider(provider)) {
       socket.pause();
       void resolveKimiWs().then((kimiWs) => {
         if (socket.destroyed) return;
@@ -2877,6 +3018,27 @@ class WsFrameParser {
 // ---------------------------------------------------------------------------
 // 错误码 / 工具
 // ---------------------------------------------------------------------------
+
+async function waitUntilAccepting(host: string, port: number, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const sock = createConnection({ host, port }, () => {
+          sock.end();
+          resolve();
+        });
+        sock.once('error', reject);
+      });
+      return;
+    } catch (err) {
+      last = err;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw last instanceof Error ? last : new Error(`gateway not accepting on ${host}:${port}`);
+}
 
 function codeNumber(code: string): number {
   const map: Record<string, number> = {

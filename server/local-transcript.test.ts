@@ -48,6 +48,68 @@ test('reports complete catch-up only while the requested cursor is journaled', (
   assert.equal(hub.getOpsSince('s1', 999).complete, false);
 });
 
+test('keeps Claude user-role tool_result on the current turn instead of starting an empty turn', () => {
+  const messages: Message[] = [
+    {
+      id: 'u1', session_id: 's1', role: 'user',
+      content: [{ type: 'text', text: 'run tool' }],
+      created_at: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'a1', session_id: 's1', role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'consider the command' } as any,
+        { type: 'tool_use', tool_call_id: 'tool-1', tool_name: 'Bash', input: { command: 'pwd' } } as any,
+      ],
+      created_at: '2026-01-01T00:00:01.000Z',
+    },
+    {
+      id: 'u2', session_id: 's1', role: 'user',
+      content: [{ type: 'tool_result', tool_call_id: 'tool-1', output: '/tmp', is_error: false } as any],
+      created_at: '2026-01-01T00:00:02.000Z',
+    },
+  ];
+  const page = buildLocalTranscriptPage(messages, { agentId: 'main' }, 'idle', 0);
+  assert.equal(page.items.length, 1);
+  assert.equal(page.items[0]?.prompt, 'run tool');
+  const frames = page.items[0]?.steps.flatMap((step) => step.frames) ?? [];
+  assert.deepEqual(frames.map((frame) => frame.kind), ['thinking', 'tool', 'tool']);
+  assert.equal(frames[2]?.output, '/tmp');
+  assert.equal(frames[2]?.state, 'done');
+});
+
+test('projects thinking and tool history blocks from both internal and Kimi wire shapes', () => {
+  const internal: Message[] = [{
+    id: 'a-internal', session_id: 's1', role: 'assistant',
+    content: [
+      { type: 'thinking', text: 'consider the command' },
+      { type: 'tool_call', id: 'tool-1', name: 'Bash', input: { command: 'pwd' } },
+      { type: 'tool_result', tool_call_id: 'tool-1', content: '/tmp', is_error: true },
+    ],
+    created_at: '2026-01-01T00:00:01.000Z',
+  }];
+  const wire: Message[] = [{
+    id: 'a-wire', session_id: 's1', role: 'assistant',
+    content: [
+      { type: 'thinking', thinking: 'consider the command' } as any,
+      { type: 'tool_use', tool_call_id: 'tool-1', tool_name: 'Bash', input: { command: 'pwd' } } as any,
+      { type: 'tool_result', tool_call_id: 'tool-1', output: '/tmp', is_error: true } as any,
+    ],
+    created_at: '2026-01-01T00:00:01.000Z',
+  }];
+
+  for (const messages of [internal, wire]) {
+    const page = buildLocalTranscriptPage(messages, { agentId: 'main' }, 'idle', 0);
+    const frames = page.items[0]?.steps[0]?.frames ?? [];
+    assert.deepEqual(frames.map((frame) => frame.kind), ['thinking', 'tool', 'tool']);
+    assert.equal(frames[0]?.text, 'consider the command');
+    assert.equal(frames[1]?.toolCallId, 'tool-1');
+    assert.equal(frames[1]?.name, 'Bash');
+    assert.equal(frames[2]?.output, '/tmp');
+    assert.equal(frames[2]?.state, 'error');
+  }
+});
+
 test('replays provider error messages as failed turns', async () => {
   const messages: Message[] = [
     {

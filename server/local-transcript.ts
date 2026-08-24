@@ -684,8 +684,11 @@ function historyTurns(messages: readonly Message[]): TranscriptTurn[] {
   let current: TranscriptTurn | undefined;
 
   for (const message of ordered) {
-    if (message.role === 'user') {
-      current = newTurn(turns.length + 1, 'user', message.created_at, messageText(message.content));
+    const prompt = messageText(message.content);
+    const isToolOnlyUser = message.role === 'user' && !prompt && message.content.some((part) =>
+      part.type === 'tool_result' || part.type === 'tool_use' || part.type === 'tool_call');
+    if (message.role === 'user' && !isToolOnlyUser) {
+      current = newTurn(turns.length + 1, 'user', message.created_at, prompt);
       turns.push(current);
       continue;
     }
@@ -748,17 +751,20 @@ function contentFrames(message: Message): TranscriptFrame[] {
         frames.push({ kind: 'text', frameId, role: message.role === 'user' ? 'user' : 'assistant', text: part.text });
       }
     } else if (part.type === 'thinking') {
-      frames.push({ kind: 'thinking', frameId, text: part.text });
-    } else if (part.type === 'tool_call') {
+      frames.push({ kind: 'thinking', frameId, text: part.thinking ?? part.text ?? '' });
+    } else if (part.type === 'tool_call' || part.type === 'tool_use') {
+      const toolCallId = part.type === 'tool_use' ? part.tool_call_id : part.id;
+      const name = part.type === 'tool_use' ? part.tool_name : part.name;
       frames.push({
-        kind: 'tool', frameId, toolCallId: part.id, name: part.name,
+        kind: 'tool', frameId, toolCallId, name,
         state: 'running', input: part.input,
       });
     } else if (part.type === 'tool_result') {
+      const output = part.output ?? part.content ?? '';
       frames.push({
         kind: 'tool', frameId, toolCallId: part.tool_call_id, name: 'tool',
-        state: part.is_error ? 'error' : 'done', output: part.content,
-        ...(part.is_error ? { error: part.content } : {}),
+        state: part.is_error ? 'error' : 'done', output,
+        ...(part.is_error ? { error: output } : {}),
       });
     }
   });

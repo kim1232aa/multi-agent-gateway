@@ -122,7 +122,7 @@ async function loadModeShim(): Promise<{ api: any; rows: any[] }> {
 
 test('rewrites global API URLs for the selected provider and pins prefixed sessions', async () => {
   const api = await loadShim('/');
-  assert.equal(Array.from(api.providers).join(','), 'kimi,claude,codex');
+  assert.equal(Array.from(api.providers).join(','), 'kimi,claude,codex,grok');
   assert.equal(api.selectedProvider(), 'kimi');
   assert.equal(api.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'kimi');
   api.setProvider('claude');
@@ -141,6 +141,9 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   const codexSession = await loadShim('/sessions/codex_abc');
   assert.equal(codexSession.selectedProvider(), 'codex');
   assert.equal(codexSession.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'codex');
+  const grokSession = await loadShim('/sessions/grok_abc');
+  assert.equal(grokSession.selectedProvider(), 'grok');
+  assert.equal(grokSession.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'grok');
 });
 
 test('routes only same-origin gateway WebSockets through the selected provider', async () => {
@@ -550,7 +553,7 @@ test('keeps all providers when the meta request fails', async () => {
   const api = await loadDomShim({ metaFails: true });
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.deepEqual(Array.from(api.providers), ['kimi', 'claude', 'codex']);
+  assert.deepEqual(Array.from(api.providers), ['kimi', 'claude', 'codex', 'grok']);
 });
 
 test('reconciles the draft model to the provider catalog after switching', async () => {
@@ -610,6 +613,8 @@ test('shows only provider-supported modes', async () => {
   api.setProvider('codex');
   assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', '']);
   api.setProvider('claude');
+  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none']);
+  api.setProvider('grok');
   assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none']);
   api.setProvider('kimi');
   assert.deepEqual(rows.map((row) => row.style.display), ['', '', '']);
@@ -686,6 +691,39 @@ test('recognizes 0.37 composer mode rows from real zh/en labels without data-mod
     assert.equal(rows[1].getAttribute('data-mode-id'), 'swarm');
     assert.equal(rows[2].getAttribute('data-mode-id'), 'goal');
   }
+});
+
+test('hides official slash items that are not Kimi slots for the current provider', async () => {
+  const makeItem = (name: string) => {
+    const attributes = new Map<string, string>();
+    const nameEl = { textContent: name };
+    const row = {
+      hidden: false,
+      style: { display: '' },
+      children: [nameEl],
+      getAttribute: (key: string) => attributes.get(key) ?? null,
+      setAttribute: (key: string, value: string) => attributes.set(key, value),
+      hasAttribute: (key: string) => attributes.has(key),
+      removeAttribute: (key: string) => attributes.delete(key),
+    };
+    (nameEl as { parentElement?: typeof row }).parentElement = row;
+    return { nameEl, row };
+  };
+  const items = ['/compact', '/swarm', '/goal', '/btw', '/status', '/undo'].map(makeItem);
+  const api = await loadShim('/', {
+    querySelectorAll: (selector: string) => {
+      if (selector === '.slash-menu .slash-name') return items.map((item) => item.nameEl);
+      return [];
+    },
+  });
+  api.setProvider('claude');
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', 'none']);
+  api.setProvider('grok');
+  assert.deepEqual(items.map((item) => item.row.style.display), ['none', 'none', 'none', 'none', '', 'none']);
+  api.setProvider('codex');
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '']);
+  api.setProvider('kimi');
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', '', '', '', '', '']);
 });
 
 test('leaves unlabeled official mode rows unchanged', async () => {

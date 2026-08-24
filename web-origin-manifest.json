@@ -1,11 +1,11 @@
 {
-  "version": "0.37.2",
-  "tag": "@moonshot-ai/kimi-code@0.37.2",
-  "commit": "0.37.2",
+  "version": "0.38.0",
+  "tag": "@moonshot-ai/kimi-code@0.38.0",
+  "commit": "0.38.0",
   "files": {
-    "index.html": "sha256:5f1a578ab812ef8a020e0c0e9b19bde915aa7d2f100a4e30bd020b896e47ac52",
+    "index.html": "sha256:356ae7f74ccdabd941c2528ad188645fe11eb72013a0890a0530ac9344a55261",
     "boot.js": "sha256:81976f84e9679f26658800df8a6fb074ee1cee42b7d05c961386c7dc1ac68129",
-    "assets/index-yKYHPeXU.js": "sha256:27d914d61bf797046ef2058d366c5325eac2feb0afab0e22aa8a6fbc29600870",
-    "assets/index-DBtc5buz.css": "sha256:dc3fc724ecd8b8b059c3de7bcfd19f0788c86c3564d6d5527172e6c4e74e483c"
+    "assets/index-BkUUBejk.js": "sha256:a0467b1a9d98814eae362e4711c41c3ebcc58bfb420b2e463081728b2b755b08",
+    "assets/index-SEzwqHoC.css": "sha256:54e36ea83999f3380da9aaac01b31e061cf84963e5674aef19c9b25b9a3b0988"
   }
 }

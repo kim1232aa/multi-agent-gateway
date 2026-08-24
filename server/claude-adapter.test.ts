@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -75,9 +75,9 @@ test('serializes a new turn behind the interrupted process instead of failing it
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-interrupt-'));
   try {
     const bin = join(base, 'claude-hang');
-    // 消费 stdin 到 EOF(startTurn 写完就关 stdin),然后挂起等信号;exec 让
-    // sh 自身变成 sleep,SIGINT 直接终结,不留孙进程。
-    await writeFile(bin, '#!/bin/sh\ncat > /dev/null\nexec sleep 60\n');
+    // Hang independently of stdin EOF so a later steer can keep the pipe open.
+    // exec sleep so SIGINT lands on the same pid the adapter spawned.
+    await writeFile(bin, '#!/bin/sh\nexec sleep 60\n');
     await chmod(bin, 0o755);
     const adapter = new ClaudeAdapter({ claudeBin: bin });
     const sessionId = '123e4567-e89b-12d3-a456-426614174001';
@@ -108,6 +108,110 @@ test('serializes a new turn behind the interrupted process instead of failing it
 
     assert.ok(events.includes('first:interrupted'), events.join(','));
     assert.ok(events.includes('second:interrupted'), events.join(','));
+    await adapter.close();
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+async function waitForLogLines(logPath: string, n: number): Promise<string[]> {
+  for (let i = 0; i < 100; i += 1) {
+    try {
+      const text = await readFile(logPath, 'utf8');
+      const lines = text.split('\n').filter(Boolean);
+      if (lines.length >= n) return lines;
+    } catch {
+      // log not created yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for ${n} stdin log line(s)`);
+}
+
+test('steers a second user line into an open stdin before interrupt', async () => {
+  // Mid-turn 插话: keep stdin open after the first prompt so a later user
+  // stream-json line reaches the SAME hanging CLI process. Do not fake this
+  // by interrupt + a new turn (that would spawn a second process).
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-steer-'));
+  try {
+    const bin = join(base, 'claude-hang');
+    const log = join(base, 'stdin.log');
+    await writeFile(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+fs.writeFileSync(log, JSON.stringify({ spawn: process.pid }) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  fs.appendFileSync(log, line + '\\n');
+});
+setInterval(() => {}, 60_000);
+`);
+    await chmod(bin, 0o755);
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    const sessionId = '123e4567-e89b-12d3-a456-426614174099';
+
+    const turn = adapter.startTurn({
+      sessionId,
+      prompt: 'first prompt',
+      onEvent: () => {},
+    });
+
+    const afterFirst = await waitForLogLines(log, 2);
+    const spawnLine = JSON.parse(afterFirst[0]!);
+    const first = JSON.parse(afterFirst[1]!);
+    assert.equal(typeof spawnLine.spawn, 'number');
+    assert.equal(first.type, 'user');
+    assert.equal(first.message.role, 'user');
+    assert.deepEqual(first.message.content, [{ type: 'text', text: 'first prompt' }]);
+
+    await adapter.steer(sessionId, 'mid-turn injection');
+    const afterSteer = await waitForLogLines(log, 3);
+    const second = JSON.parse(afterSteer[2]!);
+    assert.equal(second.type, 'user');
+    assert.equal(second.message.role, 'user');
+    assert.deepEqual(second.message.content, [{ type: 'text', text: 'mid-turn injection' }]);
+    assert.equal(JSON.parse(afterSteer[0]!).spawn, spawnLine.spawn, 'steer must reuse the same CLI process');
+
+    assert.ok(adapter.interrupt(sessionId));
+    await turn;
+    await assert.rejects(adapter.steer(sessionId, 'too late'), /no running/);
+    await adapter.close();
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('closes stdin after the result event so the CLI can exit', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-result-eof-'));
+  try {
+    const bin = join(base, 'claude-result');
+    await writeFile(bin, `#!/usr/bin/env node
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+let sent = false;
+rl.on('line', () => {
+  if (sent) return;
+  sent = true;
+  process.stdout.write(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    result: 'ok',
+    is_error: false,
+    session_id: '123e4567-e89b-12d3-a456-426614174088',
+  }) + '\\n');
+});
+rl.on('close', () => process.exit(0));
+`);
+    await chmod(bin, 0o755);
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    const events: string[] = [];
+    await adapter.startTurn({
+      sessionId: '123e4567-e89b-12d3-a456-426614174088',
+      prompt: 'go',
+      onEvent: (ev) => { events.push(ev.type); },
+    });
+    assert.ok(events.includes('done'), events.join(','));
     await adapter.close();
   } finally {
     await rm(base, { recursive: true, force: true });
