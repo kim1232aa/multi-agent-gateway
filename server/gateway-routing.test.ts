@@ -2120,6 +2120,67 @@ test('detectAvailableProviders honors CLAUDE_BIN, GROK_BIN and CODEX_PATH presen
   }
 });
 
+test('detectAvailableProviders includes claude when a fake claude is on PATH', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-path-'));
+  try {
+    const claudeBin = join(base, 'claude');
+    await writeFile(claudeBin, '#!/bin/sh\n');
+    await chmod(claudeBin, 0o755);
+    // CLAUDE_BIN 指向不存在的路径,迫使探测走 PATH,而不是 ~/.local/bin/claude。
+    const found = detectAvailableProviders({
+      CLAUDE_BIN: join(base, 'missing-claude'),
+      PATH: base,
+    });
+    assert.equal(found.includes('claude'), true);
+
+    const missing = detectAvailableProviders({
+      CLAUDE_BIN: join(base, 'missing-claude'),
+      PATH: '',
+    });
+    assert.equal(missing.includes('claude'), false);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('startGateway({kimi:off}) GET /api/v1/auth is 200 ready true without kimi child', async () => {
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    availableProviders: ['claude', 'codex', 'grok'],
+  });
+  const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
+    headers: { authorization: 'Bearer gateway-token' },
+  });
+  try {
+    const auth = await get('/auth');
+    assert.equal(auth.status, 200);
+    const authData = (await auth.json() as any).data;
+    assert.equal(authData.ready, true);
+    assert.equal(authData.providers_count, 3);
+    assert.equal(authData.default_model, null);
+    assert.equal(authData.managed_provider, null);
+    assert.equal(authData.local_only, true);
+    assert.equal(authData.upstream_error, undefined);
+
+    const meta = await get('/meta');
+    assert.equal(meta.status, 200);
+    assert.deepEqual((await meta.json() as any).data.providers, ['claude', 'codex', 'grok']);
+
+    const models = await get('/models');
+    assert.equal(models.status, 200);
+    const modelsData = (await models.json() as any).data;
+    assert.deepEqual(modelsData.items, []);
+    assert.equal(modelsData.upstream_error, undefined);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('rejects grok swarm and goal the same way as Claude', async () => {
   const gateway = await startGateway({
     port: 0,

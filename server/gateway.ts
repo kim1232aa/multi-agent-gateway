@@ -25,7 +25,7 @@ import { followKimiServer, spawnKimiServer, type KimiChild } from './kimi-child.
 import { createStaticServer } from './static.js';
 import { CodexProviderAdapter, ClaudeProviderAdapter, claudeContextWindow } from './facade.js';
 import { GrokProviderAdapter } from './grok-adapter.js';
-import { codexGatewayCommandNames } from './native-commands.js';
+import { codexGatewayCommandNames, grokGatewayCommandNames } from './native-commands.js';
 import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsSearch } from './fs-local.js';
 import {
   buildLocalTranscriptPage,
@@ -33,6 +33,16 @@ import {
   type LocalTranscriptTurn,
   type TranscriptEmission,
 } from './local-transcript.js';
+import {
+  demoEnabled,
+  demoStartTurn,
+  getDemoHistory,
+  getDemoModel,
+  getDemoSession,
+  isDemoSession,
+  listDemoModels,
+  listDemoSessions,
+} from './demo-sessions.js';
 import {
   ProviderError,
   isProviderName,
@@ -89,7 +99,7 @@ export interface GatewayOptions {
 export function detectAvailableProviders(env: NodeJS.ProcessEnv = process.env): ProviderName[] {
   const providers: ProviderName[] = ['kimi'];
   const claudeBin = env.CLAUDE_BIN ?? path.join(os.homedir(), '.local', 'bin', 'claude');
-  if (existsSync(claudeBin)) providers.push('claude');
+  if (existsSync(claudeBin) || onPath('claude', env.PATH)) providers.push('claude');
   const grokBin = env.GROK_BIN ?? path.join(os.homedir(), '.local', 'bin', 'grok');
   if (existsSync(grokBin) || onPath('grok', env.PATH)) providers.push('grok');
   const codexPath = env.CODEX_PATH;
@@ -128,6 +138,72 @@ const ID_PREFIX: Record<Exclude<ProviderName, 'kimi'>, string> = {
   claude: 'claude_',
   grok: 'grok_',
 };
+
+/** Preview transcripts when local CLIs / kimi upstream are missing. */
+let demoActive = false;
+
+function mergeDemoSessions(provider: ProviderName, items: Session[]): Session[] {
+  if (!demoActive) return items;
+  const seen = new Set(items.map((session) => session.id));
+  const extra = listDemoSessions(provider).filter((session) => !seen.has(session.id));
+  if (extra.length === 0) return items;
+  return [...items, ...extra].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+}
+
+function historyWithDemo(
+  adapter: ProviderAdapter | null,
+  provider: ProviderName,
+  nativeId: string,
+): Promise<Message[]> {
+  if (demoActive) {
+    const demo = getDemoHistory(provider, nativeId);
+    if (demo) return Promise.resolve(demo);
+  }
+  if (!adapter) return Promise.resolve([]);
+  return adapter.getHistory(nativeId).catch(() => [] as Message[]);
+}
+
+function kimiDemoAdapter(): ProviderAdapter {
+  return {
+    name: 'kimi',
+    capabilities: () => ({
+      streaming: true,
+      thinking: true,
+      tools: true,
+      approvals: false,
+      questions: false,
+      interrupt: false,
+      history: true,
+    }),
+    async list() {
+      return { items: listDemoSessions('kimi') };
+    },
+    async create() {
+      throw new ProviderError('unsupported', 'preview demo cannot create Kimi sessions', 400);
+    },
+    async getHistory(sessionId) {
+      const history = getDemoHistory('kimi', sessionId);
+      if (!history) throw new ProviderError('not_found', `kimi session not found: ${sessionId}`, 404);
+      return history;
+    },
+    async startTurn(input) {
+      const text = typeof input.input === 'string'
+        ? input.input
+        : input.input.map((part) => (part.type === 'text' ? part.text : '')).join('');
+      return demoStartTurn('kimi', input.sessionId, text);
+    },
+    async interrupt() { /* demo turns are instant */ },
+    async resolveApproval() {
+      throw new ProviderError('unsupported', 'demo session has no approvals', 400);
+    },
+    async resolveQuestion() {
+      throw new ProviderError('unsupported', 'demo session has no questions', 400);
+    },
+    async close() { /* no-op */ },
+    getCwd: (sessionId) => getDemoSession('kimi', sessionId)?.metadata.cwd,
+    getModel: (sessionId) => getDemoModel('kimi', sessionId),
+  };
+}
 
 function isLocalProvider(value: string | null): value is Exclude<ProviderName, 'kimi'> {
   return value === 'claude' || value === 'codex' || value === 'grok';
@@ -344,6 +420,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   let kimiHttp: ReturnType<typeof createKimiHttpProxy> | null = null;
   let kimiWs: ReturnType<typeof createKimiWsUpgrader> | null = null;
   const kimiOpt = options.kimi ?? 'spawn';
+  demoActive = demoEnabled(kimiOpt === 'off');
   if (kimiOpt === 'spawn') {
     const child = await spawnKimiServer();
     if (child.owned) {
@@ -573,6 +650,17 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }, requestId);
     }
     if (sub === '/auth') {
+      // kimi 上游关闭时不能 502:前端靠 /auth ready 才能进主页。
+      // 给出本地-only 登录态,不假装有 Kimi 账号。
+      if (!kimi) {
+        return ok(res, {
+          ready: true,
+          providers_count: availableProviders.length,
+          default_model: null,
+          managed_provider: null,
+          local_only: true,
+        }, requestId);
+      }
       // 登录态永远以 Kimi 上游为准,即使 URL 带了 provider=claude/codex:
       // 这两家是本地 CLI provider,不在网关伪造各自的 ready——否则模型目录
       // 为空时会被前端误显示成"未登录"(实测复现)。
@@ -599,11 +687,31 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
     // 非 Kimi provider 复用官方配置 UI，但配置只投影到当前 provider，
     // 不把 Claude/Codex 模型写进 Kimi 的 config.toml。
-    if (provider && provider !== 'kimi' && sub === '/config' && (req.method === 'GET' || req.method === 'POST')) {
-      const patch = req.method === 'POST'
-        ? ((await readBody(req)) as Record<string, unknown>)
-        : {};
-      return ok(res, await providerConfigView(provider, adapters[provider], kimiFetch, patch), requestId);
+    if (sub === '/oauth/region' && req.method === 'GET') {
+      // kap-server 用这个区分大陆/海外登录;kimi=off 时仍要 200,否则前端控制台 404。
+      const region = process.env.GATEWAY_REGION === 'mainland-cn' ? 'mainland-cn' : 'global';
+      return ok(res, { region }, requestId);
+    }
+    if (sub === '/config' && (req.method === 'GET' || req.method === 'POST')) {
+      if (provider && provider !== 'kimi') {
+        const patch = req.method === 'POST'
+          ? ((await readBody(req)) as Record<string, unknown>)
+          : {};
+        return ok(res, await providerConfigView(provider, adapters[provider], kimiFetch, patch), requestId);
+      }
+      if (!kimi) {
+        const patch = req.method === 'POST'
+          ? ((await readBody(req)) as Record<string, unknown>)
+          : {};
+        return ok(res, {
+          providers: {},
+          default_provider: null,
+          default_model: null,
+          models: [],
+          local_only: true,
+          ...patch,
+        }, requestId);
+      }
     }
     if (provider && provider !== 'kimi' && sub === '/providers' && req.method === 'GET') {
       return ok(res, { items: [await providerDto(provider, adapters[provider])] }, requestId);
@@ -623,10 +731,22 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/models' && req.method === 'GET') {
       // claude/codex → 各自 adapter 的原生目录。失败必须如实报错(500),
       // 不能吞成空列表——空目录会让前端把"没装好/握手失败"显示成"没有模型"。
+      // 预览会话打开时例外:本机没有 CLI,回演示目录,侧栏才能切 Agent。
       if (provider && provider !== 'kimi') {
         const adapter = adapters[provider];
-        const items = adapter.listModels ? await adapter.listModels() : [];
-        return ok(res, { items }, requestId);
+        try {
+          const items = adapter.listModels ? await adapter.listModels() : [];
+          if (items.length > 0) return ok(res, { items }, requestId);
+          if (demoActive) return ok(res, { items: listDemoModels(provider) }, requestId);
+          return ok(res, { items }, requestId);
+        } catch (err) {
+          if (demoActive) return ok(res, { items: listDemoModels(provider) }, requestId);
+          throw err;
+        }
+      }
+      // kimi 关闭时无上游目录:预览给演示模型,否则空列表。
+      if (!kimi) {
+        return ok(res, { items: demoActive ? listDemoModels('kimi') : [] }, requestId);
       }
       const data = kimiFetch ? ((await kimiFetch('/models').catch(() => null)) as Record<string, unknown> | null) : null;
       return ok(res, data ?? { items: [] }, requestId);
@@ -635,8 +755,13 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/commands' && req.method === 'GET') {
       if (!provider || provider === 'kimi') return ok(res, { items: [] }, requestId);
       const adapter = adapters[provider];
-      const items = adapter.listCommands ? await adapter.listCommands(undefined) : [];
-      return ok(res, { items }, requestId);
+      try {
+        const items = adapter.listCommands ? await adapter.listCommands(undefined) : [];
+        return ok(res, { items }, requestId);
+      } catch (err) {
+        if (demoActive) return ok(res, { items: [] }, requestId);
+        throw err;
+      }
     }
 
     // --- 文件上传(存网关本地;提交 prompt 时按 provider 翻译成各家输入) ---
@@ -730,10 +855,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const { provider: sp, nativeId } = providerFromSessionId(decodeURIComponent(rawId));
 
       if (sp === 'kimi') {
-        // 交给 kimi-proxy(shouldProxyToKimi 已判)。理论到不了这里。
-        return fail(res, 404, 40401, 'kimi session handled by proxy', requestId);
+        if (!demoActive || !isDemoSession('kimi', nativeId)) {
+          return fail(res, 404, 40401, kimi ? 'kimi session handled by proxy' : 'kimi session not found', requestId);
+        }
       }
-      const adapter = adapters[sp];
+      const adapter = sp === 'kimi' ? kimiDemoAdapter() : adapters[sp];
 
       if (tail === '' && req.method === 'GET') {
         return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
@@ -830,6 +956,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         throw new ProviderError('unsupported', `${sp} 不支持子会话(codex 子线程只能 agent 内部 spawn)`, 400);
       }
       if (tail === '/skills' && req.method === 'GET') {
+        if (sp === 'kimi') return ok(res, { skills: [] }, requestId);
         return ok(res, { skills: await adapterSkills(adapter, sp, nativeId) }, requestId);
       }
       const skillActivate = /^\/skills\/([^/:]+):activate$/.exec(tail);
@@ -880,7 +1007,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
       if (tail === '/export' && req.method === 'POST') {
         const session = await getSession(adapter, sp, nativeId);
-        const history = await adapter.getHistory(nativeId).catch(() => [] as Message[]);
+        const history = await historyWithDemo(adapter, sp, nativeId);
         const zip = buildStoreZip([
           { name: 'transcript.md', data: Buffer.from(transcriptMarkdown(session, history, sp), 'utf8') },
         ]);
@@ -947,15 +1074,15 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // 的 done 事件口径一致);codex 只信 tokenUsage 下发的 modelContextWindow,
         // 没有就诚实 0——不编造窗口值。
         let contextLimit = usage?.context_limit ?? 0;
+        const model = adapter.getModel?.(nativeId) ?? getDemoModel(sp, nativeId) ?? '';
         if (contextLimit <= 0 && sp === 'claude') {
-          const m = adapter.getModel?.(nativeId);
-          if (m) contextLimit = claudeContextWindow(m);
+          if (model) contextLimit = claudeContextWindow(model);
         }
         if (contextLimit <= 0 && sp === 'grok') {
           contextLimit = grokStatusContextFallback();
         }
         return ok(res, {
-          model: adapter.getModel?.(nativeId) ?? '',
+          model,
           thinking_level: adapter.getThinking?.(nativeId) ?? '',
           permission: adapter.getPermission?.(nativeId) ?? 'default',
           plan_mode: adapter.getPlanMode?.(nativeId) ?? false,
@@ -967,8 +1094,13 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }, requestId);
       }
       if (tail === '/commands' && req.method === 'GET') {
-        const items = adapter.listCommands ? await adapter.listCommands(nativeId) : [];
-        return ok(res, { items }, requestId);
+        try {
+          const items = adapter.listCommands ? await adapter.listCommands(nativeId) : [];
+          return ok(res, { items }, requestId);
+        } catch (err) {
+          if (demoActive) return ok(res, { items: [] }, requestId);
+          throw err;
+        }
       }
       if (tail === '/messages' && req.method === 'GET') {
         return ok(res, await listAdapterMessages(adapter, sp, nativeId, url), requestId);
@@ -978,7 +1110,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (!agentId) throw new ProviderError('invalid_request', 'agent_id is required', 400);
         const pageSize = Number(url.searchParams.get('page_size') ?? 20);
         const sid = prefixedId(sp, nativeId);
-        const history = await adapter.getHistory(nativeId).catch(() => null);
+        const history = await historyWithDemo(adapter, sp, nativeId);
         // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
         if (history) hub.transcript.observeHistory(sid, history);
         return ok(res, buildLocalTranscriptPage(history ?? [], {
@@ -1456,15 +1588,33 @@ async function listWorkspaces(
       if (root) roots.set(root, w);
     }
   }
+  if (demoActive && (!provider || provider === 'kimi')) {
+    for (const session of listDemoSessions('kimi')) {
+      const cwd = session.metadata.cwd;
+      if (!roots.has(cwd)) roots.set(cwd, workspaceDto(cwd));
+      const workspace = roots.get(cwd);
+      if (workspace) {
+        workspace.session_count = (typeof workspace.session_count === 'number' ? workspace.session_count : 0) + 1;
+      }
+    }
+  }
   // Codex/Claude:沿各自原生 cursor 聚合全部主会话。固定上限会漏掉老项目,
   // 还会让前端的 session_count 与“加载更多”不一致。
-  const targets: ProviderName[] = provider && provider !== 'kimi' ? [provider] : ['codex', 'claude', 'grok'];
+  const localProviders: Exclude<ProviderName, 'kimi'>[] = ['codex', 'claude', 'grok'];
+  const targets: Exclude<ProviderName, 'kimi'>[] = !provider
+    ? localProviders
+    : provider === 'kimi'
+      ? []
+      : [provider];
   for (const p of targets) {
     const adapter = adapters[p as Exclude<ProviderName, 'kimi'>];
-    const sessions = await listAllSessions(adapter).catch((err) => {
-      console.error(`[gateway] listWorkspaces: ${p}.list 失败:`, err instanceof Error ? err.message : err);
-      return [] as Session[];
-    });
+    const sessions = mergeDemoSessions(
+      p,
+      await listAllSessions(adapter).catch((err) => {
+        console.error(`[gateway] listWorkspaces: ${p}.list 失败:`, err instanceof Error ? err.message : err);
+        return [] as Session[];
+      }),
+    );
     const counts = new Map<string, number>();
     for (const session of sessions) {
       const cwd = session.metadata.cwd;
@@ -1640,9 +1790,21 @@ async function listSessions(
         archived: archivedOnly || undefined,
       });
     }
+    page = { ...page, items: mergeDemoSessions(provider, page.items) };
+    if (rootNorm) {
+      page = {
+        ...page,
+        items: page.items.filter((session) => String(session.metadata?.cwd ?? '').replace(/\/+$/, '') === rootNorm),
+      };
+    }
+    if (archivedOnly) {
+      page = { ...page, items: page.items.filter((session) => session.archived === true) };
+    } else {
+      page = { ...page, items: page.items.filter((session) => session.archived !== true) };
+    }
     const localItems = page.items.map((session) => sessionDto(
       session,
-      adapter.getModel?.(session.id),
+      adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
       adapter.getUsage?.(session.id),
       busyOf(prefixedId(provider, session.id)),
     ));
@@ -1676,6 +1838,22 @@ async function listSessions(
       if (!upstreamBefore) break;
     }
   }
+  if (demoActive && (!provider || provider === 'kimi')) {
+    for (const session of listDemoSessions('kimi')) {
+      if (rootNorm && session.metadata.cwd.replace(/\/+$/, '') !== rootNorm) continue;
+      items.push(sessionDto(session, getDemoModel('kimi', session.id)));
+    }
+  }
+  if (provider === 'kimi') {
+    items.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+    let start = 0;
+    if (beforeId) {
+      const idx = items.findIndex((it) => String(it.id) === beforeId);
+      if (idx === -1) return { items: [], has_more: false };
+      start = idx + 1;
+    }
+    return { items: items.slice(start, start + limit), has_more: start + limit < items.length };
+  }
   const targets: Exclude<ProviderName, 'kimi'>[] =
     provider && provider !== 'kimi' ? [provider] : ['codex', 'claude', 'grok'];
   for (const p of targets) {
@@ -1683,14 +1861,14 @@ async function listSessions(
       console.error(`[gateway] listSessions: ${p}.list 失败:`, err instanceof Error ? err.message : err);
       return { items: [] as Session[] };
     });
-    for (const s of page.items) {
+    for (const s of mergeDemoSessions(p, page.items)) {
       if (workspaceId) {
         // 解析不到 root 的工作区 id(已被移除的派生工作区)= 没有会话。
         if (!rootNorm) continue;
         const cwd = typeof s.metadata?.cwd === 'string' ? String(s.metadata.cwd) : '';
         if (cwd.replace(/\/+$/, '') !== rootNorm) continue;
       }
-      items.push(sessionDto(s, adapters[p].getModel?.(s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id))));
+      items.push(sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id))));
     }
   }
   items.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
@@ -1741,17 +1919,25 @@ async function getSession(
   provider: ProviderName,
   nativeId: string,
 ): Promise<Session> {
+  if (demoActive) {
+    const demo = getDemoSession(provider, nativeId);
+    if (demo) return demo;
+  }
   // 沿 provider 原生 cursor 查找,不能只看第一页或用固定 500 截断,
   // 否则较老的真实会话会被伪造成新会话。
   let cursor: string | undefined;
   const seen = new Set<string>();
-  for (;;) {
-    const page = await adapter.list({ limit: 100, cursor });
-    const found = page.items.find((session) => session.id === nativeId);
-    if (found) return found;
-    if (!page.next_cursor || seen.has(page.next_cursor)) break;
-    seen.add(page.next_cursor);
-    cursor = page.next_cursor;
+  try {
+    for (;;) {
+      const page = await adapter.list({ limit: 100, cursor });
+      const found = page.items.find((session) => session.id === nativeId);
+      if (found) return found;
+      if (!page.next_cursor || seen.has(page.next_cursor)) break;
+      seen.add(page.next_cursor);
+      cursor = page.next_cursor;
+    }
+  } catch (err) {
+    console.error(`[gateway] getSession: ${provider}.list 失败:`, err instanceof Error ? err.message : err);
   }
   // 新建但尚未落盘的会话只存在于 adapter 内存态；有真实 cwd 才能造
   // 最小 DTO。未知/已删除 id 必须 404，不能伪造成 HOME 下的空会话。
@@ -1784,14 +1970,14 @@ async function snapshot(
 ): Promise<Record<string, unknown>> {
   const [session, history] = await Promise.all([
     getSession(adapter, provider, nativeId),
-    adapter.getHistory(nativeId).catch(() => [] as Message[]),
+    historyWithDemo(adapter, provider, nativeId),
   ]);
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
   return {
     as_of_seq: hub.nextSeq(),
     epoch: hub.epoch,
-    session: sessionDto(session, adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), active !== undefined),
+    session: sessionDto(session, adapter.getModel?.(nativeId) ?? getDemoModel(provider, nativeId), adapter.getUsage?.(nativeId), active !== undefined),
     // 对齐 kap-server:快照=最后一页 + has_more。全量塞进来会让大会话
     // (几千条)首屏传输/渲染爆炸,前端表现为"会话无响应"。
     messages: {
@@ -1854,7 +2040,7 @@ async function listAdapterMessages(
   nativeId: string,
   url: URL,
 ): Promise<Record<string, unknown>> {
-  let messages = [...await adapter.getHistory(nativeId).catch(() => [] as Message[])].reverse();
+  let messages = [...await historyWithDemo(adapter, provider, nativeId)].reverse();
   const beforeId = url.searchParams.get('before_id');
   const afterId = url.searchParams.get('after_id');
   const cursor = beforeId ?? afterId;
@@ -1970,8 +2156,8 @@ async function submitPrompt(
   // 必须在 busy 排队之前拦截:代执行命令走 RPC 而非 turn/start,排进队列会被
   // drainQueue 当普通 prompt 发给模型。turn 进行中返回 409——既避免即时代执行
   // 帧与真 turn 帧在投影器里互串,也防止命令文本泄漏给模型(审查发现)。
-  const cmd = provider === 'codex' ? /^\/(\S+)\s*([\s\S]*)$/.exec(text.trim()) : null;
-  if (cmd && codexGatewayCommandNames().has(cmd[1])) {
+  const cmd = provider === 'codex' || provider === 'grok' ? /^\/(\S+)\s*([\s\S]*)$/.exec(text.trim()) : null;
+  if (cmd && provider === 'codex' && codexGatewayCommandNames().has(cmd[1])) {
     if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
     const [, name, argsText] = cmd;
     if (name === 'review') {
@@ -1979,6 +2165,11 @@ async function submitPrompt(
       return driveTurn(adapter, provider, nativeId, '/review', () => adapter.review!(nativeId), hub);
     }
     return runCodexLocalCommand(adapter, provider, nativeId, name, (argsText ?? '').trim(), hub);
+  }
+  if (cmd && provider === 'grok' && grokGatewayCommandNames().has(cmd[1])) {
+    if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+    const [, name, argsText] = cmd;
+    return runGrokLocalCommand(adapter, provider, nativeId, name, (argsText ?? '').trim(), hub);
   }
 
   // busy → 排队(对齐 kap-server:前端 steer 流依赖 status:'queued';队列里
@@ -1999,7 +2190,16 @@ async function submitPrompt(
     };
   }
 
-  return driveTurn(adapter, provider, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text, attachments }), hub);
+  return driveTurn(
+    adapter,
+    provider,
+    nativeId,
+    text,
+    () => (demoActive && isDemoSession(provider, nativeId)
+      ? Promise.resolve(demoStartTurn(provider, nativeId, text))
+      : adapter.startTurn({ sessionId: nativeId, input: text, attachments })),
+    hub,
+  );
 }
 
 /**
@@ -2031,8 +2231,8 @@ async function driveTurn(
   if (!hub.transcript.hasObservedHistory(sid)) {
     // 拉取失败不能当成"空历史"落进 hub——historyObserved 被提前固化后,
     // 真实历史回灌时会与运行中 turn 撞号(审查实测会静默丢 live turn)。
-    const history = await adapter.getHistory(nativeId).catch(() => null);
-    if (history) hub.transcript.observeHistory(sid, history);
+    const history = await historyWithDemo(adapter, provider, nativeId);
+    if (history.length > 0) hub.transcript.observeHistory(sid, history);
   }
   const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
     hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));
@@ -2188,7 +2388,7 @@ async function runCodexLocalCommand(
   let output: string;
   let reason: 'completed' | 'failed' = 'completed';
   try {
-    output = await executeCodexCommand(adapter, nativeId, name);
+    output = await (provider === 'grok' ? executeGrokCommand : executeCodexCommand)(adapter, nativeId, name);
   } catch (err) {
     reason = 'failed';
     output = `✗ ${promptText} 执行失败:${err instanceof Error ? err.message : String(err)}`;
@@ -2237,6 +2437,48 @@ async function executeCodexCommand(adapter: ProviderAdapter, nativeId: string, n
     default:
       throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
   }
+}
+
+async function runGrokLocalCommand(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  name: string,
+  argsText: string,
+  hub: SessionHub,
+): Promise<Record<string, unknown>> {
+  return runCodexLocalCommand(adapter, provider, nativeId, name, argsText, hub);
+}
+
+async function executeGrokCommand(adapter: ProviderAdapter, nativeId: string, name: string): Promise<string> {
+  switch (name) {
+    case 'compact':
+      await adapter.compact!(nativeId);
+      return '✓ 已压缩对话上下文(x.ai/compact_conversation)。';
+    case 'undo':
+      await adapter.rollback!(nativeId, 1);
+      return '✓ 已回滚最近 1 个 turn(x.ai/rewind)。';
+    case 'fork': {
+      const s = await adapter.fork!(nativeId);
+      return `⑂ 已分叉新会话:「${s.title}」\nID:${prefixedId('grok', s.id)}\n刷新会话列表后可见。`;
+    }
+    case 'usage': {
+      const usage = adapter.getUsage?.(nativeId);
+      if (!usage) return '暂无用量数据。';
+      return [
+        'Grok 用量',
+        `· input: ${usage.input_tokens}`,
+        `· output: ${usage.output_tokens}`,
+        `· context: ${usage.context_tokens}/${usage.context_limit || grokContextWindowSafe()}`,
+      ].join('\n');
+    }
+    default:
+      throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
+  }
+}
+
+function grokContextWindowSafe(): number {
+  return 500_000;
 }
 
 function renderCodexStatus(adapter: ProviderAdapter, nativeId: string): string {

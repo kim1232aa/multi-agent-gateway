@@ -719,7 +719,7 @@ test('hides official slash items that are not Kimi slots for the current provide
   api.setProvider('claude');
   assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', 'none']);
   api.setProvider('grok');
-  assert.deepEqual(items.map((item) => item.row.style.display), ['none', 'none', 'none', 'none', '', 'none']);
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', '']);
   api.setProvider('codex');
   assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '']);
   api.setProvider('kimi');

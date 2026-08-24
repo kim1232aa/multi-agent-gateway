@@ -8,6 +8,12 @@
   var OriginalWebSocket = window.WebSocket;
   var providerSockets = new Set();
 
+  try {
+    if (window.localStorage && localStorage.getItem('kimi-web.onboarded') !== '1') {
+      localStorage.setItem('kimi-web.onboarded', '1');
+    }
+  } catch (_) {}
+
   function isProvider(value) {
     return PROVIDERS.indexOf(value) !== -1;
   }
@@ -414,9 +420,10 @@
 
   // 官方 0.38 SlashMenu 仍内置 /swarm /goal /btw,也可能列出 /compact /undo。
   // Kimi 全部保留。Claude compact 是真 /compact prompt,但无 rewind,藏 /undo。
-  // Grok headless 不能 compact/rollback。Codex compact/undo/goal 由网关执行。
+  // Grok compact/undo/fork 由 adapter 执行,只藏 /swarm /goal /btw。
+  // Codex compact/undo/goal 由网关执行,藏 /swarm /btw。
   function blockedSlashNames(provider) {
-    if (provider === 'grok') return ['/swarm', '/goal', '/btw', '/compact', '/undo'];
+    if (provider === 'grok') return ['/swarm', '/goal', '/btw'];
     if (provider === 'claude') return ['/swarm', '/goal', '/btw', '/undo'];
     if (provider === 'codex') return ['/swarm', '/btw'];
     return [];
@@ -442,8 +449,22 @@
     });
   }
 
+  function dismissWelcomeWizard() {
+    var wiz = document.querySelector && document.querySelector('.wizard[role="dialog"]');
+    if (!wiz || !wiz.querySelectorAll) return;
+    var buttons = wiz.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i += 1) {
+      var text = String(buttons[i].textContent || '').trim();
+      if (text === 'Skip' || text === '跳过' || text === 'Skip for now' || text === '暂时跳过') {
+        buttons[i].click();
+        return;
+      }
+    }
+  }
+
   function syncUi() {
     if (!document.querySelector) return;
+    dismissWelcomeWizard();
     installSelector();
     var seg = document.querySelector('.multi-agent-provider-seg');
     if (seg) {
@@ -478,7 +499,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name';
+  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {

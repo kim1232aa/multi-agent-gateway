@@ -922,8 +922,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       streaming: true,
       thinking: true,
       tools: true,
-      approvals: false, // 实测:非交互 stream-json 下无法代答审批
-      questions: false, // 实测:同上
+      approvals: true, // control_request can_use_tool → approval; handler writes control_response
+      questions: true, // AskUserQuestion / questions, when the CLI shape is obvious
       interrupt: true,
       history: true,
     };
@@ -1121,6 +1121,35 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             },
           });
           break;
+        case 'approval':
+          stream.push({
+            kind: 'approval',
+            status: 'started',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: {
+              approvalId: ev.approvalId,
+              tool: ev.tool,
+              input: ev.input,
+              ...(ev.itemId ? { itemId: ev.itemId } : {}),
+            },
+          });
+          break;
+        case 'question':
+          stream.push({
+            kind: 'question',
+            status: 'started',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: {
+              questionId: ev.questionId,
+              prompt: ev.prompt,
+              rawQuestions: ev.rawQuestions,
+            },
+          });
+          break;
         case 'done': {
           // result 事件的 usage 是单 turn 量(input_tokens /
           // cache_read_input_tokens / output_tokens / total_cost_usd,
@@ -1214,12 +1243,17 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     await this.inner.steer(sessionId, text);
   }
 
-  async resolveApproval(): Promise<void> {
-    throw new ProviderError('unsupported', 'Claude 非交互模式不支持代答审批(实测)', 400);
+  async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
+    const behavior = decision === 'reject' ? 'deny' : 'allow';
+    await this.inner.resolveApproval(sessionId, approvalId, behavior);
   }
 
-  async resolveQuestion(): Promise<void> {
-    throw new ProviderError('unsupported', 'Claude 非交互模式不支持代答提问(实测)', 400);
+  async resolveQuestion(
+    sessionId: string,
+    questionId: string,
+    answer: string | Record<string, string[]>,
+  ): Promise<void> {
+    await this.inner.resolveQuestion(sessionId, questionId, answer);
   }
 
   async setGoal(): Promise<Record<string, unknown> | null> {
@@ -1359,6 +1393,40 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     // Claude 无原生 archive RPC;落本机 sidecar。true 写入,false 删除键。
     if (archived) this.settings.set('archived', sessionId, true);
     else this.settings.delete('archived', sessionId);
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    await this.inner.delete(sessionId);
+    this.renames.delete(sessionId);
+    this.sessionCwd.delete(sessionId);
+    this.settings.delete('model', sessionId);
+    this.settings.delete('thinking', sessionId);
+    this.settings.delete('permission', sessionId);
+    this.settings.delete('plan', sessionId);
+    this.settings.delete('archived', sessionId);
+    this.sessionUsage.delete(sessionId);
+  }
+
+  async fork(sessionId: string): Promise<Session> {
+    let cwd = this.sessionCwd.get(sessionId);
+    if (!cwd) {
+      const sessions = await this.inner.list().catch(() => []);
+      cwd = sessions.find((s) => s.sessionId === sessionId)?.cwd;
+    }
+    cwd = cwd || process.cwd();
+    const { sessionId: newId } = await this.inner.forkSession(sessionId, cwd);
+    this.sessionCwd.set(newId, cwd);
+    const title = this.renames.get(sessionId) ?? `Claude ${newId.slice(0, 8)}`;
+    return {
+      id: newId,
+      workspace_id: workspaceIdFromCwd(cwd, 'claude'),
+      title,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      busy: false,
+      metadata: { cwd },
+      provider: 'claude',
+    };
   }
 
   private toSession(s: {

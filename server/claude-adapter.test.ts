@@ -217,3 +217,212 @@ rl.on('close', () => process.exit(0));
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('delete unlinks the transcript jsonl and is idempotent', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-delete-'));
+  const projectsDir = join(base, 'projects');
+  try {
+    await mkdir(join(projectsDir, 'proj'), { recursive: true });
+    const uuid = '123e4567-e89b-12d3-a456-426614174010';
+    const file = join(projectsDir, 'proj', `${uuid}.jsonl`);
+    await writeFile(file, `${JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: 'hi' },
+      timestamp: '2026-01-01T00:00:00.000Z',
+    })}\n`);
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    assert.equal(adapter.hasSessionFile(uuid), true);
+    await adapter.getHistory(uuid);
+    await adapter.delete(uuid);
+    assert.equal(adapter.hasSessionFile(uuid), false);
+    await assert.rejects(adapter.getHistory(uuid), /session not found/);
+    await adapter.delete(uuid);
+    assert.deepEqual(await adapter.list(), []);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('forkSession captures a new session_id from --fork-session init', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-fork-'));
+  try {
+    const bin = join(base, 'claude-fork');
+    const oldId = '123e4567-e89b-12d3-a456-426614174020';
+    const newId = '99999999-9999-4999-8999-999999999999';
+    await writeFile(bin, `#!/usr/bin/env node
+const readline = require('node:readline');
+const forked = process.argv.includes('--fork-session');
+const resumeAt = process.argv.indexOf('--resume');
+const resumeId = resumeAt >= 0 ? process.argv[resumeAt + 1] : '';
+const sessionId = forked ? ${JSON.stringify(newId)} : resumeId;
+const rl = readline.createInterface({ input: process.stdin });
+let sent = false;
+rl.on('line', () => {
+  if (sent) return;
+  sent = true;
+  process.stdout.write(JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: sessionId,
+    cwd: '/tmp',
+    tools: [],
+  }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    result: 'ok',
+    is_error: false,
+    session_id: sessionId,
+  }) + '\\n');
+});
+rl.on('close', () => process.exit(0));
+`);
+    await chmod(bin, 0o755);
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const forked = await adapter.forkSession(oldId, '/tmp');
+      assert.equal(forked.sessionId, newId);
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('forkSession throws when the CLI reuses the original session id', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-fork-same-'));
+  try {
+    const bin = join(base, 'claude-fork-same');
+    const oldId = '123e4567-e89b-12d3-a456-426614174021';
+    await writeFile(bin, `#!/usr/bin/env node
+const readline = require('node:readline');
+const resumeAt = process.argv.indexOf('--resume');
+const sessionId = resumeAt >= 0 ? process.argv[resumeAt + 1] : 'unknown';
+const rl = readline.createInterface({ input: process.stdin });
+let sent = false;
+rl.on('line', () => {
+  if (sent) return;
+  sent = true;
+  process.stdout.write(JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: sessionId,
+    cwd: '/tmp',
+    tools: [],
+  }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    result: 'ok',
+    is_error: false,
+    session_id: sessionId,
+  }) + '\\n');
+});
+rl.on('close', () => process.exit(0));
+`);
+    await chmod(bin, 0o755);
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      await assert.rejects(
+        adapter.forkSession(oldId, '/tmp'),
+        /did not yield a new session id/,
+      );
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('control_request can_use_tool parks until resolveApproval allow, then result', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-approval-'));
+  try {
+    const bin = join(base, 'claude-approval');
+    const log = join(base, 'stdin.log');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174077';
+    await writeFile(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+const sessionId = ${JSON.stringify(sessionId)};
+const rl = readline.createInterface({ input: process.stdin });
+let phase = 0;
+rl.on('line', (line) => {
+  fs.appendFileSync(log, line + '\\n');
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (phase === 0 && msg.type === 'user') {
+    phase = 1;
+    process.stdout.write(JSON.stringify({
+      type: 'system',
+      subtype: 'init',
+      session_id: sessionId,
+      cwd: '/tmp',
+      tools: ['Bash'],
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_tool_1',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Bash',
+        input: { command: 'pwd' },
+        tool_use_id: 'toolu_1',
+      },
+    }) + '\\n');
+    return;
+  }
+  if (phase === 1 && msg.type === 'control_response') {
+    phase = 2;
+    const behavior = msg.response && msg.response.response && msg.response.response.behavior;
+    process.stdout.write(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: behavior === 'allow' ? 'allowed' : 'denied',
+      is_error: false,
+      session_id: sessionId,
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`);
+    await chmod(bin, 0o755);
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const events: Array<{ type: string; approvalId?: string; tool?: string; input?: unknown; result?: string }> = [];
+      const turn = adapter.startTurn({
+        sessionId,
+        prompt: 'run pwd',
+        onEvent: (ev) => { events.push(ev as any); },
+      });
+
+      let approval: { approvalId: string; tool: string; input?: unknown } | undefined;
+      for (let i = 0; i < 100; i += 1) {
+        approval = events.find((ev) => ev.type === 'approval') as typeof approval;
+        if (approval) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.ok(approval, `never got approval event: ${events.map((e) => e.type).join(',')}`);
+      assert.equal(approval!.approvalId, 'req_tool_1');
+      assert.equal(approval!.tool, 'Bash');
+      assert.deepEqual(approval!.input, { command: 'pwd' });
+
+      await adapter.resolveApproval(sessionId, 'req_tool_1', 'allow');
+      await turn;
+
+      assert.ok(events.some((ev) => ev.type === 'done' && ev.result === 'allowed'), events.map((e) => e.type).join(','));
+      const lines = (await readFile(log, 'utf8')).split('\n').filter(Boolean);
+      const response = lines.map((line) => JSON.parse(line)).find((msg) => msg.type === 'control_response');
+      assert.equal(response?.response?.subtype, 'success');
+      assert.equal(response?.response?.request_id, 'req_tool_1');
+      assert.equal(response?.response?.response?.behavior, 'allow');
+      assert.deepEqual(response?.response?.response?.updatedInput, { command: 'pwd' });
+    } finally {
+      await adapter.close();
+    }  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});

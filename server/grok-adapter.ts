@@ -1,6 +1,10 @@
 /**
  * GrokAdapter — wraps the Grok CLI (tested with 1.0.5) as a ProviderAdapter.
  *
+ * Main path: ACP (`grok agent stdio`, see grok-acp.ts). One long-lived JSON-RPC
+ * process, multiple sessions. Headless `-p` is the fallback when ACP spawn or
+ * initialize fails.
+ *
  * Headless turn:
  *   grok -p PROMPT --output-format streaming-messages-json --include-partial-messages
  *        [--session-id UUID | --resume UUID] [--model] [--effort] [--permission-mode]
@@ -10,7 +14,7 @@
  * so stdin is unused (stdio ignore) / never written.
  *
  * Session files live under ~/.grok/sessions/<urlencoded-cwd>/<session-id>/
- * (summary.json + chat_history.jsonl). `grok sessions list` is not trusted.
+ * (summary.json + chat_history.jsonl, plus ACP updates.jsonl).
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -19,10 +23,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { clientCommands } from './native-commands.js';
+import { listGrokCommands } from './native-commands.js';
+import { GrokAcpClient, pickPermissionOption, type GrokAcpEvent } from './grok-acp.js';
 import { SettingsStore } from './settings-store.js';
 import {
   ProviderError,
+  type ApprovalDecision,
   type CreateSessionInput,
   type GatewayEvent,
   type HistoryQuery,
@@ -36,6 +42,7 @@ import {
   type ProviderName,
   type Session,
   type SessionPage,
+  type SessionUsage,
   type StartTurnInput,
   type TurnAttachment,
   type TurnHandle,
@@ -424,6 +431,16 @@ export class GrokAdapter {
     return null;
   }
 
+  deleteSession(sessionId: string): void {
+    const dir = this.findSessionDir(sessionId);
+    if (!dir) return;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // missing / already gone
+    }
+  }
+
   private waitForExit(sessionId: string, timeoutMs: number): Promise<void> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -466,15 +483,23 @@ export class GrokAdapter {
 export class GrokProviderAdapter implements ProviderAdapter {
   readonly name = 'grok' as ProviderName;
   private readonly inner: GrokAdapter;
+  private readonly grokBin: string;
+  private readonly grokEnv: Record<string, string>;
   private readonly sessionCwd = new Map<string, string>();
   private readonly settings: SettingsStore;
   private readonly renames = new Map<string, string>();
+  private readonly sessionUsage = new Map<string, SessionUsage>();
+  private readonly acpTurns = new Map<string, EventStream<GatewayEvent>>();
   private defaultModel: string | undefined;
+  private acp: GrokAcpClient | null = null;
+  private acpDisabled = false;
 
   constructor(options?: GrokAdapterOptions & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
     this.inner = new GrokAdapter(innerOptions);
     this.settings = new SettingsStore(settingsPath);
+    this.grokBin = innerOptions.grokBin ?? process.env.GROK_BIN ?? DEFAULT_GROK_BIN;
+    this.grokEnv = innerOptions.env ?? {};
   }
 
   capabilities(): ProviderCapabilities {
@@ -482,7 +507,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
       streaming: true,
       thinking: true,
       tools: true,
-      approvals: false,
+      approvals: true,
       questions: false,
       interrupt: true,
       history: true,
@@ -696,29 +721,271 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
     const contentBlocks =
       blocks.length > 0 ? [...blocks, ...(prompt.trim() ? [{ type: 'text', text: prompt }] : [])] : undefined;
-    void this.inner
-      .startTurn({ sessionId, prompt, cwd, isNew, model, effort, permissionMode, contentBlocks, onEvent: emit })
-      .catch((err: unknown) => {
-        stream.push({
-          kind: 'turn',
-          status: 'failed',
-          sessionId,
-          turnId,
-          timestamp: Date.now(),
-          payload: { reason: 'failed', error: err instanceof Error ? err.message : String(err) },
-        });
-        stream.end();
-      });
+
+    const yolo = permissionMode === 'bypassPermissions';
+    void this.startTurnPreferAcp({
+      sessionId,
+      prompt,
+      cwd,
+      isNew,
+      model,
+      effort,
+      permissionMode,
+      contentBlocks,
+      yolo,
+      plan: this.settings.getBoolean('plan', sessionId) === true,
+      emit,
+      stream,
+      turnId,
+    });
 
     return { turnId, events: stream };
   }
 
+  private async startTurnPreferAcp(opts: {
+    sessionId: string;
+    prompt: string;
+    cwd?: string;
+    isNew: boolean;
+    model?: string;
+    effort?: string;
+    permissionMode?: string;
+    contentBlocks?: Array<Record<string, unknown>>;
+    yolo: boolean;
+    plan: boolean;
+    emit: (ev: GrokAdapterEvent) => void;
+    stream: EventStream<GatewayEvent>;
+    turnId: string;
+  }): Promise<void> {
+    const acp = await this.ensureAcp(opts.yolo);
+    if (acp) {
+      try {
+        await this.runAcpTurn(acp, opts);
+        return;
+      } catch (err) {
+        this.acpTurns.delete(opts.sessionId);
+        if (!opts.stream) return;
+        opts.emit({
+          type: 'error',
+          message: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+    }
+    void this.inner
+      .startTurn({
+        sessionId: opts.sessionId,
+        prompt: opts.prompt,
+        cwd: opts.cwd,
+        isNew: opts.isNew,
+        model: opts.model,
+        effort: opts.effort,
+        permissionMode: opts.permissionMode,
+        contentBlocks: opts.contentBlocks,
+        onEvent: opts.emit,
+      })
+      .catch((err: unknown) => {
+        opts.stream.push({
+          kind: 'turn',
+          status: 'failed',
+          sessionId: opts.sessionId,
+          turnId: opts.turnId,
+          timestamp: Date.now(),
+          payload: { reason: 'failed', error: err instanceof Error ? err.message : String(err) },
+        });
+        opts.stream.end();
+      });
+  }
+
+  private async ensureAcp(alwaysApprove: boolean): Promise<GrokAcpClient | null> {
+    if (this.acpDisabled) return null;
+    if (this.acp?.ready && this.acp.alwaysApproveEnabled === alwaysApprove) return this.acp;
+    if (this.acp) {
+      await this.acp.close().catch(() => undefined);
+      this.acp = null;
+    }
+    const client = new GrokAcpClient({
+      grokBin: this.grokBin,
+      env: this.grokEnv,
+      alwaysApprove,
+      requestTimeoutMs: 6_000,
+    });
+    try {
+      await client.connect();
+      this.acp = client;
+      client.onEvent((ev) => this.onAcpProcessEvent(ev));
+      return client;
+    } catch {
+      this.acpDisabled = true;
+      await client.close().catch(() => undefined);
+      return null;
+    }
+  }
+
+  private async runAcpTurn(
+    acp: GrokAcpClient,
+    opts: {
+      sessionId: string;
+      prompt: string;
+      cwd?: string;
+      isNew: boolean;
+      contentBlocks?: Array<Record<string, unknown>>;
+      plan: boolean;
+      yolo: boolean;
+      emit: (ev: GrokAdapterEvent) => void;
+      stream: EventStream<GatewayEvent>;
+      turnId: string;
+    },
+  ): Promise<void> {
+    const cwd = opts.cwd ?? os.homedir();
+    this.acpTurns.set(opts.sessionId, opts.stream);
+    const unsub = acp.onEvent((ev) => this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev));
+    try {
+      if (opts.isNew) {
+        const created = await acp.sessionNew({
+          cwd,
+          sessionId: opts.sessionId,
+          yoloMode: opts.yolo,
+          planMode: opts.plan,
+        });
+        if (created.sessionId !== opts.sessionId) {
+          this.sessionCwd.set(created.sessionId, cwd);
+        }
+      } else {
+        try {
+          await acp.sessionLoad({ sessionId: opts.sessionId, cwd });
+        } catch {
+          await acp.sessionNew({ cwd, sessionId: opts.sessionId, yoloMode: opts.yolo, planMode: opts.plan });
+        }
+      }
+      const prompt = acpPrompt(opts.prompt, opts.contentBlocks);
+      const { stopReason } = await acp.sessionPrompt({ sessionId: opts.sessionId, prompt });
+      const cancelled = stopReason === 'cancelled' || stopReason === 'max_tokens';
+      opts.stream.push({
+        kind: 'turn',
+        status: cancelled ? 'cancelled' : 'completed',
+        sessionId: opts.sessionId,
+        turnId: opts.turnId,
+        timestamp: Date.now(),
+        payload: { reason: cancelled ? 'cancelled' : 'completed' },
+      });
+      opts.stream.end();
+    } finally {
+      unsub();
+      this.acpTurns.delete(opts.sessionId);
+    }
+  }
+
+  private mapAcpEvent(
+    sessionId: string,
+    turnId: string,
+    stream: EventStream<GatewayEvent>,
+    ev: GrokAcpEvent,
+  ): void {
+    const ts = Date.now();
+    switch (ev.type) {
+      case 'message_chunk':
+        if (ev.sessionId !== sessionId) return;
+        stream.push({
+          kind: 'message',
+          status: 'delta',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: { delta: ev.text, message: emptyAssistantMessage(sessionId) },
+        });
+        break;
+      case 'thought_chunk':
+        if (ev.sessionId !== sessionId) return;
+        stream.push({
+          kind: 'thinking',
+          status: 'delta',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: { text: '', delta: ev.text },
+        });
+        break;
+      case 'tool_call':
+        if (ev.sessionId !== sessionId) return;
+        stream.push({
+          kind: 'tool',
+          status: 'started',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: { toolCallId: ev.toolCallId, name: ev.title, input: ev.rawInput },
+        });
+        break;
+      case 'tool_call_update':
+        if (ev.sessionId !== sessionId) return;
+        stream.push({
+          kind: 'tool',
+          status: ev.status === 'failed' ? 'failed' : 'completed',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: {
+            toolCallId: ev.toolCallId,
+            name: ev.title ?? '',
+            output: typeof ev.rawOutput === 'string' ? ev.rawOutput : JSON.stringify(ev.rawOutput ?? ''),
+            is_error: ev.status === 'failed',
+          },
+        });
+        break;
+      case 'permission_request':
+        if (ev.sessionId !== sessionId) return;
+        stream.push({
+          kind: 'approval',
+          status: 'started',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: {
+            approvalId: String(ev.requestId),
+            tool: String((ev.toolCall as { title?: string } | undefined)?.title ?? 'tool'),
+            input: ev.toolCall,
+            options: ev.options.map((o) => o.optionId),
+          },
+        });
+        break;
+      case 'usage':
+        if (ev.sessionId !== sessionId) return;
+        this.sessionUsage.set(sessionId, usageFromAcp(ev.usage, this.sessionUsage.get(sessionId)));
+        break;
+      default:
+        break;
+    }
+  }
+
+  private onAcpProcessEvent(ev: GrokAcpEvent): void {
+    if (ev.type === 'disconnected') {
+      this.acp = null;
+    }
+  }
+
   async interrupt(sessionId: string): Promise<void> {
+    if (this.acp?.ready) {
+      await this.acp.sessionCancel(sessionId).catch(() => undefined);
+    }
     this.inner.interrupt(sessionId);
   }
 
-  async resolveApproval(): Promise<void> {
-    throw new ProviderError('unsupported', 'Grok 非交互模式不支持代答审批', 400);
+  async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
+    const pending = this.acp?.getPendingPermission(approvalId);
+    if (!this.acp || !pending || pending.sessionId !== sessionId) {
+      throw new ProviderError('not_found', `grok-adapter: no pending approval ${approvalId}`, 404);
+    }
+    if (decision === 'reject') {
+      this.acp.cancelPermission(pending.id);
+      return;
+    }
+    const optionId = pickPermissionOption(pending.options, decision);
+    if (!optionId) {
+      this.acp.cancelPermission(pending.id);
+      throw new ProviderError('invalid_request', 'grok-adapter: no matching permission option', 400);
+    }
+    this.acp.resolvePermission(pending.id, optionId);
   }
 
   async resolveQuestion(): Promise<void> {
@@ -742,10 +1009,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async close(_sessionId: string): Promise<void> {
-    // 每 turn 独立进程;会话级 close 为空操作。
+    // ACP 进程常驻;会话级 close 为空操作。
   }
 
   async dispose(): Promise<void> {
+    await this.acp?.close().catch(() => undefined);
+    this.acp = null;
     await this.inner.close();
   }
 
@@ -801,7 +1070,54 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async listCommands(_sessionId?: string): Promise<NativeCommand[]> {
-    return clientCommands();
+    return listGrokCommands();
+  }
+
+  async compact(sessionId: string): Promise<void> {
+    const acp = await this.ensureAcp(false);
+    if (!acp) throw new ProviderError('unsupported', 'Grok ACP compact 不可用(CLI 未提供 grok agent stdio)', 400);
+    await acp.compact(sessionId);
+  }
+
+  async fork(sessionId: string): Promise<Session> {
+    const acp = await this.ensureAcp(false);
+    if (!acp) throw new ProviderError('unsupported', 'Grok ACP fork 不可用(CLI 未提供 grok agent stdio)', 400);
+    const { sessionId: newId } = await acp.fork(sessionId);
+    const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId) ?? process.cwd();
+    this.sessionCwd.set(newId, cwd);
+    return {
+      id: newId,
+      workspace_id: workspaceIdFromCwd(cwd, 'grok'),
+      title: this.renames.get(sessionId) ?? `Grok ${newId.slice(0, 8)}`,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      busy: false,
+      metadata: { cwd },
+      provider: this.name,
+    };
+  }
+
+  async rollback(sessionId: string, numTurns: number): Promise<void> {
+    const acp = await this.ensureAcp(false);
+    if (!acp) throw new ProviderError('unsupported', 'Grok ACP rewind 不可用(CLI 未提供 grok agent stdio)', 400);
+    await acp.rewind(sessionId, numTurns);
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    this.inner.interrupt(sessionId);
+    this.renames.delete(sessionId);
+    this.sessionCwd.delete(sessionId);
+    this.sessionUsage.delete(sessionId);
+    this.settings.delete('model', sessionId);
+    this.settings.delete('thinking', sessionId);
+    this.settings.delete('permission', sessionId);
+    this.settings.delete('plan', sessionId);
+    this.settings.delete('archived', sessionId);
+    this.inner.deleteSession(sessionId);
+  }
+
+  getUsage(sessionId: string): SessionUsage | undefined {
+    return this.sessionUsage.get(sessionId);
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
@@ -844,6 +1160,47 @@ export function grokPermissionMode(mode: string | undefined): string | undefined
     case 'yolo': return 'bypassPermissions';
     default: return undefined;
   }
+}
+
+function acpPrompt(prompt: string, contentBlocks?: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  if (contentBlocks && contentBlocks.length > 0) {
+    return contentBlocks.map((block) => {
+      if (block.type === 'text') return { type: 'text', text: String(block.text ?? '') };
+      if (block.type === 'image' && isRecord(block.source)) {
+        return {
+          type: 'image',
+          data: String(block.source.data ?? ''),
+          mimeType: String(block.source.media_type ?? 'image/png'),
+        };
+      }
+      return block;
+    });
+  }
+  return prompt.trim() ? [{ type: 'text', text: prompt }] : [];
+}
+
+function usageFromAcp(raw: Record<string, unknown>, prev?: SessionUsage): SessionUsage {
+  const used = isRecord(raw.used) ? raw.used : raw;
+  const input = num(used.input_tokens ?? used.inputTokens ?? used.input);
+  const output = num(used.output_tokens ?? used.outputTokens ?? used.output);
+  return {
+    input_tokens: (prev?.input_tokens ?? 0) + input,
+    output_tokens: (prev?.output_tokens ?? 0) + output,
+    cache_read_tokens: prev?.cache_read_tokens ?? 0,
+    cache_creation_tokens: prev?.cache_creation_tokens ?? 0,
+    total_cost_usd: prev?.total_cost_usd ?? 0,
+    context_tokens: input + output,
+    context_limit: grokContextWindow(),
+    turn_count: (prev?.turn_count ?? 0) + 1,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function num(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 function parseGrokModels(text: string): { defaultModel?: string; models: string[] } {

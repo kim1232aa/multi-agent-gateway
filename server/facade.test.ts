@@ -627,3 +627,140 @@ test('ClaudeProviderAdapter.steer forwards to the inner adapter', async () => {
 
   assert.deepEqual(calls, [{ sessionId: 'sess-1', text: 'please stop' }]);
 });
+
+test('ClaudeProviderAdapter advertises approvals and questions', () => {
+  const caps = new ClaudeProviderAdapter().capabilities();
+  assert.equal(caps.approvals, true);
+  assert.equal(caps.questions, true);
+});
+
+test('ClaudeProviderAdapter.fork returns a Session for the new id and copies cwd', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  (adapter as any).sessionCwd.set('old-id', '/tmp/proj');
+  (adapter as any).renames.set('old-id', 'Original');
+  (adapter as any).inner.forkSession = async (sessionId: string, cwd?: string) => {
+    assert.equal(sessionId, 'old-id');
+    assert.equal(cwd, '/tmp/proj');
+    return { sessionId: 'new-id' };
+  };
+
+  const session = await adapter.fork!('old-id');
+  assert.equal(session.id, 'new-id');
+  assert.equal(session.provider, 'claude');
+  assert.equal(session.metadata.cwd, '/tmp/proj');
+  assert.equal(session.title, 'Original');
+  assert.equal(adapter.getCwd('new-id'), '/tmp/proj');
+});
+
+test('ClaudeProviderAdapter.fork falls back to list() cwd when sessionCwd is empty', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  (adapter as any).inner.list = async () => [{
+    sessionId: 'old-id',
+    title: 'from list',
+    cwd: '/tmp/listed',
+    projectDir: 'listed',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  }];
+  (adapter as any).inner.forkSession = async (_sessionId: string, cwd?: string) => {
+    assert.equal(cwd, '/tmp/listed');
+    return { sessionId: 'forked-id' };
+  };
+
+  const session = await adapter.fork!('old-id');
+  assert.equal(session.id, 'forked-id');
+  assert.equal(session.metadata.cwd, '/tmp/listed');
+});
+
+test('ClaudeProviderAdapter.delete unlinks via inner and drops local state', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const deleted: string[] = [];
+  (adapter as any).inner.delete = async (id: string) => { deleted.push(id); };
+  (adapter as any).sessionCwd.set('s1', '/tmp');
+  (adapter as any).renames.set('s1', 't');
+  (adapter as any).sessionUsage.set('s1', {
+    input_tokens: 1, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
+    total_cost_usd: 0, context_tokens: 0, context_limit: 0, turn_count: 1,
+  });
+  (adapter as any).settings.set('model', 's1', 'sonnet');
+  (adapter as any).settings.set('thinking', 's1', 'high');
+  (adapter as any).settings.set('permission', 's1', 'manual');
+  (adapter as any).settings.set('plan', 's1', true);
+  (adapter as any).settings.set('archived', 's1', true);
+
+  await adapter.delete!('s1');
+
+  assert.deepEqual(deleted, ['s1']);
+  assert.equal(adapter.getCwd('s1'), undefined);
+  assert.equal(adapter.getThinking('s1'), undefined);
+  assert.equal(adapter.getPermission('s1'), undefined);
+  assert.equal(adapter.getPlanMode('s1'), undefined);
+  assert.equal(adapter.getUsage('s1'), undefined);
+});
+
+test('ClaudeProviderAdapter maps approval events and resolveApproval writes allow/deny', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const resolved: Array<[string, string, string]> = [];
+  (adapter as any).inner.resolveApproval = async (sessionId: string, approvalId: string, decision: string) => {
+    resolved.push([sessionId, approvalId, decision]);
+  };
+  (adapter as any).inner.hasSessionFile = () => true;
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    opts.onEvent({
+      type: 'approval',
+      approvalId: 'req-1',
+      tool: 'Bash',
+      input: { command: 'ls' },
+      itemId: 'toolu_1',
+    });
+    opts.onEvent({ type: 'done', sessionId: 's', result: '', isError: false, subtype: 'success', stopReason: null });
+  };
+
+  const handle = await adapter.startTurn({ sessionId: 's', input: 'go' });
+  const events: Array<{ kind: string; status: string; payload?: any }> = [];
+  for await (const ev of handle.events) events.push(ev as any);
+
+  const approval = events.find((ev) => ev.kind === 'approval');
+  assert.equal(approval?.status, 'started');
+  assert.equal(approval?.payload?.approvalId, 'req-1');
+  assert.equal(approval?.payload?.tool, 'Bash');
+  assert.deepEqual(approval?.payload?.input, { command: 'ls' });
+  assert.equal(approval?.payload?.itemId, 'toolu_1');
+
+  await adapter.resolveApproval('s', 'req-1', 'approve');
+  await adapter.resolveApproval('s', 'req-1', 'approve_always');
+  await adapter.resolveApproval('s', 'req-1', 'reject');
+  assert.deepEqual(resolved, [
+    ['s', 'req-1', 'allow'],
+    ['s', 'req-1', 'allow'],
+    ['s', 'req-1', 'deny'],
+  ]);
+});
+
+test('ClaudeProviderAdapter maps AskUserQuestion control events to question', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const answered: Array<[string, string, unknown]> = [];
+  (adapter as any).inner.resolveQuestion = async (sessionId: string, questionId: string, answer: unknown) => {
+    answered.push([sessionId, questionId, answer]);
+  };
+  (adapter as any).inner.hasSessionFile = () => true;
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    opts.onEvent({
+      type: 'question',
+      questionId: 'q-1',
+      prompt: 'What are your favorite foods?',
+      rawQuestions: [{ question: 'What are your favorite foods?', header: 'Fave foods' }],
+    });
+    opts.onEvent({ type: 'done', sessionId: 's', result: '', isError: false, subtype: 'success', stopReason: null });
+  };
+
+  const handle = await adapter.startTurn({ sessionId: 's', input: 'ask' });
+  const events: Array<{ kind: string; status: string; payload?: any }> = [];
+  for await (const ev of handle.events) events.push(ev as any);
+  const question = events.find((ev) => ev.kind === 'question');
+  assert.equal(question?.status, 'started');
+  assert.equal(question?.payload?.questionId, 'q-1');
+  assert.equal(question?.payload?.prompt, 'What are your favorite foods?');
+
+  await adapter.resolveQuestion('s', 'q-1', { q_0: ['Pizza'] });
+  assert.deepEqual(answered, [['s', 'q-1', { q_0: ['Pizza'] }]]);
+});

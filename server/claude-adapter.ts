@@ -20,9 +20,11 @@
  *    usage, permission_denials[], session_id }.
  *  - 2.1.239 实测(-p stream-json, permission-mode=manual 或缺省,stdin 开/关
  *    两种):Bash 等工具会直接执行,result.permission_denials 为空,stdout 也
- *    没有 can_use_tool control_request。因此仍无法做交互式审批/提问卡片;
- *    resolveApproval / resolveQuestion 继续抛 UnsupportedCapability。若 CLI
- *    仍拒绝某次工具,会以 permission_denied 事件上报。
+ *    没有 can_use_tool control_request(工具直接执行)。因此缺省行为与从前
+ *    一致,不强制 --permission-mode。若 CLI 发出 control_request,适配器
+ *    park 并以 approval/question 事件上报,resolveApproval/resolveQuestion
+ *    写回 control_response,不自动 deny。若 CLI 仍拒绝某次工具,会以
+ *    permission_denied 事件上报。
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -99,6 +101,19 @@ export type ClaudeAdapterEvent =
   | { type: "tool_use"; toolUseId: string; name: string; input: unknown }
   | { type: "tool_result"; toolUseId: string; content: string; isError: boolean }
   | {
+      type: "approval";
+      approvalId: string;
+      tool: string;
+      input?: unknown;
+      itemId?: string;
+    }
+  | {
+      type: "question";
+      questionId: string;
+      prompt: string;
+      rawQuestions?: unknown[];
+    }
+  | {
       type: "permission_denied";
       denials: Array<{ tool_name: string; tool_use_id: string; tool_input: unknown }>;
     }
@@ -114,6 +129,13 @@ export type ClaudeAdapterEvent =
     }
   | { type: "interrupted"; sessionId: string }
   | { type: "error"; message: string };
+
+/** Parked CLI control_request waiting for resolveApproval / resolveQuestion. */
+interface PendingControl {
+  sessionId: string;
+  kind: "approval" | "question";
+  request: Record<string, unknown>;
+}
 
 export interface StartTurnOptions {
   /** Session id from create(), or an existing session id to resume. */
@@ -191,6 +213,8 @@ export class ClaudeAdapter {
   private readonly projectsDir: string;
   /** sessionId -> running turn process (at most one turn per session). */
   private readonly running = new Map<string, ChildProcess>();
+  /** Parked control_request rows keyed by request_id (approval / question). */
+  private readonly pendingControls = new Map<string, PendingControl>();
   /** Sessions whose current turn was interrupted via interrupt(). */
   private readonly interruptRequested = new Set<string>();
   /** startTurn 的中断窗口等待者:旧进程退出时唤醒(见 startTurn/waitForExit)。 */
@@ -243,9 +267,10 @@ export class ClaudeAdapter {
     interrupt: true,
     resume: true,
     fork: true,
-    /** Auto-denied by the CLI; only reported, never answerable. */
-    approvals: false,
-    questions: false,
+    /** Best-effort: emit/resolve when CLI sends can_use_tool control_request. */
+    approvals: true,
+    /** AskUserQuestion / questions control_request, when the shape is obvious. */
+    questions: true,
   };
 
   // -- list -----------------------------------------------------------------
@@ -387,6 +412,25 @@ export class ClaudeAdapter {
     return messages;
   }
 
+  /**
+   * Unlink the session transcript .jsonl. Missing file is a no-op (idempotent).
+   * Clears the history / summarize caches so a later list/getHistory cannot
+   * revive the deleted session.
+   */
+  async delete(sessionId: string): Promise<void> {
+    this.interrupt(sessionId);
+    this.historyCache.delete(sessionId);
+    const filePath = this.findSessionFile(sessionId);
+    if (!filePath) return;
+    this.summarizeCache.delete(filePath);
+    try {
+      fs.unlinkSync(filePath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT") throw err;
+    }
+  }
+
   // -- startTurn ------------------------------------------------------------
 
   /**
@@ -449,6 +493,9 @@ export class ClaudeAdapter {
         } catch {
           return; // non-JSON noise
         }
+        if (ev?.type === "control_request") {
+          this.parkControlRequest(sessionId, ev);
+        }
         for (const mapped of mapStreamEvent(ev)) {
           if (mapped.type === "done") {
             sawResult = true;
@@ -463,6 +510,7 @@ export class ClaudeAdapter {
       child.on("error", (err) => {
         endStdin(child);
         this.running.delete(sessionId);
+        this.dropPendingForSession(sessionId);
         this.resolveExitWaiters(sessionId);
         onEvent({ type: "error", message: `spawn failed: ${err.message}` });
         reject(err);
@@ -471,6 +519,7 @@ export class ClaudeAdapter {
       child.on("close", (code, signal) => {
         endStdin(child);
         this.running.delete(sessionId);
+        this.dropPendingForSession(sessionId);
         this.resolveExitWaiters(sessionId);
         // The CLI handles SIGINT gracefully and exits code=0/signal=null
         // without a result event — so key off our own interrupt request flag,
@@ -507,6 +556,37 @@ export class ClaudeAdapter {
     child.stdin!.write(userLine + "\n");
 
     return done;
+  }
+
+  /**
+   * Resume `sessionId` with `--fork-session` and capture the NEW session id
+   * from the CLI's system/init (or result) event. Throws ProviderError
+   * unsupported if the CLI never yields a different id.
+   */
+  async forkSession(sessionId: string, cwd?: string): Promise<{ sessionId: string }> {
+    let newSessionId: string | undefined;
+    const takeId = (id: string | undefined): void => {
+      if (id && id !== sessionId) newSessionId = id;
+    };
+    await this.startTurn({
+      sessionId,
+      prompt: "Continue from this fork.",
+      cwd,
+      isNew: false,
+      fork: true,
+      onEvent: (ev) => {
+        if (ev.type === "init") takeId(ev.sessionId);
+        if (ev.type === "done") takeId(ev.sessionId);
+      },
+    });
+    if (!newSessionId) {
+      throw new ProviderError(
+        "unsupported",
+        `claude-adapter: CLI did not yield a new session id on --fork-session for ${sessionId}`,
+        400,
+      );
+    }
+    return { sessionId: newSessionId };
   }
 
   /**
@@ -569,14 +649,118 @@ export class ClaudeAdapter {
     }
   }
 
-  // -- approvals / questions (unsupported, verified) -------------------------
+  // -- approvals / questions (control_request on a live stdin) --------------
 
-  async resolveApproval(): Promise<never> {
-    throw new UnsupportedCapability("resolveApproval");
+  /**
+   * Answer a parked can_use_tool control_request. approve/always → allow;
+   * reject → deny. Does not auto-deny: if the CLI never sent control_request
+   * this throws not_found (same as no running turn).
+   */
+  async resolveApproval(sessionId: string, approvalId: string, decision: "allow" | "deny"): Promise<void> {
+    const pending = this.pendingControls.get(approvalId);
+    if (!pending || pending.kind !== "approval" || pending.sessionId !== sessionId) {
+      throw new ProviderError(
+        "not_found",
+        `claude-adapter: no pending approval ${approvalId} for session ${sessionId}`,
+        404,
+      );
+    }
+    const input = pending.request.input;
+    const response: Record<string, unknown> = { behavior: decision };
+    if (decision === "allow" && input !== undefined) response.updatedInput = input;
+    await this.writeControlResponse(sessionId, {
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: approvalId,
+        response,
+      },
+    });
+    this.pendingControls.delete(approvalId);
   }
 
-  async resolveQuestion(): Promise<never> {
-    throw new UnsupportedCapability("resolveQuestion");
+  /**
+   * Answer a parked AskUserQuestion / questions control_request. Best-effort
+   * control_response: can_use_tool AskUserQuestion is allow + answers in
+   * updatedInput; a dedicated AskUserQuestion subtype sends answers only.
+   */
+  async resolveQuestion(
+    sessionId: string,
+    questionId: string,
+    answer: string | Record<string, string[]>,
+  ): Promise<void> {
+    const pending = this.pendingControls.get(questionId);
+    if (!pending || pending.kind !== "question" || pending.sessionId !== sessionId) {
+      throw new ProviderError(
+        "not_found",
+        `claude-adapter: no pending question ${questionId} for session ${sessionId}`,
+        404,
+      );
+    }
+    const answers = typeof answer === "string" ? { q_0: [answer] } : answer;
+    const req = pending.request;
+    const response: Record<string, unknown> =
+      req.subtype === "can_use_tool"
+        ? {
+            behavior: "allow",
+            updatedInput: {
+              ...(req.input && typeof req.input === "object" ? (req.input as Record<string, unknown>) : {}),
+              answers,
+            },
+          }
+        : { answers };
+    await this.writeControlResponse(sessionId, {
+      type: "control_response",
+      response: {
+        subtype: "success",
+        request_id: questionId,
+        response,
+      },
+    });
+    this.pendingControls.delete(questionId);
+  }
+
+  private parkControlRequest(sessionId: string, ev: any): void {
+    const requestId = String(ev.request_id ?? ev.request?.request_id ?? "");
+    if (!requestId) return;
+    const req =
+      ev.request && typeof ev.request === "object" ? (ev.request as Record<string, unknown>) : {};
+    const kind = controlKind(req);
+    if (!kind) return;
+    this.pendingControls.set(requestId, { sessionId, kind, request: req });
+  }
+
+  private dropPendingForSession(sessionId: string): void {
+    for (const [id, pending] of this.pendingControls) {
+      if (pending.sessionId === sessionId) this.pendingControls.delete(id);
+    }
+  }
+
+  private writeControlResponse(sessionId: string, payload: unknown): Promise<void> {
+    const child = this.running.get(sessionId);
+    const stdin = child?.stdin;
+    if (!child || !stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) {
+      return Promise.reject(
+        new ProviderError("not_found", `claude-adapter: no running turn for session ${sessionId}`, 404),
+      );
+    }
+    const line = JSON.stringify(payload) + "\n";
+    return new Promise((resolve, reject) => {
+      stdin.write(line, (err) => {
+        if (err) {
+          reject(
+            new ProviderError(
+              "not_found",
+              `claude-adapter: control_response write failed: ${err.message}`,
+              404,
+              err,
+            ),
+          );
+          return;
+        }
+        resolve();
+      });
+    });
   }
 
   // -- 原生斜杠命令目录(initialize 握手) ---------------------------------------
@@ -716,6 +900,7 @@ export class ClaudeAdapter {
       endStdin(child);
       this.killGroup(child, "SIGTERM");
       this.running.delete(sessionId);
+      this.dropPendingForSession(sessionId);
       this.resolveExitWaiters(sessionId);
     }
   }
@@ -989,8 +1174,63 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
       break;
     }
 
+    case "control_request": {
+      const requestId = String(ev.request_id ?? ev.request?.request_id ?? "");
+      const req =
+        ev.request && typeof ev.request === "object" ? (ev.request as Record<string, unknown>) : {};
+      if (!requestId) break;
+      const kind = controlKind(req);
+      if (kind === "question") {
+        const questions = extractQuestions(req);
+        const first = questions[0] && typeof questions[0] === "object"
+          ? (questions[0] as Record<string, unknown>)
+          : undefined;
+        const prompt =
+          (typeof first?.question === "string" && first.question) ||
+          (typeof first?.header === "string" && first.header) ||
+          String(req.tool_name ?? "question");
+        out.push({
+          type: "question",
+          questionId: requestId,
+          prompt,
+          ...(questions.length > 0 ? { rawQuestions: questions } : {}),
+        });
+      } else if (kind === "approval") {
+        const itemId = req.tool_use_id;
+        out.push({
+          type: "approval",
+          approvalId: requestId,
+          tool: String(req.tool_name ?? ""),
+          input: req.input,
+          ...(typeof itemId === "string" && itemId ? { itemId } : {}),
+        });
+      }
+      break;
+    }
+
     default:
       break; // forward-compatible: ignore unknown event types
   }
   return out;
+}
+
+/** Classify a control_request payload: can_use_tool → approval; AskUserQuestion/questions → question. */
+function controlKind(req: Record<string, unknown>): "approval" | "question" | null {
+  const subtype = String(req.subtype ?? "");
+  if (subtype === "AskUserQuestion" || subtype === "ask_user_question") return "question";
+  if (Array.isArray(req.questions) && req.questions.length > 0) return "question";
+  if (subtype === "can_use_tool") {
+    const tool = String(req.tool_name ?? "");
+    const input = req.input && typeof req.input === "object" ? (req.input as Record<string, unknown>) : undefined;
+    if (tool === "AskUserQuestion" && Array.isArray(input?.questions)) return "question";
+    return "approval";
+  }
+  return null;
+}
+
+function extractQuestions(req: Record<string, unknown>): unknown[] {
+  if (Array.isArray(req.questions)) return req.questions;
+  const input = req.input && typeof req.input === "object" ? (req.input as Record<string, unknown>) : undefined;
+  if (Array.isArray(input?.questions)) return input.questions;
+  return [];
 }
