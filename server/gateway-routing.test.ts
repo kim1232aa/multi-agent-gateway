@@ -1915,6 +1915,44 @@ test('fans session global events to every local connection without leaking turn 
   }
 });
 
+test('opens a local events socket when kimi is off so the official splash can finish', async () => {
+  const gateway = await startGateway({
+    host: '127.0.0.1',
+    port: 0,
+    token: 'test-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const frames: Record<string, unknown>[] = [];
+  const ws = new WebSocket(
+    `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?client_id=browser&provider=kimi`,
+    ['kimi-code.bearer.test-token'],
+  );
+  try {
+    await Promise.race([
+      new Promise<void>((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error('kimi=off WebSocket failed to open locally'));
+        ws.onmessage = (event) => {
+          frames.push(JSON.parse(String(event.data)) as Record<string, unknown>);
+        };
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('kimi=off WebSocket open timed out')), 1_000)),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(frames[0]?.type, 'server_hello');
+    assert.equal(
+      (frames[0]?.payload as { server_id?: string } | undefined)?.server_id,
+      'multi-agent-gateway',
+    );
+  } finally {
+    ws.close();
+    await gateway.close();
+  }
+});
+
 test('keeps grok WebSocket local instead of tunneling to Kimi', async () => {
   let tunneled = false;
   const upstreamServer = createServer((_req, res) => {

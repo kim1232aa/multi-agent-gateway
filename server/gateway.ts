@@ -1308,6 +1308,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     },
     gatewaySockets,
     kimiSockets,
+    kimiOpt === 'off',
   );
 
   await new Promise<void>((resolveListen, rejectListen) => {
@@ -1316,29 +1317,32 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   });
 
   void hydrateUploadsFromDisk();
-  // 预热列表 + 模型/命令目录。切 Agent 时官方 facade.load 会连打
-  // /sessions+/models+/commands;Claude initialize 冷启动实测约 0.9s。
-  void Promise.allSettled([
-    adapters.codex.list({ limit: 100 }),
-    adapters.claude.list({ limit: 100 }),
-    adapters.grok.list({ limit: 100 }),
-    adapters.claude.listModels?.() ?? Promise.resolve(null),
-    adapters.claude.listCommands?.() ?? Promise.resolve(null),
-    adapters.codex.listModels?.() ?? Promise.resolve(null),
-    adapters.codex.listCommands?.() ?? Promise.resolve(null),
-    adapters.grok.listModels?.() ?? Promise.resolve(null),
-    adapters.grok.listCommands?.() ?? Promise.resolve(null),
-  ]).then((rs) => {
-    const names = ['codex.list', 'claude.list', 'grok.list', 'claude.models', 'claude.cmds', 'codex.models', 'codex.cmds', 'grok.models', 'grok.cmds'];
-    const parts = rs.map((r, i) => {
-      if (r.status !== 'fulfilled') return `${names[i]}=失败`;
-      const value = r.value as { items?: unknown[] } | unknown[] | null;
-      if (Array.isArray(value)) return `${names[i]}=${value.length}`;
-      if (value && Array.isArray(value.items)) return `${names[i]}=${value.items.length}`;
-      return `${names[i]}=ok`;
+  // 预热只打本机已安装的 provider。没装的 CLI 会在 handshake 上空等 ~20s,
+  // 抢首屏 /auth + WS,把官方「连接中」拖长。
+  const warm: Array<Promise<unknown>> = [];
+  const warmNames: string[] = [];
+  const enqueueWarm = (name: string, task: Promise<unknown>): void => {
+    warmNames.push(name);
+    warm.push(task);
+  };
+  for (const p of ['codex', 'claude', 'grok'] as const) {
+    if (!availableProviders.includes(p)) continue;
+    enqueueWarm(`${p}.list`, adapters[p].list({ limit: 100 }));
+    enqueueWarm(`${p}.models`, adapters[p].listModels?.() ?? Promise.resolve(null));
+    enqueueWarm(`${p}.cmds`, adapters[p].listCommands?.() ?? Promise.resolve(null));
+  }
+  if (warm.length > 0) {
+    void Promise.allSettled(warm).then((rs) => {
+      const parts = rs.map((r, i) => {
+        if (r.status !== 'fulfilled') return `${warmNames[i]}=失败`;
+        const value = r.value as { items?: unknown[] } | unknown[] | null;
+        if (Array.isArray(value)) return `${warmNames[i]}=${value.length}`;
+        if (value && Array.isArray(value.items)) return `${warmNames[i]}=${value.items.length}`;
+        return `${warmNames[i]}=ok`;
+      });
+      console.error(`[gateway] 预热: ${parts.join(' ')}`);
     });
-    console.error(`[gateway] 预热: ${parts.join(' ')}`);
-  });
+  }
 
   const address = server.address();
   const actualPort = typeof address === 'object' && address ? address.port : port;
@@ -2876,6 +2880,8 @@ function attachGatewayWebSocket(
   resolveKimiWs: () => Promise<ReturnType<typeof createKimiWsUpgrader> | null>,
   gatewaySockets: Set<Duplex>,
   kimiSockets: Set<Duplex>,
+  /** kimi=off: 官方启动屏等 WS open。没有上游时走本地事件通道,不能 503。 */
+  stubKimiEvents: boolean,
 ): void {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -2889,7 +2895,7 @@ function attachGatewayWebSocket(
       return;
     }
     const provider = url.searchParams.get('provider');
-    if (!isLocalProvider(provider)) {
+    if (!isLocalProvider(provider) && !stubKimiEvents) {
       socket.pause();
       void resolveKimiWs().then((kimiWs) => {
         if (socket.destroyed) return;
@@ -2914,6 +2920,7 @@ function attachGatewayWebSocket(
       });
       return;
     }
+    const socketProvider: ProviderName = isLocalProvider(provider) ? provider : 'kimi';
     // 本地 provider 握手:从客户端提议里选一个子协议回显(RFC 6455 要求恰好
     // 一个;原样回显整个逗号分隔列表是非法响应,浏览器会拒绝握手)。
     const protos = (req.headers['sec-websocket-protocol'] ?? '')
@@ -3002,7 +3009,7 @@ function attachGatewayWebSocket(
         if (
           !sid
           || !split
-          || split.provider !== provider
+          || split.provider !== socketProvider
           || !validTranscriptSpec(spec)
           || (rawSince !== undefined && (!Number.isInteger(rawSince) || Number(rawSince) < 0))
         ) {
@@ -3018,7 +3025,8 @@ function attachGatewayWebSocket(
           if (filtered) sendObj(transcriptEnvelope(sid, hub, filtered));
         });
         transcriptOffs.set(sid, subscription.close);
-        const history = await adapters[provider].getHistory(split.nativeId).catch(() => null);
+        const adapter = isLocalProvider(socketProvider) ? adapters[socketProvider] : null;
+        const history = adapter ? await adapter.getHistory(split.nativeId).catch(() => null) : null;
         if (history) subscription.seed(history, hub.busy.has(sid) ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
         sendObj({
           type: 'ack', id: msg.id, code: 0, msg: 'success',
@@ -3047,7 +3055,7 @@ function attachGatewayWebSocket(
       }
       if (msg.type === 'client_hello' || msg.type === 'subscribe') {
         const ids = msg.type === 'client_hello' ? msg.payload?.subscriptions ?? [] : msg.payload?.session_ids ?? [];
-        const localIds = ids.filter((id) => providerFromSessionId(id).provider === provider);
+        const localIds = ids.filter((id) => providerFromSessionId(id).provider === socketProvider);
         const cursors = msg.payload?.cursors ?? {};
         const resyncRequired: { sid: string; reason: 'buffer_overflow' | 'epoch_changed' }[] = [];
         for (const sid of localIds) {
