@@ -572,17 +572,20 @@ test('surfaces Claude model handshake failure and retries next call', async () =
   }
 });
 
-test('keeps env-derived Claude models when a custom endpoint is configured', async () => {
+test('Claude model selector stays on the CLI handshake catalog even when ANTHROPIC_MODEL is set', async () => {
   const saved = stashAnthropicModelVars();
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-models-env-'));
   try {
-    process.env.ANTHROPIC_MODEL = 'custom-endpoint-model';
+    process.env.ANTHROPIC_MODEL = 'qwen3.6-flash[1m]';
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'qwen3.6-flash[1m]';
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'qwen3.6-flash[1m]';
     const { bin, marker } = await fakeClaudeBin(base);
     const models = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
 
-    assert.deepEqual(models.map((m) => m.model), ['custom-endpoint-model']);
-    assert.equal(models[0]?.max_context_size, 200_000);
-    assert.equal((await readFile(marker, 'utf8').catch(() => '')).length, 0);
+    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'claude-fable-5[1m]', 'haiku']);
+    assert.equal(models[0]?.display_name, 'Default (recommended)');
+    assert.equal(models.some((m) => /qwen/i.test(m.model) || /qwen/i.test(m.display_name ?? '')), false);
+    assert.equal((await readFile(marker, 'utf8')).length, 1);
   } finally {
     restoreAnthropicModelVars(saved);
     await rm(base, { recursive: true, force: true });

@@ -8,12 +8,6 @@
   var OriginalWebSocket = window.WebSocket;
   var providerSockets = new Set();
 
-  try {
-    if (window.localStorage && localStorage.getItem('kimi-web.onboarded') !== '1') {
-      localStorage.setItem('kimi-web.onboarded', '1');
-    }
-  } catch (_) {}
-
   function isProvider(value) {
     return PROVIDERS.indexOf(value) !== -1;
   }
@@ -449,22 +443,8 @@
     });
   }
 
-  function dismissWelcomeWizard() {
-    var wiz = document.querySelector && document.querySelector('.wizard[role="dialog"]');
-    if (!wiz || !wiz.querySelectorAll) return;
-    var buttons = wiz.querySelectorAll('button');
-    for (var i = 0; i < buttons.length; i += 1) {
-      var text = String(buttons[i].textContent || '').trim();
-      if (text === 'Skip' || text === '跳过' || text === 'Skip for now' || text === '暂时跳过') {
-        buttons[i].click();
-        return;
-      }
-    }
-  }
-
   function syncUi() {
     if (!document.querySelector) return;
-    dismissWelcomeWizard();
     installSelector();
     var seg = document.querySelector('.multi-agent-provider-seg');
     if (seg) {

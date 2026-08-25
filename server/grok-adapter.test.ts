@@ -422,3 +422,85 @@ test('provider startTurn forwards image attachments as --prompt-json', async () 
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('ACP spawn failure falls back to -p for that turn and retries ACP on the next turn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-acp-retry-'));
+  try {
+    const bin = join(base, 'grok');
+    const spawnLog = join(base, 'spawn.log');
+    const countFile = join(base, 'acp.count');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+spawn_log = os.environ.get("GROK_SPAWN_LOG")
+if spawn_log:
+    with open(spawn_log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(args) + "\\n")
+if args[:2] == ["agent", "stdio"]:
+    count_path = os.environ.get("GROK_ACP_COUNT")
+    n = 1
+    if count_path:
+        try:
+            n = int(open(count_path, encoding="utf-8").read() or "0") + 1
+        except Exception:
+            n = 1
+        open(count_path, "w", encoding="utf-8").write(str(n))
+    if n == 1:
+        sys.exit(1)
+    sys.stdout.reconfigure(line_buffering=True)
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        method = msg.get("method")
+        mid = msg.get("id")
+        if method == "initialize":
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "0.1"}}), flush=True)
+        elif method == "session/new":
+            sid = (msg.get("params") or {}).get("sessionId") or "acp-session"
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": sid}}), flush=True)
+        elif method == "session/load":
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+        elif method == "session/prompt":
+            sid = (msg.get("params") or {}).get("sessionId") or ""
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": sid,
+                    "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "acp-ok"}},
+                },
+            }), flush=True)
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}), flush=True)
+        elif mid is not None:
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+    sys.exit(0)
+if args[:1] == ["models"]:
+    sys.stdout.write("Default model: grok-4.6\\nAvailable models:\\n  * grok-4.6 (default)\\n")
+    sys.exit(0)
+sys.stdout.write(
+    '{"type":"system","subtype":"init","session_id":"s","cwd":"/tmp","tools":[]}\\n'
+    '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"p-ok"}}}\\n'
+    '{"type":"result","subtype":"success","result":"p-ok","is_error":false,"session_id":"s"}\\n'
+)
+sys.exit(0)
+`)
+    await chmod(bin, 0o755);
+    const adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_SPAWN_LOG: spawnLog, GROK_ACP_COUNT: countFile },
+    });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'first' }));
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'second' }));
+    const spawns = (await readFile(spawnLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[]);
+    assert.ok(spawns.length >= 3, JSON.stringify(spawns));
+    assert.deepEqual(spawns[0].slice(0, 2), ['agent', 'stdio']);
+    assert.ok(spawns[1].includes('-p') || spawns[1][0] === '-p', JSON.stringify(spawns[1]));
+    assert.deepEqual(spawns[2].slice(0, 2), ['agent', 'stdio']);
+    assert.equal(spawns.filter((args) => args[0] === 'agent' && args[1] === 'stdio').length, 2);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});

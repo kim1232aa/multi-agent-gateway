@@ -1,6 +1,7 @@
 /**
  * Preview transcripts so the Kimi Web sidebar is not empty when local CLIs
- * are missing. Gated by GATEWAY_DEMO (default on when kimi=off).
+ * are missing. Opt-in only: GATEWAY_DEMO=on. Product default is off — empty
+ * sidebar / 500 on missing CLI is honest, not a fake catalog.
  */
 import { randomUUID } from 'node:crypto';
 import type {
@@ -476,10 +477,8 @@ export function listDemoModels(provider: ProviderName): NativeModel[] {
   ];
 }
 
-export function demoEnabled(kimiOff: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.GATEWAY_DEMO === 'off') return false;
-  if (env.GATEWAY_DEMO === '1' || env.GATEWAY_DEMO === 'on') return true;
-  return kimiOff;
+export function demoEnabled(_kimiOff: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.GATEWAY_DEMO === '1' || env.GATEWAY_DEMO === 'on';
 }
 
 export function listDemoSessions(provider: ProviderName): Session[] {

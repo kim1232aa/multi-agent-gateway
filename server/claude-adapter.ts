@@ -493,10 +493,12 @@ export class ClaudeAdapter {
         } catch {
           return; // non-JSON noise
         }
-        if (ev?.type === "control_request") {
-          this.parkControlRequest(sessionId, ev);
-        }
         for (const mapped of mapStreamEvent(ev)) {
+          if (mapped.type === "approval") {
+            this.parkControlRequest(sessionId, ev, "approval");
+          } else if (mapped.type === "question") {
+            this.parkControlRequest(sessionId, ev, "question");
+          }
           if (mapped.type === "done") {
             sawResult = true;
             // Turn naturally finished: close stdin so the CLI can exit.
@@ -560,25 +562,90 @@ export class ClaudeAdapter {
 
   /**
    * Resume `sessionId` with `--fork-session` and capture the NEW session id
-   * from the CLI's system/init (or result) event. Throws ProviderError
+   * from the CLI's system/init (or result) event. Does not write a user
+   * prompt — that would land in the forked transcript. Throws ProviderError
    * unsupported if the CLI never yields a different id.
    */
   async forkSession(sessionId: string, cwd?: string): Promise<{ sessionId: string }> {
+    if (this.running.has(sessionId)) {
+      await this.waitForExit(sessionId, 8_000);
+    }
+    const args = [
+      "-p",
+      "--input-format", "stream-json",
+      "--output-format", "stream-json",
+      "--include-partial-messages",
+      "--verbose",
+      "--resume", sessionId,
+      "--fork-session",
+    ];
+    const child = spawn(this.claudeBin, args, {
+      cwd: cwd ?? os.homedir(),
+      env: { ...process.env, ...this.env },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    child.stdin?.on("error", () => undefined);
+    child.stderr?.resume();
+
     let newSessionId: string | undefined;
     const takeId = (id: string | undefined): void => {
       if (id && id !== sessionId) newSessionId = id;
     };
-    await this.startTurn({
-      sessionId,
-      prompt: "Continue from this fork.",
-      cwd,
-      isNew: false,
-      fork: true,
-      onEvent: (ev) => {
-        if (ev.type === "init") takeId(ev.sessionId);
-        if (ev.type === "done") takeId(ev.sessionId);
-      },
-    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (err?: Error): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (err) reject(err);
+          else resolve();
+        };
+        const timer = setTimeout(() => {
+          endStdin(child);
+          this.killGroup(child, "SIGTERM");
+          finish(new Error(`claude-adapter: --fork-session timed out waiting for system/init for ${sessionId}`));
+        }, 20_000);
+        timer.unref();
+        const rl = readline.createInterface({ input: child.stdout! });
+        rl.on("line", (line) => {
+          if (!line.trim()) return;
+          let ev: any;
+          try {
+            ev = JSON.parse(line);
+          } catch {
+            return;
+          }
+          for (const mapped of mapStreamEvent(ev)) {
+            if (mapped.type === "init") takeId(mapped.sessionId);
+            if (mapped.type === "done") takeId(mapped.sessionId);
+          }
+          if (newSessionId) {
+            endStdin(child);
+            this.killGroup(child, "SIGTERM");
+            finish();
+          }
+        });
+        child.on("error", (err) => finish(err));
+        child.on("close", () => {
+          if (newSessionId) finish();
+          else finish(new Error(`claude-adapter: CLI did not yield a new session id on --fork-session for ${sessionId}`));
+        });
+      });
+    } catch (err) {
+      if (!newSessionId) {
+        throw err instanceof ProviderError
+          ? err
+          : new ProviderError(
+            "unsupported",
+            err instanceof Error ? err.message : String(err),
+            400,
+          );
+      }
+    }
+
     if (!newSessionId) {
       throw new ProviderError(
         "unsupported",
@@ -720,13 +787,11 @@ export class ClaudeAdapter {
     this.pendingControls.delete(questionId);
   }
 
-  private parkControlRequest(sessionId: string, ev: any): void {
+  private parkControlRequest(sessionId: string, ev: any, kind: "approval" | "question"): void {
     const requestId = String(ev.request_id ?? ev.request?.request_id ?? "");
     if (!requestId) return;
     const req =
       ev.request && typeof ev.request === "object" ? (ev.request as Record<string, unknown>) : {};
-    const kind = controlKind(req);
-    if (!kind) return;
     this.pendingControls.set(requestId, { sessionId, kind, request: req });
   }
 

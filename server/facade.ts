@@ -1331,38 +1331,12 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   /**
-   * 原生模型目录,两种真实情形:
-   * - 配了自定义端点(ANTHROPIC_MODEL 等):env 里的模型就是该端点实际可用的,
-   *   同一模型被多个别名指向时合并成一行,display_name 标注别名来源。
-   * - 没配(未登录/官方默认):展示 CLI initialize 握手返回的内置目录
-   *   (default/opus/fable/sonnet/haiku,2.1.226 实测);握手失败如实抛错,
-   *   不伪造空目录,也不进缓存。
+   * 选择器目录永远来自 CLI initialize 握手(default/opus/fable/sonnet/haiku)。
+   * ANTHROPIC_MODEL 等是当时测自定义端点的临时环境,不是产品目录;
+   * 当前进程真正跑哪个模型由 getModel() 读 env,不把 qwen 别名塞进选择器。
+   * 握手失败如实抛错,不伪造空目录,也不进缓存。
    */
   async listModels(): Promise<NativeModel[]> {
-    const rows: Array<[string, string | undefined]> = [
-      ['default', process.env.ANTHROPIC_MODEL],
-      ['opus', process.env.ANTHROPIC_DEFAULT_OPUS_MODEL],
-      ['sonnet', process.env.ANTHROPIC_DEFAULT_SONNET_MODEL],
-      ['haiku', process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL],
-    ];
-    const byModel = new Map<string, string[]>();
-    for (const [alias, model] of rows) {
-      if (!model) continue;
-      const aliases = byModel.get(model) ?? [];
-      aliases.push(alias);
-      byModel.set(model, aliases);
-    }
-    if (byModel.size > 0) {
-      return [...byModel.entries()].map(([model, aliases]) => ({
-        provider: 'claude',
-        model,
-        display_name: `${model}(${aliases.join('/')})`,
-        max_context_size: claudeContextWindow(model, ...aliases),
-        capabilities: ['thinking'],
-        support_efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
-      }));
-    }
-
     const builtin = await this.inner.listBuiltinModels();
     return builtin.map((model) => ({
       provider: 'claude',

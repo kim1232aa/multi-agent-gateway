@@ -492,7 +492,6 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly acpTurns = new Map<string, EventStream<GatewayEvent>>();
   private defaultModel: string | undefined;
   private acp: GrokAcpClient | null = null;
-  private acpDisabled = false;
 
   constructor(options?: GrokAdapterOptions & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
@@ -798,7 +797,6 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   private async ensureAcp(alwaysApprove: boolean): Promise<GrokAcpClient | null> {
-    if (this.acpDisabled) return null;
     if (this.acp?.ready && this.acp.alwaysApproveEnabled === alwaysApprove) return this.acp;
     if (this.acp) {
       await this.acp.close().catch(() => undefined);
@@ -816,7 +814,6 @@ export class GrokProviderAdapter implements ProviderAdapter {
       client.onEvent((ev) => this.onAcpProcessEvent(ev));
       return client;
     } catch {
-      this.acpDisabled = true;
       await client.close().catch(() => undefined);
       return null;
     }

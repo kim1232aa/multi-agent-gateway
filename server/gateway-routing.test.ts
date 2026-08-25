@@ -2238,6 +2238,32 @@ test('surfaces provider model catalog errors instead of faking an empty list', a
   }
 });
 
+test('GATEWAY_DEMO does not replace a failed Claude model catalog', async () => {
+  const saved = process.env.GATEWAY_DEMO;
+  process.env.GATEWAY_DEMO = 'on';
+  const claude = fakeAdapter('claude');
+  claude.listModels = async () => { throw new Error('handshake failed'); };
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any, grok: fakeAdapter('grok') as any,
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/models?provider=claude`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.notEqual(response.status, 200);
+    const body = (await response.json()) as { code?: number; msg?: string };
+    assert.match(body.msg ?? '', /handshake failed/);
+  } finally {
+    await gateway.close();
+    if (saved === undefined) delete process.env.GATEWAY_DEMO;
+    else process.env.GATEWAY_DEMO = saved;
+  }
+});
+
 test('keeps a running turn visible when the first history fetch fails but a later one succeeds', async () => {
   // 回归:首轮 getHistory 失败曾把 historyObserved 提前固化,之后历史成功
   // 回灌时运行中 turn 与同号持久化 turn 撞号,REST 页静默丢 live turn。

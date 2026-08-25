@@ -40,7 +40,6 @@ import {
   getDemoModel,
   getDemoSession,
   isDemoSession,
-  listDemoModels,
   listDemoSessions,
 } from './demo-sessions.js';
 import {
@@ -139,10 +138,9 @@ const ID_PREFIX: Record<Exclude<ProviderName, 'kimi'>, string> = {
   grok: 'grok_',
 };
 
-/** Preview transcripts when local CLIs / kimi upstream are missing. */
-let demoActive = false;
+/** Preview transcripts. Bound per startGateway() instance — never module-global. */
 
-function mergeDemoSessions(provider: ProviderName, items: Session[]): Session[] {
+function mergeDemoSessions(provider: ProviderName, items: Session[], demoActive: boolean): Session[] {
   if (!demoActive) return items;
   const seen = new Set(items.map((session) => session.id));
   const extra = listDemoSessions(provider).filter((session) => !seen.has(session.id));
@@ -154,6 +152,7 @@ function historyWithDemo(
   adapter: ProviderAdapter | null,
   provider: ProviderName,
   nativeId: string,
+  demoActive: boolean,
 ): Promise<Message[]> {
   if (demoActive) {
     const demo = getDemoHistory(provider, nativeId);
@@ -420,7 +419,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   let kimiHttp: ReturnType<typeof createKimiHttpProxy> | null = null;
   let kimiWs: ReturnType<typeof createKimiWsUpgrader> | null = null;
   const kimiOpt = options.kimi ?? 'spawn';
-  demoActive = demoEnabled(kimiOpt === 'off');
+  const demoActive = demoEnabled(kimiOpt === 'off');
   if (kimiOpt === 'spawn') {
     const child = await spawnKimiServer();
     if (child.owned) {
@@ -581,7 +580,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (archived) v1.searchParams.set('archived_only', 'true');
       const pageToken = url.searchParams.get('page_token');
       if (pageToken) v1.searchParams.set('before_id', pageToken);
-      const data = await listSessions(adapters, kimiFetch, v1, provider, (sid) => hub.busy.has(sid), sessionPageCursors);
+      const data = await listSessions(adapters, kimiFetch, v1, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive);
       const items = ((data.items ?? []) as Record<string, unknown>[]).map((item) => sessionV2Dto(item, Boolean(item.busy)));
       if (view === 'by_workspace') {
         return ok(res, sessionGroupsV2(items, url), requestId);
@@ -729,24 +728,15 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
     }
     if (sub === '/models' && req.method === 'GET') {
-      // claude/codex → 各自 adapter 的原生目录。失败必须如实报错(500),
-      // 不能吞成空列表——空目录会让前端把"没装好/握手失败"显示成"没有模型"。
-      // 预览会话打开时例外:本机没有 CLI,回演示目录,侧栏才能切 Agent。
+      // claude/codex/grok → 各自 adapter 的原生目录。失败必须如实报错(500),
+      // 不能吞成空列表或演示目录——那会把"没装好/握手失败"显示成"有模型"。
       if (provider && provider !== 'kimi') {
         const adapter = adapters[provider];
-        try {
-          const items = adapter.listModels ? await adapter.listModels() : [];
-          if (items.length > 0) return ok(res, { items }, requestId);
-          if (demoActive) return ok(res, { items: listDemoModels(provider) }, requestId);
-          return ok(res, { items }, requestId);
-        } catch (err) {
-          if (demoActive) return ok(res, { items: listDemoModels(provider) }, requestId);
-          throw err;
-        }
+        const items = adapter.listModels ? await adapter.listModels() : [];
+        return ok(res, { items }, requestId);
       }
-      // kimi 关闭时无上游目录:预览给演示模型,否则空列表。
       if (!kimi) {
-        return ok(res, { items: demoActive ? listDemoModels('kimi') : [] }, requestId);
+        return ok(res, { items: [] }, requestId);
       }
       const data = kimiFetch ? ((await kimiFetch('/models').catch(() => null)) as Record<string, unknown> | null) : null;
       return ok(res, data ?? { items: [] }, requestId);
@@ -755,13 +745,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/commands' && req.method === 'GET') {
       if (!provider || provider === 'kimi') return ok(res, { items: [] }, requestId);
       const adapter = adapters[provider];
-      try {
-        const items = adapter.listCommands ? await adapter.listCommands(undefined) : [];
-        return ok(res, { items }, requestId);
-      } catch (err) {
-        if (demoActive) return ok(res, { items: [] }, requestId);
-        throw err;
-      }
+      const items = adapter.listCommands ? await adapter.listCommands(undefined) : [];
+      return ok(res, { items }, requestId);
     }
 
     // --- 文件上传(存网关本地;提交 prompt 时按 provider 翻译成各家输入) ---
@@ -807,7 +792,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
     // --- workspaces ---
     if (sub === '/workspaces' && req.method === 'GET') {
-      return ok(res, await listWorkspaces(adapters, kimiFetch, provider), requestId);
+      return ok(res, await listWorkspaces(adapters, kimiFetch, provider, demoActive), requestId);
     }
     if (sub === '/workspaces' && req.method === 'POST') {
       const body = (await readBody(req)) as { root: string; name?: string };
@@ -823,7 +808,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           return ok(res, { deleted: wid }, requestId);
         }
         const body = (await readBody(req).catch(() => ({}))) as { name?: string };
-        const all = await listWorkspaces(adapters, kimiFetch, provider);
+        const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive);
         const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
         const hit = wsItems.find((w) => w.id === wid);
         return ok(res, { ...(hit ?? { id: wid, root: '' }), name: body.name ?? '' }, requestId);
@@ -831,7 +816,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
     if (sub === '/workspace/fs:search' && req.method === 'POST' && provider && provider !== 'kimi') {
       const body = (await readBody(req)) as { workspace?: string; query?: string; limit?: number };
-      const all = await listWorkspaces(adapters, kimiFetch, provider);
+      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive);
       const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
       const hit = wsItems.find((w) => w.id === body.workspace);
       const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : process.env.HOME ?? '/home/ubuntu';
@@ -840,7 +825,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
     // --- sessions ---
     if (sub === '/sessions' && req.method === 'GET') {
-      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid), sessionPageCursors), requestId);
+      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive), requestId);
     }
     if (sub === '/sessions' && req.method === 'POST') {
       if (!provider || provider === 'kimi') {
@@ -862,7 +847,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const adapter = sp === 'kimi' ? kimiDemoAdapter() : adapters[sp];
 
       if (tail === '' && req.method === 'GET') {
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
       if (tail === '' && req.method === 'DELETE') {
         if (!adapter.delete) throw new ProviderError('unsupported', `${sp} 不支持删除会话`, 400);
@@ -885,7 +870,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持恢复归档`, 400);
         await adapter.setArchived(nativeId, false);
         clearSessionPageCursors(sessionPageCursors, prefixedId(sp, nativeId));
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
       if (tail === ':btw' && req.method === 'POST') {
         // 0.37 侧边对话是 Kimi 原生能力;Claude/Codex 暂无等价通道。
@@ -931,7 +916,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         const text = `/compact${body.instruction ? ` ${body.instruction}` : ''}`;
         const result = await driveTurn(adapter, sp, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text }), hub, randomUUID(), (reason) => {
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: { reason } }));
-        });
+        }, demoActive);
         return ok(res, result, requestId);
       }
       if (tail === ':fork' && req.method === 'POST') {
@@ -966,12 +951,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         const body = (await readBody(req).catch(() => ({}))) as { args?: string };
         const name = decodeURIComponent(skillActivate[1]);
         const text = `/${name}${body.args ? ` ${body.args}` : ''}`;
-        await submitPrompt(adapter, sp, nativeId, { content: [{ type: 'text', text }] }, hub);
+        await submitPrompt(adapter, sp, nativeId, { content: [{ type: 'text', text }] }, hub, demoActive);
         return ok(res, { activated: true, skill_name: name }, requestId);
       }
       // --- fs:*(文件树/@提及/搜索/git 状态;网关本机实现,cwd 沙箱防穿越) ---
       if (tail.startsWith('/fs:') || /^\/fs\/.*:download$/.test(tail)) {
-        const session = await getSession(adapter, sp, nativeId);
+        const session = await getSession(adapter, sp, nativeId, demoActive);
         const cwd = session.metadata?.cwd;
         if (!cwd) throw new ProviderError('invalid_request', '会话没有工作目录', 400);
         if (tail === '/fs:list' && req.method === 'POST') {
@@ -1006,8 +991,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         return ok(res, codexGoalToWire(await adapter.getGoal(nativeId)), requestId);
       }
       if (tail === '/export' && req.method === 'POST') {
-        const session = await getSession(adapter, sp, nativeId);
-        const history = await historyWithDemo(adapter, sp, nativeId);
+        const session = await getSession(adapter, sp, nativeId, demoActive);
+        const history = await historyWithDemo(adapter, sp, nativeId, demoActive);
         const zip = buildStoreZip([
           { name: 'transcript.md', data: Buffer.from(transcriptMarkdown(session, history, sp), 'utf8') },
         ]);
@@ -1063,7 +1048,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           if (!adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
           await adapter.controlGoal(nativeId, cfg.goal_control);
         }
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
       if (tail === '/status' && req.method === 'GET') {
         // 前端 refreshSessionStatus 的唯一回读通道:live model/thinking/permission/
@@ -1094,23 +1079,18 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }, requestId);
       }
       if (tail === '/commands' && req.method === 'GET') {
-        try {
-          const items = adapter.listCommands ? await adapter.listCommands(nativeId) : [];
-          return ok(res, { items }, requestId);
-        } catch (err) {
-          if (demoActive) return ok(res, { items: [] }, requestId);
-          throw err;
-        }
+        const items = adapter.listCommands ? await adapter.listCommands(nativeId) : [];
+        return ok(res, { items }, requestId);
       }
       if (tail === '/messages' && req.method === 'GET') {
-        return ok(res, await listAdapterMessages(adapter, sp, nativeId, url), requestId);
+        return ok(res, await listAdapterMessages(adapter, sp, nativeId, url, demoActive), requestId);
       }
       if (tail === '/transcript' && req.method === 'GET') {
         const agentId = url.searchParams.get('agent_id');
         if (!agentId) throw new ProviderError('invalid_request', 'agent_id is required', 400);
         const pageSize = Number(url.searchParams.get('page_size') ?? 20);
         const sid = prefixedId(sp, nativeId);
-        const history = await historyWithDemo(adapter, sp, nativeId);
+        const history = await historyWithDemo(adapter, sp, nativeId, demoActive);
         // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
         if (history) hub.transcript.observeHistory(sid, history);
         return ok(res, buildLocalTranscriptPage(history ?? [], {
@@ -1141,7 +1121,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }, requestId);
       }
       if (tail === '/snapshot' && req.method === 'GET') {
-        return ok(res, await snapshot(adapter, sp, nativeId, hub), requestId);
+        return ok(res, await snapshot(adapter, sp, nativeId, hub, demoActive), requestId);
       }
       if (tail === '/prompts' && req.method === 'GET') {
         return ok(res, listPrompts(prefixedId(sp, nativeId), hub), requestId);
@@ -1183,10 +1163,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (typeof body.plan_mode === 'boolean' && adapter.setPlanMode && adapter.getPlanMode?.(nativeId) !== body.plan_mode) {
           await adapter.setPlanMode(nativeId, body.plan_mode);
         }
-        return ok(res, await submitPrompt(adapter, sp, nativeId, body, hub), requestId);
+        return ok(res, await submitPrompt(adapter, sp, nativeId, body, hub, demoActive), requestId);
       }
       if (tail === ':abort' && req.method === 'POST') {
-        const aborted = await abortTurn(adapter, sp, nativeId, hub);
+        const aborted = await abortTurn(adapter, sp, nativeId, hub, demoActive);
         return ok(res, { aborted }, requestId);
       }
       const promptAbort = /^\/prompts\/([^/:]+):abort$/.exec(tail);
@@ -1210,7 +1190,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (active && active.promptId !== pid) {
           return ok(res, { aborted: false }, requestId);
         }
-        const aborted = await abortTurn(adapter, sp, nativeId, hub);
+        const aborted = await abortTurn(adapter, sp, nativeId, hub, demoActive);
         return ok(res, { aborted }, requestId);
       }
       if (tail === '/approvals' && req.method === 'GET') {
@@ -1578,6 +1558,7 @@ async function listWorkspaces(
   adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
   provider: ProviderName | undefined,
+  demoActive: boolean,
 ): Promise<Record<string, unknown>> {
   const roots = new Map<string, Record<string, unknown>>();
   // Kimi 工作区:直接取上游视图(自带 session_count)。
@@ -1614,6 +1595,7 @@ async function listWorkspaces(
         console.error(`[gateway] listWorkspaces: ${p}.list 失败:`, err instanceof Error ? err.message : err);
         return [] as Session[];
       }),
+      demoActive,
     );
     const counts = new Map<string, number>();
     for (const session of sessions) {
@@ -1736,6 +1718,7 @@ async function listSessions(
   provider: ProviderName | undefined,
   busyOf: (sid: string) => boolean,
   pageCursors: Map<string, string>,
+  demoActive: boolean,
 ): Promise<Record<string, unknown>> {
   const limit = Math.min(Number(url.searchParams.get('page_size') ?? 50) || 50, 100);
   const beforeId = url.searchParams.get('before_id') ?? undefined;
@@ -1754,7 +1737,7 @@ async function listSessions(
   // 不同,直接透传会被上游 40410 拒掉(实测),所以 kimi 也在本地按 cwd 过滤。
   let workspaceRoot: string | undefined;
   if (workspaceId) {
-    const all = (await listWorkspaces(adapters, kimiFetch, provider).catch(() => null)) as
+    const all = (await listWorkspaces(adapters, kimiFetch, provider, demoActive).catch(() => null)) as
       | { items?: Record<string, unknown>[] }
       | null;
     const hit = (all?.items ?? []).find((w) => w.id === workspaceId);
@@ -1790,7 +1773,7 @@ async function listSessions(
         archived: archivedOnly || undefined,
       });
     }
-    page = { ...page, items: mergeDemoSessions(provider, page.items) };
+    page = { ...page, items: mergeDemoSessions(provider, page.items, demoActive) };
     if (rootNorm) {
       page = {
         ...page,
@@ -1861,7 +1844,7 @@ async function listSessions(
       console.error(`[gateway] listSessions: ${p}.list 失败:`, err instanceof Error ? err.message : err);
       return { items: [] as Session[] };
     });
-    for (const s of mergeDemoSessions(p, page.items)) {
+    for (const s of mergeDemoSessions(p, page.items, demoActive)) {
       if (workspaceId) {
         // 解析不到 root 的工作区 id(已被移除的派生工作区)= 没有会话。
         if (!rootNorm) continue;
@@ -1918,6 +1901,7 @@ async function getSession(
   adapter: ProviderAdapter,
   provider: ProviderName,
   nativeId: string,
+  demoActive: boolean,
 ): Promise<Session> {
   if (demoActive) {
     const demo = getDemoSession(provider, nativeId);
@@ -1967,10 +1951,11 @@ async function snapshot(
   provider: ProviderName,
   nativeId: string,
   hub: SessionHub,
+  demoActive: boolean,
 ): Promise<Record<string, unknown>> {
   const [session, history] = await Promise.all([
-    getSession(adapter, provider, nativeId),
-    historyWithDemo(adapter, provider, nativeId),
+    getSession(adapter, provider, nativeId, demoActive),
+    historyWithDemo(adapter, provider, nativeId, demoActive),
   ]);
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
@@ -2039,8 +2024,9 @@ async function listAdapterMessages(
   provider: ProviderName,
   nativeId: string,
   url: URL,
+  demoActive: boolean,
 ): Promise<Record<string, unknown>> {
-  let messages = [...await historyWithDemo(adapter, provider, nativeId)].reverse();
+  let messages = [...await historyWithDemo(adapter, provider, nativeId, demoActive)].reverse();
   const beforeId = url.searchParams.get('before_id');
   const afterId = url.searchParams.get('after_id');
   const cursor = beforeId ?? afterId;
@@ -2142,6 +2128,7 @@ async function submitPrompt(
   nativeId: string,
   body: { content: Array<Record<string, unknown>> },
   hub: SessionHub,
+  demoActive: boolean,
 ): Promise<Record<string, unknown>> {
   // hub 键统一用带 provider 前缀的 wire id:codex/claude 的原生 id 都是 UUID,
   // 只用 nativeId 会让同名会话跨 provider 互串 busy/广播(审查发现)。
@@ -2162,7 +2149,7 @@ async function submitPrompt(
     const [, name, argsText] = cmd;
     if (name === 'review') {
       if (!adapter.review) throw new ProviderError('unsupported', 'review 不可用', 400);
-      return driveTurn(adapter, provider, nativeId, '/review', () => adapter.review!(nativeId), hub);
+      return driveTurn(adapter, provider, nativeId, '/review', () => adapter.review!(nativeId), hub, undefined, undefined, demoActive);
     }
     return runCodexLocalCommand(adapter, provider, nativeId, name, (argsText ?? '').trim(), hub);
   }
@@ -2199,6 +2186,9 @@ async function submitPrompt(
       ? Promise.resolve(demoStartTurn(provider, nativeId, text))
       : adapter.startTurn({ sessionId: nativeId, input: text, attachments })),
     hub,
+    undefined,
+    undefined,
+    demoActive,
   );
 }
 
@@ -2215,6 +2205,7 @@ async function driveTurn(
   hub: SessionHub,
   promptId: string = randomUUID(),
   onSettled?: (reason: 'completed' | 'failed') => void,
+  demoActive: boolean = false,
 ): Promise<Record<string, unknown>> {
   const sid = prefixedId(provider, nativeId);
   const turn = newActiveTurn(nativeId, promptId);
@@ -2231,7 +2222,7 @@ async function driveTurn(
   if (!hub.transcript.hasObservedHistory(sid)) {
     // 拉取失败不能当成"空历史"落进 hub——historyObserved 被提前固化后,
     // 真实历史回灌时会与运行中 turn 撞号(审查实测会静默丢 live turn)。
-    const history = await historyWithDemo(adapter, provider, nativeId);
+    const history = await historyWithDemo(adapter, provider, nativeId, demoActive);
     if (history.length > 0) hub.transcript.observeHistory(sid, history);
   }
   const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
@@ -2259,7 +2250,7 @@ async function driveTurn(
       emit('prompt.completed', { promptId, reason: 'failed' });
       emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: 'failed' });
       // 队列里还有等着的 prompt:busy 已清,接力给下一个(审查实测会卡死)。
-      drainQueue(adapter, provider, nativeId, hub);
+      drainQueue(adapter, provider, nativeId, hub, demoActive);
     }
     throw acquireResult.error;
   }
@@ -2327,7 +2318,7 @@ async function driveTurn(
         const pending = turn.pendingApprovals.size > 0 ? 'approval' : turn.pendingQuestions.size > 0 ? 'question' : 'none';
         emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: pending, last_turn_reason: reason });
         // 接力:队列里的下一个 prompt 作为自己的 turn 启动(kap-server 语义)。
-        drainQueue(adapter, provider, nativeId, hub);
+        drainQueue(adapter, provider, nativeId, hub, demoActive);
         // 终态广播后的收尾钩子(:compact 的 completed 帧在这发,时机对齐
         // kap-server 的 worker 尾部)。
         onSettled?.(reason);
@@ -2349,16 +2340,16 @@ async function driveTurn(
  * 直到队列空或某个 turn 成功起跑(它的终态会再次调本函数接力)。
  * 审查实测:任何一个排队 prompt 启动失败都会让后续全部永久卡住。
  */
-function drainQueue(adapter: ProviderAdapter, provider: ProviderName, nativeId: string, hub: SessionHub): void {
+function drainQueue(adapter: ProviderAdapter, provider: ProviderName, nativeId: string, hub: SessionHub, demoActive: boolean = false): void {
   const sid = prefixedId(provider, nativeId);
   if (hub.busy.has(sid)) return;
   const next = hub.queued.get(sid)?.shift();
   if (!next) return;
   if ((hub.queued.get(sid)?.length ?? 0) === 0) hub.queued.delete(sid);
-  void driveTurn(adapter, provider, nativeId, next.text, () => adapter.startTurn({ sessionId: nativeId, input: next.text, attachments: next.attachments }), hub, next.promptId)
+  void driveTurn(adapter, provider, nativeId, next.text, () => adapter.startTurn({ sessionId: nativeId, input: next.text, attachments: next.attachments }), hub, next.promptId, undefined, demoActive)
     .catch((err: unknown) => {
       console.error('[gateway] 队列 prompt 接力失败:', err instanceof Error ? err.message : err);
-      drainQueue(adapter, provider, nativeId, hub);
+      drainQueue(adapter, provider, nativeId, hub, demoActive);
     });
 }
 
@@ -2616,7 +2607,7 @@ function consumeEvent(
  * 回 aborted:false,而不是谎称成功。帧序:turn.ended → prompt.aborted →
  * work_changed(前端投影器按 promptId 清 in-flight 状态,顺序敏感)。
  */
-async function abortTurn(adapter: ProviderAdapter, provider: ProviderName, nativeId: string, hub: SessionHub): Promise<boolean> {
+async function abortTurn(adapter: ProviderAdapter, provider: ProviderName, nativeId: string, hub: SessionHub, demoActive: boolean = false): Promise<boolean> {
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
   if (!active) return false;
@@ -2632,7 +2623,7 @@ async function abortTurn(adapter: ProviderAdapter, provider: ProviderName, nativ
   hub.broadcast(sid, frame(sid, hub, 'prompt.aborted', { promptId: active.promptId, abortedAt: new Date().toISOString() }));
   hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: 'cancelled' }));
   // 被取消 turn 后面可能还有排队 prompt,接力。
-  drainQueue(adapter, provider, nativeId, hub);
+  drainQueue(adapter, provider, nativeId, hub, demoActive);
   return true;
 }
 

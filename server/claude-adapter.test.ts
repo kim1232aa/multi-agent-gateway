@@ -248,41 +248,42 @@ test('forkSession captures a new session_id from --fork-session init', async () 
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-fork-'));
   try {
     const bin = join(base, 'claude-fork');
+    const stdinLog = join(base, 'stdin.log');
     const oldId = '123e4567-e89b-12d3-a456-426614174020';
     const newId = '99999999-9999-4999-8999-999999999999';
     await writeFile(bin, `#!/usr/bin/env node
-const readline = require('node:readline');
+const fs = require('node:fs');
+const stdinLog = ${JSON.stringify(stdinLog)};
+fs.writeFileSync(stdinLog, '');
+process.stdin.on('data', (chunk) => fs.appendFileSync(stdinLog, chunk));
 const forked = process.argv.includes('--fork-session');
 const resumeAt = process.argv.indexOf('--resume');
 const resumeId = resumeAt >= 0 ? process.argv[resumeAt + 1] : '';
 const sessionId = forked ? ${JSON.stringify(newId)} : resumeId;
-const rl = readline.createInterface({ input: process.stdin });
-let sent = false;
-rl.on('line', () => {
-  if (sent) return;
-  sent = true;
-  process.stdout.write(JSON.stringify({
-    type: 'system',
-    subtype: 'init',
-    session_id: sessionId,
-    cwd: '/tmp',
-    tools: [],
-  }) + '\\n');
-  process.stdout.write(JSON.stringify({
-    type: 'result',
-    subtype: 'success',
-    result: 'ok',
-    is_error: false,
-    session_id: sessionId,
-  }) + '\\n');
-});
-rl.on('close', () => process.exit(0));
+process.stdout.write(JSON.stringify({
+  type: 'system',
+  subtype: 'init',
+  session_id: sessionId,
+  cwd: '/tmp',
+  tools: [],
+}) + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  result: 'ok',
+  is_error: false,
+  session_id: sessionId,
+}) + '\\n');
+setTimeout(() => process.exit(0), 50);
 `);
     await chmod(bin, 0o755);
     const adapter = new ClaudeAdapter({ claudeBin: bin });
     try {
       const forked = await adapter.forkSession(oldId, '/tmp');
       assert.equal(forked.sessionId, newId);
+      const stdin = await readFile(stdinLog, 'utf8').catch(() => '');
+      assert.equal(stdin.includes('Continue from this fork.'), false);
+      assert.equal(stdin.trim(), '');
     } finally {
       await adapter.close();
     }
@@ -297,30 +298,23 @@ test('forkSession throws when the CLI reuses the original session id', async () 
     const bin = join(base, 'claude-fork-same');
     const oldId = '123e4567-e89b-12d3-a456-426614174021';
     await writeFile(bin, `#!/usr/bin/env node
-const readline = require('node:readline');
 const resumeAt = process.argv.indexOf('--resume');
 const sessionId = resumeAt >= 0 ? process.argv[resumeAt + 1] : 'unknown';
-const rl = readline.createInterface({ input: process.stdin });
-let sent = false;
-rl.on('line', () => {
-  if (sent) return;
-  sent = true;
-  process.stdout.write(JSON.stringify({
-    type: 'system',
-    subtype: 'init',
-    session_id: sessionId,
-    cwd: '/tmp',
-    tools: [],
-  }) + '\\n');
-  process.stdout.write(JSON.stringify({
-    type: 'result',
-    subtype: 'success',
-    result: 'ok',
-    is_error: false,
-    session_id: sessionId,
-  }) + '\\n');
-});
-rl.on('close', () => process.exit(0));
+process.stdout.write(JSON.stringify({
+  type: 'system',
+  subtype: 'init',
+  session_id: sessionId,
+  cwd: '/tmp',
+  tools: [],
+}) + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  result: 'ok',
+  is_error: false,
+  session_id: sessionId,
+}) + '\\n');
+setTimeout(() => process.exit(0), 50);
 `);
     await chmod(bin, 0o755);
     const adapter = new ClaudeAdapter({ claudeBin: bin });
