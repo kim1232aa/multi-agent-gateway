@@ -1295,7 +1295,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     return fail(res, 404, 40400, `unknown route ${sub}`, requestId);
   }
 
-  // Kimi 走官方 WebSocket 字节流;Claude/Codex 保留本地协议适配。
+  // Kimi 开着走官方 WebSocket 字节流;kimi=off 时启动屏走本地 server_hello。
+  // Claude/Codex/Grok 始终是本地协议适配。
   const gatewaySockets = new Set<Duplex>();
   attachGatewayWebSocket(
     server,
@@ -2981,9 +2982,14 @@ function attachGatewayWebSocket(
     const transcriptOffs = new Map<string, () => void>();
     const sendFrame = (event: Record<string, unknown>): void => {
       const sid = typeof event.session_id === 'string' ? event.session_id : '';
+      if (sid && providerFromSessionId(sid).provider !== socketProvider) return;
       if (!transcriptSuppressesLegacy(event, transcriptSpecs.get(sid))) sendObj(event);
     };
-    const offGlobal = hub.subscribeGlobal(sendFrame);
+    // kimi=off 启动屏只要通道 open + server_hello,不能把 Claude/Codex/Grok
+    // 的 session.meta / work_changed 灌进去。
+    const offGlobal = socketProvider === 'kimi'
+      ? () => undefined
+      : hub.subscribeGlobal(sendFrame);
 
     // ---- 客户端帧处理:legacy 事件与 transcript v2 是两条独立订阅 ----
     const localOffs = new Map<string, () => void>();

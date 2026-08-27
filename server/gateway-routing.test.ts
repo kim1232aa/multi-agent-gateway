@@ -1953,6 +1953,171 @@ test('opens a local events socket when kimi is off so the official splash can fi
   }
 });
 
+test('does not fan other-provider session events onto the kimi=off splash socket', async () => {
+  const codex = fakeAdapter('codex');
+  let resolveIdle!: () => void;
+  const idle = new Promise<void>((resolve) => { resolveIdle = resolve; });
+  codex.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'splash-isolation',
+    events: (async function* () {
+      const base = { sessionId: 'codex-native', turnId: 'splash-isolation', timestamp: Date.now() };
+      yield { ...base, kind: 'message', status: 'delta', payload: { delta: 'hi' } } as any;
+      yield { ...base, kind: 'turn', status: 'completed', payload: { reason: 'completed' } } as any;
+    })(),
+  });
+  const gateway = await startGateway({
+    host: '127.0.0.1',
+    port: 0,
+    token: 'test-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const splashFrames: Record<string, unknown>[] = [];
+  const splash = new WebSocket(
+    `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?client_id=browser&provider=kimi`,
+    ['kimi-code.bearer.test-token'],
+  );
+  const observer = new WebSocket(
+    `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`,
+    ['kimi-code.bearer.test-token'],
+  );
+  observer.onmessage = (event) => {
+    const frame = JSON.parse(String(event.data)) as Record<string, unknown>;
+    if (frame.type === 'event.session.work_changed' && (frame.payload as { busy?: boolean } | undefined)?.busy === false) {
+      resolveIdle();
+    }
+  };
+  splash.onmessage = (event) => {
+    splashFrames.push(JSON.parse(String(event.data)) as Record<string, unknown>);
+  };
+  try {
+    await Promise.race([
+      new Promise<void>((resolve, reject) => {
+        let opened = 0;
+        const mark = (): void => { opened += 1; if (opened === 2) resolve(); };
+        splash.onopen = mark;
+        observer.onopen = mark;
+        splash.onerror = () => reject(new Error('splash WebSocket failed'));
+        observer.onerror = () => reject(new Error('codex observer WebSocket failed'));
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('WebSocket open timed out')), 1_000)),
+    ]);
+    const response = await fetch(`${gateway.url}/api/v1/sessions/codex_codex-native/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: 'isolate' }] }),
+    });
+    assert.equal(response.status, 200);
+    await Promise.race([
+      idle,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('codex turn did not finish')), 1_000)),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(splashFrames.every((frame) => frame.type === 'server_hello'), true);
+    assert.equal(splashFrames.some((frame) => frame.type === 'event.session.work_changed'), false);
+  } finally {
+    splash.close();
+    observer.close();
+    await gateway.close();
+  }
+});
+
+test('returns 502 when kimi is on and the upstream WebSocket is unreachable', async () => {
+  const gateway = await startGateway({
+    host: '127.0.0.1',
+    port: 0,
+    token: 'test-token',
+    kimi: { upstream: 'http://127.0.0.1:1', token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const gatewayUrl = new URL(gateway.url);
+  try {
+    const statusLine = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection(Number(gatewayUrl.port), '127.0.0.1', () => {
+        socket.write([
+          'GET /api/v1/ws?client_id=browser&provider=kimi HTTP/1.1',
+          `Host: ${gatewayUrl.host}`,
+          'Upgrade: websocket',
+          'Connection: Upgrade',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Protocol: kimi-code.bearer.test-token',
+          '',
+          '',
+        ].join('\r\n'));
+      });
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error('kimi=on unreachable upstream handshake timed out'));
+      }, 2_000);
+      let buf = Buffer.alloc(0);
+      socket.on('data', (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        const idx = buf.indexOf('\r\n\r\n');
+        if (idx !== -1) {
+          clearTimeout(timer);
+          resolve(buf.subarray(0, idx).toString().split('\r\n')[0]);
+          socket.destroy();
+        }
+      });
+      socket.on('error', (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    assert.match(statusLine, /^HTTP\/1\.1 502 /);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('does not preheat list/models/commands for providers that are not installed', async () => {
+  const claude = fakeAdapter('claude');
+  const grok = fakeAdapter('grok');
+  const codex = fakeAdapter('codex');
+  const calls: string[] = [];
+  claude.list = async () => { calls.push('claude.list'); return { items: [] }; };
+  claude.listModels = async () => { calls.push('claude.models'); return []; };
+  claude.listCommands = async () => { calls.push('claude.cmds'); return []; };
+  grok.list = async () => { calls.push('grok.list'); return { items: [] }; };
+  grok.listModels = async () => { calls.push('grok.models'); return []; };
+  grok.listCommands = async () => { calls.push('grok.cmds'); return []; };
+  let resolveCodex!: () => void;
+  const codexWarmed = new Promise<void>((resolve) => { resolveCodex = resolve; });
+  const originalList = codex.list.bind(codex);
+  codex.list = async (query) => {
+    const page = await originalList(query);
+    calls.push('codex.list');
+    resolveCodex();
+    return page;
+  };
+  const gateway = await startGateway({
+    host: '127.0.0.1',
+    port: 0,
+    token: 'test-token',
+    kimi: 'off',
+    availableProviders: ['kimi', 'codex'],
+    codex: codex as any,
+    claude: claude as any,
+    grok: grok as any,
+  });
+  try {
+    await Promise.race([
+      codexWarmed,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('codex preheat did not run')), 1_000)),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(calls.includes('codex.list'), true);
+    assert.equal(calls.some((name) => name.startsWith('claude.') || name.startsWith('grok.')), false);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('keeps grok WebSocket local instead of tunneling to Kimi', async () => {
   let tunneled = false;
   const upstreamServer = createServer((_req, res) => {

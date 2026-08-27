@@ -592,6 +592,82 @@ test('Claude model selector stays on the CLI handshake catalog even when ANTHROP
   }
 });
 
+test('drops env-only extras that the Claude handshake appends beside official aliases', async () => {
+  const saved = stashAnthropicModelVars();
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-models-extra-'));
+  try {
+    const bin = join(base, 'claude');
+    const models = [
+      ...HANDSHAKE_MODELS,
+      { value: 'qwen3.6-flash[1m]', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    ];
+    await writeFile(bin, `#!/usr/bin/env node
+process.stdin.on('data', (chunk) => {
+  if (!chunk.toString().includes('control_request')) return;
+  process.stdout.write(JSON.stringify({
+    type: 'control_response',
+    response: { subtype: 'success', request_id: 'gw_init', response: { models: ${JSON.stringify(models)}, commands: [] } },
+  }) + '\\n');
+  process.exit(0);
+});
+process.stdin.resume();
+`);
+    await chmod(bin, 0o755);
+    const listed = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
+    assert.deepEqual(listed.map((m) => m.model), ['default', 'sonnet', 'claude-fable-5[1m]', 'haiku']);
+    assert.equal(listed.some((m) => /qwen/i.test(m.model)), false);
+  } finally {
+    restoreAnthropicModelVars(saved);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('getModel ignores ANTHROPIC_MODEL and leftover qwen session values', async () => {
+  const saved = stashAnthropicModelVars();
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-getmodel-'));
+  try {
+    process.env.ANTHROPIC_MODEL = 'qwen3.6-flash[1m]';
+    const settingsPath = join(base, 'session-settings.claude.json');
+    await writeFile(settingsPath, JSON.stringify({
+      model: {
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa': 'qwen3.6-flash[1m]',
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb': 'sonnet',
+      },
+    }));
+    const adapter = new ClaudeProviderAdapter({ settingsPath } as any);
+    assert.equal(adapter.getModel('missing'), undefined);
+    assert.equal(adapter.getModel('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'), undefined);
+    assert.equal(adapter.getModel('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'), 'sonnet');
+  } finally {
+    restoreAnthropicModelVars(saved);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('startTurn does not pass leftover qwen as --model', async () => {
+  const saved = stashAnthropicModelVars();
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-startturn-qwen-'));
+  try {
+    process.env.ANTHROPIC_MODEL = 'qwen3.6-flash[1m]';
+    const settingsPath = join(base, 'session-settings.claude.json');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174099';
+    await writeFile(settingsPath, JSON.stringify({ model: { [sessionId]: 'qwen3.6-flash[1m]' } }));
+    const adapter = new ClaudeProviderAdapter({ settingsPath } as any);
+    const seen: Array<string | undefined> = [];
+    (adapter as any).inner.hasSessionFile = () => false;
+    (adapter as any).inner.startTurn = async (opts: any) => {
+      seen.push(opts.model);
+      opts.onEvent({ type: 'done', usage: null, isError: false, result: '' });
+    };
+    const handle = await adapter.startTurn({ sessionId, input: 'hi' });
+    for await (const _ of handle.events) { /* drain */ }
+    assert.deepEqual(seen, [undefined]);
+  } finally {
+    restoreAnthropicModelVars(saved);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test('decides Claude --session-id vs --resume from transcript file presence', async () => {
   // 回归:isNew 曾是一次性内存标记(created.delete)——首轮失败/网关重启后
   // 重试走 --resume 不存在的会话必败。现在只看 transcript 文件是否落盘。

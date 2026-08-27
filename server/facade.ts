@@ -61,6 +61,14 @@ export function claudeContextWindow(...labels: Array<string | undefined>): numbe
   return CLAUDE_CONTEXT_200K;
 }
 
+/** Official Claude picker aliases. Env endpoint names (qwen, custom ids) stay out. */
+export function isClaudeCatalogModel(model: string | undefined): model is string {
+  if (!model) return false;
+  const id = model.trim();
+  if (!id || /qwen/i.test(id)) return false;
+  return /^(default|opus|sonnet|haiku|fable)(\b|[-\[]|$)/i.test(id) || /^claude-/i.test(id);
+}
+
 function isCodexToolItem(type: unknown): boolean {
   return type === 'commandExecution'
     || type === 'mcpToolCall'
@@ -1039,7 +1047,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     // CLI 以 "session id 已存在" 直接退出,实测 turn 静默空转)。
     const isNew = !this.inner.hasSessionFile(sessionId);
     const cwd = this.sessionCwd.get(sessionId);
-    const model = this.settings.getString('model', sessionId);
+    const storedModel = this.settings.getString('model', sessionId);
+    const model = isClaudeCatalogModel(storedModel) ? storedModel : undefined;
     // thinking 'off' = 用户显式关闭 → 不传 --effort(CLI 无 off 档)。
     const thinking = this.settings.getString('thinking', sessionId);
     const effort = thinking && thinking !== 'off' ? thinking : undefined;
@@ -1282,6 +1291,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
 
   async setModel(sessionId: string, model: string): Promise<void> {
+    if (!isClaudeCatalogModel(model)) return;
     this.settings.set('model', sessionId, model);
   }
 
@@ -1323,22 +1333,20 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   getModel(sessionId: string): string | undefined {
-    // 未显式选择时,CLI 实际会用 ANTHROPIC_MODEL(优先级:CLI 参数 > 环境变量
-    // > settings,2.1.226 产物取证),DTO 如实展示它。
-    return this.settings.getString('model', sessionId)
-      ?? this.settings.getString('model', '__default__')
-      ?? process.env.ANTHROPIC_MODEL;
+    // 选择器只展示 CLI 别名。ANTHROPIC_MODEL / 旧会话里的 qwen 不是目录项。
+    const stored = this.settings.getString('model', sessionId)
+      ?? this.settings.getString('model', '__default__');
+    return isClaudeCatalogModel(stored) ? stored : undefined;
   }
 
   /**
    * 选择器目录永远来自 CLI initialize 握手(default/opus/fable/sonnet/haiku)。
-   * ANTHROPIC_MODEL 等是当时测自定义端点的临时环境,不是产品目录;
-   * 当前进程真正跑哪个模型由 getModel() 读 env,不把 qwen 别名塞进选择器。
+   * 自定义端点若把 qwen 额外塞进握手结果,过滤掉,不进选择器。
    * 握手失败如实抛错,不伪造空目录,也不进缓存。
    */
   async listModels(): Promise<NativeModel[]> {
     const builtin = await this.inner.listBuiltinModels();
-    return builtin.map((model) => ({
+    return builtin.filter((model) => isClaudeCatalogModel(model.value)).map((model) => ({
       provider: 'claude',
       model: model.value,
       display_name: model.displayName ?? model.value,
