@@ -56,6 +56,8 @@ export function isKimiApiPath(url: string | undefined): boolean {
   if (url === undefined) return false;
   const path = url.split('?', 1)[0];
   if (path === '/api/v2' || path.startsWith('/api/v2/')) return true;
+  // 0.39 Remote Control lists devices outside /api/v1.
+  if (path === '/v1/remote' || path.startsWith('/v1/remote/')) return true;
   return path === '/api/v1' || (path.startsWith('/api/v1/') && !isKimiWsPath(url));
 }
 

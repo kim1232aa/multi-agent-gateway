@@ -19,7 +19,7 @@ test('an owned fallback yields to a later registered official Kimi server', asyn
     res.writeHead(401).end();
   });
   try {
-    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => upstream.listen(0, 'localhost', resolve));
     const address = upstream.address();
     const port = typeof address === 'object' && address ? address.port : 0;
     await mkdir(instances, { recursive: true });
@@ -27,7 +27,7 @@ test('an owned fallback yields to a later registered official Kimi server', asyn
     await writeFile(join(instances, 'official.json'), JSON.stringify({
       server_id: 'official',
       pid: process.pid,
-      host: '127.0.0.1',
+      host: 'localhost',
       port,
       started_at: Date.now(),
       heartbeat_at: Date.now(),
@@ -44,7 +44,7 @@ test('an owned fallback yields to a later registered official Kimi server', asyn
 
     const selected = await followKimiServer(fallback, { env: { KIMI_CODE_HOME: root } });
 
-    assert.equal(selected.url, `http://127.0.0.1:${port}`);
+    assert.equal(selected.url, `http://localhost:${port}`);
     assert.equal(selected.owned, false);
   } finally {
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
@@ -66,7 +66,7 @@ test('reuses the only live registered Kimi server', async () => {
     }
     res.writeHead(401).end();
   });
-  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => upstream.listen(0, 'localhost', resolve));
   const address = upstream.address();
   const port = typeof address === 'object' && address ? address.port : 0;
   await mkdir(instances, { recursive: true });
@@ -74,7 +74,7 @@ test('reuses the only live registered Kimi server', async () => {
   await writeFile(join(instances, 'registered.json'), JSON.stringify({
     server_id: 'registered',
     pid: process.pid,
-    host: '127.0.0.1',
+    host: 'localhost',
     port,
     started_at: Date.now(),
     heartbeat_at: Date.now(),
@@ -88,7 +88,7 @@ test('reuses the only live registered Kimi server', async () => {
   let child: Awaited<ReturnType<typeof spawnKimiServer>> | undefined;
   try {
     child = await spawnKimiServer({ bin: fakeKimi });
-    assert.equal(child.url, `http://127.0.0.1:${port}`);
+    assert.equal(child.url, `http://localhost:${port}`);
     assert.equal(child.token, 'reused-token');
     assert.equal(child.owned, false);
     await child.close();
@@ -116,19 +116,19 @@ test('uses an explicit loopback Kimi URL and reports its version', async () => {
     res.writeHead(401).end();
   });
   try {
-    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => upstream.listen(0, 'localhost', resolve));
     const address = upstream.address();
     const port = typeof address === 'object' && address ? address.port : 0;
     const child = await spawnKimiServer({
       bin: join(root, 'must-not-spawn'),
       env: {
         KIMI_CODE_HOME: root,
-        KIMI_UPSTREAM_URL: `http://127.0.0.1:${port}`,
+        KIMI_UPSTREAM_URL: `http://localhost:${port}`,
         KIMI_UPSTREAM_TOKEN: 'explicit-token',
       },
     });
 
-    assert.equal(child.url, `http://127.0.0.1:${port}`);
+    assert.equal(child.url, `http://localhost:${port}`);
     assert.equal(child.token, 'explicit-token');
     assert.equal(child.version, '0.34.0');
     assert.equal(child.owned, false);
@@ -143,7 +143,7 @@ test('rejects an unreachable registered Kimi server instead of silently spawning
   const instances = join(root, 'server', 'instances');
   const portHolder = createServer();
   try {
-    await new Promise<void>((resolve) => portHolder.listen(0, '127.0.0.1', resolve));
+    await new Promise<void>((resolve) => portHolder.listen(0, 'localhost', resolve));
     const address = portHolder.address();
     const port = typeof address === 'object' && address ? address.port : 0;
     await new Promise<void>((resolve) => portHolder.close(() => resolve()));
@@ -151,7 +151,7 @@ test('rejects an unreachable registered Kimi server instead of silently spawning
     await writeFile(join(root, 'server.token'), 'registered-token\n', { mode: 0o600 });
     await writeFile(join(instances, 'unreachable.json'), JSON.stringify({
       pid: process.pid,
-      host: '127.0.0.1',
+      host: 'localhost',
       port,
     }));
 
@@ -181,12 +181,12 @@ test('refuses to guess between multiple live registered Kimi servers', async () 
           res.writeHead(401).end();
         }
       });
-      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
       const address = server.address();
       const port = typeof address === 'object' && address ? address.port : 0;
       await writeFile(join(instances, `${index}.json`), JSON.stringify({
         pid: process.pid,
-        host: '127.0.0.1',
+        host: 'localhost',
         port,
       }));
     }
@@ -212,11 +212,11 @@ test('selects the requested registered Kimi port', async () => {
     for (let index = 0; index < servers.length; index += 1) {
       const server = servers[index];
       server.on('request', (_req, res) => res.writeHead(200, { 'content-type': 'application/json' }).end('{}'));
-      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
       const address = server.address();
       const port = typeof address === 'object' && address ? address.port : 0;
       ports.push(port);
-      await writeFile(join(instances, `${index}.json`), JSON.stringify({ pid: process.pid, host: '127.0.0.1', port }));
+      await writeFile(join(instances, `${index}.json`), JSON.stringify({ pid: process.pid, host: 'localhost', port }));
     }
 
     const child = await spawnKimiServer({ env: { KIMI_CODE_HOME: root, KIMI_UPSTREAM_PORT: String(ports[1]) } });

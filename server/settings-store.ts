@@ -64,6 +64,20 @@ export class SettingsStore {
     }
   }
 
+  /** Copy every scoped value from one session id onto another (fork). */
+  copySession(fromId: string, toId: string): void {
+    if (!fromId || !toId || fromId === toId) return;
+    for (const bucket of Object.values(this.data)) {
+      if (fromId in bucket) {
+        const value = bucket[fromId];
+        if (typeof value === 'string' || typeof value === 'boolean') {
+          bucket[toId] = value;
+        }
+      }
+    }
+    this.scheduleFlush();
+  }
+
   /** 测试/关停时强制落盘。 */
   flushNow(): void {
     if (this.flushTimer) {

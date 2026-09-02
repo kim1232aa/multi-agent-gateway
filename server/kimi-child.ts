@@ -7,6 +7,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import http from 'node:http';
 import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -143,14 +144,15 @@ async function connectExisting(
   const url = upstream.origin;
   let version = versionHint;
   try {
-    const response = await fetch(`${url}/api/v1/meta`, {
-      headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(1_000),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const body = await response.json() as { code?: number; data?: { server_version?: unknown } };
-    if (body.code !== undefined && body.code !== 0) throw new Error(`response code ${body.code}`);
-    if (typeof body.data?.server_version === 'string') version = body.data.server_version;
+    // NODE_USE_ENV_PROXY + HTTP_PROXY 会把 127.0.0.1 打到代理(no_proxy 对 Node fetch
+    // 经常无效)。loopback 探测必须走独立 Agent,否则复用本机 kimi web 会误报 unreachable。
+    const { status, body } = await loopbackGet(`${url}/api/v1/meta`, {
+      authorization: `Bearer ${token}`,
+    }, 1_000);
+    if (status < 200 || status >= 300) throw new Error(`HTTP ${status}`);
+    const parsed = JSON.parse(body) as { code?: number; data?: { server_version?: unknown } };
+    if (parsed.code !== undefined && parsed.code !== 0) throw new Error(`response code ${parsed.code}`);
+    if (typeof parsed.data?.server_version === 'string') version = parsed.data.server_version;
   } catch (error) {
     throw new Error(`${label} at ${url} is unreachable: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -162,6 +164,31 @@ async function connectExisting(
     owned: false,
     close: async () => {},
   };
+}
+
+function loopbackGet(url: string, headers: http.OutgoingHttpHeaders, timeoutMs: number): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const req = http.get({
+      hostname: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      headers,
+      timeout: timeoutMs,
+      agent: new http.Agent({ keepAlive: false }),
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => chunks.push(chunk as Buffer));
+      res.on('end', () => {
+        resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') });
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('timeout'));
+    });
+  });
 }
 
 function numberEnv(value: string | undefined): number | undefined {

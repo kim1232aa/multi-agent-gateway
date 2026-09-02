@@ -37,6 +37,10 @@ async function loadShim(pathname = '/', options: { readyState?: string; querySel
       getItem: (key: string) => storage.get(key) ?? null,
       setItem: (key: string, value: string) => storage.set(key, value),
     },
+    sessionStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
     addEventListener: (name: string, fn: () => void) => listeners.set(name, fn),
     removeEventListener: (name: string) => listeners.delete(name),
     history: { pushState() {}, replaceState() {} },
@@ -46,6 +50,7 @@ async function loadShim(pathname = '/', options: { readyState?: string; querySel
     document: documentObject,
     location,
     localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
     URL,
     Request,
     MutationObserver: TestMutationObserver,
@@ -138,6 +143,11 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   assert.equal(api.rewriteApiUrl('/api/v1/auth').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/sessions/codex_abc/snapshot').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/files/abc').searchParams.get('provider'), 'claude');
+  // 0.39 remote control / capabilities / plugins 是 Kimi 全局态,不跟 Agent 走。
+  assert.equal(api.rewriteApiUrl('/v1/remote/devices').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/capabilities').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/plugins').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/plugins/marketplace').searchParams.has('provider'), false);
   const codexSession = await loadShim('/sessions/codex_abc');
   assert.equal(codexSession.selectedProvider(), 'codex');
   assert.equal(codexSession.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'codex');
@@ -173,6 +183,10 @@ test('routes filesystem APIs through the selected provider', async () => {
   api.setProvider('codex');
   assert.equal(api.rewriteApiUrl('/api/v1/fs:home').searchParams.get('provider'), 'codex');
   assert.equal(api.rewriteApiUrl('/api/v1/fs:browse?path=%2Ftmp').searchParams.get('provider'), 'codex');
+  assert.equal(api.rewriteApiUrl('/api/v1/workspace/fs:search').searchParams.get('provider'), 'codex');
+  // 网关没有 suggest/content 的本地实现;打标会让非 Kimi 路径 404。
+  assert.equal(api.rewriteApiUrl('/api/v1/workspace/fs:suggest').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/fs:content').searchParams.has('provider'), false);
 });
 
 test('renders the Agent switcher as an official-style segmented control', async () => {
@@ -181,6 +195,18 @@ test('renders the Agent switcher as an official-style segmented control', async 
   assert.match(source, /role:\s*['\"]tablist['\"]|setAttribute\(['\"]role['\"],\s*['\"]tablist['\"]\)/);
   assert.match(source, /setAttribute\(['\"]aria-selected['\"]/);
   assert.match(source, /updateSegIndicator/);
+  assert.match(source, /\.side-footer, \.user-menu-trigger/);
+  assert.match(source, /querySelector\(['\"]\.view-tabs['\"]\)/);
+  assert.doesNotMatch(source, /querySelector\(['\"]\.user-menu-trigger, \.user-menu-login['\"]\)/);
+});
+
+test('styles the switcher for 0.39 footer and mobile sheets without touching new chrome', async () => {
+  const css = await readFile(join(process.cwd(), '../web-extension/style.css'), 'utf8');
+  assert.match(css, /\.side-footer .multi-agent-provider-wrap/);
+  assert.match(css, /\.sheet-panel .multi-agent-provider-wrap/);
+  assert.match(css, /\.sheet-body .multi-agent-provider-wrap/);
+  assert.doesNotMatch(css, /model-pill/);
+  assert.doesNotMatch(css, /panel-tab-bar/);
 });
 
 test('leaves the official Kimi account controls unchanged', async () => {
@@ -309,7 +335,9 @@ function fakeElement(tag: string): any {
 async function loadDomShim(options: {
   pathname?: string;
   getAnchor?: () => any;
+  getMobileTabs?: () => any;
   withFacade?: boolean;
+  vueSetupState?: boolean;
   metaProviders?: string[];
   metaFails?: boolean;
   storedProvider?: string;
@@ -341,9 +369,9 @@ async function loadDomShim(options: {
     load: track('load'),
   };
   const facadeSymbol = Symbol('KimiWebClientFacade');
-  const appRoot = {
-    __vue_app__: { _context: { provides: { [facadeSymbol]: facade } } },
-  };
+  const appRoot = options.vueSetupState
+    ? { __vue_app__: { _context: { provides: {} }, _instance: { setupState: facade } } }
+    : { __vue_app__: { _context: { provides: { [facadeSymbol]: facade } } } };
   const docListeners: Record<string, (event: any) => void> = {};
   const documentObject: any = {
     readyState: 'complete',
@@ -353,7 +381,8 @@ async function loadDomShim(options: {
     querySelector: (selector: string) => {
       queries.push(selector);
       if (selector === '#app') return options.withFacade === false ? null : appRoot;
-      if (selector === '.user-menu-trigger, .user-menu-login') return options.getAnchor?.() ?? null;
+      if (selector === '.side-footer, .user-menu-trigger') return options.getAnchor?.() ?? null;
+      if (selector === '.view-tabs') return options.getMobileTabs?.() ?? null;
       if (selector === '.multi-agent-provider-wrap') {
         return sidebar.children.find((c: any) => c.classList.contains('multi-agent-provider-wrap')) ?? null;
       }
@@ -371,6 +400,10 @@ async function loadDomShim(options: {
   const windowObject: any = {
     location,
     localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
+    sessionStorage: {
       getItem: (key: string) => storage.get(key) ?? null,
       setItem: (key: string, value: string) => storage.set(key, value),
     },
@@ -396,6 +429,7 @@ async function loadDomShim(options: {
     document: documentObject,
     location,
     localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
     URL,
     Request,
     Event: class { type: string; constructor(type: string) { this.type = type; } },
@@ -473,6 +507,8 @@ test('mounts the Agent selector directly above the sidebar account row', async (
   assert.equal(anchor.children.length, 0);
   assert.equal(api.queries.some((q: string) => q.includes('.composer')), false);
 
+  assert.equal(api.queries.some((q: string) => q.includes('.model-pill') || q.includes('.panel-tab-bar') || q.includes('.ptb-tab')), false);
+
   items[1].click();
   assert.equal(api.selectedProvider(), 'claude');
   assert.equal(api.reloads(), 0);
@@ -533,12 +569,24 @@ test('serializes provider refreshes so the latest selection lands last', async (
   assert.deepEqual(order, ['start-1', 'end-1', 'start-2', 'end-2']);
 });
 
-test('falls back to a full reload only when the official facade is unavailable', async () => {
+test('does not reload to Kimi when the 0.38 facade symbol is missing', async () => {
   const api = await loadDomShim({ pathname: '/', getAnchor: () => null, withFacade: false });
 
   api.switchProvider('claude');
 
-  assert.equal(api.reloads(), 1);
+  assert.equal(api.reloads(), 0);
+  assert.equal(api.selectedProvider(), 'claude');
+});
+
+test('loads via the 0.39 Vue setupState client when KimiWebClientFacade is gone', async () => {
+  const api = await loadDomShim({ pathname: '/', getAnchor: () => null, vueSetupState: true });
+
+  api.switchProvider('claude');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(api.reloads(), 0);
+  assert.equal(api.selectedProvider(), 'claude');
+  assert.deepEqual(api.facadeCalls, { load: 1 });
 });
 
 test('limits the selector to providers the gateway reports as installed', async () => {
@@ -581,6 +629,28 @@ test('reconciles the draft model to the provider catalog after switching', async
   api.switchProvider('kimi');
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(setModelCalls, ['default', 'kimi-code/k3']);
+});
+
+test('restores the remembered model even when load already picked the catalog default', async () => {
+  const api = await loadDomShim({ pathname: '/', getAnchor: () => null });
+  const setModelCalls: string[] = [];
+  api.testWindow.localStorage.setItem(
+    'multi-agent-gateway.modelByProvider.v1',
+    JSON.stringify({ claude: 'sonnet' }),
+  );
+  api.facade.defaultModel = 'kimi-code/k3';
+  api.facade.models = [{ model: 'kimi-code/k3' }];
+  api.facade.setModel = (model: string) => { setModelCalls.push(model); api.facade.defaultModel = model; };
+  api.facade.load = () => {
+    api.facade.models = [{ model: 'default' }, { model: 'sonnet' }];
+    api.facade.defaultModel = 'default';
+    return Promise.resolve();
+  };
+
+  api.switchProvider('claude');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(setModelCalls, ['sonnet']);
+  assert.equal(api.facade.defaultModel, 'sonnet');
 });
 
 test('removes and restores the Agent selector with the official account row', async () => {
@@ -910,4 +980,61 @@ test('keeps the segmented Agent switcher always visible without a popup menu', a
   api.docClick({ target: anchor });
   assert.equal(api.sidebar.children[0], wrap);
   assert.ok(wrap.querySelector('.multi-agent-provider-seg'));
+});
+
+test('mounts the Agent selector above the desktop side-footer when present', async () => {
+  const footer = fakeElement('div');
+  footer.className = 'side-footer';
+  const trigger = makeAnchor();
+  footer.appendChild(trigger);
+  const api = await loadDomShim({ getAnchor: () => footer });
+  api.sidebar.appendChild(footer);
+  api.emitMutations([{ type: 'childList', addedNodes: [footer], removedNodes: [] }]);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(api.sidebar.children[0]?.classList.contains('multi-agent-provider-wrap'), true);
+  assert.equal(api.sidebar.children[1], footer);
+  assert.equal(footer.children[0], trigger);
+});
+
+test('mounts the Agent selector above mobile session list tabs', async () => {
+  const tabs = fakeElement('div');
+  tabs.className = 'view-tabs';
+  const api = await loadDomShim({ getAnchor: () => null, getMobileTabs: () => tabs });
+  api.sidebar.appendChild(tabs);
+  api.emitMutations([{ type: 'childList', addedNodes: [tabs], removedNodes: [] }]);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(api.sidebar.children[0]?.classList.contains('multi-agent-provider-wrap'), true);
+  assert.equal(api.sidebar.children[1], tabs);
+  const seg = api.sidebar.children[0].querySelector('.multi-agent-provider-seg');
+  assert.ok(seg);
+  assert.ok(seg.classList.contains('ui-seg'));
+});
+
+test('resyncs when the mobile session list tabs are mounted', async () => {
+  let queryCount = 0;
+  const api = await loadShim('/', {
+    readyState: 'complete',
+    querySelector: () => {
+      queryCount += 1;
+      return null;
+    },
+  });
+  const initialQueryCount = queryCount;
+  const tabsNode = {
+    nodeType: 1,
+    matches: (selector: string) => selector.split(',').some((part) => part.trim() === '.view-tabs'),
+    querySelector: () => null,
+  };
+
+  api.emitMutations([{
+    type: 'childList',
+    target: tabsNode,
+    addedNodes: [tabsNode],
+    removedNodes: [],
+  }]);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.ok(queryCount > initialQueryCount);
 });

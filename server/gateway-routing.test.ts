@@ -155,6 +155,12 @@ test('falls back to Kimi for native global routes and keeps non-Kimi config loca
     const unknown = await get('/native-route');
     assert.equal((await unknown.json() as any).data.upstream, true);
 
+    // 0.39 POST /sessions/:id/tasks/:taskId:detach — Kimi 会话必须透传到 kap-server。
+    const detachKimi = await get('/sessions/plain-kimi-id/tasks/task-1:detach', { method: 'POST', body: '{}' });
+    assert.equal(detachKimi.status, 200);
+    assert.equal((await detachKimi.json() as any).data.upstream, true);
+    assert.ok(seen.some((x) => x.path === '/api/v1/sessions/plain-kimi-id/tasks/task-1:detach'));
+
     // /meta 不透传:本地合并官方字段 + 实际安装的 provider 列表(选择器靠它过滤)。
     const meta = await get('/meta');
     const metaData = (await meta.json() as any).data;
@@ -2372,7 +2378,9 @@ test('startGateway({kimi:off}) GET /api/v1/auth is 200 ready true without kimi c
 
     const meta = await get('/meta');
     assert.equal(meta.status, 200);
-    assert.deepEqual((await meta.json() as any).data.providers, ['claude', 'codex', 'grok']);
+    const metaData = (await meta.json() as any).data;
+    assert.deepEqual(metaData.providers, ['claude', 'codex', 'grok']);
+    assert.match(String(metaData.server_version), /Kimi 0\.40\.1 compatible/);
 
     const models = await get('/models');
     assert.equal(models.status, 200);
@@ -2405,6 +2413,9 @@ test('rejects grok swarm and goal the same way as Claude', async () => {
     assert.equal(goal.status, 400);
     const btw = await post('/sessions/grok_grok-native:btw', {});
     assert.equal(btw.status, 400);
+    const detach = await post('/sessions/grok_grok-native/tasks/task-1:detach', {});
+    assert.equal(detach.status, 400);
+    assert.match(((await detach.json()) as { msg?: string }).msg ?? '', /不支持.*:detach/);
     const compact = await post('/sessions/grok_grok-native:compact', {});
     assert.equal(compact.status, 400);
     assert.match(((await compact.json()) as { msg?: string }).msg ?? '', /不支持压缩/);
@@ -3005,6 +3016,112 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
     assert.equal(flatData.groups, undefined);
   } finally {
     await gateway.close();
+  }
+});
+
+test('0.39 remote control, local title/generate and :cancel stay on the right side', async () => {
+  const seen: string[] = [];
+  const renamed: string[] = [];
+  const upstream = await listen(createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://upstream');
+    seen.push(`${req.method} ${url.pathname}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(envelope({ upstream: true, path: url.pathname }));
+  }));
+  const claude = fakeAdapter('claude');
+  claude.rename = async (sessionId, title) => {
+    renamed.push(`${sessionId}:${title}`);
+  };
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const auth = { authorization: 'Bearer gateway-token', 'content-type': 'application/json' };
+  try {
+    const remote = await fetch(`${gateway.url}/v1/remote/devices`, { headers: auth });
+    assert.equal(remote.status, 200);
+    assert.match(remote.headers.get('content-type') ?? '', /application\/json/);
+    assert.equal((await remote.json() as any).data.path, '/v1/remote/devices');
+    assert.equal(seen.includes('GET /v1/remote/devices'), true);
+
+    const title = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/title/generate`, {
+      method: 'POST',
+      headers: auth,
+      body: '{}',
+    });
+    assert.equal(title.status, 200);
+    assert.equal((await title.json() as any).data.title, 'one');
+    assert.deepEqual(renamed, ['claude-native:one']);
+    assert.equal(seen.some((line) => line.includes('title/generate')), false);
+
+    const kimiCancel = await fetch(`${gateway.url}/api/v1/sessions/kimi-session/tasks/bg-1:cancel`, {
+      method: 'POST',
+      headers: auth,
+      body: '{}',
+    });
+    assert.equal(kimiCancel.status, 200);
+    assert.equal((await kimiCancel.json() as any).data.upstream, true);
+    assert.equal(seen.includes('POST /api/v1/sessions/kimi-session/tasks/bg-1:cancel'), true);
+
+    for (const provider of ['claude', 'codex', 'grok'] as const) {
+      const response = await fetch(`${gateway.url}/api/v1/sessions/${provider}_${provider}-native/tasks/bg-1:cancel`, {
+        method: 'POST',
+        headers: auth,
+        body: '{}',
+      });
+      assert.equal(response.status, 400);
+      const body = (await response.json()) as { code?: number; msg?: string };
+      assert.notEqual(body.code, 0);
+      assert.match(body.msg ?? '', /不支持.*:cancel/);
+    }
+  } finally {
+    await gateway.close();
+    await upstream.close();
+  }
+});
+
+test('0.39 task detach is proxied for Kimi and 400 for local providers', async () => {
+  const seen: string[] = [];
+  const upstream = await listen(createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://upstream');
+    seen.push(`${req.method} ${url.pathname}`);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(envelope({ upstream: true, path: url.pathname }));
+  }));
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+  const post = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+    body: '{}',
+  });
+  try {
+    const kimi = await post('/sessions/kimi-session/tasks/bg-1:detach');
+    assert.equal(kimi.status, 200);
+    assert.equal((await kimi.json() as any).data.upstream, true);
+    assert.equal(seen.includes('POST /api/v1/sessions/kimi-session/tasks/bg-1:detach'), true);
+
+    for (const provider of ['claude', 'codex', 'grok'] as const) {
+      const response = await post(`/sessions/${provider}_${provider}-native/tasks/bg-1:detach`);
+      assert.equal(response.status, 400);
+      const body = (await response.json()) as { code?: number; msg?: string };
+      assert.notEqual(body.code, 0);
+      assert.match(body.msg ?? '', /不支持.*:detach/);
+    }
+    assert.equal(seen.some((line) => line.includes('claude_') || line.includes('codex_') || line.includes('grok_')), false);
+  } finally {
+    await gateway.close();
+    await upstream.close();
   }
 });
 

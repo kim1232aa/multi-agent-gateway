@@ -1,6 +1,6 @@
 # Kimi Web 基线说明
 
-`web-dist/` 现在严格保存官方 `@moonshot-ai/kimi-code@0.38.0` 的
+`web-dist/` 现在严格保存官方 `@moonshot-ai/kimi-code@0.40.1` 的
 `dist-web`。关键文件的 SHA-256 记录在 `web-origin-manifest.json`。
 
 此前提交的 `c2d7beb` 实际对应 0.28.1 时代的公开源码，不是 0.33.0 的 Web

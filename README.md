@@ -1,6 +1,6 @@
 # Multi-Agent Gateway
 
-Official **Kimi Code Web 0.38.0** is the only UI. Claude, Codex, and Grok
+Official **Kimi Code Web 0.40.1** is the only UI. Claude, Codex, and Grok
 speak Kimi's kap-server protocol behind it. The official `web-dist` is never
 edited — a SHA-checked injection (`web-extension/boot.js` + `style.css`) adds
 the agent switcher.

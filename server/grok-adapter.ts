@@ -1,5 +1,5 @@
 /**
- * GrokAdapter — wraps the Grok CLI (tested with 1.0.5) as a ProviderAdapter.
+ * GrokAdapter — wraps the Grok CLI (tested with 1.0.5; ACP rechecked on 1.0.13) as a ProviderAdapter.
  *
  * Main path: ACP (`grok agent stdio`, see grok-acp.ts). One long-lived JSON-RPC
  * process, multiple sessions. Headless `-p` is the fallback when ACP spawn or
@@ -490,6 +490,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
   private readonly sessionUsage = new Map<string, SessionUsage>();
   private readonly acpTurns = new Map<string, EventStream<GatewayEvent>>();
+  /** Gateway session id → ACP session id. Grok 1.0.13 ignores session/new.sessionId. */
+  private readonly acpSessionIds = new Map<string, string>();
   private defaultModel: string | undefined;
   private acp: GrokAcpClient | null = null;
 
@@ -605,7 +607,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId);
     const model = this.settings.getString('model', sessionId);
     const thinking = this.settings.getString('thinking', sessionId);
-    const effort = thinking && thinking !== 'off' ? thinking : undefined;
+    const effort = grokEffort(thinking);
     const permissionMode = this.settings.getBoolean('plan', sessionId)
       ? 'plan'
       : grokPermissionMode(this.settings.getString('permission', sessionId));
@@ -807,6 +809,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
       env: this.grokEnv,
       alwaysApprove,
       requestTimeoutMs: 6_000,
+      promptTimeoutMs: 20_000,
     });
     try {
       await client.connect();
@@ -826,6 +829,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
       prompt: string;
       cwd?: string;
       isNew: boolean;
+      model?: string;
+      effort?: string;
       contentBlocks?: Array<Record<string, unknown>>;
       plan: boolean;
       yolo: boolean;
@@ -838,25 +843,29 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.acpTurns.set(opts.sessionId, opts.stream);
     const unsub = acp.onEvent((ev) => this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev));
     try {
+      let acpSessionId = this.acpSessionIds.get(opts.sessionId) ?? opts.sessionId;
       if (opts.isNew) {
         const created = await acp.sessionNew({
           cwd,
           sessionId: opts.sessionId,
           yoloMode: opts.yolo,
           planMode: opts.plan,
+          model: opts.model,
+          effort: opts.effort,
         });
-        if (created.sessionId !== opts.sessionId) {
-          this.sessionCwd.set(created.sessionId, cwd);
-        }
+        acpSessionId = created.sessionId || opts.sessionId;
+        this.rememberAcpSession(opts.sessionId, acpSessionId, cwd);
       } else {
         try {
-          await acp.sessionLoad({ sessionId: opts.sessionId, cwd });
+          await acp.sessionLoad({ sessionId: acpSessionId, cwd });
         } catch {
-          await acp.sessionNew({ cwd, sessionId: opts.sessionId, yoloMode: opts.yolo, planMode: opts.plan });
+          const created = await acp.sessionNew({ cwd, sessionId: opts.sessionId, yoloMode: opts.yolo, planMode: opts.plan, model: opts.model, effort: opts.effort });
+          acpSessionId = created.sessionId || opts.sessionId;
+          this.rememberAcpSession(opts.sessionId, acpSessionId, cwd);
         }
       }
       const prompt = acpPrompt(opts.prompt, opts.contentBlocks);
-      const { stopReason } = await acp.sessionPrompt({ sessionId: opts.sessionId, prompt });
+      const { stopReason } = await acp.sessionPrompt({ sessionId: acpSessionId, prompt });
       const cancelled = stopReason === 'cancelled' || stopReason === 'max_tokens';
       opts.stream.push({
         kind: 'turn',
@@ -871,6 +880,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
       unsub();
       this.acpTurns.delete(opts.sessionId);
     }
+  }
+
+  private rememberAcpSession(gatewayId: string, acpId: string, cwd: string): void {
+    this.acpSessionIds.set(gatewayId, acpId);
+    this.sessionCwd.set(gatewayId, cwd);
+    if (acpId !== gatewayId) this.sessionCwd.set(acpId, cwd);
   }
 
   private mapAcpEvent(
@@ -940,6 +955,9 @@ export class GrokProviderAdapter implements ProviderAdapter {
           timestamp: ts,
           payload: {
             approvalId: String(ev.requestId),
+            itemId: String((ev.toolCall as { toolCallId?: unknown; id?: unknown } | undefined)?.toolCallId
+              ?? (ev.toolCall as { id?: unknown } | undefined)?.id
+              ?? ''),
             tool: String((ev.toolCall as { title?: string } | undefined)?.title ?? 'tool'),
             input: ev.toolCall,
             options: ev.options.map((o) => o.optionId),
@@ -1012,6 +1030,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async dispose(): Promise<void> {
     await this.acp?.close().catch(() => undefined);
     this.acp = null;
+    this.acpSessionIds.clear();
     await this.inner.close();
   }
 
@@ -1063,6 +1082,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
       display_name: model,
       max_context_size: grokContextWindow(model),
       capabilities: ['thinking'],
+      support_efforts: [...GROK_EFFORTS],
+      default_effort: 'high',
     }));
   }
 
@@ -1070,18 +1091,23 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return listGrokCommands();
   }
 
+  private acpId(sessionId: string): string {
+    return this.acpSessionIds.get(sessionId) ?? sessionId;
+  }
+
   async compact(sessionId: string): Promise<void> {
     const acp = await this.ensureAcp(false);
     if (!acp) throw new ProviderError('unsupported', 'Grok ACP compact 不可用(CLI 未提供 grok agent stdio)', 400);
-    await acp.compact(sessionId);
+    await acp.compact(this.acpId(sessionId));
   }
 
   async fork(sessionId: string): Promise<Session> {
     const acp = await this.ensureAcp(false);
     if (!acp) throw new ProviderError('unsupported', 'Grok ACP fork 不可用(CLI 未提供 grok agent stdio)', 400);
-    const { sessionId: newId } = await acp.fork(sessionId);
+    const { sessionId: newId } = await acp.fork(this.acpId(sessionId));
     const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId) ?? process.cwd();
     this.sessionCwd.set(newId, cwd);
+    this.settings.copySession(sessionId, newId);
     return {
       id: newId,
       workspace_id: workspaceIdFromCwd(cwd, 'grok'),
@@ -1097,13 +1123,14 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async rollback(sessionId: string, numTurns: number): Promise<void> {
     const acp = await this.ensureAcp(false);
     if (!acp) throw new ProviderError('unsupported', 'Grok ACP rewind 不可用(CLI 未提供 grok agent stdio)', 400);
-    await acp.rewind(sessionId, numTurns);
+    await acp.rewind(this.acpId(sessionId), numTurns);
   }
 
   async delete(sessionId: string): Promise<void> {
     this.inner.interrupt(sessionId);
     this.renames.delete(sessionId);
     this.sessionCwd.delete(sessionId);
+    this.acpSessionIds.delete(sessionId);
     this.sessionUsage.delete(sessionId);
     this.settings.delete('model', sessionId);
     this.settings.delete('thinking', sessionId);
@@ -1157,6 +1184,16 @@ export function grokPermissionMode(mode: string | undefined): string | undefined
     case 'yolo': return 'bypassPermissions';
     default: return undefined;
   }
+}
+
+const GROK_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** Map Kimi thinking chips onto grok --effort. UI 'on' is not a CLI value. */
+export function grokEffort(thinking: string | undefined): string | undefined {
+  if (!thinking || thinking === 'off') return undefined;
+  if ((GROK_EFFORTS as readonly string[]).includes(thinking)) return thinking;
+  if (thinking === 'on') return 'high';
+  return undefined;
 }
 
 function acpPrompt(prompt: string, contentBlocks?: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
@@ -1218,7 +1255,12 @@ function parseGrokModels(text: string): { defaultModel?: string; models: string[
     seen.add(name);
     models.push(name);
   }
-  if (defaultModel && !seen.has(defaultModel)) models.unshift(defaultModel);
+  if (defaultModel) {
+    const rest = models.filter((model) => model !== defaultModel);
+    models.length = 0;
+    models.push(defaultModel, ...rest);
+    seen.add(defaultModel);
+  }
   return { defaultModel, models };
 }
 

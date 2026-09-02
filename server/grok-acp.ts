@@ -86,7 +86,8 @@ export interface PendingPermission {
 }
 
 const INIT_PARAMS = {
-  protocolVersion: '0.1',
+  // Grok 1.0.13 replies with numeric protocolVersion 1 and still accepts "0.1".
+  protocolVersion: 1,
   clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
   clientInfo: { name: 'multi-agent-gateway', version: '0.1.0' },
   _meta: { clientIdentifier: 'multi-agent-gateway' },
@@ -155,11 +156,15 @@ export class GrokAcpClient {
     sessionId?: string;
     yoloMode?: boolean;
     planMode?: boolean;
+    model?: string;
+    effort?: string;
   }): Promise<{ sessionId: string }> {
     await this.connect();
     const meta: Record<string, unknown> = {};
     if (params.yoloMode) meta.yoloMode = true;
     if (params.planMode) meta.planMode = true;
+    if (params.model) meta.model = params.model;
+    if (params.effort) meta.effort = params.effort;
     const result = await this.request('session/new', {
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
@@ -509,7 +514,7 @@ export class GrokAcpClient {
   }
 
   private childEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env, ...this.env };
+    const env: NodeJS.ProcessEnv = { ...process.env, ...this.env, PYTHONUNBUFFERED: '1' };
     const extra = ['127.0.0.1', 'localhost', '::1'];
     const current = String(env.NO_PROXY ?? env.no_proxy ?? '')
       .split(',')

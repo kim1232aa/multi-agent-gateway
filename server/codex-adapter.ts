@@ -1,5 +1,5 @@
 /**
- * CodexAdapter — wraps `codex app-server` (Codex CLI 0.147.x, JSON-RPC over
+ * CodexAdapter — wraps `codex app-server` (Codex CLI 0.147.x–0.152.1, JSON-RPC over
  * newline-delimited stdio) behind a ProviderAdapter-shaped interface so the
  * gateway can treat Codex like any other provider.
  *

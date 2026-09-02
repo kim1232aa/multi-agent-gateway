@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { GrokAdapter, GrokProviderAdapter, grokContextWindow } from './grok-adapter.js';
+import { GrokAdapter, GrokProviderAdapter, grokContextWindow, grokEffort } from './grok-adapter.js';
 import { ProviderError } from './types.js';
 
 async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: string; stdinLog: string }> {
@@ -37,11 +37,11 @@ if args[:1] == ["models"]:
     sys.stdout.write(
         "Model 'grok' is using its own API key.\\n"
         "\\n"
-        "Default model: grok-4.6\\n"
+        "Default model: grok-4.5\\n"
         "\\n"
         "Available models:\\n"
-        "  * grok-4.6 (default)\\n"
-        "  - grok-4.5\\n"
+        "  - grok-4.6\\n"
+        "  * grok-4.5 (default)\\n"
         "  - grok\\n"
     )
     sys.exit(0)
@@ -72,7 +72,7 @@ test('listModels max_context_size is 500000 not 0/200000', async () => {
     const { bin } = await writeFakeGrok(base);
     const adapter = new GrokProviderAdapter({ grokBin: bin });
     const models = await adapter.listModels();
-    assert.deepEqual(models.map((m) => m.model), ['grok-4.6', 'grok-4.5', 'grok']);
+    assert.deepEqual(models.map((m) => m.model), ['grok-4.5', 'grok-4.6', 'grok']);
     assert.equal(models[0]?.provider, 'grok');
     assert.ok(models.every((m) => m.max_context_size === 500_000));
     assert.ok(models.every((m) => m.max_context_size !== 0));
@@ -82,6 +82,9 @@ test('listModels max_context_size is 500000 not 0/200000', async () => {
     assert.equal(grokContextWindow('grok'), 500_000);
     assert.equal(grokContextWindow('unknown-family-model'), 500_000);
     assert.equal(grokContextWindow(), 500_000);
+    assert.deepEqual(models[0]?.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+    assert.equal(models[0]?.default_effort, 'high');
+    assert.ok(models.every((m) => m.capabilities?.includes('thinking')));
   } finally {
     await rm(base, { recursive: true, force: true });
   }
@@ -375,6 +378,47 @@ test('maps kimi permission and plan_mode onto grok --permission-mode flags', asy
   }
 });
 
+test('maps kimi thinking chips onto grok --effort', async () => {
+  assert.equal(grokEffort(undefined), undefined);
+  assert.equal(grokEffort('off'), undefined);
+  assert.equal(grokEffort('on'), 'high');
+  assert.equal(grokEffort('low'), 'low');
+  assert.equal(grokEffort('medium'), 'medium');
+  assert.equal(grokEffort('high'), 'high');
+  assert.equal(grokEffort('xhigh'), 'xhigh');
+  assert.equal(grokEffort('max'), 'max');
+  assert.equal(grokEffort('unknown'), undefined);
+
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-effort-'));
+  try {
+    const { bin, argvLog, stdinLog } = await writeFakeGrok(base);
+    const adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_ARGV_LOG: argvLog, GROK_STDIN_LOG: stdinLog },
+    });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    const run = async (): Promise<string[]> => {
+      const handle = await adapter.startTurn({ sessionId: session.id, input: 'effort-check' });
+      await drain(handle);
+      return JSON.parse(await readFile(argvLog, 'utf8')) as string[];
+    };
+
+    await adapter.setThinking(session.id, 'on');
+    let argv = await run();
+    assert.equal(argv[argv.indexOf('--effort') + 1], 'high', JSON.stringify(argv));
+
+    await adapter.setThinking(session.id, 'max');
+    argv = await run();
+    assert.equal(argv[argv.indexOf('--effort') + 1], 'max', JSON.stringify(argv));
+
+    await adapter.setThinking(session.id, 'off');
+    argv = await run();
+    assert.equal(argv.includes('--effort'), false, JSON.stringify(argv));
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test('steer rejects because grok has no stdin channel', async () => {
   const adapter = new GrokProviderAdapter();
   await assert.rejects(
@@ -425,6 +469,7 @@ test('provider startTurn forwards image attachments as --prompt-json', async () 
 
 test('ACP spawn failure falls back to -p for that turn and retries ACP on the next turn', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-acp-retry-'));
+  let adapter: GrokProviderAdapter | undefined;
   try {
     const bin = join(base, 'grok');
     const spawnLog = join(base, 'spawn.log');
@@ -448,6 +493,10 @@ if args[:2] == ["agent", "stdio"]:
     if n == 1:
         sys.exit(1)
     sys.stdout.reconfigure(line_buffering=True)
+    try:
+        sys.stdin.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     for raw in sys.stdin:
         line = raw.strip()
         if not line:
@@ -458,8 +507,7 @@ if args[:2] == ["agent", "stdio"]:
         if method == "initialize":
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "0.1"}}), flush=True)
         elif method == "session/new":
-            sid = (msg.get("params") or {}).get("sessionId") or "acp-session"
-            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": sid}}), flush=True)
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "acp-assigned"}}), flush=True)
         elif method == "session/load":
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
         elif method == "session/prompt":
@@ -487,13 +535,14 @@ sys.stdout.write(
 sys.exit(0)
 `)
     await chmod(bin, 0o755);
-    const adapter = new GrokProviderAdapter({
+    adapter = new GrokProviderAdapter({
       grokBin: bin,
       env: { GROK_SPAWN_LOG: spawnLog, GROK_ACP_COUNT: countFile },
     });
     const session = await adapter.create({ provider: 'grok', cwd: base });
     await drain(await adapter.startTurn({ sessionId: session.id, input: 'first' }));
     await drain(await adapter.startTurn({ sessionId: session.id, input: 'second' }));
+    assert.equal((adapter as any).acpSessionIds.get(session.id), 'acp-assigned');
     const spawns = (await readFile(spawnLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[]);
     assert.ok(spawns.length >= 3, JSON.stringify(spawns));
     assert.deepEqual(spawns[0].slice(0, 2), ['agent', 'stdio']);
@@ -501,6 +550,7 @@ sys.exit(0)
     assert.deepEqual(spawns[2].slice(0, 2), ['agent', 'stdio']);
     assert.equal(spawns.filter((args) => args[0] === 'agent' && args[1] === 'stdio').length, 2);
   } finally {
+    await adapter?.dispose().catch(() => undefined);
     await rm(base, { recursive: true, force: true });
   }
 });

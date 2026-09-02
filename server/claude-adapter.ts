@@ -1,5 +1,5 @@
 /**
- * ClaudeAdapter — wraps the Claude Code CLI (tested with 2.1.220) as a
+ * ClaudeAdapter — wraps the Claude Code CLI (tested with 2.1.220–2.1.258) as a
  * ProviderAdapter for the multi-agent gateway.
  *
  * Driving mechanism: each turn spawns

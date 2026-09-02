@@ -8,11 +8,11 @@ import { createStaticServer } from './static.js';
 import type { WebShell } from './web-assets.js';
 
 async function listen(server: Server): Promise<{ url: string; close: () => Promise<void> }> {
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
   return {
-    url: `http://127.0.0.1:${port}`,
+    url: `http://localhost:${port}`,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }
@@ -23,7 +23,7 @@ test('serves the injected shell and real assets with safe HTTP behavior', async 
   try {
     await mkdir(join(root, 'assets'), { recursive: true });
     await writeFile(join(root, 'index.html'), '<html>official</html>');
-    await writeFile(join(root, 'assets', 'app.js'), 'console.log("official");');
+    await writeFile(join(root, 'assets', 'index--0t1wzw_.js'), 'console.log("official");');
     await writeFile(join(base, 'outside.txt'), 'secret outside root');
     await symlink(join(base, 'outside.txt'), join(root, 'assets', 'link.txt'));
 
@@ -50,7 +50,7 @@ test('serves the injected shell and real assets with safe HTTP behavior', async 
       assert.equal(home.headers.get('x-frame-options'), 'DENY');
       assert.equal(home.headers.get('cache-control'), 'no-cache');
 
-      const asset = await fetch(`${server.url}/assets/app.js`);
+      const asset = await fetch(`${server.url}/assets/index--0t1wzw_.js`);
       assert.equal(asset.status, 200);
       assert.equal(await asset.text(), 'console.log("official");');
       assert.match(asset.headers.get('content-type') ?? '', /^text\/javascript/);

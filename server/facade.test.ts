@@ -415,7 +415,7 @@ test('lists Claude built-in models from the CLI handshake when no custom endpoin
     const { bin, marker } = await fakeClaudeBin(base);
     const models = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
 
-    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'claude-fable-5[1m]', 'haiku']);
+    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'fable', 'haiku']);
     assert.equal(models[0]?.display_name, 'Default (recommended)');
     assert.deepEqual(models[0]?.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
     assert.equal(models[0]?.capabilities?.includes('thinking'), true);
@@ -582,7 +582,7 @@ test('Claude model selector stays on the CLI handshake catalog even when ANTHROP
     const { bin, marker } = await fakeClaudeBin(base);
     const models = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
 
-    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'claude-fable-5[1m]', 'haiku']);
+    assert.deepEqual(models.map((m) => m.model), ['default', 'sonnet', 'fable', 'haiku']);
     assert.equal(models[0]?.display_name, 'Default (recommended)');
     assert.equal(models.some((m) => /qwen/i.test(m.model) || /qwen/i.test(m.display_name ?? '')), false);
     assert.equal((await readFile(marker, 'utf8')).length, 1);
@@ -614,12 +614,56 @@ process.stdin.resume();
 `);
     await chmod(bin, 0o755);
     const listed = await new ClaudeProviderAdapter({ claudeBin: bin } as any).listModels();
-    assert.deepEqual(listed.map((m) => m.model), ['default', 'sonnet', 'claude-fable-5[1m]', 'haiku']);
-    assert.equal(listed.some((m) => /qwen/i.test(m.model)), false);
+    assert.deepEqual(listed.map((m) => m.model), ['default', 'sonnet', 'fable', 'haiku']);
+    assert.deepEqual(listed.map((m) => m.display_name), ['Default (recommended)', 'Sonnet', 'Fable', 'Haiku']);
+    assert.equal(listed.some((m) => /qwen/i.test(m.model) || /qwen/i.test(m.display_name ?? '')), false);
   } finally {
     restoreAnthropicModelVars(saved);
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test('Claude listModels rewrites handshake displayName so qwen never appears in the picker', async () => {
+  // 回归:自定义端点会把官方别名的 displayName/resolvedModel 改成 qwen3.6-flash[1m]。
+  // isClaudeCatalogModel 只看 value,选择器就会显示
+  // "qwen3.6-flash[1m](default/opus/sonnet)" / "qwen3.6-flash(haiku)"。
+  const adapter = new ClaudeProviderAdapter();
+  (adapter as any).inner.listBuiltinModels = async () => [
+    { value: 'default', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'opus', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'sonnet', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'opus[1m]', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'claude-fable-5[1m]', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'haiku', displayName: 'qwen3.6-flash', resolvedModel: 'qwen3.6-flash', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { value: 'qwen3.6-flash[1m]', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]', supportsEffort: true, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  ];
+
+  const models = await adapter.listModels();
+
+  assert.deepEqual(models.map((m) => m.model), ['default', 'opus', 'sonnet', 'fable', 'haiku']);
+  assert.deepEqual(models.map((m) => m.display_name), [
+    'Default (recommended)',
+    'Opus',
+    'Sonnet',
+    'Fable',
+    'Haiku',
+  ]);
+  assert.equal(models.every((m) => m.provider === 'claude'), true);
+  assert.equal(models.some((m) => /qwen/i.test(JSON.stringify(m))), false);
+  assert.deepEqual(models[0]?.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(models[3]?.max_context_size, 1_048_576);
+});
+
+test('Claude listModels does not invent aliases when handshake only returns qwen ids', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  (adapter as any).inner.listBuiltinModels = async () => [
+    { value: 'qwen3.6-flash[1m]', displayName: 'qwen3.6-flash[1m]', resolvedModel: 'qwen3.6-flash[1m]' },
+    { value: 'qwen3.6-flash', displayName: 'qwen3.6-flash', resolvedModel: 'qwen3.6-flash' },
+  ];
+
+  const models = await adapter.listModels();
+
+  assert.deepEqual(models, []);
 });
 
 test('getModel ignores ANTHROPIC_MODEL and leftover qwen session values', async () => {
@@ -748,6 +792,34 @@ test('ClaudeProviderAdapter.fork falls back to list() cwd when sessionCwd is emp
   const session = await adapter.fork!('old-id');
   assert.equal(session.id, 'forked-id');
   assert.equal(session.metadata.cwd, '/tmp/listed');
+});
+
+test('ClaudeProviderAdapter.fork copies session settings onto the new id', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  (adapter as any).sessionCwd.set('old-id', '/tmp/proj');
+  await adapter.setModel('old-id', 'sonnet');
+  await adapter.setThinking('old-id', 'high');
+  (adapter as any).inner.forkSession = async () => ({ sessionId: 'new-id' });
+
+  await adapter.fork!('old-id');
+  assert.equal(adapter.getModel('new-id'), 'sonnet');
+  assert.equal(adapter.getThinking!('new-id'), 'high');
+  assert.equal(adapter.getModel('old-id'), 'sonnet');
+});
+
+test('CodexProviderAdapter.fork copies session settings onto the new id', async () => {
+  const adapter = new CodexProviderAdapter();
+  await adapter.setModel('old-id', 'gpt-5.6-sol');
+  await adapter.setThinking('old-id', 'high');
+  (adapter as any).inner.forkThread = async (sessionId: string) => {
+    assert.equal(sessionId, 'old-id');
+    return { id: 'new-id', cwd: '/tmp/codex' };
+  };
+
+  const session = await adapter.fork!('old-id');
+  assert.equal(session.id, 'new-id');
+  assert.equal(adapter.getModel('new-id'), 'gpt-5.6-sol');
+  assert.equal(adapter.getThinking!('new-id'), 'high');
 });
 
 test('ClaudeProviderAdapter.delete unlinks via inner and drops local state', async () => {

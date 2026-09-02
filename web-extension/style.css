@@ -1,9 +1,23 @@
-/* Agent 选择器:挂在侧边栏账号行正上方,视觉对齐官方 SegmentedControl (ui-seg)。 */
+/* Agent 选择器:桌面挂在 .side-footer 正上方,移动端挂在会话 sheet 的 .view-tabs 正上方。
+   视觉对齐官方 SegmentedControl (ui-seg / status-seg)。 */
 
 .multi-agent-provider-wrap {
   position: relative;
   flex: none;
+  width: 100%;
   padding: var(--space-2) var(--sb-inset, 12px) 0;
+}
+
+/* 0.39 账号行在横向 .side-footer 里:选择器若只能插到 trigger 旁,不要再叠一层 inset。 */
+.side-footer .multi-agent-provider-wrap,
+.side-footer-account .multi-agent-provider-wrap {
+  padding: var(--space-1, 4px) 0 0;
+}
+
+/* 移动端 BottomSheet:与官方 .view-tabs 的 padding 对齐。 */
+.sheet-panel .multi-agent-provider-wrap,
+.sheet-body .multi-agent-provider-wrap {
+  padding: var(--space-1, 4px) var(--space-2, 8px) 0;
 }
 
 .multi-agent-provider-seg {

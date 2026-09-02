@@ -217,6 +217,27 @@ function prefixedId(provider: ProviderName, nativeId: string): string {
   return provider === 'kimi' ? nativeId : `${ID_PREFIX[provider]}${nativeId}`;
 }
 
+function firstUserText(messages: Message[]): string {
+  for (const message of messages) {
+    if (message.role !== 'user') continue;
+    for (const part of message.content) {
+      if (part.type === 'text' && part.text.trim()) {
+        return part.text.trim().replace(/\s+/g, ' ').slice(0, 80);
+      }
+    }
+  }
+  return '';
+}
+
+async function generateLocalSessionTitle(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+  const history = adapter.getHistory ? await adapter.getHistory(nativeId, { limit: 20 }).catch(() => []) : [];
+  const fromHistory = firstUserText(history);
+  if (fromHistory) return fromHistory;
+  const listed = adapter.list ? await adapter.list({ limit: 50 }).catch(() => ({ items: [] as Session[] })) : { items: [] };
+  const existing = listed.items.find((session) => session.id === nativeId)?.title?.trim();
+  return existing || 'New session';
+}
+
 function providerFromSessionId(id: string): { provider: ProviderName; nativeId: string } {
   for (const [provider, prefix] of Object.entries(ID_PREFIX) as [Exclude<ProviderName, 'kimi'>, string][]) {
     if (id.startsWith(prefix)) {
@@ -637,7 +658,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // 实际安装的 provider——前端选择器只显示这些。
       const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
       return ok(res, {
-        server_version: 'multi-agent-gateway/0.1 (Kimi 0.38.0 compatible)',
+        server_version: 'multi-agent-gateway/0.1 (Kimi 0.40.1 compatible)',
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
         server_id: 'multi-agent-gateway',
         started_at: new Date(0).toISOString(),
@@ -1276,6 +1297,21 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // claude 无后台任务机制。如实回空。
         return ok(res, { items: [] }, requestId);
       }
+      // 0.39 运行中卡片「移到后台」调 POST /tasks/:id:detach。Kimi 走上游代理;
+      // 本地 provider 无对等物,明确 400,避免前端把裸 404 当成路由错误。
+      const taskDetach = /^\/tasks\/([^/:]+):detach$/.exec(tail);
+      if (taskDetach && req.method === 'POST') {
+        throw new ProviderError('unsupported', `${sp} 不支持把任务移到后台(:detach)`, 400);
+      }
+      const taskCancel = /^\/tasks\/([^/:]+):cancel$/.exec(tail);
+      if (taskCancel && req.method === 'POST') {
+        throw new ProviderError('unsupported', `${sp} 不支持取消后台任务(:cancel)`, 400);
+      }
+      if (tail === '/title/generate' && req.method === 'POST') {
+        const title = await generateLocalSessionTitle(adapter, nativeId);
+        if (adapter.rename) await adapter.rename(nativeId, title);
+        return ok(res, { title }, requestId);
+      }
       if (tail === '/terminals' && req.method === 'GET') {
         // codex 后台终端(thread/backgroundTerminals/list);claude 无此机制回空。
         if (!adapter.listTerminals) return ok(res, { items: [] }, requestId);
@@ -1396,6 +1432,7 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
   const url = new URL(req.url ?? '/', 'http://localhost');
   // 0.36+ /api/v2：Kimi 会话列表仍走 kap;claude/codex/grok 必须留在本网关,
   // 否则平铺视图/搜索/已归档只看得到 Kimi。
+  if (url.pathname === '/v1/remote' || url.pathname.startsWith('/v1/remote/')) return true;
   if (url.pathname.startsWith('/api/v2')) {
     const v2Provider = url.searchParams.get('provider');
     // 列表与批量归档/恢复:只有显式 claude/codex/grok 才留在本网关;其余透传 kap。

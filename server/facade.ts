@@ -62,11 +62,31 @@ export function claudeContextWindow(...labels: Array<string | undefined>): numbe
 }
 
 /** Official Claude picker aliases. Env endpoint names (qwen, custom ids) stay out. */
+const CLAUDE_CATALOG_DISPLAY_NAME = {
+  default: 'Default (recommended)',
+  sonnet: 'Sonnet',
+  fable: 'Fable',
+  opus: 'Opus',
+  haiku: 'Haiku',
+} as const;
+
+export type ClaudeCatalogAlias = keyof typeof CLAUDE_CATALOG_DISPLAY_NAME;
+
 export function isClaudeCatalogModel(model: string | undefined): model is string {
-  if (!model) return false;
-  const id = model.trim();
-  if (!id || /qwen/i.test(id)) return false;
-  return /^(default|opus|sonnet|haiku|fable)(\b|[-\[]|$)/i.test(id) || /^claude-/i.test(id);
+  return claudeCatalogAlias(model) !== undefined;
+}
+
+/** Map a CLI model id onto the official picker alias, or undefined if it is not a catalog entry. */
+export function claudeCatalogAlias(model: string | undefined): ClaudeCatalogAlias | undefined {
+  if (!model) return undefined;
+  const id = model.trim().toLowerCase();
+  if (!id || /qwen/i.test(id)) return undefined;
+  if (/^default(\b|[-[]|$)/.test(id)) return 'default';
+  if (/^sonnet(\b|[-[]|$)/.test(id) || id.startsWith('claude-sonnet')) return 'sonnet';
+  if (/^fable(\b|[-[]|$)/.test(id) || id.startsWith('claude-fable')) return 'fable';
+  if (/^opus(\b|[-[]|$)/.test(id) || id.startsWith('claude-opus')) return 'opus';
+  if (/^haiku(\b|[-[]|$)/.test(id) || id.startsWith('claude-haiku')) return 'haiku';
+  return undefined;
 }
 
 function isCodexToolItem(type: unknown): boolean {
@@ -566,6 +586,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   async fork(sessionId: string): Promise<Session> {
     const thread = await this.inner.forkThread(sessionId);
+    const forkedId = typeof thread.id === 'string' ? thread.id : '';
+    this.settings.copySession(sessionId, forkedId);
     this.invalidateListCache();
     return this.toSession(thread);
   }
@@ -1048,7 +1070,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const isNew = !this.inner.hasSessionFile(sessionId);
     const cwd = this.sessionCwd.get(sessionId);
     const storedModel = this.settings.getString('model', sessionId);
-    const model = isClaudeCatalogModel(storedModel) ? storedModel : undefined;
+    const model = claudeCatalogAlias(storedModel);
     // thinking 'off' = 用户显式关闭 → 不传 --effort(CLI 无 off 档)。
     const thinking = this.settings.getString('thinking', sessionId);
     const effort = thinking && thinking !== 'off' ? thinking : undefined;
@@ -1291,8 +1313,9 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    if (!isClaudeCatalogModel(model)) return;
-    this.settings.set('model', sessionId, model);
+    const alias = claudeCatalogAlias(model);
+    if (!alias) return;
+    this.settings.set('model', sessionId, alias);
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
@@ -1336,24 +1359,34 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     // 选择器只展示 CLI 别名。ANTHROPIC_MODEL / 旧会话里的 qwen 不是目录项。
     const stored = this.settings.getString('model', sessionId)
       ?? this.settings.getString('model', '__default__');
-    return isClaudeCatalogModel(stored) ? stored : undefined;
+    return claudeCatalogAlias(stored);
   }
 
   /**
-   * 选择器目录永远来自 CLI initialize 握手(default/opus/fable/sonnet/haiku)。
-   * 自定义端点若把 qwen 额外塞进握手结果,过滤掉,不进选择器。
+   * 选择器目录永远来自 CLI initialize 握手(default/sonnet/fable/opus/haiku)。
+   * value 收成官方别名;display_name 用 Kimi Web 友好文案,不用握手里的
+   * 端点名(自定义端点常把 displayName 写成 qwen3.6-flash[1m],前端会按
+   * display_name 聚合成 "qwen3.6-flash[1m](default/opus/sonnet)")。
    * 握手失败如实抛错,不伪造空目录,也不进缓存。
    */
   async listModels(): Promise<NativeModel[]> {
     const builtin = await this.inner.listBuiltinModels();
-    return builtin.filter((model) => isClaudeCatalogModel(model.value)).map((model) => ({
-      provider: 'claude',
-      model: model.value,
-      display_name: model.displayName ?? model.value,
-      max_context_size: claudeContextWindow(model.value, model.resolvedModel, model.displayName),
-      capabilities: model.supportsEffort ? ['thinking'] : [],
-      ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
-    }));
+    const seen = new Set<ClaudeCatalogAlias>();
+    const out: NativeModel[] = [];
+    for (const model of builtin) {
+      const alias = claudeCatalogAlias(model.value);
+      if (!alias || seen.has(alias)) continue;
+      seen.add(alias);
+      out.push({
+        provider: 'claude',
+        model: alias,
+        display_name: CLAUDE_CATALOG_DISPLAY_NAME[alias],
+        max_context_size: claudeContextWindow(alias, model.value, model.resolvedModel),
+        capabilities: model.supportsEffort ? ['thinking'] : [],
+        ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
+      });
+    }
+    return out;
   }
 
   async listCommands(sessionId?: string): Promise<NativeCommand[]> {
@@ -1398,6 +1431,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     cwd = cwd || process.cwd();
     const { sessionId: newId } = await this.inner.forkSession(sessionId, cwd);
     this.sessionCwd.set(newId, cwd);
+    this.settings.copySession(sessionId, newId);
     const title = this.renames.get(sessionId) ?? `Claude ${newId.slice(0, 8)}`;
     return {
       id: newId,

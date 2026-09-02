@@ -61,3 +61,34 @@ test('path-less store is memory-only and never touches disk', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('copySession clones every scoped value onto the forked id', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'settings-store-copy-'));
+  const path = join(dir, 'session-settings.claude.json');
+  try {
+    const store = new SettingsStore(path);
+    store.set('model', 'old', 'sonnet');
+    store.set('thinking', 'old', 'high');
+    store.set('permission', 'old', 'yolo');
+    store.set('plan', 'old', true);
+    store.set('model', 'other', 'haiku');
+    store.copySession('old', 'new');
+    store.copySession('old', 'old');
+    store.copySession('', 'new');
+
+    assert.equal(store.getString('model', 'new'), 'sonnet');
+    assert.equal(store.getString('thinking', 'new'), 'high');
+    assert.equal(store.getString('permission', 'new'), 'yolo');
+    assert.equal(store.getBoolean('plan', 'new'), true);
+    assert.equal(store.getString('model', 'old'), 'sonnet');
+    assert.equal(store.getString('model', 'other'), 'haiku');
+
+    store.flushNow();
+    const restarted = new SettingsStore(path);
+    assert.equal(restarted.getString('model', 'new'), 'sonnet');
+    assert.equal(restarted.getBoolean('plan', 'new'), true);
+    assert.equal(restarted.getString('model', 'other'), 'haiku');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

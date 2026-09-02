@@ -4,6 +4,7 @@
   var PROVIDERS = ['kimi', 'claude', 'codex', 'grok'];
   var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok' };
   var STORAGE_KEY = 'multi-agent-gateway.provider.v1';
+  var EXPLICIT_KEY = 'multi-agent-gateway.explicitProvider.v1';
   var originalFetch = window.fetch || fetch;
   var OriginalWebSocket = window.WebSocket;
   var providerSockets = new Set();
@@ -36,15 +37,24 @@
     return 'kimi';
   }
 
-  // 首页(新建会话草稿)不沿用 localStorage 里的 provider:官方默认是 kimi,
-  // 带 codex 会让输入区显示 codex 模型并藏掉 Swarm(实测复现)。
-  // 侧边栏选择器显式切换后写入 runtimeProvider,覆盖默认值。
+  // 首页默认 kimi,不读 localStorage(否则上次的 codex 会藏掉 Swarm)。
+  // 本 tab 里点过选择器则写 sessionStorage,刷新后仍跟这次选择,避免 0.39
+  // 找不到 facade 整页 reload 时被打回 kimi。
   var runtimeProvider = null;
+
+  function explicitProvider() {
+    try {
+      var value = sessionStorage.getItem(EXPLICIT_KEY);
+      return isProvider(value) ? value : null;
+    } catch (_) {
+      return null;
+    }
+  }
 
   function selectedProvider() {
     var fromPath = providerFromPath(window.location.pathname);
     if (fromPath) return fromPath;
-    return runtimeProvider || 'kimi';
+    return runtimeProvider || explicitProvider() || 'kimi';
   }
 
   function setProvider(provider) {
@@ -55,6 +65,11 @@
     } catch (_) {
       /* localStorage may be unavailable in hardened browsers. */
     }
+    try {
+      sessionStorage.setItem(EXPLICIT_KEY, provider);
+    } catch (_) {
+      /* sessionStorage may be unavailable. */
+    }
     syncUi();
   }
 
@@ -63,6 +78,8 @@
     // 会话/模型/命令来源,不切登录体系(否则 Claude/Codex 会被误显示成未登录)。
     if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta') return true;
     if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/workspace/fs:search' || /^\/api\/v1\/files\//.test(pathname)) return true;
+    // 0.39 新增的 /v1/remote/devices、/capabilities、/plugins 是 Kimi 全局能力,不跟 Agent 走。
+    // /workspace/fs:suggest 与 /fs:content 仍不打标:网关没有对应本地实现,打上 provider 会 404。
     // /providers 和 /catalog/providers 是 Kimi 的供应商目录(设置页),不跟 Agent 切换走。
     if (/^\/api\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
     return /^\/api\/v1\/workspaces\/[^/]+\/skills$/.test(pathname);
@@ -203,9 +220,17 @@
       .filter(function (id) { return typeof id === 'string' && id; });
     if (ids.length === 0) return;
     var current = unwrapRef(facade.defaultModel);
-    if (current && ids.indexOf(current) !== -1) return;
     var saved = modelMemory()[provider];
-    var pick = saved && ids.indexOf(saved) !== -1 ? saved : ids[0];
+    if (saved && ids.indexOf(saved) !== -1) {
+      if (current !== saved) {
+        try { facade.setModel(saved); } catch (error) {
+          if (window.console && console.warn) console.warn('[multi-agent] setModel failed', error);
+        }
+      }
+      return;
+    }
+    if (current && ids.indexOf(current) !== -1) return;
+    var pick = ids[0];
     try {
       facade.setModel(pick);
     } catch (error) {
@@ -229,13 +254,13 @@
     }
   }
 
-  // 官方应用把自己暴露成 KimiWebClientFacade(Vue provide),列表数据只在
-  // bootstrap 时取一次——切换 provider 后要让它用自己的加载器重取,
-  // 这些加载器走我们 patch 过的 fetch,自动带上新 provider。
-  function findFacade() {
-    var root = document.querySelector('#app');
-    var app = root && root.__vue_app__;
-    var provides = app && app._context && app._context.provides;
+  // 0.38 把客户端暴露成 provide(Symbol(KimiWebClientFacade))。
+  // 0.39 不再 provide 这个 symbol,改成根组件 setup 返回值(setupState.load)。
+  function looksLikeFacade(obj) {
+    return !!(obj && typeof obj === 'object' && typeof obj.load === 'function');
+  }
+
+  function facadeFromProvides(provides) {
     if (!provides || typeof Object.getOwnPropertySymbols !== 'function') return null;
     var symbols = Object.getOwnPropertySymbols(provides);
     for (var i = 0; i < symbols.length; i += 1) {
@@ -246,18 +271,53 @@
     return null;
   }
 
+  function facadeFromInstance(inst, depth) {
+    if (!inst || depth > 8) return null;
+    var buckets = [inst.setupState, inst.exposed, inst.ctx, inst.proxy];
+    for (var i = 0; i < buckets.length; i += 1) {
+      if (looksLikeFacade(buckets[i])) return buckets[i];
+    }
+    var fromProvide = facadeFromProvides(inst.provides);
+    if (fromProvide) return fromProvide;
+    var sub = inst.subTree;
+    if (sub && sub.component) {
+      var nested = facadeFromInstance(sub.component, depth + 1);
+      if (nested) return nested;
+    }
+    var kids = sub && sub.children;
+    if (Array.isArray(kids)) {
+      for (var k = 0; k < kids.length; k += 1) {
+        var child = kids[k] && kids[k].component;
+        var hit = facadeFromInstance(child, depth + 1);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  }
+
+  function findFacade() {
+    var root = document.querySelector('#app');
+    var app = root && root.__vue_app__;
+    var fromLegacy = facadeFromProvides(app && app._context && app._context.provides);
+    if (fromLegacy) return fromLegacy;
+    return facadeFromInstance(app && app._instance, 0);
+  }
+
   // 慢 provider(codex 全量扫描实测 ~4s)的响应若在下次切换后才返回,
   // 会把列表覆盖回旧 provider;刷新串行排队,保证最后选中的 provider 最后落盘。
   var refreshChain = Promise.resolve();
+  var pendingProviderRefresh = false;
 
   function refreshProviderData() {
     var facade = findFacade();
     if (!facade || typeof facade.load !== 'function') {
-      // facade 不存在说明官方前端结构变了(注入本应按哈希失配关闭);
-      // 兜底整页刷新,保证列表内容一定正确。
-      window.location.reload();
+      // 0.39 不再 provide KimiWebClientFacade。整页 reload 会丢掉 runtimeProvider,
+      // 首页又强制 kimi,表现为点 Claude/Codex/Grok 立刻跳回 Kimi。
+      // fetch 已经带上新 provider;Vue 根实例出来后再 load。
+      pendingProviderRefresh = true;
       return;
     }
+    pendingProviderRefresh = false;
     closeProviderSockets();
     // 入队时捕获 provider:慢 provider 的 load 落地时选择可能已变,旧 provider
     // 的目录不能用新 provider 的记忆/默认值去校正。
@@ -343,14 +403,24 @@
     return seg;
   }
 
-  // 选择器挂在侧边栏底部、官方账号行正上方:用官方 SegmentedControl
-  // (ui-seg) 同款分段条,视觉对齐「进行中 / 已完成 / 工作空间」。
+  // 桌面:挂在侧边栏 .side-footer(账号行)正上方,视觉对齐官方 status-seg。
+  // 移动端 0.39 不再渲染 Sidebar,改挂在会话 sheet 的 .view-tabs(flat / 按工作区)正上方。
+  // .user-menu-login 在 0.39 是传送到 body 的菜单项,不是挂载点。
+  function findMountAnchor() {
+    if (!document.querySelector) return null;
+    var desktop = document.querySelector('.side-footer, .user-menu-trigger');
+    if (desktop && desktop.parentElement) return desktop;
+    var mobileTabs = document.querySelector('.view-tabs');
+    if (mobileTabs && mobileTabs.parentElement) return mobileTabs;
+    return null;
+  }
+
   function installSelector() {
     if (!document.querySelector) return;
     var existing = document.querySelector('.multi-agent-provider-wrap');
-    var anchor = document.querySelector('.user-menu-trigger, .user-menu-login');
+    var anchor = findMountAnchor();
     if (!anchor || !anchor.parentElement) {
-      // 账号区未挂载(加载中/被官方重渲染拆掉):选择器一并移除,不留孤儿。
+      // 账号区/移动 sheet 未挂载(加载中/被官方重渲染拆掉):选择器一并移除,不留孤儿。
       if (existing) existing.remove();
       return;
     }
@@ -388,7 +458,7 @@
     document.querySelectorAll('.am-row').forEach(function (row) {
       var id = row.getAttribute ? String(row.getAttribute('data-mode-id') || '') : '';
       if (!id && row.querySelector) {
-        var labelNode = row.querySelector('[data-icon], .am-row-name, .mode-row-name');
+        var labelNode = row.querySelector('[data-icon], .am-row-name, .mode-row-name, .am-name');
         var raw = labelNode ? String(labelNode.getAttribute && labelNode.getAttribute('name') || labelNode.textContent || '').trim().toLowerCase() : '';
         if (!raw) raw = String(row.textContent || '').trim().toLowerCase();
         if (raw.indexOf('swarm') !== -1) id = 'swarm';
@@ -412,7 +482,7 @@
     });
   }
 
-  // 官方 0.38 SlashMenu 仍内置 /swarm /goal /btw,也可能列出 /compact /undo。
+  // 官方 0.39 SlashMenu 仍内置 /swarm /goal /btw,也可能列出 /compact /undo。移动端走 .slash-menu.is-sheet。
   // Kimi 全部保留。Claude compact 是真 /compact prompt,但无 rewind,藏 /undo。
   // Grok compact/undo/fork 由 adapter 执行,只藏 /swarm /goal /btw。
   // Codex compact/undo/goal 由网关执行,藏 /swarm /btw。
@@ -459,6 +529,7 @@
     }
     gateModes();
     gateSlashMenu();
+    if (pendingProviderRefresh) refreshProviderData();
   }
 
   function onRouteChange() {
@@ -479,7 +550,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.user-menu-trigger, .user-menu-login, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard';
+  var uiMutationSelector = '.side-footer, .user-menu-trigger, .view-tabs, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {
