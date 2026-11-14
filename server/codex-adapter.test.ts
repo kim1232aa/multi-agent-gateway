@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { CodexAdapter, type CodexEvent } from './codex-adapter.js';
+import {
+  CodexAdapter,
+  extractCodexReasoningSummary,
+  normalizeCodexThreadItem,
+  stripCodexMemoryCitations,
+  stripCodexSystemTags,
+  type CodexEvent,
+} from './codex-adapter.js';
 import { ProviderError } from './types.js';
 
 function stubTransport(adapter: CodexAdapter): void {
@@ -288,4 +298,863 @@ test('stall watchdog leaves a slow-but-alive turn alone', async () => {
   try {
     for await (const _ of handle.events) { /* drain */ }
   } catch { /* 进程退出 → queue fail 是预期 */ }
+});
+
+test('doConnect strips GATEWAY_* env vars while preserving explicit options.env overrides', async () => {
+  const prevToken = process.env.GATEWAY_TOKEN;
+  const prevKimi = process.env.GATEWAY_KIMI;
+  process.env.GATEWAY_TOKEN = 'secret-gateway-token';
+  process.env.GATEWAY_KIMI = '1';
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-env-test-'));
+  const fakeBin = path.join(tmpDir, 'fake-codex.js');
+  fs.writeFileSync(
+    fakeBin,
+    `#!/usr/bin/env node
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    process.stderr.write('ENV_CHECK:' + JSON.stringify({
+      hasToken: Boolean(process.env.GATEWAY_TOKEN),
+      hasKimi: Boolean(process.env.GATEWAY_KIMI),
+      customVal: process.env.CUSTOM_FLAG || null,
+      explicitGateway: process.env.GATEWAY_EXPLICIT || null,
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      id: msg.id,
+      result: { userAgent: 'fake/0.169.0' },
+    }) + '\\n');
+  }
+});
+`,
+    { mode: 0o755 },
+  );
+  try {
+    let observedEnv: Record<string, unknown> | null = null;
+    const adapter = new CodexAdapter({
+      codexPath: fakeBin,
+      env: { CUSTOM_FLAG: 'yes', GATEWAY_EXPLICIT: 'allowed' },
+      onStderr: (line) => {
+        if (line.startsWith('ENV_CHECK:')) {
+          observedEnv = JSON.parse(line.slice('ENV_CHECK:'.length));
+        }
+      },
+    });
+    await adapter.connect();
+    for (let i = 0; i < 20 && !observedEnv; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(observedEnv);
+    assert.equal((observedEnv as any).hasToken, false);
+    assert.equal((observedEnv as any).hasKimi, false);
+    assert.equal((observedEnv as any).customVal, 'yes');
+    assert.equal((observedEnv as any).explicitGateway, 'allowed');
+    await adapter.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (prevToken === undefined) delete process.env.GATEWAY_TOKEN;
+    else process.env.GATEWAY_TOKEN = prevToken;
+    if (prevKimi === undefined) delete process.env.GATEWAY_KIMI;
+    else process.env.GATEWAY_KIMI = prevKimi;
+  }
+});
+
+test('rollback resolves beforeTurnId via paginated thread/turns/list and calls thread/revert', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const calls: Array<{ method: string; params: any }> = [];
+  (adapter as any).request = async (method: string, params: any) => {
+    calls.push({ method, params });
+    if (method === 'thread/turns/list') {
+      if (!params.cursor) {
+        return {
+          data: [
+            { id: 't4', status: 'completed', startedAt: 400 },
+            { id: 't3', status: 'completed', startedAt: 300 },
+          ],
+          nextCursor: 'cur-2',
+        };
+      }
+      return {
+        data: [
+          { id: 't2', status: 'completed', startedAt: 200 },
+          { id: 't1', status: 'completed', startedAt: 100 },
+        ],
+        nextCursor: null,
+      };
+    }
+    if (method === 'thread/revert') {
+      return {};
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+
+  await adapter.rollback('th-1', 3);
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0]!.method, 'thread/turns/list');
+  assert.equal(calls[0]!.params.threadId, 'th-1');
+  assert.equal(calls[0]!.params.sortDirection, 'desc');
+  assert.equal(calls[1]!.method, 'thread/turns/list');
+  assert.equal(calls[1]!.params.cursor, 'cur-2');
+  assert.deepEqual(calls[2], {
+    method: 'thread/revert',
+    params: { threadId: 'th-1', beforeTurnId: 't2' },
+  });
+});
+
+test('rollback rejects active inProgress turn, legacy unpaginated thread, and insufficient turns', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+
+  // 1) Active turn inProgress -> 409 busy
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list') {
+      return { data: [{ id: 't2', status: 'inProgress', startedAt: 200 }], nextCursor: null };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(
+    () => adapter.rollback('th-1', 1),
+    (err: unknown) => err instanceof ProviderError && err.code === 'busy' && err.httpStatus === 409,
+  );
+
+  // 2) Legacy unpaginated thread -> 400 unsupported (never calls removed thread/rollback)
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list') {
+      throw new Error("codex 'thread/turns/list' failed (-32600): thread th-legacy does not use paginated history");
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(
+    () => adapter.rollback('th-legacy', 1),
+    (err: unknown) => err instanceof ProviderError && err.code === 'unsupported' && err.httpStatus === 400,
+  );
+
+  // 3) Insufficient turns -> 400 invalid_request
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list') {
+      return { data: [{ id: 't1', status: 'completed', startedAt: 100 }], nextCursor: null };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(
+    () => adapter.rollback('th-1', 2),
+    (err: unknown) => err instanceof ProviderError && err.code === 'invalid_request' && err.httpStatus === 400,
+  );
+});
+
+test('stripCodexSystemTags and stripCodexMemoryCitations preserve code fences and inline backticks', () => {
+  const input = [
+    '<INSTRUCTIONS>system prompt</INSTRUCTIONS>',
+    '<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>',
+    'Hello world <oai-mem-citation><citation_entries>mem-1</citation_entries></oai-mem-citation>!',
+    'Inline `<INSTRUCTIONS>keep me</INSTRUCTIONS>` and `<oai-mem-citation>keep</oai-mem-citation>` stay.',
+    '```xml\n<environment_context>keep fenced</environment_context>\n<oai-mem-citation>keep fenced</oai-mem-citation>\n```',
+    '<turn_aborted>cancelled</turn_aborted>',
+  ].join('\n');
+
+  const stripped = stripCodexMemoryCitations(stripCodexSystemTags(input));
+  assert.ok(!stripped.includes('system prompt'));
+  assert.ok(!stripped.includes('<cwd>/tmp</cwd>'));
+  assert.ok(!stripped.includes('mem-1'));
+  assert.ok(!stripped.includes('cancelled'));
+  assert.ok(stripped.includes('Hello world !'));
+  assert.ok(stripped.includes('`<INSTRUCTIONS>keep me</INSTRUCTIONS>`'));
+  assert.ok(stripped.includes('<environment_context>keep fenced</environment_context>'));
+});
+
+test('getHistory paginates thread/turns/list and thread/items/list, filters system items, and normalizes 0.169 items', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  (adapter as any).request = async (method: string, params: any) => {
+    if (method === 'thread/turns/list') {
+      if (!params.cursor) {
+        return {
+          data: [{ id: 't1', status: 'completed', startedAt: 100 }],
+          nextCursor: 'turn-cur-2',
+        };
+      }
+      return {
+        data: [{ id: 't2', status: 'completed', startedAt: 200 }],
+        nextCursor: null,
+      };
+    }
+    if (method === 'thread/items/list') {
+      if (!params.cursor) {
+        return {
+          data: [
+            {
+              turnId: 't1',
+              item: {
+                id: 'u-sys',
+                type: 'userMessage',
+                content: [{ type: 'text', text: '<INSTRUCTIONS>hidden</INSTRUCTIONS>\n<environment_context>env</environment_context>' }],
+              },
+            },
+            {
+              turnId: 't1',
+              item: {
+                id: 'u-1',
+                type: 'userMessage',
+                content: [{ type: 'text', text: '<environment_context>env</environment_context>\nReal user question' }],
+              },
+            },
+            {
+              turnId: 't1',
+              item: {
+                id: 'r-1',
+                type: 'reasoning',
+                summary: ['First thought', 'Second thought'],
+                content: [],
+              },
+            },
+          ],
+          nextCursor: 'items-page-2',
+        };
+      }
+      return {
+        data: [
+          {
+            turnId: 't2',
+            item: {
+              id: 'a-1',
+              type: 'agentMessage',
+              text: 'Answer here<oai-mem-citation>secret</oai-mem-citation>',
+            },
+          },
+          {
+            turnId: 't2',
+            item: {
+              id: 'c-1',
+              type: 'collabAgentToolCall',
+              tool: 'spawnAgent',
+              status: 'completed',
+              senderThreadId: 'th-1',
+              receiverThreadIds: ['th-sub-1'],
+              prompt: 'check files',
+              model: 'gpt-5.4',
+              reasoningEffort: 'high',
+              agentsStates: { 'th-sub-1': { status: 'completed', message: 'all good' } },
+            },
+          },
+          {
+            turnId: 't2',
+            item: {
+              id: 'sa-1',
+              type: 'subAgentActivity',
+              threadId: 'th-sub-1',
+              agentLabel: 'explorer',
+              activityType: 'completed',
+              summary: 'finished exploration',
+            },
+          },
+          {
+            turnId: 't2',
+            item: {
+              id: 'pl-1',
+              type: 'plan',
+              text: '1. Step one\n2. Step two',
+            },
+          },
+          {
+            turnId: 't2',
+            item: {
+              id: 'rv-1',
+              type: 'enteredReviewMode',
+              review: 'uncommitted changes',
+            },
+          },
+          {
+            turnId: 't2',
+            item: {
+              id: 'cc-1',
+              type: 'contextCompaction',
+            },
+          },
+        ],
+        nextCursor: null,
+      };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+
+  const turns = await adapter.getHistory('th-1');
+  assert.equal(turns.length, 2);
+  const t1 = turns[0]!;
+  const t2 = turns[1]!;
+  assert.equal(t1.id, 't1');
+  const t1Items = t1.items as any[];
+  // u-sys was purely system-injected and stripped out
+  assert.equal(t1Items.length, 2);
+  assert.equal(t1Items[0].id, 'u-1');
+  assert.equal(t1Items[0].content[0].text, 'Real user question');
+  assert.equal(t1Items[1].id, 'r-1');
+  assert.equal(t1Items[1].summaryText, 'First thought\nSecond thought');
+  assert.equal(extractCodexReasoningSummary(t1Items[1]), 'First thought\nSecond thought');
+
+  assert.equal(t2.id, 't2');
+  const t2Items = t2.items as any[];
+  assert.equal(t2Items[0].text, 'Answer here');
+  assert.equal(t2Items[1].tool, 'spawnAgent');
+  assert.equal(t2Items[1].name, 'spawnAgent');
+  assert.deepEqual(t2Items[1].receiverThreadIds, ['th-sub-1']);
+  assert.equal(t2Items[2].type, 'subAgentActivity');
+  assert.equal(t2Items[2].agentLabel, 'explorer');
+  assert.equal(t2Items[3].type, 'plan');
+  assert.equal(t2Items[4].type, 'enteredReviewMode');
+  assert.equal(t2Items[5].type, 'contextCompaction');
+});
+
+test('getHistory falls back to thread/read on legacy threads and returns [] for unmaterialized threads', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+
+  // Legacy thread fallback
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list') {
+      throw new Error('thread th-old does not use paginated history');
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: 'th-old',
+          turns: [
+            {
+              id: 't-old',
+              status: 'completed',
+              items: [{ id: 'm1', type: 'agentMessage', text: 'Hi <oai-mem-citation>x</oai-mem-citation>' }],
+            },
+          ],
+        },
+      };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  const legacyTurns = await adapter.getHistory('th-old');
+  assert.equal(legacyTurns.length, 1);
+  assert.equal((legacyTurns[0]!.items as any[])[0].text, 'Hi ');
+
+  // Unmaterialized thread returns []
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list' || method === 'thread/read') {
+      throw new Error('thread th-new is not materialized yet; includeTurns is unavailable before first user message');
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  const emptyTurns = await adapter.getHistory('th-new');
+  assert.deepEqual(emptyTurns, []);
+});
+
+test('handleServerRequest supports 0.169 granular commandExecution, fileChange, and serverRequest/resolved', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const sentMessages: any[] = [];
+  (adapter as any).write = (msg: any) => sentMessages.push(msg);
+
+  const events: CodexEvent[] = [];
+  adapter.onEvent((ev: CodexEvent) => events.push(ev));
+
+  // 1) commandExecution with granular fields + acceptWithExecpolicyAmendment
+  (adapter as any).handleServerRequest(101, 'item/commandExecution/requestApproval', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'cmd-1',
+    approvalId: 'subcmd-1',
+    command: 'cargo test',
+    cwd: '/workspace',
+    reason: 'Need test run',
+    availableDecisions: ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['cargo', 'test'] } }, 'decline'],
+    proposedExecpolicyAmendment: ['cargo', 'test'],
+    proposedNetworkPolicyAmendments: [{ host: 'crates.io', action: 'allow' }],
+    networkApprovalContext: { host: 'crates.io', protocol: 'https' },
+  });
+
+  assert.equal(events.length, 1);
+  const cmdEv = events[0] as Extract<CodexEvent, { type: 'approval-request' }>;
+  assert.equal(cmdEv.type, 'approval-request');
+  assert.equal(cmdEv.kind, 'commandExecution');
+  assert.equal(cmdEv.requestId, 101);
+  assert.equal(cmdEv.approvalId, 'subcmd-1');
+  assert.deepEqual(cmdEv.proposedExecpolicyAmendment, ['cargo', 'test']);
+  assert.deepEqual(cmdEv.networkApprovalContext, { host: 'crates.io', protocol: 'https' });
+
+  adapter.resolveApproval(
+    '101',
+    CodexAdapter.acceptWithExecpolicyAmendment(['cargo', 'test']),
+  );
+  assert.deepEqual(sentMessages.pop(), {
+    id: 101,
+    result: {
+      decision: {
+        acceptWithExecpolicyAmendment: { execpolicy_amendment: ['cargo', 'test'] },
+      },
+    },
+  });
+
+  // 2) network policy amendment helper
+  (adapter as any).handleServerRequest(102, 'item/commandExecution/requestApproval', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'cmd-2',
+    command: 'curl https://crates.io',
+  });
+  adapter.resolveApproval(
+    '102',
+    CodexAdapter.applyNetworkPolicyAmendment({ host: 'crates.io', action: 'allow' }),
+  );
+  assert.deepEqual(sentMessages.pop(), {
+    id: 102,
+    result: {
+      decision: {
+        applyNetworkPolicyAmendment: {
+          network_policy_amendment: { host: 'crates.io', action: 'allow' },
+        },
+      },
+    },
+  });
+
+  // 3) fileChange approval + serverRequest/resolved cleanup
+  (adapter as any).handleServerRequest(103, 'item/fileChange/requestApproval', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'fc-1',
+    reason: 'Write Outside Root',
+    grantRoot: '/etc',
+  });
+  assert.equal((adapter as any).pendingServer.has('103'), true);
+  (adapter as any).handleNotification('serverRequest/resolved', {
+    threadId: 'th-1',
+    requestId: 103,
+  });
+  assert.equal((adapter as any).pendingServer.has('103'), false);
+  const resolvedEv = events.find((e) => e.type === 'server-request-resolved');
+  assert.ok(resolvedEv && resolvedEv.type === 'server-request-resolved');
+  assert.equal(resolvedEv.requestId, 103);
+});
+
+test('handleServerRequest supports item/permissions/requestApproval and mcpServer/elicitation/request (with null turnId and 0.171 environmentId)', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const sentMessages: any[] = [];
+  (adapter as any).write = (msg: any) => sentMessages.push(msg);
+
+  (adapter as any).request = async (method: string) => {
+    if (method === 'turn/start') return { turn: { id: 't-active', status: 'inProgress' } };
+    throw new Error(`unexpected ${method}`);
+  };
+
+  const handle = await adapter.startTurn('th-1', 'run mcp tool');
+  const it = handle.events[Symbol.asyncIterator]();
+  assert.equal((await it.next()).value.type, 'turn-started');
+
+  // 1) item/permissions/requestApproval
+  (adapter as any).handleServerRequest(201, 'item/permissions/requestApproval', {
+    threadId: 'th-1',
+    turnId: 't-active',
+    itemId: 'perm-item-1',
+    reason: 'Need filesystem write',
+    permissions: { fileSystem: { write: ['/tmp/out'] } },
+  });
+  const permEv = (await it.next()).value as Extract<CodexEvent, { type: 'approval-request' }>;
+  assert.equal(permEv.type, 'approval-request');
+  assert.equal(permEv.kind, 'permissions');
+  assert.deepEqual(permEv.permissions, { fileSystem: { write: ['/tmp/out'] } });
+
+  adapter.resolvePermissionsApproval('201', { fileSystem: { write: ['/tmp/out'] } }, 'session', true);
+  assert.deepEqual(sentMessages.pop(), {
+    id: 201,
+    result: {
+      permissions: { fileSystem: { write: ['/tmp/out'] } },
+      scope: 'session',
+      strictAutoReview: true,
+    },
+  });
+
+  // 2) mcpServer/elicitation/request with turnId: null and 0.171 environmentId
+  // Should correlate to active turn 't-active' on 'th-1'!
+  (adapter as any).handleServerRequest('elic-req-1', 'mcpServer/elicitation/request', {
+    threadId: 'th-1',
+    turnId: null,
+    serverName: 'github-mcp',
+    mode: 'form',
+    environmentId: 'env-alpha-5',
+    message: 'Provide token scope',
+    requestedSchema: { type: 'object', properties: { scope: { type: 'string' } } },
+  });
+  const elicEv = (await it.next()).value as Extract<CodexEvent, { type: 'approval-request' }>;
+  assert.equal(elicEv.type, 'approval-request');
+  assert.equal(elicEv.kind, 'mcpElicitation');
+  assert.equal(elicEv.turnId, 't-active');
+  assert.equal(elicEv.elicitation?.serverName, 'github-mcp');
+  assert.equal(elicEv.elicitation?.environmentId, 'env-alpha-5');
+
+  adapter.resolveElicitation('elic-req-1', 'accept', { scope: 'repo' }, { trace: '1' });
+  assert.deepEqual(sentMessages.pop(), {
+    id: 'elic-req-1',
+    result: {
+      action: 'accept',
+      content: { scope: 'repo' },
+      _meta: { trace: '1' },
+    },
+  });
+
+  (adapter as any).handleNotification('turn/completed', {
+    threadId: 'th-1',
+    turn: { id: 't-active', status: 'completed' },
+  });
+  assert.equal((await it.next()).value.type, 'turn-completed');
+});
+
+test('handleServerRequest maps legacy applyPatchApproval/execCommandApproval and maps requestUserInput question ids', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const sentMessages: any[] = [];
+  (adapter as any).write = (msg: any) => sentMessages.push(msg);
+
+  // Legacy applyPatchApproval
+  (adapter as any).handleServerRequest(301, 'applyPatchApproval', {
+    conversationId: 'th-legacy',
+    callId: 'patch-call-1',
+    fileChanges: { 'a.txt': { type: 'add', content: 'hi' } },
+    reason: 'patch file',
+    grantRoot: '/workspace',
+  });
+  adapter.resolveApproval('301', 'acceptForSession');
+  assert.deepEqual(sentMessages.pop(), {
+    id: 301,
+    result: { decision: 'approved_for_session' },
+  });
+
+  // Legacy execCommandApproval declined
+  (adapter as any).handleServerRequest(302, 'execCommandApproval', {
+    conversationId: 'th-legacy',
+    callId: 'exec-call-1',
+    command: ['rm', '-rf', '/tmp/x'],
+    cwd: '/tmp',
+    reason: 'cleanup',
+    parsedCmd: [],
+  });
+  adapter.resolveApproval('302', 'decline');
+  assert.deepEqual(sentMessages.pop(), {
+    id: 302,
+    result: { decision: { denied: { rejection: 'Rejected by user' } } },
+  });
+
+  // item/tool/requestUserInput with synthetic q_0 key mapping to actual question.id
+  (adapter as any).handleServerRequest(303, 'item/tool/requestUserInput', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'ask-1',
+    isBlocking: true,
+    autoResolutionMs: 15000,
+    questions: [
+      { id: 'real_question_id', header: 'Env', question: 'Which env?', options: [{ label: 'prod', description: 'Production' }] },
+    ],
+  });
+  adapter.resolveQuestion('303', { q_0: ['prod'] });
+  assert.deepEqual(sentMessages.pop(), {
+    id: 303,
+    result: {
+      answers: {
+        real_question_id: { answers: ['prod'] },
+      },
+    },
+  });
+});
+
+test('handleServerRequest immediately rejects unhandled host requests (-32601) without hanging pendingServer', () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const sentMessages: any[] = [];
+  (adapter as any).write = (msg: any) => sentMessages.push(msg);
+
+  const events: CodexEvent[] = [];
+  adapter.onEvent((ev: CodexEvent) => events.push(ev));
+
+  (adapter as any).handleServerRequest(401, 'item/tool/call', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    callId: 'call-1',
+    tool: 'customTool',
+    arguments: { a: 1 },
+  });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.type, 'server-request');
+  assert.equal((adapter as any).pendingServer.has('401'), false);
+  assert.equal(sentMessages.length, 1);
+  assert.equal(sentMessages[0].id, 401);
+  assert.equal(sentMessages[0].error.code, -32601);
+});
+
+test('compact registers event listener before thread/compact/start to prevent race condition and rejects on failure', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+
+  // 1) Same-chunk contextCompaction emitted BEFORE thread/compact/start RPC resolves
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/compact/start') {
+      (adapter as any).handleNotification('item/completed', {
+        threadId: 'th-1',
+        turnId: 't-compact',
+        item: { id: 'cc-1', type: 'contextCompaction' },
+      });
+      return {};
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await adapter.compact('th-1', 1000);
+
+  // 2) thread/compacted notification also resolves compact()
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/compact/start') {
+      queueMicrotask(() => {
+        (adapter as any).handleNotification('thread/compacted', {
+          threadId: 'th-1',
+          turnId: 't-compact-2',
+        });
+      });
+      return {};
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await adapter.compact('th-1', 1000);
+
+  // 3) terminal error during compaction rejects compact() immediately
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/compact/start') {
+      queueMicrotask(() => {
+        (adapter as any).handleNotification('error', {
+          threadId: 'th-1',
+          turnId: 't-compact-3',
+          willRetry: false,
+          error: { message: 'context window overflow during compaction' },
+        });
+      });
+      return {};
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(() => adapter.compact('th-1', 1000), /context window overflow/);
+});
+
+test('reviewTurn correlates 0.169 { turn, reviewThreadId } response and streams events from reviewThreadId', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  (adapter as any).request = async (method: string, params: any) => {
+    if (method === 'review/start') {
+      assert.deepEqual(params.target, { type: 'baseBranch', branch: 'main' });
+      assert.equal(params.delivery, 'detached');
+      // Emit same-chunk event on the detached reviewThreadId before continuation runs
+      queueMicrotask(() => {
+        (adapter as any).handleNotification('item/agentMessage/delta', {
+          threadId: 'th-review-detached',
+          turnId: 'rev-turn-1',
+          itemId: 'msg-1',
+          delta: 'Review finding 1',
+        });
+        (adapter as any).handleNotification('turn/completed', {
+          threadId: 'th-review-detached',
+          turn: { id: 'rev-turn-1', status: 'completed' },
+        });
+      });
+      return {
+        turn: { id: 'rev-turn-1', status: 'inProgress', items: [] },
+        reviewThreadId: 'th-review-detached',
+      };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+
+  const handle = await adapter.reviewTurn('th-main', {
+    target: { type: 'baseBranch', branch: 'main' },
+    delivery: 'detached',
+  });
+  assert.equal(handle.turnId, 'rev-turn-1');
+  assert.equal(handle.reviewThreadId, 'th-review-detached');
+
+  const collected: CodexEvent[] = [];
+  for await (const ev of handle.events) collected.push(ev);
+  assert.deepEqual(
+    collected.map((e) => e.type),
+    ['turn-started', 'text-delta', 'turn-completed'],
+  );
+});
+
+test('listModels and mcpStatus paginate via nextCursor, and listSkills passes cwd and auto-reloads after skills/changed', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const calls: Array<{ method: string; params: any }> = [];
+
+  (adapter as any).request = async (method: string, params: any) => {
+    calls.push({ method, params });
+    if (method === 'model/list') {
+      if (!params.cursor) {
+        return { data: [{ id: 'gpt-5.4' }], nextCursor: 'm-page-2' };
+      }
+      return { data: [{ id: 'gpt-5.4-mini' }], nextCursor: null };
+    }
+    if (method === 'mcpServerStatus/list') {
+      if (!params.cursor) {
+        return { data: [{ name: 'srv-1' }], nextCursor: 's-page-2' };
+      }
+      return { data: [{ name: 'srv-2' }], nextCursor: null };
+    }
+    if (method === 'skills/list') {
+      return { data: [{ cwd: params.cwds?.[0] ?? '/default/cwd', skills: [{ name: 'skill-a', description: 'desc', path: '/p', scope: 'repo', enabled: true }], errors: [] }] };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+
+  const models = await adapter.listModels();
+  assert.deepEqual(models.map((m) => m.id), ['gpt-5.4', 'gpt-5.4-mini']);
+
+  const servers = await adapter.mcpStatus();
+  assert.deepEqual(servers.map((s) => s.name), ['srv-1', 'srv-2']);
+
+  await adapter.listSkills({ cwd: '/custom/project' });
+  assert.deepEqual(calls.pop(), {
+    method: 'skills/list',
+    params: { cwds: ['/custom/project'] },
+  });
+
+  // Trigger skills/changed notification -> next listSkills should automatically set forceReload: true
+  (adapter as any).handleNotification('skills/changed', {});
+  assert.equal(adapter.getSkillsVersion(), 1);
+  assert.equal(adapter.isSkillsDirty(), true);
+  await adapter.listSkills({ cwd: '/custom/project' });
+  assert.deepEqual(calls.pop(), {
+    method: 'skills/list',
+    params: { cwds: ['/custom/project'], forceReload: true },
+  });
+  assert.equal(adapter.isSkillsDirty(), false);
+});
+
+test('handleNotification maps plan, diff, goal/cleared, thread/reverted, summaryIndex, turn.error, reasoningOutputTokens, and effort/serviceTier', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const events: CodexEvent[] = [];
+  adapter.onEvent((ev: CodexEvent) => events.push(ev));
+
+  (adapter as any).handleNotification('turn/plan/updated', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    explanation: 'Updating plan',
+    plan: [{ step: 'Write tests', status: 'inProgress' }],
+  });
+  (adapter as any).handleNotification('item/plan/delta', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'pl-1',
+    delta: '+ step 2',
+  });
+  (adapter as any).handleNotification('turn/diff/updated', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    diff: '--- a/file\n+++ b/file',
+  });
+  (adapter as any).handleNotification('thread/goal/cleared', {
+    threadId: 'th-1',
+  });
+  (adapter as any).handleNotification('thread/reverted', {
+    threadId: 'th-1',
+  });
+  (adapter as any).handleNotification('item/reasoning/summaryTextDelta', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'r-1',
+    delta: 'thinking...',
+    summaryIndex: 2,
+  });
+  (adapter as any).handleNotification('thread/tokenUsage/updated', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    tokenUsage: {
+      last: { inputTokens: 100, outputTokens: 50, cachedInputTokens: 20, reasoningOutputTokens: 30 },
+      total: { inputTokens: 200, outputTokens: 90, cachedInputTokens: 40, reasoningOutputTokens: 50 },
+      modelContextWindow: 200000,
+    },
+  });
+  (adapter as any).handleNotification('turn/completed', {
+    threadId: 'th-1',
+    turn: {
+      id: 't-1',
+      status: 'failed',
+      error: { message: 'rate limit reached', codexErrorInfo: 'UsageLimitExceeded', additionalDetails: 'retry in 10s' },
+    },
+  });
+
+  assert.equal(events[0]!.type, 'plan-updated');
+  assert.equal(events[1]!.type, 'plan-delta');
+  assert.equal(events[2]!.type, 'diff-updated');
+  assert.deepEqual(events[3], { type: 'goal-updated', threadId: 'th-1', goal: null, cleared: true });
+  assert.deepEqual(events[4], { type: 'thread-reverted', threadId: 'th-1' });
+  assert.deepEqual(events[5], {
+    type: 'reasoning-delta',
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'r-1',
+    contentIndex: 2,
+    summaryIndex: 2,
+    delta: 'thinking...',
+  });
+  assert.equal(events[6]!.type, 'token-usage');
+  const tokenEv = events[6] as Extract<CodexEvent, { type: 'token-usage' }>;
+  assert.equal(tokenEv.usage.last.reasoningOutputTokens, 30);
+  assert.equal(tokenEv.usage.reasoningOutputTokens, 50);
+  const completedEv = events[7] as Extract<CodexEvent, { type: 'turn-completed' }>;
+  assert.equal(completedEv.type, 'turn-completed');
+  assert.equal(completedEv.error, 'rate limit reached: retry in 10s');
+  assert.equal(completedEv.turnError?.codexErrorInfo, 'UsageLimitExceeded');
+
+  // Verify startTurn forwards effort: 'ultra' and serviceTier: 'fast'
+  let capturedTurnStartParams: any = null;
+  (adapter as any).request = async (method: string, params: any) => {
+    if (method === 'turn/start') {
+      capturedTurnStartParams = params;
+      return { turn: { id: 't-ultra', status: 'inProgress' } };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  const h = await adapter.startTurn('th-1', 'go', { effort: 'ultra', serviceTier: 'fast' });
+  assert.equal(capturedTurnStartParams.effort, 'ultra');
+  assert.equal(capturedTurnStartParams.serviceTier, 'fast');
+  (adapter as any).handleNotification('turn/completed', {
+    threadId: 'th-1',
+    turn: { id: 't-ultra', status: 'completed' },
+  });
+  for await (const _ of h.events) { /* drain */ }
+});
+
+test('live smoke test against extracted @openai/codex 0.169.0 binary when present', async (t) => {
+  const codex0169Bin = '/tmp/codex-survey.LoV5Nh/stable/package/vendor/x86_64-unknown-linux-musl/bin/codex';
+  if (!fs.existsSync(codex0169Bin)) {
+    t.skip(`0.169.0 binary not found at ${codex0169Bin}`);
+    return;
+  }
+
+  const tmpCodexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-m10-smoke-'));
+  const adapter = new CodexAdapter({
+    codexPath: codex0169Bin,
+    env: { CODEX_HOME: tmpCodexHome },
+  });
+
+  try {
+    await adapter.connect();
+
+    const thread = await adapter.create({ cwd: tmpCodexHome });
+    assert.ok(thread.id.length > 0);
+    assert.equal(thread.historyMode, 'paginated');
+
+    // Unmaterialized new 0.169 thread should cleanly return empty history
+    const history = await adapter.getHistory(thread.id);
+    assert.deepEqual(history, []);
+
+    // Skills list should succeed against 0.169 app-server
+    const skills = await adapter.listSkills({ cwd: tmpCodexHome });
+    assert.ok(Array.isArray(skills));
+  } finally {
+    await adapter.close();
+    fs.rmSync(tmpCodexHome, { recursive: true, force: true });
+  }
 });
