@@ -134,6 +134,7 @@ export interface TranscriptPrompt extends Record<string, unknown> {
 
 interface TranscriptSessionState {
   seq: number;
+  lastResetSeq: number;
   generation: number;
   nextOrdinal: number;
   historyObserved: boolean;
@@ -155,7 +156,8 @@ interface TranscriptSubscriber {
   closed: boolean;
   seeded: boolean;
   startSeq: number;
-  baselineItems: TranscriptTurn[];
+  baselineActiveItems: TranscriptTurn[];
+  hasCompletedBaseline: boolean;
   baselineInteractions: TranscriptInteraction[];
   baselinePrompts: TranscriptPrompt[];
   pending: TranscriptBatch[];
@@ -242,7 +244,7 @@ export class LocalTranscriptHub {
     if (turnRemap.size > 0) this.rewriteJournalIds(state, turnRemap, stepRemap);
   }
 
-  /** 重编号后把 journal 里旧 turnId/stepId 的 op 改写到新号,重放不产生幽灵。 */
+  /** 重编号后把 journal 与未 seed 订阅方缓存里旧 turnId/stepId 改写到新号,重放不产生幽灵。 */
   private rewriteJournalIds(
     state: TranscriptSessionState,
     turnRemap: Map<string, string>,
@@ -254,7 +256,24 @@ export class LocalTranscriptHub {
       }
       return frameId;
     };
-    for (const batch of state.journal) {
+    const rewriteTurnObj = (turn: TranscriptTurn | undefined): void => {
+      if (!turn || typeof turn.turnId !== 'string' || !turnRemap.has(turn.turnId)) return;
+      turn.turnId = turnRemap.get(turn.turnId) as string;
+      turn.ordinal = Number.parseInt(turn.turnId.slice(1), 10);
+      for (const step of turn.steps ?? []) {
+        if (stepRemap.has(step.stepId)) {
+          step.turnId = turn.turnId;
+          step.stepId = stepRemap.get(step.stepId) as string;
+        }
+        for (const frame of step.frames ?? []) {
+          if (typeof frame.frameId === 'string') frame.frameId = mapFrameId(frame.frameId);
+        }
+      }
+    };
+    const visitedBatches = new Set<TranscriptBatch>();
+    const rewriteBatch = (batch: TranscriptBatch): void => {
+      if (visitedBatches.has(batch)) return;
+      visitedBatches.add(batch);
       for (const op of batch.ops) {
         if (typeof op.turnId === 'string' && turnRemap.has(op.turnId)) op.turnId = turnRemap.get(op.turnId);
         if (typeof op.stepId === 'string' && stepRemap.has(op.stepId)) op.stepId = stepRemap.get(op.stepId);
@@ -265,17 +284,7 @@ export class LocalTranscriptHub {
           if (typeof target.stepId === 'string' && stepRemap.has(target.stepId)) target.stepId = stepRemap.get(target.stepId);
           if (typeof target.frameId === 'string') target.frameId = mapFrameId(target.frameId);
         }
-        const turn = op.turn as TranscriptTurn | undefined;
-        if (turn && typeof turn.turnId === 'string' && turnRemap.has(turn.turnId)) {
-          turn.turnId = turnRemap.get(turn.turnId) as string;
-          turn.ordinal = Number.parseInt(turn.turnId.slice(1), 10);
-          for (const step of turn.steps ?? []) {
-            if (stepRemap.has(step.stepId)) {
-              step.turnId = turn.turnId;
-              step.stepId = stepRemap.get(step.stepId) as string;
-            }
-          }
-        }
+        rewriteTurnObj(op.turn as TranscriptTurn | undefined);
         const step = op.step as TranscriptStep | undefined;
         if (step && typeof step.stepId === 'string' && stepRemap.has(step.stepId)) {
           if (typeof step.turnId === 'string' && turnRemap.has(step.turnId)) step.turnId = turnRemap.get(step.turnId) as string;
@@ -283,6 +292,18 @@ export class LocalTranscriptHub {
         }
         const frame = op.frame as TranscriptFrame | undefined;
         if (frame && typeof frame.frameId === 'string') frame.frameId = mapFrameId(frame.frameId);
+      }
+    };
+
+    for (const batch of state.journal) {
+      rewriteBatch(batch);
+    }
+    for (const subscriber of state.subscribers) {
+      for (const turn of subscriber.baselineActiveItems) {
+        rewriteTurnObj(turn);
+      }
+      for (const batch of subscriber.pending) {
+        rewriteBatch(batch);
       }
     }
   }
@@ -436,7 +457,8 @@ export class LocalTranscriptHub {
       closed: false,
       seeded: false,
       startSeq: state.seq,
-      baselineItems: cloneTurns([...state.recentTurns.values(), ...state.activeTurns.values()]),
+      baselineActiveItems: cloneTurns([...state.activeTurns.values()]),
+      hasCompletedBaseline: state.recentTurns.size > 0,
       baselineInteractions: structuredClone([...state.interactions.values()]) as TranscriptInteraction[],
       baselinePrompts: structuredClone([...state.prompts.values()]) as TranscriptPrompt[],
       pending: [],
@@ -454,14 +476,14 @@ export class LocalTranscriptHub {
         if (catchup?.complete) {
           for (const batch of catchup.batches) send(opsEmission(batch));
         } else {
-          const hasOlder = historyTurns(messages).turns.length > 0 || subscriber.baselineItems.length > 0;
+          const hasOlder = historyTurns(messages).turns.length > 0 || subscriber.hasCompletedBaseline;
           send({
             type: 'transcript.reset',
             payload: {
               type: 'transcript.reset',
               agent_id: 'main',
               snapshot: snapshotFromState(
-                [],
+                subscriber.baselineActiveItems,
                 subscriber.baselineInteractions,
                 subscriber.baselinePrompts,
                 [...state.tasks.values()],
@@ -568,10 +590,10 @@ export class LocalTranscriptHub {
 
   /**
    * undo/compact 后使旧投影失效并协调活跃订阅方:
-   * - 重置 journal 与 seq,递增 generation;
-   * - 若传入新鲜历史 messages 则立刻重新 observeHistory;
-   * - 清理未 seed 订阅方挂起的过期批,并向已 seed 的活跃订阅方推送
-   *   `transcript.reset`(除非 options.notify === false),保证客户端游标与视图同步刷新。
+   * - 保持 seq 严格单调递增并设置 lastResetSeq 边界,防止失效前游标误判为 complete;
+   * - 若传入新鲜历史 messages 则立刻重新 observeHistory(含在途 turn 重编号);
+   * - 清理未 seed 订阅方挂起的过期批并更新其基线,向已 seed 订阅方推送包含当前
+   *   activeTurns 的 `transcript.reset`(除非 options.notify === false)。
    */
   invalidateHistory(sessionId: string, options?: InvalidateHistoryOptions): void {
     const state = this.sessions.get(sessionId);
@@ -580,12 +602,15 @@ export class LocalTranscriptHub {
     state.historyObserved = false;
     state.recentTurns.clear();
     state.unbasedTurns.clear();
-    for (const turnId of state.activeTurns.keys()) {
+    let maxActiveOrdinal = 0;
+    for (const [turnId, turn] of state.activeTurns) {
       state.unbasedTurns.add(turnId);
+      if (turn.ordinal > maxActiveOrdinal) maxActiveOrdinal = turn.ordinal;
     }
     state.journal = [];
-    state.seq = 0;
-    state.nextOrdinal = 1;
+    state.seq += 1;
+    state.lastResetSeq = state.seq;
+    state.nextOrdinal = options?.messages !== undefined ? 1 : maxActiveOrdinal + 1;
     if (options?.clearPrompts) state.prompts.clear();
     if (options?.clearInteractions) state.interactions.clear();
 
@@ -594,10 +619,10 @@ export class LocalTranscriptHub {
     }
 
     const activity: TranscriptActivity = options?.activity ?? (state.activeTurns.size > 0 ? 'turn' : 'idle');
-    const activeList = [...state.activeTurns.values()];
+    const activeList = cloneTurns([...state.activeTurns.values()]);
     const hasMoreOlder = options?.hasMoreOlder
       ?? (options?.messages !== undefined
-        ? historyTurns(options.messages).turns.length > 0 || activeList.length > 0
+        ? historyTurns(options.messages).turns.length > 0
         : true);
 
     const notify = options?.notify !== false;
@@ -609,7 +634,8 @@ export class LocalTranscriptHub {
       if (subscriber.closed) continue;
       subscriber.pending = [];
       subscriber.startSeq = state.seq;
-      subscriber.baselineItems = cloneTurns(activeList);
+      subscriber.baselineActiveItems = cloneTurns(activeList);
+      subscriber.hasCompletedBaseline = false;
       subscriber.baselineInteractions = structuredClone(interactions) as TranscriptInteraction[];
       subscriber.baselinePrompts = structuredClone(prompts) as TranscriptPrompt[];
       if (subscriber.seeded && notify) {
@@ -618,7 +644,7 @@ export class LocalTranscriptHub {
           payload: {
             type: 'transcript.reset',
             agent_id: 'main',
-            snapshot: snapshotFromState([], interactions, prompts, tasks, state.meta, activity),
+            snapshot: snapshotFromState(activeList, interactions, prompts, tasks, state.meta, activity),
             has_more_older: hasMoreOlder,
             seq: state.seq,
             ...(options?.reason ? { reason: options.reason } : {}),
@@ -633,6 +659,7 @@ export class LocalTranscriptHub {
     if (!state) {
       state = {
         seq: 0,
+        lastResetSeq: 0,
         generation: 0,
         nextOrdinal: 1,
         historyObserved: false,
@@ -657,7 +684,7 @@ export class LocalTranscriptHub {
     since: number,
     through: number,
   ): { batches: TranscriptBatch[]; latestSeq: number; complete: boolean } {
-    if (!Number.isInteger(since) || since < 0 || since > through) {
+    if (!Number.isInteger(since) || since < 0 || since > through || since < state.lastResetSeq) {
       return { batches: [], latestSeq: through, complete: false };
     }
     const batches = state.journal.filter((batch) => batch.seq > since && batch.seq <= through);
@@ -684,8 +711,9 @@ export class LocalTranscriptTurn {
     if (!text || this.ended) return;
     const step = this.ensureStep(meta);
     const suffix = streamKeySuffix(meta);
-    const frameId = suffix ? `${step.stepId}.${kind}.${suffix}` : `${step.stepId}.${kind}`;
-    const current = this.streamText.get(frameId) ?? '';
+    const streamKey = suffix ? `${kind}.${suffix}` : kind;
+    const frameId = `${step.stepId}.${streamKey}`;
+    const current = this.streamText.get(streamKey) ?? '';
     if (current.length === 0) {
       const frame: TranscriptFrame = kind === 'assistant'
         ? { kind: 'text', frameId, role: 'assistant', text: '', ...compactFrameMeta(meta) }
@@ -700,7 +728,7 @@ export class LocalTranscriptTurn {
       text,
     }]);
     const next = current + text;
-    this.streamText.set(frameId, next);
+    this.streamText.set(streamKey, next);
     const frame = step.frames.find((item) => item.frameId === frameId);
     if (frame) frame.text = next;
   }
@@ -1209,12 +1237,55 @@ function toolErrorText(output: unknown): string {
   }
 }
 
+const ALLOWED_MEDIA_PROTOCOLS = new Set(['http:', 'https:', 'blob:']);
+
 function safeMediaUrl(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined;
+  // Reject ASCII control chars (including \t, \n, \r, \0, DEL) before parsing,
+  // because WHATWG URL() strips ASCII tabs/newlines inside schemes.
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return undefined;
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
-  if (/^\s*(data|javascript|vbscript):/i.test(trimmed)) return undefined;
-  return trimmed;
+  if (trimmed.startsWith('//') || trimmed.startsWith('/\\') || trimmed.startsWith('\\')) {
+    return undefined;
+  }
+  if (trimmed.startsWith('/')) {
+    try {
+      const parsed = new URL(trimmed, 'https://gateway.local');
+      return parsed.origin === 'https://gateway.local' ? trimmed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const hasSchemeLikePrefix = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed);
+  if (!hasSchemeLikePrefix) {
+    if (trimmed.includes('\\')) return undefined;
+    const colonIdx = trimmed.indexOf(':');
+    if (colonIdx !== -1) {
+      const firstDelim = trimmed.search(/[/?#]/);
+      if (firstDelim === -1 || colonIdx < firstDelim) return undefined;
+    }
+    try {
+      const parsed = new URL(trimmed, 'https://gateway.local');
+      return parsed.origin === 'https://gateway.local' ? trimmed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!ALLOWED_MEDIA_PROTOCOLS.has(parsed.protocol)) return undefined;
+    if (parsed.protocol === 'blob:') {
+      const inner = trimmed.slice(5);
+      const innerScheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(inner)?.[1]?.toLowerCase();
+      if (innerScheme && innerScheme !== 'http' && innerScheme !== 'https') {
+        return undefined;
+      }
+    }
+    return trimmed;
+  } catch {
+    return undefined;
+  }
 }
 
 function safeMediaInfo(

@@ -4,7 +4,7 @@
  * 一律 git -C <cwd>;遍历/搜索排除 .git、node_modules,限条目数与文件大小。
  */
 import { spawn } from 'node:child_process';
-import { constants as fsConstants, type Stats } from 'node:fs';
+import { constants as fsConstants, existsSync, type Stats } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { ProviderError, type ProviderErrorCode } from './types.js';
@@ -175,20 +175,281 @@ export interface BoundFileHandle {
   realPath: string;
 }
 
+export interface OpenBoundOptions {
+  /** Test/verification hook invoked after preflight checks and before anchored open. */
+  beforeAnchoredOpen?: () => void | Promise<void>;
+}
+
 const OPEN_BOUND_FLAGS =
   fsConstants.O_RDONLY |
   (fsConstants.O_NONBLOCK ?? 0) |
   (fsConstants.O_NOFOLLOW ?? 0);
 
+const OPEN_DIR_FLAGS =
+  fsConstants.O_RDONLY |
+  (fsConstants.O_DIRECTORY ?? 0) |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const HAS_PROC_SELF_FD = process.platform === 'linux' && existsSync('/proc/self/fd');
+const MAX_SYMLINK_HOPS = 8;
+
+function splitSafeSegments(rel: string, sep: string): string[] {
+  if (!rel || rel === '.') return [];
+  const parts = rel.split(sep).filter(Boolean);
+  for (const seg of parts) {
+    if (seg === '.' || seg === '..' || seg.includes('/') || seg.includes('\\') || seg.includes('\0')) {
+      throw new FsError(400, 40001, `非法路径段: ${seg}`);
+    }
+  }
+  return parts;
+}
+
+function mapOpenError(err: unknown, abs: string): never {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === 'ENOENT' || code === 'ENOTDIR') {
+    throw new FsError(404, 40404, `文件不存在: ${abs}`);
+  }
+  if (code === 'ELOOP' || code === 'ENXIO') {
+    throw new FsError(400, 40001, `拒绝打开非受信任文件(${code}): ${abs}`);
+  }
+  if (code === 'EISDIR') {
+    throw new FsError(400, 40003, `不是文件: ${abs}`);
+  }
+  throw new FsError(400, 40001, `打开文件失败: ${(err as Error).message}`);
+}
+
+function verifyStatMatch(opened: Stats, expected: Stats, abs: string): void {
+  if (!opened.isFile()) {
+    throw new FsError(400, 40003, `不是常规文件: ${abs}`);
+  }
+  const devMismatch = opened.dev !== expected.dev;
+  const inoTestable = process.platform !== 'win32' || (opened.ino !== 0 && expected.ino !== 0);
+  const inoMismatch = inoTestable && opened.ino !== expected.ino;
+  if (devMismatch || inoMismatch) {
+    throw new FsError(400, 40001, '文件在打开期间发生替换');
+  }
+}
+
+async function openFileAtAnchoredDir(
+  dirPathOrFd: string,
+  displayAbs: string,
+): Promise<{ fh: fsp.FileHandle; stat: Stats }> {
+  const expectedLst = await fsp.lstat(dirPathOrFd).catch((err: unknown) => {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new FsError(404, 40404, `文件不存在: ${displayAbs}`);
+    }
+    throw new FsError(400, 40001, `无法访问文件: ${(err as Error).message}`);
+  });
+  if (expectedLst.isSymbolicLink()) {
+    throw new FsError(400, 40001, '禁止打开符号链接');
+  }
+  if (!expectedLst.isFile()) {
+    throw new FsError(400, 40003, `不是文件: ${displayAbs}`);
+  }
+  let fh: fsp.FileHandle;
+  try {
+    fh = await fsp.open(dirPathOrFd, OPEN_BOUND_FLAGS);
+  } catch (err) {
+    mapOpenError(err, displayAbs);
+  }
+  try {
+    const st = await fh.stat();
+    verifyStatMatch(st, expectedLst, displayAbs);
+    return { fh, stat: st };
+  } catch (err) {
+    await fh.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+async function openAnchoredOnLinux(
+  abs: string,
+  cwd: string | undefined,
+): Promise<BoundFileHandle> {
+  if (cwd === undefined) {
+    const resolvedTarget = path.resolve(abs);
+    const parentDir = path.dirname(resolvedTarget);
+    const baseName = path.basename(resolvedTarget);
+    if (!baseName || baseName === '.' || baseName === '..') {
+      throw new FsError(400, 40003, `不是文件: ${abs}`);
+    }
+    const realParent = await fsp.realpath(parentDir).catch((err: unknown) => mapOpenError(err, abs));
+    const parentLst = await fsp.lstat(realParent).catch((err: unknown) => mapOpenError(err, abs));
+    const parentFd = await fsp.open(realParent, OPEN_DIR_FLAGS).catch((err: unknown) => mapOpenError(err, abs));
+    try {
+      const pSt = await parentFd.stat();
+      if (!pSt.isDirectory() || pSt.dev !== parentLst.dev || pSt.ino !== parentLst.ino) {
+        throw new FsError(400, 40001, '父目录在打开期间发生变化');
+      }
+      const { fh, stat } = await openFileAtAnchoredDir(`/proc/self/fd/${parentFd.fd}/${baseName}`, abs);
+      return { fh, stat, realPath: path.join(realParent, baseName) };
+    } finally {
+      await parentFd.close().catch(() => undefined);
+    }
+  }
+
+  const resolvedBase = path.resolve(cwd);
+  const resolvedTarget = path.resolve(abs);
+  if (!isWithinNormalized(resolvedBase, resolvedTarget, false)) {
+    throw new FsError(400, 40001, `path 越出会话目录: ${abs}`);
+  }
+  const realBase = await fsp.realpath(resolvedBase).catch((err: unknown) => mapOpenError(err, abs));
+  const baseLst = await fsp.lstat(realBase).catch((err: unknown) => mapOpenError(err, abs));
+  const baseFd = await fsp.open(realBase, OPEN_DIR_FLAGS).catch((err: unknown) => mapOpenError(err, abs));
+
+  let curFd: fsp.FileHandle = baseFd;
+  try {
+    const baseSt = await baseFd.stat();
+    if (!baseSt.isDirectory() || baseSt.dev !== baseLst.dev || baseSt.ino !== baseLst.ino) {
+      throw new FsError(400, 40001, '会话根目录在打开期间发生变化');
+    }
+
+    let segments = splitSafeSegments(path.relative(resolvedBase, resolvedTarget), path.sep);
+    if (segments.length === 0) {
+      throw new FsError(400, 40003, `不是文件: ${abs}`);
+    }
+
+    let curRelParts: string[] = [];
+    let hops = 0;
+
+    const resolveIntraCwdSymlink = (linkTarget: string, tail: string[]): string[] => {
+      hops += 1;
+      if (hops > MAX_SYMLINK_HOPS) {
+        throw new FsError(400, 40001, '路径存在循环符号链接');
+      }
+      const curDirLogical = path.join(realBase, ...curRelParts);
+      let nextPath: string;
+      if (path.isAbsolute(linkTarget)) {
+        if (isWithinNormalized(realBase, linkTarget, false)) {
+          nextPath = path.resolve(linkTarget);
+        } else if (isWithinNormalized(resolvedBase, linkTarget, false)) {
+          nextPath = path.join(realBase, path.relative(resolvedBase, linkTarget));
+        } else {
+          throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+        }
+      } else {
+        nextPath = path.resolve(curDirLogical, linkTarget);
+        if (!isWithinNormalized(realBase, nextPath, false)) {
+          throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+        }
+      }
+      return [...splitSafeSegments(path.relative(realBase, nextPath), path.sep), ...tail];
+    };
+
+    for (let i = 0; i < segments.length; i += 1) {
+      const seg = segments[i]!;
+      const isLast = i === segments.length - 1;
+      const anchoredPath = `/proc/self/fd/${curFd.fd}/${seg}`;
+
+      if (!isLast) {
+        let nextFd: fsp.FileHandle;
+        try {
+          nextFd = await fsp.open(anchoredPath, OPEN_DIR_FLAGS);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException | undefined)?.code;
+          if (code === 'ENOENT') {
+            throw new FsError(404, 40404, `文件不存在: ${abs}`);
+          }
+          if (code === 'ELOOP' || code === 'ENOTDIR') {
+            const linkTarget = await fsp.readlink(anchoredPath).catch(() => null);
+            if (linkTarget === null) {
+              if (code === 'ENOTDIR') {
+                throw new FsError(400, 40003, `路径中间段不是目录: ${abs}`);
+              }
+              throw new FsError(400, 40001, `目录打开失败: ${abs}`);
+            }
+            segments = resolveIntraCwdSymlink(linkTarget, segments.slice(i + 1));
+            if (curFd !== baseFd) await curFd.close().catch(() => undefined);
+            curFd = baseFd;
+            curRelParts = [];
+            i = -1;
+            continue;
+          }
+          mapOpenError(err, abs);
+        }
+        if (curFd !== baseFd) await curFd.close().catch(() => undefined);
+        curFd = nextFd;
+        curRelParts.push(seg);
+        continue;
+      }
+
+      const preLst = await fsp.lstat(anchoredPath).catch((err: unknown) => {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') {
+          throw new FsError(404, 40404, `文件不存在: ${abs}`);
+        }
+        throw new FsError(400, 40001, `无法访问文件: ${(err as Error).message}`);
+      });
+
+      if (preLst.isSymbolicLink()) {
+        const linkTarget = await fsp.readlink(anchoredPath).catch(() => null);
+        if (linkTarget === null) {
+          throw new FsError(400, 40001, '符号链接在读取期间发生变化');
+        }
+        segments = resolveIntraCwdSymlink(linkTarget, []);
+        if (segments.length === 0) {
+          throw new FsError(400, 40003, `不是文件: ${abs}`);
+        }
+        if (curFd !== baseFd) await curFd.close().catch(() => undefined);
+        curFd = baseFd;
+        curRelParts = [];
+        i = -1;
+        continue;
+      }
+
+      if (!preLst.isFile()) {
+        throw new FsError(400, 40003, `不是文件: ${abs}`);
+      }
+
+      let fh: fsp.FileHandle;
+      try {
+        fh = await fsp.open(anchoredPath, OPEN_BOUND_FLAGS);
+      } catch (err) {
+        mapOpenError(err, abs);
+      }
+      try {
+        const st = await fh.stat();
+        verifyStatMatch(st, preLst, abs);
+        return { fh, stat: st, realPath: path.join(realBase, ...curRelParts, seg) };
+      } catch (err) {
+        await fh.close().catch(() => undefined);
+        throw err;
+      }
+    }
+
+    throw new FsError(400, 40003, `不是文件: ${abs}`);
+  } finally {
+    if (curFd !== baseFd) await curFd.close().catch(() => undefined);
+    await baseFd.close().catch(() => undefined);
+  }
+}
+
 /**
  * TOCTOU-safe bounded file opener:
- * uses O_RDONLY | O_NONBLOCK | O_NOFOLLOW (where available) plus post-open fstat
- * verification of regular-file type and dev/ino identity against lstat/realpath.
+ * - On Linux (/proc/self/fd), anchors traversal from an O_DIRECTORY | O_NOFOLLOW
+ *   handle on the verified base directory and walks segment-by-segment with
+ *   O_NOFOLLOW so parent-directory symlink swaps cannot escape the sandbox.
+ * - Uses O_RDONLY | O_NONBLOCK | O_NOFOLLOW plus post-open fstat verification
+ *   of regular-file type and dev/ino identity.
  */
-export async function openBound(abs: string, cwd?: string): Promise<BoundFileHandle> {
+export async function openBound(
+  abs: string,
+  cwd?: string,
+  options?: OpenBoundOptions,
+): Promise<BoundFileHandle> {
   if (cwd !== undefined) {
     await assertRealInCwd(cwd, abs);
   }
+  if (options?.beforeAnchoredOpen) {
+    await options.beforeAnchoredOpen();
+  }
+  const win32 = cwd !== undefined ? useWin32Paths(cwd, abs) : isWindowsPath(abs);
+  if (HAS_PROC_SELF_FD && !win32) {
+    return openAnchoredOnLinux(abs, cwd);
+  }
+
   const initialLst = await fsp.lstat(abs).catch((err: unknown) => {
     const code = (err as NodeJS.ErrnoException | undefined)?.code;
     if (code === 'ENOENT' || code === 'ENOTDIR') {
@@ -203,7 +464,6 @@ export async function openBound(abs: string, cwd?: string): Promise<BoundFileHan
     if (cwd === undefined) {
       throw new FsError(400, 40001, '禁止打开符号链接');
     }
-    const win32 = useWin32Paths(cwd, abs);
     const pMod = win32 ? path.win32 : path;
     const realBase = stripWindowsDevicePrefix(
       await fsp.realpath(pMod.resolve(stripWindowsDevicePrefix(cwd))).catch(() => pMod.resolve(stripWindowsDevicePrefix(cwd))),
@@ -236,30 +496,12 @@ export async function openBound(abs: string, cwd?: string): Promise<BoundFileHan
   try {
     fh = await fsp.open(target, OPEN_BOUND_FLAGS);
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException | undefined)?.code;
-    if (code === 'ENOENT' || code === 'ENOTDIR') {
-      throw new FsError(404, 40404, `文件不存在: ${abs}`);
-    }
-    if (code === 'ELOOP' || code === 'ENXIO') {
-      throw new FsError(400, 40001, `拒绝打开非受信任文件(${code}): ${abs}`);
-    }
-    if (code === 'EISDIR') {
-      throw new FsError(400, 40003, `不是文件: ${abs}`);
-    }
-    throw new FsError(400, 40001, `打开文件失败: ${(err as Error).message}`);
+    mapOpenError(err, abs);
   }
 
   try {
     const st = await fh.stat();
-    if (!st.isFile()) {
-      throw new FsError(400, 40003, `不是常规文件: ${abs}`);
-    }
-    const devMismatch = st.dev !== expectedLst.dev;
-    const inoTestable = process.platform !== 'win32' || (st.ino !== 0 && expectedLst.ino !== 0);
-    const inoMismatch = inoTestable && st.ino !== expectedLst.ino;
-    if (devMismatch || inoMismatch) {
-      throw new FsError(400, 40001, '文件在打开期间发生替换');
-    }
+    verifyStatMatch(st, expectedLst, abs);
     return { fh, stat: st, realPath: target };
   } catch (err) {
     await fh.close().catch(() => undefined);
@@ -268,8 +510,8 @@ export async function openBound(abs: string, cwd?: string): Promise<BoundFileHan
 }
 
 /** 读前 8KB 判 NUL 字节,有则视为二进制。 */
-async function isBinaryFile(abs: string): Promise<boolean> {
-  const { fh } = await openBound(abs);
+async function isBinaryFile(abs: string, cwd?: string): Promise<boolean> {
+  const { fh } = await openBound(abs, cwd);
   try {
     const buf = Buffer.alloc(8192);
     const { bytesRead } = await fh.read(buf, 0, 8192, 0);
@@ -317,7 +559,7 @@ async function entryWire(cwd: string, abs: string, gitMap?: Map<string, string>)
     if (lang) wire.language_id = lang;
     // 只对可疑类型判二进制(已知文本类型跳过 I/O)。
     if (!lang && wire.mime === 'application/octet-stream') {
-      wire.is_binary = await isBinaryFile(abs).catch(() => false);
+      wire.is_binary = await isBinaryFile(abs, cwd).catch(() => false);
     } else {
       wire.is_binary = false;
     }

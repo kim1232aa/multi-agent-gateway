@@ -1,8 +1,18 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import {
+  assertRealInCwd,
+  displayPath,
+  fsDiff,
+  fsList,
+  fsRead,
+  openBound,
+  resolveInCwd,
+} from './fs-local.js';
 import { SettingsStore } from './settings-store.js';
 
 test('settings persist across store instances (gateway restart)', async () => {
@@ -172,6 +182,75 @@ test('records flush failures, leaves no temp files, and retries until writable',
     store.close();
   } finally {
     console.warn = originalWarn;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('fs-local: openBound rejects intermediate parent-directory symlink swap TOCTOU', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fs-local-parent-swap-'));
+  try {
+    const cwd = join(dir, 'ws');
+    const sub = join(cwd, 'sub');
+    const outside = join(dir, 'outside');
+    await mkdir(sub, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(sub, 'secret.txt'), 'inside');
+    await writeFile(join(outside, 'secret.txt'), 'escaped-outside');
+
+    await assert.rejects(
+      () => openBound(join(sub, 'secret.txt'), cwd, {
+        beforeAnchoredOpen: async () => {
+          // Simulates an attacker swapping the verified intermediate directory `sub`
+          // with a symlink to `outside` right after assertRealInCwd finishes.
+          await rm(sub, { recursive: true, force: true });
+          await symlink(outside, sub);
+        },
+      }),
+      /符号链接越出/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('fs-local: openBound, fsRead, fsList, fsDiff, and cross-platform path guards hold invariants', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fs-local-guards-'));
+  try {
+    const cwd = join(dir, 'ws');
+    const outside = join(dir, 'outside.txt');
+    await mkdir(join(cwd, 'nested'), { recursive: true });
+    await writeFile(join(cwd, 'nested', 'hello.txt'), 'hello world\n');
+    await writeFile(outside, 'secret');
+    await symlink(outside, join(cwd, 'evil-link'));
+    await symlink(join(cwd, 'nested', 'hello.txt'), join(cwd, 'good-link'));
+    await symlink(dir, join(cwd, 'evil-dir'));
+    if (process.platform === 'linux') {
+      execFileSync('mkfifo', [join(cwd, 'pipe')]);
+      await assert.rejects(() => openBound(join(cwd, 'pipe'), cwd), /不是文件/);
+      await assert.rejects(() => fsRead(cwd, { path: 'pipe' }), /不是文件/);
+      const listRes = await fsList(cwd, { depth: 1 });
+      assert.ok(listRes.items.some((entry) => entry.name === 'pipe'));
+    }
+
+    assert.equal(resolveInCwd('C:\\Repo', 'src\\app.ts'), 'C:\\Repo\\src\\app.ts');
+    assert.equal(resolveInCwd('C:\\Repo', 'c:\\repo\\src\\app.ts'), 'c:\\repo\\src\\app.ts');
+    assert.equal(resolveInCwd('C:\\', 'foo.txt'), 'C:\\foo.txt');
+    assert.equal(displayPath('C:\\Repo', 'c:\\repo\\src\\app.ts'), 'src/app.ts');
+    assert.equal(displayPath('C:\\Repo', 'c:\\repo'), '.');
+    assert.throws(() => resolveInCwd('C:\\Repo', '..\\secret'), /越出/);
+    assert.throws(() => resolveInCwd('/tmp/ws', '..\\..\\etc\\passwd'), /越出/);
+    assert.throws(() => resolveInCwd('/tmp/ws', 'C:\\Windows\\win.ini'), /越出/);
+
+    await assert.rejects(() => assertRealInCwd(cwd, join(cwd, 'evil-link')), /符号链接/);
+    await assert.rejects(() => assertRealInCwd(cwd, join(cwd, 'evil-dir', 'missing.txt')), /符号链接/);
+    await assert.rejects(() => openBound(join(cwd, 'good-link')), /符号链接/);
+    await assert.rejects(() => fsRead(cwd, { path: 'evil-link' }), /符号链接/);
+
+    const goodRead = await fsRead(cwd, { path: 'good-link' });
+    assert.equal(goodRead.content, 'hello world\n');
+    const diffRes = await fsDiff(cwd, { path: 'nested/hello.txt' });
+    assert.match(diffRes.diff, /\+hello world/);
+  } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
