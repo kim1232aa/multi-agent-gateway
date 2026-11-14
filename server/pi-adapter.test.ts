@@ -113,6 +113,7 @@ current_model = {
     "name": "Claude Sonnet 4",
     "provider": "anthropic",
     "reasoning": True,
+    "input": ["text", "image"],
     "contextWindow": 200000,
     "maxTokens": 16384,
 }
@@ -142,6 +143,12 @@ while True:
     ctype = cmd.get("type")
 
     if ctype == "get_state":
+        if mode == "startup_ui_dialog" and os.environ.get("FAKE_STARTUP_UI_ONCE", "1") == "1":
+            os.environ["FAKE_STARTUP_UI_ONCE"] = "0"
+            send({"type": "extension_ui_request", "id": "startup-cf", "method": "confirm", "title": "Trust?", "message": "Workspace?"})
+            resp_raw = sys.stdin.buffer.readline()
+            if resp_raw:
+                log_line(os.environ.get("FAKE_UI_RESP_LOG"), json.loads(resp_raw.decode("utf-8")))
         send({
             "id": cid,
             "type": "response",
@@ -265,9 +272,20 @@ while True:
         session_name = cmd.get("name")
         send({"id": cid, "type": "response", "command": "set_session_name", "success": True})
     elif ctype == "compact":
+        if mode == "idle_compact_ui":
+            send({"type": "extension_ui_request", "id": "idle-ff-1", "method": "notify", "message": "compacting", "notifyType": "info"})
+            send({"type": "extension_ui_request", "id": "idle-compact-confirm", "method": "confirm", "title": "Compact?", "message": "Proceed?"})
+            resp_raw = sys.stdin.buffer.readline()
+            if resp_raw:
+                log_line(os.environ.get("FAKE_UI_RESP_LOG"), json.loads(resp_raw.decode("utf-8")))
         mode = "null_context_stats"
         send({"id": cid, "type": "response", "command": "compact", "success": True, "data": {"summary": "compacted", "firstKeptEntryId": "e1", "tokensBefore": 5000}})
     elif ctype == "clone":
+        if mode == "clone_ui_dialog":
+            send({"type": "extension_ui_request", "id": "clone-ui-1", "method": "input", "title": "Clone note?"})
+            resp_raw = sys.stdin.buffer.readline()
+            if resp_raw:
+                log_line(os.environ.get("FAKE_UI_RESP_LOG"), json.loads(resp_raw.decode("utf-8")))
         if message_count == 0:
             send({"id": cid, "type": "response", "command": "clone", "success": False, "error": "This session has not been saved yet. Send a message before cloning or forking it."})
         else:
@@ -279,6 +297,8 @@ while True:
     elif ctype == "fork":
         session_id = f"{session_id}-forked"
         session_file = os.path.join(os.environ.get("FAKE_SESSIONS_DIR", "/tmp"), f"{session_id}.jsonl")
+        if mode == "root_fork_empty":
+            message_count = 0
         send({"id": cid, "type": "response", "command": "fork", "success": True, "data": {"text": "hello", "cancelled": False}})
     elif ctype == "steer":
         send({"id": cid, "type": "response", "command": "steer", "success": True, "data": {"disposition": "queued"}})
@@ -414,6 +434,20 @@ while True:
                 "content": [{"type": "text", "text": "file-data"}],
                 "isError": False,
             }})
+            send({"type": "agent_settled", "aborted": False})
+        elif mode == "compaction_end_turn":
+            send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
+            send({"type": "agent_start"})
+            send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+            send({"type": "message_end", "message": {
+                "role": "assistant",
+                "provider": "anthropic",
+                "model": "claude-sonnet-4",
+                "content": [{"type": "text", "text": "before compact"}],
+                "usage": {"input": 100, "output": 50, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.01}},
+                "stopReason": "stop",
+            }})
+            send({"type": "compaction_end", "reason": "threshold", "result": {"summary": "sum", "firstKeptEntryId": "e1", "tokensBefore": 150, "usage": {"input": 20, "output": 10, "cacheRead": 0, "cacheWrite": 0, "cost": {"total": 0.005}}}, "aborted": False, "willRetry": False})
             send({"type": "agent_settled", "aborted": False})
         elif mode == "crash_mid_turn":
             send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
@@ -1001,15 +1035,27 @@ test('reversible model encoding, dynamic thinking levels without off, commands w
       'openrouter/anthropic/claude-sonnet-4',
       'custom%2Forg/no-off-model',
     ]);
+    assert.ok(models[0]?.capabilities?.includes('vision'));
+    assert.ok(models[0]?.capabilities?.includes('thinking'));
+    assert.equal(models[0]?.supportsThinkingOff, true);
     assert.equal(models[1]?.support_efforts?.includes('off'), false);
+    assert.equal(models[1]?.supportsThinkingOff, false);
 
     const sess = await adapter.create({ provider: 'pi', cwd: base });
     const levels = await adapter.listThinkingLevels(sess.id);
     assert.deepEqual(levels, ['low', 'medium', 'high']);
 
-    // Setting `off` when model lacks `off` reads back Pi's clamped `low` via `get_state`.
+    // Setting `off` when model lacks `off` reads back Pi's clamped `low` via `get_state`
+    // without issuing a redundant get_available_thinking_levels RPC.
+    const beforeSetCount = (await readFile(stdinLog, 'utf8')).trim().split('\n').length;
     await adapter.setThinking(sess.id, 'off');
     assert.equal(adapter.getThinking(sess.id), 'low');
+    const afterSetLines = (await readFile(stdinLog, 'utf8'))
+      .trim()
+      .split('\n')
+      .slice(beforeSetCount)
+      .map((l) => (JSON.parse(l) as { cmd: { type: string } }).cmd.type);
+    assert.deepEqual(afterSetLines, ['set_thinking_level', 'get_state']);
 
     await adapter.setModel(sess.id, 'openrouter/anthropic/claude-sonnet-4');
     assert.equal(adapter.getModel(sess.id), 'openrouter/anthropic/claude-sonnet-4');
@@ -1465,6 +1511,286 @@ test('followUp, fork at entryId, non-streamed message_end fallback, and fail-clo
   } finally {
     await piAdapter?.dispose().catch(() => undefined);
     await providerAdapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('SettingsStore restart and __default__ model/thinking preferences sync into PiAdapter startTurn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-settings-sync-'));
+  const sessionsDir = join(base, 'sessions');
+  const settingsPath = join(base, 'pi-settings.json');
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin, stdinLog } = await writeContractFakePi(base);
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const resumedId = '66666666-6666-4666-8666-666666666666';
+    await writeFile(join(cwdDir, `2026-11-14T21-00-00-000Z_${resumedId}.jsonl`), [
+      JSON.stringify({ type: 'session', version: 3, id: resumedId, timestamp: '2026-11-14T21:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-14T21:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'hi' }], timestamp: 1 } }),
+    ].join('\n') + '\n');
+
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir,
+      settingsPath,
+      env: { FAKE_STDIN_LOG: stdinLog },
+    });
+    await adapter.setModel('__default__', 'openrouter/anthropic/claude-sonnet-4');
+    await adapter.setThinking('__default__', 'high');
+
+    const draft = await adapter.create({ provider: 'pi', cwd: base });
+    assert.equal(adapter.getModel(draft.id), 'openrouter/anthropic/claude-sonnet-4');
+    assert.equal(adapter.getThinking(draft.id), 'high');
+    await adapter.dispose();
+
+    // Simulate gateway restart: fresh PiProviderAdapter reads SettingsStore from disk
+    // while PiAdapter starts with empty in-memory maps.
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir,
+      settingsPath,
+      env: { FAKE_STDIN_LOG: stdinLog },
+    });
+    assert.equal(adapter.getModel(resumedId), 'openrouter/anthropic/claude-sonnet-4');
+    assert.equal(adapter.getThinking(resumedId), 'high');
+
+    await drainEvents(await adapter.startTurn({ sessionId: resumedId, input: 'after restart' }));
+    const cmds = (await readFile(stdinLog, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l).cmd as Record<string, unknown>);
+    const setModelIdx = cmds.findIndex(
+      (c) => c.type === 'set_model' && c.provider === 'openrouter' && c.modelId === 'anthropic/claude-sonnet-4',
+    );
+    const setThinkIdx = cmds.findIndex(
+      (c) => c.type === 'set_thinking_level' && c.level === 'high',
+    );
+    const promptIdx = cmds.findIndex((c) => c.type === 'prompt' && c.message === 'after restart');
+    assert.ok(setModelIdx >= 0 && setThinkIdx > setModelIdx && promptIdx > setThinkIdx, JSON.stringify(cmds));
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('fails closed {cancelled:true} on extension_ui_request outside active turns (startup, compact, clone)', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-ui-outside-turn-'));
+  const sessionsDir = join(base, 'sessions');
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin, uiRespLog } = await writeContractFakePi(base);
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const sid = '77777777-7777-4777-8777-777777777777';
+    await writeFile(join(cwdDir, `2026-11-14T21-00-00-000Z_${sid}.jsonl`), [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-14T21:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-14T21:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: 1 } }),
+    ].join('\n') + '\n');
+
+    // 1. UI dialog during idle compact -> fail-closed {cancelled:true}, fire-and-forget ignored
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir,
+      env: { FAKE_PI_MODE: 'idle_compact_ui', FAKE_UI_RESP_LOG: uiRespLog },
+    });
+    await adapter.compact(sid);
+    await adapter.dispose();
+
+    // 2. UI dialog during clone -> fail-closed {cancelled:true}
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir,
+      env: { FAKE_PI_MODE: 'clone_ui_dialog', FAKE_UI_RESP_LOG: uiRespLog },
+    });
+    const cloned = await adapter.clone(sid);
+    assert.notEqual(cloned.id, sid);
+    await adapter.dispose();
+
+    // 3. UI dialog during process startup (get_state) -> fail-closed {cancelled:true}
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir,
+      env: { FAKE_PI_MODE: 'startup_ui_dialog', FAKE_UI_RESP_LOG: uiRespLog },
+    });
+    await drainEvents(await adapter.startTurn({ sessionId: sid, input: 'ok' }));
+
+    const uiResps = (await readFile(uiRespLog, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(uiResps, [
+      { type: 'extension_ui_response', id: 'idle-compact-confirm', cancelled: true },
+      { type: 'extension_ui_response', id: 'clone-ui-1', cancelled: true },
+      { type: 'extension_ui_response', id: 'startup-cf', cancelled: true },
+    ]);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('clone/fork reject busy sessions with 409 and root-message fork keeps empty draft history', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-clone-busy-root-'));
+  const sessionsDir = join(base, 'sessions');
+  let piAdapter: PiAdapter | undefined;
+  try {
+    const { bin } = await writeContractFakePi(base);
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const sid = '88888888-8888-4888-8888-888888888888';
+    await writeFile(join(cwdDir, `2026-11-14T21-00-00-000Z_${sid}.jsonl`), [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-14T21:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-14T21:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'root' }], timestamp: 1 } }),
+    ].join('\n') + '\n');
+
+    // 1. Busy session rejects clone and fork with 409 busy
+    piAdapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir,
+      env: { FAKE_PI_MODE: 'wait_for_abort' },
+    });
+    const turn = await piAdapter.startTurn(sid, 'running');
+    const turnEvs = drainEvents(turn);
+    await assert.rejects(
+      piAdapter.clone(sid),
+      (e: unknown) => e instanceof ProviderError && e.code === 'busy' && e.httpStatus === 409,
+    );
+    await assert.rejects(
+      piAdapter.fork(sid),
+      (e: unknown) => e instanceof ProviderError && e.code === 'busy' && e.httpStatus === 409,
+    );
+    await piAdapter.abort(sid);
+    await turnEvs;
+    await piAdapter.dispose();
+
+    // 2. Root-message fork (messageCount: 0, no file yet) returns [] on getHistory instead of 404
+    piAdapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir,
+      env: { FAKE_PI_MODE: 'root_fork_empty', FAKE_SESSIONS_DIR: cwdDir },
+    });
+    const forked = await piAdapter.fork(sid, 'u1');
+    assert.deepEqual(await piAdapter.getHistory(forked.sessionId), []);
+    await piAdapter.dispose();
+
+    // 3. Also verify root-message fork against real local pi 1.5.2 binary
+    const realBase = await mkdtemp(join(tmpdir(), 'pi-real-root-fork-'));
+    const realSessions = join(realBase, 'agent', 'sessions');
+    const realWork = join(realBase, 'work');
+    let realAdapter: PiAdapter | undefined;
+    try {
+      await mkdir(realWork, { recursive: true });
+      const realCwdDir = join(realSessions, encodePiCwdDir(realWork));
+      await mkdir(realCwdDir, { recursive: true });
+      const rSid = '99999999-9999-4999-8999-999999999999';
+      await writeFile(join(realCwdDir, `2026-11-14T21-00-00-000Z_${rSid}.jsonl`), [
+        JSON.stringify({ type: 'session', version: 3, id: rSid, timestamp: '2026-11-14T21:00:00.000Z', cwd: realWork }),
+        JSON.stringify({ type: 'message', id: 'm1', parentId: null, timestamp: '2026-11-14T21:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'first' }], timestamp: 1 } }),
+        JSON.stringify({ type: 'message', id: 'm2', parentId: 'm1', timestamp: '2026-11-14T21:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'reply' }], stopReason: 'stop', timestamp: 2 } }),
+      ].join('\n') + '\n');
+
+      realAdapter = new PiAdapter({
+        piBin: REAL_PI_BIN,
+        sessionsDir: realSessions,
+        extraArgs: ['--offline', '--no-extensions', '--no-skills', '--no-prompt-templates'],
+        env: { HOME: realBase, PI_CODING_AGENT_DIR: join(realBase, 'agent') },
+      });
+      const rootForked = await realAdapter.fork(rSid, 'm1');
+      assert.notEqual(rootForked.sessionId, rSid);
+      assert.deepEqual(await realAdapter.getHistory(rootForked.sessionId), []);
+    } finally {
+      await realAdapter?.dispose().catch(() => undefined);
+      await rm(realBase, { recursive: true, force: true });
+    }
+  } finally {
+    await piAdapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('StdinLineWriter endAndFlush timeout and abort reject both in-flight and queued writes', async () => {
+  // 1. Backpressured / stalled write times out in endAndFlush -> rejects both in-flight and queued
+  const stalledStream = new PassThrough();
+  (stalledStream as any).write = () => false; // Never invokes callback and never drains!
+  const writer1 = new StdinLineWriter(stalledStream);
+  const inFlight = writer1.writeLine('{"id":"a"}\n');
+  const queued = writer1.writeLine('{"id":"b"}\n');
+  await writer1.endAndFlush(25);
+  await assert.rejects(inFlight, /stdin closed before flush completed/);
+  await assert.rejects(queued, /stdin closed before flush completed/);
+
+  // 2. Explicit abort rejects in-flight write whose callback has not fired
+  const stalledStream2 = new PassThrough();
+  (stalledStream2 as any).write = () => true; // Callback intentionally never called
+  const writer2 = new StdinLineWriter(stalledStream2);
+  const p = writer2.writeLine('{"id":"c"}\n');
+  await new Promise((r) => setTimeout(r, 10));
+  writer2.abort(new Error('stream aborted'));
+  await assert.rejects(p, /stream aborted/);
+});
+
+test('symlinked sessionsRoot works, intermediate symlinked dir fails, string context_edit on toolResult and compaction_end usage work', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-root-edit-compact-'));
+  const realRoot = join(base, 'real-sessions');
+  const linkRoot = join(base, 'link-sessions');
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const cwdDir = join(realRoot, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    await symlink(realRoot, linkRoot);
+
+    const sid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const fileName = `2026-11-14T21-00-00-000Z_${sid}.jsonl`;
+    const fileViaLink = join(linkRoot, encodePiCwdDir(base), fileName);
+    await writeFile(join(cwdDir, fileName), [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-14T21:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-14T21:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'run' }], timestamp: 1 } }),
+      JSON.stringify({ type: 'message', id: 'tr1', parentId: 'u1', timestamp: '2026-11-14T21:00:02.000Z', message: { role: 'toolResult', toolCallId: 'tc1', toolName: 'bash', content: [{ type: 'text', text: 'raw output' }], isError: false, timestamp: 2 } }),
+      JSON.stringify({ type: 'context_edit', id: 'ce1', parentId: 'tr1', timestamp: '2026-11-14T21:00:03.000Z', targetId: 'tr1', replacement: { content: 'redacted string output' } }),
+    ].join('\n') + '\n');
+
+    // Symlinked sessionsRoot + string context_edit replacement on toolResult
+    const history = await readPiActiveBranchHistory(fileViaLink, {
+      sessionId: sid,
+      sessionsRoot: linkRoot,
+    });
+    assert.equal(history.length, 2);
+    assert.equal(history[1]?.role, 'tool');
+    assert.equal(
+      (history[1]?.content[0] as { type: 'tool_result'; output: string }).output,
+      'redacted string output',
+    );
+
+    // Intermediate symlinked directory inside sessionsRoot must still be rejected
+    const outsideDir = join(base, 'outside-dir');
+    await mkdir(outsideDir, { recursive: true });
+    await writeFile(join(outsideDir, 'evil.jsonl'), JSON.stringify({ type: 'session', version: 3, id: 'evil', cwd: base }) + '\n');
+    await symlink(outsideDir, join(realRoot, 'symlink-cwd-dir'));
+    await assert.rejects(
+      readPiActiveBranchHistory(join(linkRoot, 'symlink-cwd-dir', 'evil.jsonl'), {
+        sessionId: 'evil',
+        sessionsRoot: linkRoot,
+      }),
+      (e: unknown) => e instanceof ProviderError && e.code === 'not_found',
+    );
+
+    // compaction_end clears stale pre-compaction context_tokens and marks context_unavailable: true
+    const { bin } = await writeContractFakePi(base);
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir: linkRoot,
+      env: { FAKE_PI_MODE: 'compaction_end_turn' },
+    });
+    const s = await adapter.create({ provider: 'pi', cwd: base });
+    await drainEvents(await adapter.startTurn({ sessionId: s.id, input: 'go' }));
+    const usage = adapter.getUsage(s.id);
+    assert.equal(usage?.input_tokens, 120);
+    assert.equal(usage?.output_tokens, 60);
+    assert.equal(usage?.context_tokens, 0);
+    assert.equal(usage?.context_unavailable, true);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
     await rm(base, { recursive: true, force: true });
   }
 });

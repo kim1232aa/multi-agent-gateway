@@ -84,6 +84,14 @@ const SAFE_OPEN_FLAGS =
   (fsConstants.O_NONBLOCK ?? 0) |
   (fsConstants.O_NOFOLLOW ?? 0);
 
+const OPEN_DIR_FLAGS =
+  fsConstants.O_RDONLY |
+  (fsConstants.O_DIRECTORY ?? 0) |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const HAS_PROC_SELF_FD = process.platform === 'linux' && fs.existsSync('/proc/self/fd');
+
 const VALID_SESSION_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 
 // ---------------------------------------------------------------------------
@@ -191,6 +199,8 @@ export interface PiAdapterOptions {
   maxHistoryTailBytes?: number;
   /** Optional stderr line callback for diagnostics. */
   onStderr?: (line: string) => void;
+  /** Optional preference resolver (used by PiProviderAdapter to sync SettingsStore). */
+  resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
 }
 
 export interface PiStartTurnResult {
@@ -252,6 +262,9 @@ interface PendingWrite {
 
 export class StdinLineWriter {
   private readonly queue: PendingWrite[] = [];
+  private readonly idleWaiters: Array<() => void> = [];
+  private inFlight: PendingWrite | null = null;
+  private inFlightReject: ((err: Error) => void) | null = null;
   private flushing = false;
   private closed = false;
   private closeError: Error | null = null;
@@ -279,27 +292,43 @@ export class StdinLineWriter {
     if (this.closed) return;
     this.closed = true;
     this.closeError = err;
+    const active = this.inFlight;
+    const activeReject = this.inFlightReject;
+    this.inFlight = null;
+    this.inFlightReject = null;
+    if (activeReject) activeReject(err);
+    else active?.reject(err);
     this.wakeDrain();
     while (this.queue.length > 0) {
       const item = this.queue.shift()!;
       item.reject(err);
     }
+    this.wakeIdle();
     this.detach();
   }
 
   async endAndFlush(timeoutMs = 500): Promise<void> {
-    if (!this.closed && this.queue.length > 0) {
-      await Promise.race([
-        this.waitUntilIdle(),
-        new Promise<void>((resolve) => {
-          const t = setTimeout(resolve, timeoutMs);
-          t.unref?.();
-        }),
-      ]);
+    if (!this.closed && (this.flushing || this.queue.length > 0 || this.inFlight !== null)) {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        await Promise.race([
+          this.waitUntilIdle(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
-    this.closed = true;
-    this.wakeDrain();
-    this.detach();
+    if (!this.closed && (this.flushing || this.queue.length > 0 || this.inFlight !== null)) {
+      this.abort(new Error('stdin closed before flush completed'));
+    } else if (!this.closed) {
+      this.closed = true;
+      this.wakeDrain();
+      this.wakeIdle();
+      this.detach();
+    }
     const writable = this.stdin as NodeJS.WritableStream & {
       destroyed?: boolean;
       writableEnded?: boolean;
@@ -315,17 +344,11 @@ export class StdinLineWriter {
   }
 
   private waitUntilIdle(): Promise<void> {
-    if (!this.flushing && this.queue.length === 0) return Promise.resolve();
+    if (this.closed || (!this.flushing && this.queue.length === 0 && this.inFlight === null)) {
+      return Promise.resolve();
+    }
     return new Promise<void>((resolve) => {
-      const check = (): void => {
-        if (!this.flushing && this.queue.length === 0) {
-          resolve();
-          return;
-        }
-        const t = setTimeout(check, 10);
-        t.unref?.();
-      };
-      check();
+      this.idleWaiters.push(resolve);
     });
   }
 
@@ -347,15 +370,25 @@ export class StdinLineWriter {
           continue;
         }
         let ok = false;
+        this.inFlight = item;
         try {
           await new Promise<void>((resolveWrite, rejectWrite) => {
+            this.inFlightReject = rejectWrite;
             ok = writable.write(item.line, 'utf8', (err) => {
               if (err) rejectWrite(err);
               else resolveWrite();
             });
           });
-          item.resolve();
+          if (this.inFlight === item) {
+            this.inFlight = null;
+            this.inFlightReject = null;
+            item.resolve();
+          }
         } catch (err) {
+          if (this.inFlight === item) {
+            this.inFlight = null;
+            this.inFlightReject = null;
+          }
           const writeErr = err instanceof Error ? err : new Error(String(err));
           item.reject(writeErr);
           continue;
@@ -368,6 +401,16 @@ export class StdinLineWriter {
       }
     } finally {
       this.flushing = false;
+      if (this.queue.length === 0 && this.inFlight === null) {
+        this.wakeIdle();
+      }
+    }
+  }
+
+  private wakeIdle(): void {
+    while (this.idleWaiters.length > 0) {
+      const resolve = this.idleWaiters.shift()!;
+      resolve();
     }
   }
 
@@ -740,8 +783,10 @@ export class PiAdapter {
   private readonly maxImageBytes: number;
   private readonly maxHistoryTailBytes: number;
   private readonly onStderr?: (line: string) => void;
+  private readonly resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
 
   private readonly processes = new Map<string, PiRpcClient>();
+  private readonly clientToSession = new WeakMap<PiRpcClient, string>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly parkedQuestions = new Map<string, ParkedQuestion>();
   private readonly sessionCwd = new Map<string, string>();
@@ -751,6 +796,7 @@ export class PiAdapter {
   private readonly sessionUsage = new Map<string, SessionUsage>();
   private readonly sessionModels = new Map<string, string>();
   private readonly sessionThinkings = new Map<string, string>();
+  private readonly appliedPreferences = new Map<string, { model?: string; thinking?: string }>();
 
   private modelsCache: { ts: number; models: PiModelInfo[] } | null = null;
   private modelsInflight: Promise<PiModelInfo[]> | null = null;
@@ -770,6 +816,7 @@ export class PiAdapter {
     this.maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
     this.maxHistoryTailBytes = options.maxHistoryTailBytes ?? DEFAULT_HISTORY_TAIL_BYTES;
     this.onStderr = options.onStderr;
+    this.resolveSessionPreferences = options.resolveSessionPreferences;
   }
 
   getPiBin(): string {
@@ -951,7 +998,7 @@ export class PiAdapter {
     if (!parsed) {
       throw new ProviderError('invalid_request', `Invalid Pi model identifier: ${encodedModel}`, 400);
     }
-    const client = await this.ensureSessionProcess(sessionId);
+    const client = await this.ensureSessionProcess(sessionId, { skipModelSync: true });
     const model = await client.request<PiModelInfo>({
       type: 'set_model',
       provider: parsed.provider,
@@ -959,6 +1006,13 @@ export class PiAdapter {
     });
     const state = await client.request<PiSessionState>({ type: 'get_state' });
     this.recordState(sessionId, state);
+    const resolvedEncoded = encodePiModelId(model.provider || parsed.provider, model.id || parsed.modelId);
+    const prevApplied = this.appliedPreferences.get(sessionId);
+    this.appliedPreferences.set(sessionId, {
+      ...prevApplied,
+      model: resolvedEncoded,
+      ...(state.thinkingLevel ? { thinking: state.thinkingLevel } : {}),
+    });
     return model;
   }
 
@@ -967,13 +1021,14 @@ export class PiAdapter {
     if (!VALID_THINKING_LEVELS.has(normalized)) {
       throw new ProviderError('invalid_request', `Unsupported thinking level: ${level}`, 400);
     }
-    const client = await this.ensureSessionProcess(sessionId);
-    // Query supported levels dynamically (do not assume `off` always exists).
-    await client.request<{ levels?: string[] }>({ type: 'get_available_thinking_levels' });
+    const client = await this.ensureSessionProcess(sessionId, { skipThinkingSync: true });
     await client.request({ type: 'set_thinking_level', level: normalized });
     const state = await client.request<PiSessionState>({ type: 'get_state' });
     this.recordState(sessionId, state);
-    return state.thinkingLevel ?? normalized;
+    const effective = state.thinkingLevel ?? normalized;
+    const prevApplied = this.appliedPreferences.get(sessionId);
+    this.appliedPreferences.set(sessionId, { ...prevApplied, thinking: normalized });
+    return effective;
   }
 
   async getSessionStats(sessionId: string): Promise<PiSessionStats> {
@@ -1067,6 +1122,9 @@ export class PiAdapter {
     entryId?: string,
   ): Promise<PiSessionSummary> {
     assertSafeSessionId(sourceSessionId);
+    if (this.activeTurns.has(sourceSessionId)) {
+      throw new ProviderError('busy', `pi-adapter: cannot ${mode} busy session ${sourceSessionId}`, 409);
+    }
 
     // Reject unsaved empty drafts immediately before spawning a clone process.
     const sourceFile = await this.locateSessionFile(sourceSessionId);
@@ -1142,8 +1200,9 @@ export class PiAdapter {
         throw new ProviderError('upstream_error', 'Pi clone did not yield a distinct sessionId', 502);
       }
 
-      const sourceModel = this.sessionModels.get(sourceSessionId);
-      const sourceThinking = this.sessionThinkings.get(sourceSessionId);
+      const sourcePrefs = this.resolveSessionPreferences?.(sourceSessionId);
+      const sourceModel = this.sessionModels.get(sourceSessionId) ?? sourcePrefs?.model;
+      const sourceThinking = this.sessionThinkings.get(sourceSessionId) ?? sourcePrefs?.thinking;
       const clonedModel = newState.model?.provider && newState.model?.id && newState.model.id !== 'unknown'
         ? encodePiModelId(newState.model.provider, newState.model.id)
         : undefined;
@@ -1163,10 +1222,23 @@ export class PiAdapter {
         newState = await newClient.request<PiSessionState>({ type: 'get_state' });
       }
 
+      this.clientToSession.set(newClient, newSessionId);
       this.processes.set(newSessionId, newClient);
       this.sessionCwd.set(newSessionId, sourceCwd);
-      if (newSessionFile) this.sessionFiles.set(newSessionId, newSessionFile);
+      if ((newState.messageCount ?? 0) > 0) {
+        if (newSessionFile) this.sessionFiles.set(newSessionId, newSessionFile);
+        this.draftSessions.delete(newSessionId);
+      } else {
+        this.sessionFiles.delete(newSessionId);
+        this.draftSessions.add(newSessionId);
+      }
       this.recordState(newSessionId, newState);
+      if (sourceModel || sourceThinking) {
+        this.appliedPreferences.set(newSessionId, {
+          ...(sourceModel ? { model: sourceModel } : {}),
+          ...(sourceThinking ? { thinking: sourceThinking } : {}),
+        });
+      }
 
       const now = new Date().toISOString();
       const title =
@@ -1176,7 +1248,7 @@ export class PiAdapter {
 
       return {
         sessionId: newSessionId,
-        sessionFile: newSessionFile,
+        sessionFile: (newState.messageCount ?? 0) > 0 ? newSessionFile : '',
         title,
         cwd: sourceCwd,
         createdAt: now,
@@ -1381,6 +1453,7 @@ export class PiAdapter {
     this.sessionUsage.delete(sessionId);
     this.sessionModels.delete(sessionId);
     this.sessionThinkings.delete(sessionId);
+    this.appliedPreferences.delete(sessionId);
   }
 
   async close(sessionId: string): Promise<void> {
@@ -1389,6 +1462,7 @@ export class PiAdapter {
     const client = this.processes.get(sessionId);
     this.processes.delete(sessionId);
     if (client) {
+      this.clientToSession.delete(client);
       await client.close().catch(() => undefined);
     }
     if (turn && !turn.settled) {
@@ -1410,7 +1484,7 @@ export class PiAdapter {
   // -- Internals ------------------------------------------------------------
 
   private createClient(cwd: string, args: string[]): PiRpcClient {
-    return new PiRpcClient({
+    const client = new PiRpcClient({
       piBin: this.getPiBin(),
       cwd,
       env: this.env,
@@ -1420,13 +1494,41 @@ export class PiAdapter {
       killGraceMs: this.killGraceMs,
       onStderr: this.onStderr,
     });
+    // Persistent client-level fallback: any extension_ui_request outside an active
+    // unsettled turn fails closed `{ cancelled: true }` (fire-and-forget stays a no-op).
+    client.onEvent((ev) => {
+      if (ev.kind === 'ui_request') {
+        const sid = this.clientToSession.get(client);
+        const activeTurn = sid ? this.activeTurns.get(sid) : undefined;
+        if (activeTurn && !activeTurn.settled && activeTurn.client === client) {
+          return;
+        }
+        this.failCloseExtensionUiRequest(client, ev.request);
+        return;
+      }
+      if (ev.kind === 'exit') {
+        const sid = this.clientToSession.get(client);
+        this.clientToSession.delete(client);
+        if (sid && this.processes.get(sid) === client) {
+          this.processes.delete(sid);
+        }
+      }
+    });
+    return client;
   }
 
-  private async ensureSessionProcess(sessionId: string): Promise<PiRpcClient> {
+  private async ensureSessionProcess(
+    sessionId: string,
+    opts?: { skipModelSync?: boolean; skipThinkingSync?: boolean },
+  ): Promise<PiRpcClient> {
     const existing = this.processes.get(sessionId);
-    if (existing?.isAlive) return existing;
+    if (existing?.isAlive) {
+      await this.syncSessionPreferencesToClient(existing, sessionId, undefined, opts);
+      return existing;
+    }
     if (existing) {
       this.processes.delete(sessionId);
+      this.clientToSession.delete(existing);
       await existing.close().catch(() => undefined);
     }
 
@@ -1442,31 +1544,76 @@ export class PiAdapter {
       args.push('--name', pendingName);
     }
 
-    const pendingModel = !existingFile ? this.sessionModels.get(sessionId) : undefined;
-    const pendingThinking = !existingFile ? this.sessionThinkings.get(sessionId) : undefined;
-
     const client = this.createClient(cwd, args);
+    this.clientToSession.set(client, sessionId);
     client.start();
     this.processes.set(sessionId, client);
 
     try {
-      if (pendingModel) {
-        const parsed = decodePiModelId(pendingModel, this.modelsCache?.models);
-        if (parsed) {
-          await client.request({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId }).catch(() => undefined);
-        }
-      }
-      if (pendingThinking && VALID_THINKING_LEVELS.has(pendingThinking)) {
-        await client.request({ type: 'set_thinking_level', level: pendingThinking }).catch(() => undefined);
-      }
-      const state = await client.request<PiSessionState>({ type: 'get_state' });
-      this.recordState(sessionId, state);
+      const initialState = await client.request<PiSessionState>({ type: 'get_state' });
+      this.recordState(sessionId, initialState);
+      await this.syncSessionPreferencesToClient(client, sessionId, initialState, opts);
       return client;
     } catch (err) {
       this.processes.delete(sessionId);
+      this.clientToSession.delete(client);
       await client.close().catch(() => undefined);
       throw err;
     }
+  }
+
+  private async syncSessionPreferencesToClient(
+    client: PiRpcClient,
+    sessionId: string,
+    initialState?: PiSessionState,
+    opts?: { skipModelSync?: boolean; skipThinkingSync?: boolean },
+  ): Promise<void> {
+    const resolved = this.resolveSessionPreferences?.(sessionId);
+    const desiredModel = resolved?.model ?? this.sessionModels.get(sessionId);
+    const desiredThinking = resolved?.thinking ?? this.sessionThinkings.get(sessionId);
+    const applied = this.appliedPreferences.get(sessionId);
+
+    const currentModel = initialState?.model?.provider && initialState?.model?.id && initialState.model.id !== 'unknown'
+      ? encodePiModelId(initialState.model.provider, initialState.model.id)
+      : this.sessionModels.get(sessionId);
+    const currentThinking = initialState?.thinkingLevel ?? this.sessionThinkings.get(sessionId);
+
+    let changed = false;
+    const isStartup = initialState !== undefined;
+    const shouldSyncModel = Boolean(
+      !opts?.skipModelSync &&
+      desiredModel &&
+      desiredModel !== currentModel &&
+      (isStartup || desiredModel !== applied?.model),
+    );
+    if (shouldSyncModel && desiredModel) {
+      const parsed = decodePiModelId(desiredModel, this.modelsCache?.models);
+      if (parsed) {
+        await client.request({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId }).catch(() => undefined);
+        changed = true;
+      }
+    }
+
+    const shouldSyncThinking = Boolean(
+      !opts?.skipThinkingSync &&
+      desiredThinking &&
+      VALID_THINKING_LEVELS.has(desiredThinking) &&
+      (changed || (desiredThinking !== currentThinking && (isStartup || desiredThinking !== applied?.thinking))),
+    );
+    if (shouldSyncThinking && desiredThinking) {
+      await client.request({ type: 'set_thinking_level', level: desiredThinking }).catch(() => undefined);
+      changed = true;
+    }
+
+    if (changed) {
+      const refreshed = await client.request<PiSessionState>({ type: 'get_state' });
+      this.recordState(sessionId, refreshed);
+    }
+
+    this.appliedPreferences.set(sessionId, {
+      model: opts?.skipModelSync ? applied?.model : (desiredModel ?? applied?.model),
+      thinking: opts?.skipThinkingSync ? applied?.thinking : (desiredThinking ?? applied?.thinking),
+    });
   }
 
   private async runEphemeralRpc<T>(
@@ -1515,11 +1662,9 @@ export class PiAdapter {
   }
 
   private recordState(sessionId: string, state: PiSessionState): void {
-    if (state.sessionFile) {
+    if (state.sessionFile && (state.messageCount ?? 0) > 0) {
       this.sessionFiles.set(sessionId, state.sessionFile);
-      if ((state.messageCount ?? 0) > 0) {
-        this.draftSessions.delete(sessionId);
-      }
+      this.draftSessions.delete(sessionId);
     }
     if (state.model?.provider && state.model?.id && state.model.id !== 'unknown') {
       this.sessionModels.set(sessionId, encodePiModelId(state.model.provider, state.model.id));
@@ -1532,21 +1677,50 @@ export class PiAdapter {
     }
   }
 
+  private emitToolStartedIfNeeded(
+    turn: ActiveTurnState,
+    toolCallId: string,
+    name: string,
+    ts: number,
+    input?: unknown,
+    parentToolCallId?: string,
+  ): void {
+    if (!toolCallId || turn.startedTools.has(toolCallId)) return;
+    turn.startedTools.add(toolCallId);
+    turn.stream.push({
+      kind: 'tool',
+      status: 'started',
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      timestamp: ts,
+      payload: {
+        toolCallId,
+        name,
+        ...(input !== undefined ? { input } : {}),
+        ...(parentToolCallId ? { parentToolUseId: parentToolCallId } : {}),
+      },
+    });
+  }
+
   private handleClientEvent(turn: ActiveTurnState, ev: PiRpcClientEvent): void {
-    if (turn.settled) return;
+    if (turn.settled) {
+      if (ev.kind === 'ui_request') {
+        this.failCloseExtensionUiRequest(turn.client, ev.request);
+      }
+      return;
+    }
 
     if (ev.kind === 'exit') {
-      void this.failCloseSessionQuestions(turn.sessionId);
+      this.failCloseSessionQuestions(turn.sessionId);
       if (this.processes.get(turn.sessionId) === turn.client) {
         this.processes.delete(turn.sessionId);
       }
-      if (!turn.settled) {
-        const reason = turn.abortRequested ? 'cancelled' : 'failed';
-        const errorMsg = reason === 'failed'
-          ? (ev.error?.message ?? 'Pi RPC process terminated unexpectedly')
-          : undefined;
-        this.settleTurn(turn, reason, errorMsg);
-      }
+      this.clientToSession.delete(turn.client);
+      const reason = turn.abortRequested ? 'cancelled' : 'failed';
+      const errorMsg = reason === 'failed'
+        ? (ev.error?.message ?? 'Pi RPC process terminated unexpectedly')
+        : undefined;
+      this.settleTurn(turn, reason, errorMsg);
       return;
     }
 
@@ -1579,22 +1753,8 @@ export class PiAdapter {
       case 'tool_execution_start': {
         const toolCallId = String(msg.toolCallId ?? '');
         const name = String(msg.toolName ?? 'tool');
-        if (toolCallId && !turn.startedTools.has(toolCallId)) {
-          turn.startedTools.add(toolCallId);
-          turn.stream.push({
-            kind: 'tool',
-            status: 'started',
-            sessionId: turn.sessionId,
-            turnId: turn.turnId,
-            timestamp: ts,
-            payload: {
-              toolCallId,
-              name,
-              input: msg.args,
-              ...(typeof msg.parentToolCallId === 'string' ? { parentToolUseId: msg.parentToolCallId } : {}),
-            },
-          });
-        }
+        const parentToolCallId = typeof msg.parentToolCallId === 'string' ? msg.parentToolCallId : undefined;
+        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, msg.args, parentToolCallId);
         break;
       }
 
@@ -1602,22 +1762,8 @@ export class PiAdapter {
         const toolCallId = String(msg.toolCallId ?? '');
         const name = String(msg.toolName ?? 'tool');
         if (!toolCallId) break;
-        if (!turn.startedTools.has(toolCallId)) {
-          turn.startedTools.add(toolCallId);
-          turn.stream.push({
-            kind: 'tool',
-            status: 'started',
-            sessionId: turn.sessionId,
-            turnId: turn.turnId,
-            timestamp: ts,
-            payload: {
-              toolCallId,
-              name,
-              input: msg.args,
-              ...(typeof msg.parentToolCallId === 'string' ? { parentToolUseId: msg.parentToolCallId } : {}),
-            },
-          });
-        }
+        const parentToolCallId = typeof msg.parentToolCallId === 'string' ? msg.parentToolCallId : undefined;
+        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, msg.args, parentToolCallId);
         const full = extractToolContentText(msg.partialResult);
         const prev = turn.lastToolPartial.get(toolCallId);
         const delta = prev !== undefined && full.startsWith(prev) ? full.slice(prev.length) : full;
@@ -1633,7 +1779,7 @@ export class PiAdapter {
               toolCallId,
               name,
               output: delta,
-              ...(typeof msg.parentToolCallId === 'string' ? { parentToolUseId: msg.parentToolCallId } : {}),
+              ...(parentToolCallId ? { parentToolUseId: parentToolCallId } : {}),
             },
           });
         }
@@ -1644,21 +1790,8 @@ export class PiAdapter {
         const toolCallId = String(msg.toolCallId ?? '');
         const name = String(msg.toolName ?? 'tool');
         if (!toolCallId) break;
-        if (!turn.startedTools.has(toolCallId)) {
-          turn.startedTools.add(toolCallId);
-          turn.stream.push({
-            kind: 'tool',
-            status: 'started',
-            sessionId: turn.sessionId,
-            turnId: turn.turnId,
-            timestamp: ts,
-            payload: {
-              toolCallId,
-              name,
-              ...(typeof msg.parentToolCallId === 'string' ? { parentToolUseId: msg.parentToolCallId } : {}),
-            },
-          });
-        }
+        const parentToolCallId = typeof msg.parentToolCallId === 'string' ? msg.parentToolCallId : undefined;
+        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, undefined, parentToolCallId);
         if (!turn.endedTools.has(toolCallId)) {
           turn.endedTools.add(toolCallId);
           const isError = msg.isError === true;
@@ -1676,7 +1809,7 @@ export class PiAdapter {
               output,
               ...(structured !== undefined ? { structuredOutput: structured } : {}),
               is_error: isError,
-              ...(typeof msg.parentToolCallId === 'string' ? { parentToolUseId: msg.parentToolCallId } : {}),
+              ...(parentToolCallId ? { parentToolUseId: parentToolCallId } : {}),
             },
           });
         }
@@ -1685,6 +1818,12 @@ export class PiAdapter {
 
       case 'message_end':
         this.handleMessageEnd(turn, msg, ts);
+        break;
+
+      case 'compaction_end':
+        if (msg.aborted !== true && isRecord(msg.result)) {
+          this.recordUsageAfterCompaction(turn.sessionId, msg.result);
+        }
         break;
 
       case 'auto_retry_end':
@@ -1892,17 +2031,7 @@ export class PiAdapter {
       const toolCallId = String(message.toolCallId ?? '');
       if (!toolCallId || turn.endedTools.has(toolCallId)) return;
       const toolName = String(message.toolName ?? 'tool');
-      if (!turn.startedTools.has(toolCallId)) {
-        turn.startedTools.add(toolCallId);
-        turn.stream.push({
-          kind: 'tool',
-          status: 'started',
-          sessionId: turn.sessionId,
-          turnId: turn.turnId,
-          timestamp: ts,
-          payload: { toolCallId, name: toolName },
-        });
-      }
+      this.emitToolStartedIfNeeded(turn, toolCallId, toolName, ts);
       turn.endedTools.add(toolCallId);
       const isError = message.isError === true;
       turn.stream.push({
@@ -1919,6 +2048,35 @@ export class PiAdapter {
         },
       });
     }
+  }
+
+  private recordUsageAfterCompaction(sessionId: string, result: Record<string, unknown>): void {
+    const prev = this.sessionUsage.get(sessionId);
+    const usage = isRecord(result.usage) ? result.usage : null;
+    const costObj = usage && isRecord(usage.cost) ? usage.cost : null;
+    const input = usage ? num(usage.input) : 0;
+    const output = usage ? num(usage.output) : 0;
+    const cacheRead = usage ? num(usage.cacheRead) : 0;
+    const cacheWrite = usage ? num(usage.cacheWrite) : 0;
+    const costTotal = costObj ? num(costObj.total) : 0;
+    const contextLimit = prev?.context_limit
+      || lookupPiContextWindow(this.sessionModels.get(sessionId), this.modelsCache?.models);
+
+    // After compaction, Pi's actual context token count is unknown until a fresh
+    // post-compaction assistant response supplies usage (`context_unavailable: true`).
+    this.sessionUsage.set(sessionId, {
+      input_tokens: (prev?.input_tokens ?? 0) + input,
+      output_tokens: (prev?.output_tokens ?? 0) + output,
+      cache_read_tokens: (prev?.cache_read_tokens ?? 0) + cacheRead,
+      cache_creation_tokens: (prev?.cache_creation_tokens ?? 0) + cacheWrite,
+      total_cost_usd: (prev?.total_cost_usd ?? 0) + costTotal,
+      context_tokens: 0,
+      context_limit: contextLimit,
+      turn_count: prev?.turn_count ?? 0,
+      ...(prev?.reasoning_output_tokens !== undefined ? { reasoning_output_tokens: prev.reasoning_output_tokens } : {}),
+      authoritative: true,
+      context_unavailable: true,
+    });
   }
 
   private recordUsageFromAssistantMessage(sessionId: string, message: Record<string, unknown>): void {
@@ -1953,6 +2111,15 @@ export class PiAdapter {
     });
   }
 
+  private failCloseExtensionUiRequest(client: PiRpcClient, req: Record<string, unknown>): void {
+    const method = typeof req.method === 'string' ? req.method : '';
+    const id = typeof req.id === 'string' ? req.id : '';
+    if (!id || FIRE_AND_FORGET_UI_METHODS.has(method)) return;
+    if (client.canWriteStdin) {
+      void client.sendExtensionUiResponse({ type: 'extension_ui_response', id, cancelled: true }).catch(() => undefined);
+    }
+  }
+
   private handleExtensionUiRequest(turn: ActiveTurnState, req: Record<string, unknown>): void {
     const method = typeof req.method === 'string' ? req.method : '';
     const id = typeof req.id === 'string' ? req.id : '';
@@ -1974,19 +2141,13 @@ export class PiAdapter {
 
     if (!id) return;
 
-    const failClosed = (): void => {
-      if (turn.client.canWriteStdin) {
-        void turn.client.sendExtensionUiResponse({ type: 'extension_ui_response', id, cancelled: true }).catch(() => undefined);
-      }
-    };
-
-    // Unsupported UI dialogs (including `editor`) must fail closed immediately.
-    if (method !== 'select' && method !== 'confirm' && method !== 'input') {
-      failClosed();
-      return;
-    }
-    if (turn.settled || turn.abortRequested || !turn.client.canWriteStdin) {
-      failClosed();
+    // Unsupported UI dialogs (including `editor`) and aborted/unwritable turns fail closed.
+    if (
+      (method !== 'select' && method !== 'confirm' && method !== 'input') ||
+      turn.abortRequested ||
+      !turn.client.canWriteStdin
+    ) {
+      this.failCloseExtensionUiRequest(turn.client, req);
       return;
     }
 
@@ -2000,7 +2161,7 @@ export class PiAdapter {
         ? req.options.filter((o): o is string => typeof o === 'string')
         : [];
       if (validOptions.length === 0) {
-        failClosed();
+        this.failCloseExtensionUiRequest(turn.client, req);
         return;
       }
       options = validOptions;
@@ -2162,8 +2323,14 @@ export class PiProviderAdapter implements ProviderAdapter {
   private readonly sessionCwd = new Map<string, string>();
 
   constructor(options?: PiAdapterOptions) {
-    this.inner = new PiAdapter(options);
     this.settings = new SettingsStore(options?.settingsPath);
+    this.inner = new PiAdapter({
+      ...options,
+      resolveSessionPreferences: (sessionId) => ({
+        model: this.settings.getString('model', sessionId) ?? this.settings.getString('model', '__default__'),
+        thinking: this.settings.getString('thinking', sessionId) ?? this.settings.getString('thinking', '__default__'),
+      }),
+    });
   }
 
   capabilities(): ProviderCapabilities {
@@ -2287,14 +2454,18 @@ export class PiProviderAdapter implements ProviderAdapter {
     return models.map((m) => {
       const encoded = encodePiModelId(m.provider, m.id);
       const levels = piModelSupportedThinkingLevels(m);
+      const caps: string[] = [];
+      if (Array.isArray(m.input) && m.input.includes('image')) caps.push('vision');
+      if (m.reasoning) caps.push('thinking');
       return {
         provider: 'pi',
         model: encoded,
         display_name: m.name ? `${m.name} (${m.provider})` : encoded,
         max_context_size: num(m.contextWindow),
         ...(typeof m.maxTokens === 'number' && m.maxTokens > 0 ? { max_output_tokens: m.maxTokens } : {}),
-        capabilities: m.reasoning ? ['thinking'] : [],
+        capabilities: caps,
         support_efforts: levels,
+        supportsThinkingOff: levels.includes('off'),
         ...(levels.length > 0 ? { default_effort: levels.includes('medium') ? 'medium' : levels[0] } : {}),
         raw: m,
       };
@@ -2325,7 +2496,11 @@ export class PiProviderAdapter implements ProviderAdapter {
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
     if (sessionId === '__default__') {
-      this.settings.set('thinking', '__default__', thinking);
+      const normalized = thinking.trim();
+      if (!VALID_THINKING_LEVELS.has(normalized)) {
+        throw new ProviderError('invalid_request', `Unsupported thinking level: ${thinking}`, 400);
+      }
+      this.settings.set('thinking', '__default__', normalized);
       return;
     }
     const effective = await this.inner.setThinkingLevel(sessionId, thinking);
@@ -2333,7 +2508,11 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   getThinking(sessionId: string): string | undefined {
-    return this.inner.getCachedThinking(sessionId) ?? this.settings.getString('thinking', sessionId);
+    return (
+      this.inner.getCachedThinking(sessionId) ??
+      this.settings.getString('thinking', sessionId) ??
+      this.settings.getString('thinking', '__default__')
+    );
   }
 
   async listCommands(sessionId?: string): Promise<NativeCommand[]> {
@@ -2586,7 +2765,10 @@ export async function readPiActiveBranchHistory(
   options: ReadPiHistoryOptions,
 ): Promise<Message[]> {
   const maxTailBytes = Math.max(1024, options.maxTailBytes ?? DEFAULT_HISTORY_TAIL_BYTES);
-  const rawLines = await readTailWindowLinesNoFollow(filePath, maxTailBytes, options.sessionsRoot);
+  const resolvedRoot = options.sessionsRoot
+    ? ((await safeRealpath(options.sessionsRoot)) ?? path.resolve(options.sessionsRoot))
+    : undefined;
+  const rawLines = await readTailWindowLinesNoFollow(filePath, maxTailBytes, resolvedRoot, options.sessionsRoot);
 
   const entriesById = new Map<string, Record<string, unknown>>();
   let lastEntryId: string | null = null;
@@ -2739,17 +2921,132 @@ async function verifyDirInsideRoot(realRoot: string, candidateDir: string): Prom
   }
 }
 
+function splitSafeSegments(rel: string): string[] {
+  if (!rel || rel === '.') return [];
+  const parts = rel.split(path.sep).filter(Boolean);
+  for (const seg of parts) {
+    if (seg === '.' || seg === '..' || seg.includes('/') || seg.includes('\\') || seg.includes('\0')) {
+      throw new ProviderError('not_found', `pi-adapter: invalid path segment`, 404);
+    }
+  }
+  return parts;
+}
+
+async function openAnchoredParentDir(
+  filePath: string,
+  expectedRoot?: string,
+  rawRoot?: string,
+): Promise<{ anchoredPath: string; close: () => Promise<void> }> {
+  const resolvedFile = path.resolve(filePath);
+  if (expectedRoot) {
+    const realRoot = (await safeRealpath(expectedRoot)) ?? path.resolve(expectedRoot);
+    const resolvedRawRoot = rawRoot ? path.resolve(rawRoot) : undefined;
+    let rel: string | null = null;
+    if (isPathWithin(realRoot, resolvedFile)) {
+      rel = path.relative(realRoot, resolvedFile);
+    } else if (resolvedRawRoot && isPathWithin(resolvedRawRoot, resolvedFile)) {
+      rel = path.relative(resolvedRawRoot, resolvedFile);
+    }
+    if (rel === null) {
+      throw new ProviderError('not_found', `pi-adapter: invalid or outside-root session path`, 404);
+    }
+    const segments = splitSafeSegments(rel);
+    if (segments.length === 0) {
+      throw new ProviderError('not_found', `pi-adapter: invalid session file path`, 404);
+    }
+
+    if (HAS_PROC_SELF_FD) {
+      const baseLst = await fsp.lstat(realRoot).catch(() => {
+        throw new ProviderError('not_found', `pi-adapter: session root not found`, 404);
+      });
+      if (!baseLst.isDirectory()) {
+        throw new ProviderError('not_found', `pi-adapter: session root is not a directory`, 404);
+      }
+      const baseFd = await fsp.open(realRoot, OPEN_DIR_FLAGS).catch(() => {
+        throw new ProviderError('not_found', `pi-adapter: cannot open session root`, 404);
+      });
+      let curFd: fsp.FileHandle = baseFd;
+      try {
+        const baseSt = await baseFd.stat();
+        if (!baseSt.isDirectory() || baseSt.dev !== baseLst.dev || baseSt.ino !== baseLst.ino) {
+          throw new ProviderError('not_found', `pi-adapter: session root changed during open`, 404);
+        }
+        for (let i = 0; i < segments.length - 1; i += 1) {
+          const seg = segments[i]!;
+          const nextFd = await fsp.open(`/proc/self/fd/${curFd.fd}/${seg}`, OPEN_DIR_FLAGS).catch(() => {
+            throw new ProviderError('not_found', `pi-adapter: invalid or symlinked session directory`, 404);
+          });
+          await curFd.close().catch(() => undefined);
+          curFd = nextFd;
+        }
+        const finalSeg = segments[segments.length - 1]!;
+        return {
+          anchoredPath: `/proc/self/fd/${curFd.fd}/${finalSeg}`,
+          close: () => curFd.close(),
+        };
+      } catch (err) {
+        await curFd.close().catch(() => undefined);
+        throw err;
+      }
+    }
+
+    let curDir = realRoot;
+    for (let i = 0; i < segments.length - 1; i += 1) {
+      curDir = path.join(curDir, segments[i]!);
+      const lst = await fsp.lstat(curDir).catch(() => {
+        throw new ProviderError('not_found', `pi-adapter: session directory not found`, 404);
+      });
+      if (lst.isSymbolicLink() || !lst.isDirectory()) {
+        throw new ProviderError('not_found', `pi-adapter: invalid or symlinked session directory`, 404);
+      }
+    }
+    return {
+      anchoredPath: path.join(curDir, segments[segments.length - 1]!),
+      close: async () => undefined,
+    };
+  }
+
+  const baseName = path.basename(resolvedFile);
+  if (!baseName || baseName === '.' || baseName === '..') {
+    throw new ProviderError('not_found', `pi-adapter: invalid file path`, 404);
+  }
+  if (HAS_PROC_SELF_FD) {
+    const realParent = await safeRealpath(path.dirname(resolvedFile));
+    if (!realParent) {
+      throw new ProviderError('not_found', `pi-adapter: parent directory not found`, 404);
+    }
+    const parentLst = await fsp.lstat(realParent).catch(() => {
+      throw new ProviderError('not_found', `pi-adapter: parent directory not found`, 404);
+    });
+    const parentFd = await fsp.open(realParent, OPEN_DIR_FLAGS).catch(() => {
+      throw new ProviderError('not_found', `pi-adapter: cannot open parent directory`, 404);
+    });
+    try {
+      const pSt = await parentFd.stat();
+      if (!pSt.isDirectory() || pSt.dev !== parentLst.dev || pSt.ino !== parentLst.ino) {
+        throw new ProviderError('not_found', `pi-adapter: parent directory changed during open`, 404);
+      }
+      return {
+        anchoredPath: `/proc/self/fd/${parentFd.fd}/${baseName}`,
+        close: () => parentFd.close(),
+      };
+    } catch (err) {
+      await parentFd.close().catch(() => undefined);
+      throw err;
+    }
+  }
+  return { anchoredPath: resolvedFile, close: async () => undefined };
+}
+
 async function verifyRegularFileWithinRoot(realRoot: string, filePath: string): Promise<boolean> {
   try {
-    const parent = path.dirname(filePath);
-    const parentLst = await fsp.lstat(parent);
-    if (parentLst.isSymbolicLink() || !parentLst.isDirectory()) return false;
-    const realParent = await fsp.realpath(parent);
-    if (!isPathWithin(realRoot, realParent)) return false;
-
-    const lst = await fsp.lstat(filePath);
-    if (lst.isSymbolicLink() || !lst.isFile()) return false;
-    return true;
+    const anchor = await openAnchoredParentDir(filePath, realRoot);
+    try {
+      const lst = await fsp.lstat(anchor.anchoredPath);
+      return !lst.isSymbolicLink() && lst.isFile();
+    } finally {
+      await anchor.close().catch(() => undefined);
+    }
   } catch {
     return false;
   }
@@ -2758,36 +3055,36 @@ async function verifyRegularFileWithinRoot(realRoot: string, filePath: string): 
 async function openFileNoFollowVerified(
   filePath: string,
   expectedRoot?: string,
+  rawRoot?: string,
 ): Promise<{ fh: fsp.FileHandle; stat: fs.Stats }> {
-  if (expectedRoot) {
-    const ok = await verifyRegularFileWithinRoot(expectedRoot, filePath);
-    if (!ok) {
-      throw new ProviderError('not_found', `pi-adapter: invalid or symlinked session path`, 404);
-    }
-  }
-  const lst = await fsp.lstat(filePath).catch(() => {
-    throw new ProviderError('not_found', `pi-adapter: session file not found`, 404);
-  });
-  if (lst.isSymbolicLink() || !lst.isFile()) {
-    throw new ProviderError('not_found', `pi-adapter: refusing symlink or non-regular file`, 404);
-  }
-
-  let fh: fsp.FileHandle;
+  const anchor = await openAnchoredParentDir(filePath, expectedRoot, rawRoot);
   try {
-    fh = await fsp.open(filePath, SAFE_OPEN_FLAGS);
-  } catch {
-    throw new ProviderError('not_found', `pi-adapter: failed to open session file`, 404);
-  }
-
-  try {
-    const st = await fh.stat();
-    if (!st.isFile() || st.dev !== lst.dev || (process.platform !== 'win32' && st.ino !== lst.ino)) {
-      throw new ProviderError('not_found', `pi-adapter: file identity changed during open`, 404);
+    const lst = await fsp.lstat(anchor.anchoredPath).catch(() => {
+      throw new ProviderError('not_found', `pi-adapter: session file not found`, 404);
+    });
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new ProviderError('not_found', `pi-adapter: refusing symlink or non-regular file`, 404);
     }
-    return { fh, stat: st };
-  } catch (err) {
-    await fh.close().catch(() => undefined);
-    throw err;
+
+    let fh: fsp.FileHandle;
+    try {
+      fh = await fsp.open(anchor.anchoredPath, SAFE_OPEN_FLAGS);
+    } catch {
+      throw new ProviderError('not_found', `pi-adapter: failed to open session file`, 404);
+    }
+
+    try {
+      const st = await fh.stat();
+      if (!st.isFile() || st.dev !== lst.dev || (process.platform !== 'win32' && st.ino !== lst.ino)) {
+        throw new ProviderError('not_found', `pi-adapter: file identity changed during open`, 404);
+      }
+      return { fh, stat: st };
+    } catch (err) {
+      await fh.close().catch(() => undefined);
+      throw err;
+    }
+  } finally {
+    await anchor.close().catch(() => undefined);
   }
 }
 
@@ -2795,8 +3092,9 @@ async function readTailWindowLinesNoFollow(
   filePath: string,
   maxBytes: number,
   expectedRoot?: string,
+  rawRoot?: string,
 ): Promise<string[]> {
-  const { fh, stat } = await openFileNoFollowVerified(filePath, expectedRoot);
+  const { fh, stat } = await openFileNoFollowVerified(filePath, expectedRoot, rawRoot);
   try {
     const size = stat.size;
     if (size === 0) return [];
@@ -3009,15 +3307,34 @@ async function summarizePiSessionFile(filePath: string, realRoot: string): Promi
 }
 
 async function safeUnlinkWithinRoot(realRoot: string, targetPath: string): Promise<void> {
-  const ok = await verifyRegularFileWithinRoot(realRoot, targetPath);
-  if (!ok) {
-    throw new ProviderError('invalid_request', `Refusing to delete non-regular or outside-root file: ${targetPath}`, 400);
+  let anchor: { anchoredPath: string; close: () => Promise<void> };
+  try {
+    anchor = await openAnchoredParentDir(targetPath, realRoot);
+  } catch (err) {
+    throw new ProviderError(
+      'invalid_request',
+      `Refusing to delete non-regular or outside-root file: ${targetPath}`,
+      400,
+      err,
+    );
   }
   try {
-    await fsp.unlink(targetPath);
+    const lst = await fsp.lstat(anchor.anchoredPath).catch((err: unknown) => {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'ENOENT') return null;
+      throw err;
+    });
+    if (!lst) return;
+    if (lst.isSymbolicLink() || !lst.isFile()) {
+      throw new ProviderError('invalid_request', `Refusing to delete non-regular or outside-root file: ${targetPath}`, 400);
+    }
+    await fsp.unlink(anchor.anchoredPath);
   } catch (err) {
+    if (err instanceof ProviderError) throw err;
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== 'ENOENT') throw err;
+  } finally {
+    await anchor.close().catch(() => undefined);
   }
 }
 
@@ -3508,6 +3825,9 @@ function extractToolContentText(raw: unknown): string {
       .join('\n');
   }
   if (isRecord(raw)) {
+    if (typeof raw.content === 'string') {
+      return raw.content;
+    }
     if (Array.isArray(raw.content)) {
       return extractToolContentText(raw.content);
     }
