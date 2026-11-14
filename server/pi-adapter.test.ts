@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import {
   chmod,
   lstat,
@@ -1760,6 +1761,93 @@ test('StdinLineWriter endAndFlush timeout and abort reject both in-flight and qu
   };
   const writer5 = new StdinLineWriter(throwingStream);
   await assert.rejects(writer5.writeLine('{"id":"f"}\n'), /sync write boom/);
+});
+
+test('StdinLineWriter handles real Writable, PassThrough, and child.stdin OS pipe backpressure without losing drain', async () => {
+  // 1. Real Node Writable with highWaterMark: 1 and async cb (Node emits 'drain' in same turn as cb)
+  const receivedWritable: string[] = [];
+  const realWritable = new Writable({
+    highWaterMark: 1,
+    write(chunk, _enc, cb) {
+      receivedWritable.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      setTimeout(cb, 5);
+    },
+  });
+  const w1 = new StdinLineWriter(realWritable);
+  await Promise.all([
+    w1.writeLine('line1\n'),
+    w1.writeLine('line2\n'),
+    w1.writeLine('line3\n'),
+  ]);
+  await w1.endAndFlush();
+  assert.equal(receivedWritable.join(''), 'line1\nline2\nline3\n');
+
+  // 2. Real PassThrough with highWaterMark: 1 and delayed consumer
+  const pt = new PassThrough({ highWaterMark: 1 });
+  const ptChunks: string[] = [];
+  const w2 = new StdinLineWriter(pt);
+  const ptWrites = Promise.all([
+    w2.writeLine('alpha-long-line\n'),
+    w2.writeLine('beta-long-line\n'),
+    w2.writeLine('gamma\n'),
+  ]);
+  setTimeout(() => {
+    pt.on('data', (chunk: Buffer) => ptChunks.push(chunk.toString('utf8')));
+  }, 15);
+  await ptWrites;
+  await w2.endAndFlush();
+  assert.equal(ptChunks.join(''), 'alpha-long-line\nbeta-long-line\ngamma\n');
+
+  // 3. Real child_process.spawn child.stdin OS pipe backpressure (200KB line + follow-up line)
+  const child = spawn(
+    process.execPath,
+    [
+      '-e',
+      'setTimeout(() => { let n = 0; process.stdin.on("data", (d) => { n += d.length; }); process.stdin.on("end", () => { process.stdout.write(String(n)); }); }, 20);',
+    ],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  let stdout = '';
+  child.stdout.on('data', (d: Buffer) => { stdout += d.toString('utf8'); });
+  const bigLine = `${'x'.repeat(200_000)}\n`;
+  const smallLine = 'small\n';
+  const w3 = new StdinLineWriter(child.stdin);
+  await Promise.all([
+    w3.writeLine(bigLine),
+    w3.writeLine(smallLine),
+  ]);
+  await w3.endAndFlush();
+  await new Promise<void>((resolve) => child.once('close', () => resolve()));
+  assert.equal(Number(stdout), bigLine.length + smallLine.length);
+
+  // 4. PiRpcClient end-to-end with 200KB payload followed by a second request
+  const base = await mkdtemp(join(tmpdir(), 'pi-bp-rpc-'));
+  let rpcClient: PiRpcClient | undefined;
+  try {
+    const script = `#!/usr/bin/env python3
+import json, sys, time
+time.sleep(0.02)
+for raw in sys.stdin.buffer:
+    line = raw.decode("utf-8").strip()
+    if not line:
+        continue
+    cmd = json.loads(line)
+    sys.stdout.write(json.dumps({"id": cmd["id"], "type": "response", "command": cmd["type"], "success": True, "data": {"len": len(line)}}) + "\\n")
+    sys.stdout.flush()
+`;
+    const bin = await writeFakePiScript(base, script);
+    rpcClient = new PiRpcClient({ piBin: bin, cwd: base, requestTimeoutMs: 5_000 });
+    rpcClient.start();
+    const [r1, r2] = await Promise.all([
+      rpcClient.request<{ len: number }>({ type: 'prompt', message: 'y'.repeat(200_000) }),
+      rpcClient.request<{ len: number }>({ type: 'get_state' }),
+    ]);
+    assert.ok(r1.len > 200_000);
+    assert.ok(r2.len > 0 && r2.len < 200);
+  } finally {
+    await rpcClient?.close().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
 });
 
 test('symlinked sessionsRoot works, intermediate symlinked dir fails, string context_edit on toolResult and compaction_end usage work', async () => {

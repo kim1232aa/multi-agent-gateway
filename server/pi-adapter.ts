@@ -269,6 +269,7 @@ export class StdinLineWriter {
   private closed = false;
   private closeError: Error | null = null;
   private drainWake: (() => void) | null = null;
+  private drainedSinceWrite = false;
 
   constructor(private readonly stdin: NodeJS.WritableStream) {
     this.stdin.on('error', this.onStreamClosed);
@@ -383,6 +384,7 @@ export class StdinLineWriter {
           continue;
         }
         let ok = false;
+        this.drainedSinceWrite = false;
         this.inFlight = item;
         try {
           await new Promise<void>((resolveWrite, rejectWrite) => {
@@ -411,7 +413,7 @@ export class StdinLineWriter {
           item.reject(writeErr);
           continue;
         }
-        if (!ok && !this.closed) {
+        if (!ok && !this.closed && !this.drainedSinceWrite && !writable.destroyed) {
           await new Promise<void>((resolveDrain) => {
             this.drainWake = resolveDrain;
           });
@@ -433,6 +435,7 @@ export class StdinLineWriter {
   }
 
   private readonly onDrain = (): void => {
+    this.drainedSinceWrite = true;
     this.wakeDrain();
   };
 
