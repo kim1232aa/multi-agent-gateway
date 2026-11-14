@@ -944,8 +944,8 @@ test('reviewTurn correlates 0.169 { turn, reviewThreadId } response and streams 
   (adapter as any).request = async (method: string, params: any) => {
     if (method === 'review/start') {
       assert.deepEqual(params.target, { type: 'baseBranch', branch: 'main' });
-      assert.equal(params.delivery, 'detached');
-      // Emit same-chunk event on the detached reviewThreadId before continuation runs
+      assert.equal(params.delivery, 'inline');
+      // Emit same-chunk event on the returned reviewThreadId before continuation runs
       queueMicrotask(() => {
         (adapter as any).handleNotification('item/agentMessage/delta', {
           threadId: 'th-review-detached',
@@ -968,7 +968,7 @@ test('reviewTurn correlates 0.169 { turn, reviewThreadId } response and streams 
 
   const handle = await adapter.reviewTurn('th-main', {
     target: { type: 'baseBranch', branch: 'main' },
-    delivery: 'detached',
+    delivery: 'inline',
   });
   assert.equal(handle.turnId, 'rev-turn-1');
   assert.equal(handle.reviewThreadId, 'th-review-detached');
@@ -1157,4 +1157,152 @@ test('live smoke test against extracted @openai/codex 0.169.0 binary when presen
     await adapter.close();
     fs.rmSync(tmpCodexHome, { recursive: true, force: true });
   }
+});
+
+test('revert and rollback map real 0.169.0 legacy/ephemeral thread/revert errors to 400 unsupported', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+
+  // Real 0.169.0 legacy thread: thread/turns/list succeeds, then thread/revert rejects
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list') {
+      return { data: [{ id: 't1', status: 'completed', startedAt: 100 }], nextCursor: null };
+    }
+    if (method === 'thread/revert') {
+      throw new Error("codex 'thread/revert' failed (-32600): thread/revert only supports paginated threads");
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(
+    () => adapter.rollback('th-legacy', 1),
+    (err: unknown) => err instanceof ProviderError && err.code === 'unsupported' && err.httpStatus === 400,
+  );
+  await assert.rejects(
+    () => adapter.revert('th-legacy', 't1'),
+    (err: unknown) => err instanceof ProviderError && err.code === 'unsupported' && err.httpStatus === 400,
+  );
+
+  // Ephemeral thread rejection on thread/revert
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/revert') {
+      throw new Error("codex 'thread/revert' failed (-32600): ephemeral threads do not support thread/revert");
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(
+    () => adapter.revert('th-ephemeral', 't1'),
+    (err: unknown) => err instanceof ProviderError && err.code === 'unsupported' && err.httpStatus === 400,
+  );
+});
+
+test('stripCodexSystemTags and stripCodexMemoryCitations strip tags containing backticks and fences', () => {
+  const withBackticks = '<INSTRUCTIONS>Run `npm test` before commit</INSTRUCTIONS>';
+  assert.equal(stripCodexSystemTags(withBackticks), '');
+  assert.equal(
+    normalizeCodexThreadItem({
+      id: 'u-bt',
+      type: 'userMessage',
+      content: [{ type: 'text', text: withBackticks }],
+    }),
+    null,
+  );
+
+  const withFences = '<INSTRUCTIONS>Follow `AGENTS.md` and run ```bash\necho hi\n```</INSTRUCTIONS>\nActual question';
+  assert.equal(stripCodexSystemTags(withFences).trim(), 'Actual question');
+
+  const citeWithBackticks = 'Answer<oai-mem-citation><citation_entries>used `foo.ts`</citation_entries></oai-mem-citation> done';
+  assert.equal(stripCodexMemoryCitations(citeWithBackticks), 'Answer done');
+});
+
+test('compact and reviewTurn handle timeout before withThreadRetry settles without unhandledRejection and emit reviewTurn turn-started to listeners', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const rejections: unknown[] = [];
+  const onUnhandled = (err: unknown): void => { rejections.push(err); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    (adapter as any).request = async () => new Promise((resolve) => setTimeout(() => resolve({}), 60));
+    await assert.rejects(() => adapter.compact('th-1', 15), /timed out after 15ms/);
+    await assert.rejects(() => adapter.reviewTurn('th-1', { timeoutMs: 15 }), /did not start within 15ms/);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(rejections, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+
+  // Verify reviewTurn notifies global listeners when synthesizing turn-started
+  const listenerAdapter = new CodexAdapter();
+  stubTransport(listenerAdapter);
+  const seenEvents: CodexEvent[] = [];
+  listenerAdapter.onEvent((ev) => seenEvents.push(ev));
+  (listenerAdapter as any).request = async (method: string) => {
+    if (method === 'review/start') {
+      queueMicrotask(() => {
+        (listenerAdapter as any).handleNotification('turn/completed', {
+          threadId: 'th-rev',
+          turn: { id: 'rt-1', status: 'completed' },
+        });
+      });
+      return { turn: { id: 'rt-1', status: 'inProgress' }, reviewThreadId: 'th-rev' };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  const h = await listenerAdapter.reviewTurn('th-main');
+  for await (const _ of h.events) { /* drain */ }
+  assert.ok(seenEvents.some((e) => e.type === 'turn-started' && e.turnId === 'rt-1'));
+});
+
+test('probeStalledTurn uses thread/turns/list without killing responsive child, skills/list preserves mid-flight skills/changed, and server-request honors handled=true', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+
+  // 1) probeStalledTurn receives RPC -32601 -> must NOT terminate child
+  let killed = false;
+  (adapter as any).child = { exitCode: null };
+  (adapter as any).terminateChild = () => { killed = true; };
+  (adapter as any).turnQueues.set('th-1:t-1', { push() {}, close() {}, fail() {} });
+  (adapter as any).request = async (method: string) => {
+    if (method === 'thread/turns/list') {
+      throw new Error("codex 'thread/turns/list' failed (-32601): list_turns unsupported");
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await (adapter as any).probeStalledTurn();
+  assert.equal(killed, false);
+  (adapter as any).turnQueues.clear();
+  (adapter as any).child = null;
+
+  // 2) skills/changed arriving during in-flight skills/list preserves skillsDirty=true
+  (adapter as any).handleNotification('skills/changed', {});
+  assert.equal(adapter.isSkillsDirty(), true);
+  (adapter as any).request = async (method: string) => {
+    if (method === 'skills/list') {
+      (adapter as any).handleNotification('skills/changed', {});
+      return { data: [] };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  await adapter.listSkills();
+  assert.equal(adapter.isSkillsDirty(), true);
+
+  // 3) server-request listener setting ev.handled = true keeps request parked for async respondServerRequest
+  const sent: any[] = [];
+  (adapter as any).write = (msg: any) => sent.push(msg);
+  const off = adapter.onEvent((ev) => {
+    if (ev.type === 'server-request' && ev.method === 'item/tool/call') {
+      ev.handled = true;
+    }
+  });
+  (adapter as any).handleLine(JSON.stringify({
+    id: 77,
+    method: 'item/tool/call',
+    params: { threadId: 'th-1', turnId: 't-1', callId: 'c1', tool: 'my_tool' },
+  }));
+  assert.equal(sent.length, 0);
+  adapter.respondServerRequest(77, { contentItems: [{ type: 'inputText', text: 'ok' }], success: true });
+  assert.deepEqual(sent[0], {
+    id: 77,
+    result: { contentItems: [{ type: 'inputText', text: 'ok' }], success: true },
+  });
+  off();
 });

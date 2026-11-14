@@ -248,126 +248,171 @@ const DynamicToolCallParamsSchema = z
 // Text / Tag filtering & Item normalization helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Apply `fn` only to prose segments outside fenced code blocks (``` / ~~~)
- * and inline backtick code spans (`...`).
- */
-function transformOutsideMarkdownCode(text: string, fn: (segment: string) => string): string {
+const TARGET_SYSTEM_TAG_RE = /^<(INSTRUCTIONS|user_instructions|environment_context|turn_aborted)\b/i;
+const TARGET_CITATION_TAG_RE = /^<oai-mem-citation\b/i;
+
+function findOpeningTagEnd(text: string, start: number): number {
+  let quote: string | null = null;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function findFencedBlockEnd(text: string, start: number): number {
+  const len = text.length;
+  let indent = start;
+  while (indent < len && indent - start < 4 && (text[indent] === ' ' || text[indent] === '\t')) {
+    indent++;
+  }
+  const ch = text[indent];
+  if (ch !== '`' && ch !== '~') return -1;
+  let fenceEnd = indent;
+  while (fenceEnd < len && text[fenceEnd] === ch) fenceEnd++;
+  const fenceLen = fenceEnd - indent;
+  if (fenceLen < 3) return -1;
+  const lineEnd = text.indexOf('\n', fenceEnd);
+  if (lineEnd === -1) return len;
+  let searchPos = lineEnd + 1;
+  while (searchPos <= len) {
+    let cIndent = searchPos;
+    while (cIndent < len && cIndent - searchPos < 4 && (text[cIndent] === ' ' || text[cIndent] === '\t')) {
+      cIndent++;
+    }
+    let cFence = cIndent;
+    while (cFence < len && text[cFence] === ch) cFence++;
+    if (cFence - cIndent >= fenceLen) {
+      let trail = cFence;
+      while (trail < len && (text[trail] === ' ' || text[trail] === '\t' || text[trail] === '\r')) {
+        trail++;
+      }
+      if (trail === len || text[trail] === '\n') {
+        return trail < len ? trail + 1 : trail;
+      }
+    }
+    const nextNl = text.indexOf('\n', searchPos);
+    if (nextNl === -1) break;
+    searchPos = nextNl + 1;
+  }
+  return len;
+}
+
+function findInlineCodeSpanEnd(text: string, start: number): { tickCount: number; end: number } {
+  const len = text.length;
+  let tickEnd = start;
+  while (tickEnd < len && text[tickEnd] === '`') tickEnd++;
+  const tickCount = tickEnd - start;
+  const needle = '`'.repeat(tickCount);
+  let searchPos = tickEnd;
+  while (searchPos < len) {
+    const idx = text.indexOf(needle, searchPos);
+    if (idx === -1) break;
+    let after = idx + tickCount;
+    while (after < len && text[after] === '`') after++;
+    if ((idx === 0 || text[idx - 1] !== '`') && after - idx === tickCount) {
+      return { tickCount, end: after };
+    }
+    searchPos = after;
+  }
+  return { tickCount, end: -1 };
+}
+
+function isLineLeadingWhitespace(text: string, pos: number): boolean {
+  let k = pos - 1;
+  while (k >= 0 && (text[k] === ' ' || text[k] === '\t')) k--;
+  return k < 0 || text[k] === '\n';
+}
+
+function stripTagsOutsideMarkdownCode(
+  text: string,
+  options: { systemTags: boolean; citations: boolean },
+): string {
   if (!text) return text;
   const out: string[] = [];
-  let i = 0;
+  const lower = text.toLowerCase();
   const len = text.length;
-  let proseStart = 0;
+  let i = 0;
+  let copyFrom = 0;
 
   while (i < len) {
     const atLineStart = i === 0 || text[i - 1] === '\n';
     if (atLineStart) {
-      let indent = i;
-      while (indent < len && indent - i < 4 && (text[indent] === ' ' || text[indent] === '\t')) {
-        indent++;
-      }
-      const ch = text[indent];
-      if (ch === '`' || ch === '~') {
-        let fenceEnd = indent;
-        while (fenceEnd < len && text[fenceEnd] === ch) fenceEnd++;
-        const fenceLen = fenceEnd - indent;
-        if (fenceLen >= 3) {
-          if (i > proseStart) out.push(fn(text.slice(proseStart, i)));
-          const lineEnd = text.indexOf('\n', fenceEnd);
-          if (lineEnd === -1) {
-            out.push(text.slice(i));
-            return out.join('');
-          }
-          let searchPos = lineEnd + 1;
-          let closeEnd = -1;
-          while (searchPos <= len) {
-            let cIndent = searchPos;
-            while (
-              cIndent < len &&
-              cIndent - searchPos < 4 &&
-              (text[cIndent] === ' ' || text[cIndent] === '\t')
-            ) {
-              cIndent++;
-            }
-            let cFence = cIndent;
-            while (cFence < len && text[cFence] === ch) cFence++;
-            if (cFence - cIndent >= fenceLen) {
-              let trail = cFence;
-              while (trail < len && (text[trail] === ' ' || text[trail] === '\t' || text[trail] === '\r')) {
-                trail++;
-              }
-              if (trail === len || text[trail] === '\n') {
-                closeEnd = trail < len ? trail + 1 : trail;
-                break;
-              }
-            }
-            const nextNl = text.indexOf('\n', searchPos);
-            if (nextNl === -1) break;
-            searchPos = nextNl + 1;
-          }
-          if (closeEnd === -1) {
-            out.push(text.slice(i));
-            return out.join('');
-          }
-          out.push(text.slice(i, closeEnd));
-          i = closeEnd;
-          proseStart = i;
-          continue;
-        }
+      const fenceEnd = findFencedBlockEnd(text, i);
+      if (fenceEnd !== -1) {
+        i = fenceEnd;
+        continue;
       }
     }
 
     if (text[i] === '`') {
-      let tickEnd = i;
-      while (tickEnd < len && text[tickEnd] === '`') tickEnd++;
-      const tickCount = tickEnd - i;
-      const needle = '`'.repeat(tickCount);
-      let searchPos = tickEnd;
-      let foundClose = -1;
-      while (searchPos < len) {
-        const idx = text.indexOf(needle, searchPos);
-        if (idx === -1) break;
-        let after = idx + tickCount;
-        while (after < len && text[after] === '`') after++;
-        if (idx === 0 || text[idx - 1] !== '`') {
-          if (after - idx === tickCount) {
-            foundClose = after;
-            break;
+      const span = findInlineCodeSpanEnd(text, i);
+      if (span.end !== -1) {
+        i = span.end;
+      } else {
+        i += span.tickCount;
+      }
+      continue;
+    }
+
+    if (text[i] === '<') {
+      const tail = text.slice(i);
+      const citeMatch = options.citations ? TARGET_CITATION_TAG_RE.exec(tail) : null;
+      const sysMatch = !citeMatch && options.systemTags ? TARGET_SYSTEM_TAG_RE.exec(tail) : null;
+      const tagName = citeMatch ? 'oai-mem-citation' : sysMatch ? sysMatch[1] : null;
+      if (tagName) {
+        const gt = findOpeningTagEnd(text, i + 1);
+        if (gt !== -1) {
+          if (text[gt - 1] === '/') {
+            if (i > copyFrom) out.push(text.slice(copyFrom, i));
+            i = gt + 1;
+            copyFrom = i;
+            continue;
+          }
+          const closeToken = `</${tagName.toLowerCase()}>`;
+          const closeIdx = lower.indexOf(closeToken, gt + 1);
+          if (closeIdx !== -1) {
+            if (i > copyFrom) out.push(text.slice(copyFrom, i));
+            i = closeIdx + closeToken.length;
+            copyFrom = i;
+            continue;
+          }
+          if (sysMatch) {
+            if (tagName.toLowerCase() === 'turn_aborted') {
+              if (i > copyFrom) out.push(text.slice(copyFrom, i));
+              i = gt + 1;
+              copyFrom = i;
+              continue;
+            }
+            if (isLineLeadingWhitespace(text, i)) {
+              if (i > copyFrom) out.push(text.slice(copyFrom, i));
+              return out.join('');
+            }
           }
         }
-        searchPos = after;
       }
-      if (foundClose !== -1) {
-        if (i > proseStart) out.push(fn(text.slice(proseStart, i)));
-        out.push(text.slice(i, foundClose));
-        i = foundClose;
-        proseStart = i;
-        continue;
-      }
-      i = tickEnd;
-      continue;
     }
 
     i++;
   }
 
-  if (proseStart < len) out.push(fn(text.slice(proseStart)));
+  if (copyFrom === 0) return text;
+  if (copyFrom < len) out.push(text.slice(copyFrom));
   return out.join('');
 }
-
-const MEMORY_CITATION_RE =
-  /<oai-mem-citation\b[^>]*>[\s\S]*?<\/oai-mem-citation>|<oai-mem-citation\b[^>]*\/>/gi;
-
-const SYSTEM_TAG_BLOCK_RE =
-  /<(INSTRUCTIONS|user_instructions|environment_context|turn_aborted)\b[^>]*>[\s\S]*?<\/\1>|<turn_aborted\s*\/?>/gi;
-
-const UNCLOSED_SYSTEM_TAG_RE =
-  /(?:^|\n)\s*<(INSTRUCTIONS|user_instructions|environment_context|turn_aborted)\b[^>]*>[\s\S]*$/i;
 
 /** Strip `<oai-mem-citation>` blocks outside markdown code spans/fences. */
 export function stripCodexMemoryCitations(text: string): string {
   if (!text || !/oai-mem-citation/i.test(text)) return text;
-  return transformOutsideMarkdownCode(text, (seg) => seg.replace(MEMORY_CITATION_RE, ''));
+  return stripTagsOutsideMarkdownCode(text, { systemTags: false, citations: true });
 }
 
 /**
@@ -375,14 +420,8 @@ export function stripCodexMemoryCitations(text: string): string {
  * `<turn_aborted>`) and `<oai-mem-citation>` outside markdown code spans/fences.
  */
 export function stripCodexSystemTags(text: string): string {
-  if (!text) return text;
-  return transformOutsideMarkdownCode(text, (seg) => {
-    let cleaned = seg.replace(MEMORY_CITATION_RE, '').replace(SYSTEM_TAG_BLOCK_RE, '');
-    if (UNCLOSED_SYSTEM_TAG_RE.test(cleaned)) {
-      cleaned = cleaned.replace(UNCLOSED_SYSTEM_TAG_RE, '');
-    }
-    return cleaned;
-  });
+  if (!text || !text.includes('<')) return text;
+  return stripTagsOutsideMarkdownCode(text, { systemTags: true, citations: true });
 }
 
 /** Extract reasoning summary text from either `string[]` (0.169.0) or `{text}[]` (legacy). */
@@ -476,13 +515,12 @@ export function normalizeCodexThreadItem(rawItem: CodexThreadItem): CodexThreadI
       const summaryText = summaryStrings.join('\n').trim() || extractCodexReasoningSummary(item);
       item.summaryStrings = summaryStrings;
       item.summaryText = summaryText;
-      // Preserve both `.summary` array compatibility (objects with `.text` AND `.toString()` string coercion)
-      // and 0.169.0 `string[]` access via `summaryStrings` / `summaryText`.
+      // Normalize `.summary` entries to plain strings (0.169.0 schema: `string[]`).
       if (Array.isArray(item.summary)) {
         item.summary = item.summary.map((s) => {
           if (typeof s === 'string') return stripCodexMemoryCitations(s);
           if (s && typeof s === 'object' && typeof (s as { text?: unknown }).text === 'string') {
-            return { ...(s as Record<string, unknown>), text: stripCodexMemoryCitations((s as { text: string }).text) };
+            return stripCodexMemoryCitations((s as { text: string }).text);
           }
           return s;
         });
@@ -794,7 +832,7 @@ export type ReviewTargetOption =
 
 export interface ReviewStartOptions {
   target?: ReviewTargetOption;
-  delivery?: 'inline' | 'detached';
+  delivery?: 'inline';
   instructions?: string;
 }
 
@@ -1509,6 +1547,15 @@ export class CodexAdapter {
       }
     }
 
+    const serverReqEvent: CodexEvent = {
+      type: 'server-request',
+      requestId: id,
+      method,
+      threadId: corrThreadId,
+      turnId: corrTurnId,
+      params,
+      handled: false,
+    };
     this.pendingServer.set(key, {
       id,
       method,
@@ -1516,15 +1563,8 @@ export class CodexAdapter {
       threadId: corrThreadId,
       turnId: corrTurnId,
     });
-    this.emit({
-      type: 'server-request',
-      requestId: id,
-      method,
-      threadId: corrThreadId,
-      turnId: corrTurnId,
-      params,
-    });
-    if (this.pendingServer.has(key)) {
+    this.emit(serverReqEvent);
+    if (this.pendingServer.has(key) && serverReqEvent.handled !== true) {
       this.pendingServer.delete(key);
       this.safeRespondError(id, -32601, `unsupported server request '${method}'`);
     }
@@ -2245,20 +2285,51 @@ export class CodexAdapter {
       const sep = key.indexOf(':');
       const threadId = key.slice(0, sep);
       const turnId = key.slice(sep + 1);
-      const raw = await this.request(
-        'thread/read',
-        { threadId, includeTurns: true },
-        CodexAdapter.STALL_PROBE_TIMEOUT_MS,
-      ).catch(() => null);
-      if (raw === null) {
-        // 探测本身失败:进程 wedge 或已死。死进程由 exit 路径收尾;活着才杀。
-        if (this.child && this.child.exitCode === null) {
-          this.emit({ type: 'log', line: `turn ${turnId} stalled and probe unreadable; killing wedged app-server` });
-          this.terminateChild();
+      let turn: CodexTurn | undefined;
+      try {
+        const rawTurns = await this.request(
+          'thread/turns/list',
+          { threadId, limit: 20, sortDirection: 'desc', itemsView: 'notLoaded' },
+          CodexAdapter.STALL_PROBE_TIMEOUT_MS,
+        );
+        const parsedTurns = ThreadTurnsListResponseSchema.parse(rawTurns);
+        turn = parsedTurns.data.find((t) => t.id === turnId);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/unknown variant|method not found|unexpected thread\/turns\/list/i.test(msg)) {
+          try {
+            const raw = await this.request(
+              'thread/read',
+              { threadId, includeTurns: true },
+              CodexAdapter.STALL_PROBE_TIMEOUT_MS,
+            );
+            turn = (ThreadReadResponseSchema.parse(raw).thread.turns ?? []).find((t) => t.id === turnId);
+          } catch (fbErr) {
+            const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+            if (/^codex '[^']+' failed \(/i.test(fbMsg)) {
+              this.emit({ type: 'log', line: `stall probe received RPC error (${fbMsg}); process responsive` });
+              this.lastTurnActivityAt = Date.now();
+              return;
+            }
+            if (this.child && this.child.exitCode === null) {
+              this.emit({ type: 'log', line: `turn ${turnId} stalled and probe unreadable; killing wedged app-server` });
+              this.terminateChild();
+            }
+            return;
+          }
+        } else if (/^codex '[^']+' failed \(/i.test(msg)) {
+          // Process replied with a JSON-RPC error, so it is responsive, not wedged.
+          this.emit({ type: 'log', line: `stall probe received RPC error (${msg}); process responsive` });
+          this.lastTurnActivityAt = Date.now();
+          return;
+        } else {
+          if (this.child && this.child.exitCode === null) {
+            this.emit({ type: 'log', line: `turn ${turnId} stalled and probe unreadable; killing wedged app-server` });
+            this.terminateChild();
+          }
+          return;
         }
-        return;
       }
-      const turn = (ThreadReadResponseSchema.parse(raw).thread.turns ?? []).find((t) => t.id === turnId);
       if (turn && turn.status !== 'inProgress') {
         this.emit({ type: 'log', line: `turn ${turnId} terminal on server (${turn.status}) but notification never arrived; synthesizing turn-completed` });
         this.handleNotification('turn/completed', { threadId, turn });
@@ -2712,6 +2783,26 @@ export class CodexAdapter {
     return { threadId, turnId: turn.id, turn, events: queue };
   }
 
+  private async collectCursorPages<T>(
+    method: string,
+    buildParams: (cursor: string | null) => Record<string, unknown>,
+    extract: (raw: unknown) => T[],
+    maxPages = 50,
+  ): Promise<T[]> {
+    const out: T[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < maxPages; page++) {
+      const raw = await this.request(method, buildParams(cursor));
+      out.push(...extract(raw));
+      const nextCursor = (raw as { nextCursor?: unknown })?.nextCursor;
+      if (typeof nextCursor !== 'string' || !nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    return out;
+  }
+
   /**
    * List available models (model/list), following `nextCursor` across all pages.
    * Preserves 0.169.0 `serviceTiers`, `defaultServiceTier`, and `supportedReasoningEfforts` (`ultra` etc.).
@@ -2722,32 +2813,23 @@ export class CodexAdapter {
     limit?: number;
   }): Promise<Array<Record<string, unknown>>> {
     await this.connect();
-    const out: Array<Record<string, unknown>> = [];
-    const seenCursors = new Set<string>();
-    let cursor: string | null = null;
-
-    for (let page = 0; page < 50; page++) {
-      const params: Record<string, unknown> = {};
-      if (cursor !== null) params.cursor = cursor;
-      if (options?.modelProvider !== undefined) params.modelProvider = options.modelProvider;
-      if (options?.includeHidden !== undefined) params.includeHidden = options.includeHidden;
-      if (options?.limit !== undefined) params.limit = options.limit;
-
-      const raw = await this.request('model/list', params);
-      const data = (raw as { data?: unknown })?.data;
-      if (Array.isArray(data)) {
-        for (const row of data) {
-          if (row && typeof row === 'object') {
-            out.push(row as Record<string, unknown>);
-          }
-        }
-      }
-      const nextCursor = (raw as { nextCursor?: unknown })?.nextCursor;
-      if (typeof nextCursor !== 'string' || !nextCursor || seenCursors.has(nextCursor)) break;
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
-    }
-    return out;
+    return this.collectCursorPages(
+      'model/list',
+      (cursor) => {
+        const params: Record<string, unknown> = {};
+        if (cursor !== null) params.cursor = cursor;
+        if (options?.modelProvider !== undefined) params.modelProvider = options.modelProvider;
+        if (options?.includeHidden !== undefined) params.includeHidden = options.includeHidden;
+        if (options?.limit !== undefined) params.limit = options.limit;
+        return params;
+      },
+      (raw) => {
+        const data = (raw as { data?: unknown })?.data;
+        return Array.isArray(data)
+          ? data.filter((row): row is Record<string, unknown> => Boolean(row && typeof row === 'object'))
+          : [];
+      },
+    );
   }
 
   /** Interrupt a running turn (turn/interrupt). */
@@ -2788,25 +2870,27 @@ export class CodexAdapter {
     await this.connect();
     let off: () => void = () => undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let completionAborted = false;
 
     const completion = new Promise<void>((resolve, reject) => {
-      timer = setTimeout(() => {
+      const failWith = (err: Error): void => {
+        completionAborted = true;
+        clearTimeout(timer);
         off();
-        reject(new Error(`codex thread compact timed out after ${timeoutMs}ms`));
+        reject(err);
+      };
+      timer = setTimeout(() => {
+        failWith(new Error(`codex thread compact timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       timer.unref?.();
 
       off = this.onEvent((ev) => {
         if (ev.type === 'disconnected') {
-          clearTimeout(timer);
-          off();
-          reject(new Error('codex app-server disconnected during thread compact'));
+          failWith(new Error('codex app-server disconnected during thread compact'));
           return;
         }
         if (ev.type === 'error' && (!ev.threadId || ev.threadId === threadId) && ev.willRetry !== true) {
-          clearTimeout(timer);
-          off();
-          reject(new Error(ev.message || 'codex thread compact failed'));
+          failWith(new Error(ev.message || 'codex thread compact failed'));
           return;
         }
         if (ev.type === 'thread-compacted' && ev.threadId === threadId) {
@@ -2822,12 +2906,12 @@ export class CodexAdapter {
           return;
         }
         if (ev.type === 'turn-completed' && ev.threadId === threadId && ev.turn?.status === 'failed') {
-          clearTimeout(timer);
-          off();
-          reject(new Error(ev.error || ev.turn?.error?.message || 'codex thread compact turn failed'));
+          failWith(new Error(ev.error || ev.turn?.error?.message || 'codex thread compact turn failed'));
         }
       });
     });
+    // Guard against unhandled rejection if the timer/disconnect rejects while withThreadRetry is still pending.
+    completion.catch(() => undefined);
 
     try {
       await this.withThreadRetry(threadId, () =>
@@ -2836,10 +2920,12 @@ export class CodexAdapter {
     } catch (err) {
       clearTimeout(timer);
       off();
-      completion.catch(() => undefined);
       throw err;
     }
-
+    if (completionAborted) {
+      await completion;
+      return;
+    }
     await completion;
   }
 
@@ -2874,6 +2960,32 @@ export class CodexAdapter {
     return (raw as { thread?: Record<string, unknown> }).thread ?? (raw as Record<string, unknown>);
   }
 
+  private mapRevertError(err: unknown): ProviderError | null {
+    if (err instanceof ProviderError) return err;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      /does not use paginated history|legacy history|unpaginated|only supports paginated threads|ephemeral threads do not support/i.test(
+        msg,
+      )
+    ) {
+      return new ProviderError(
+        'unsupported',
+        '该 Codex 会话不支持撤销（Codex 0.169.0 的 thread/revert 仅支持持久化分页历史会话，不支持旧版或临时会话）。',
+        400,
+        err,
+      );
+    }
+    if (/not materialized yet|no rollout found/i.test(msg)) {
+      return new ProviderError(
+        'invalid_request',
+        '当前会话尚未产生可撤销的对话轮次(turn)。',
+        400,
+        err,
+      );
+    }
+    return null;
+  }
+
   /**
    * Revert a paginated thread's durable history before `beforeTurnId`
    * (`thread/revert { threadId, beforeTurnId }` in Codex 0.169.0).
@@ -2888,16 +3000,8 @@ export class CodexAdapter {
         const raw = await this.request('thread/revert', { threadId, beforeTurnId });
         return (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
       } catch (err) {
-        if (err instanceof ProviderError) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/does not use paginated history|legacy history|unpaginated/i.test(msg)) {
-          throw new ProviderError(
-            'unsupported',
-            '该 Codex 会话使用旧版非分页历史(legacy history)，Codex 0.169.0 的 thread/revert 仅支持分页历史会话，无法执行撤销。',
-            400,
-            err,
-          );
-        }
+        const mapped = this.mapRevertError(err);
+        if (mapped) throw mapped;
         throw err;
       }
     });
@@ -2942,27 +3046,12 @@ export class CodexAdapter {
           cursor = parsed.nextCursor;
         }
       } catch (err) {
-        if (err instanceof ProviderError) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         if (/already in progress/i.test(msg) || /thread not found/i.test(msg)) {
           throw err;
         }
-        if (/does not use paginated history|legacy history|unpaginated/i.test(msg)) {
-          throw new ProviderError(
-            'unsupported',
-            '该 Codex 会话使用旧版非分页历史(legacy history)，Codex 0.169.0 的 thread/revert 仅支持分页历史会话，无法执行撤销。',
-            400,
-            err,
-          );
-        }
-        if (/not materialized yet|no rollout found/i.test(msg)) {
-          throw new ProviderError(
-            'invalid_request',
-            '当前会话尚未产生可撤销的对话轮次(turn)。',
-            400,
-            err,
-          );
-        }
+        const mapped = this.mapRevertError(err);
+        if (mapped) throw mapped;
         // Only if the server explicitly reports unknown variant / method not found for
         // thread/turns/list (an older pre-0.169 binary), try legacy thread/rollback.
         if (/unknown variant [`']?thread\/turns\/list|method not found/i.test(msg)) {
@@ -3008,16 +3097,8 @@ export class CodexAdapter {
       try {
         await this.request('thread/revert', { threadId, beforeTurnId: targetTurn.id });
       } catch (err) {
-        if (err instanceof ProviderError) throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/does not use paginated history|legacy history|unpaginated/i.test(msg)) {
-          throw new ProviderError(
-            'unsupported',
-            '该 Codex 会话使用旧版非分页历史(legacy history)，Codex 0.169.0 的 thread/revert 仅支持分页历史会话，无法执行撤销。',
-            400,
-            err,
-          );
-        }
+        const mapped = this.mapRevertError(err);
+        if (mapped) throw mapped;
         throw err;
       }
     });
@@ -3064,6 +3145,11 @@ export class CodexAdapter {
     return this.skillsVersion;
   }
 
+  /** Return the last recorded serviceTier for a thread, if any. */
+  getThreadServiceTier(threadId: string): string | null | undefined {
+    return this.threadServiceTiers.get(threadId);
+  }
+
   /**
    * 原生 skills 目录(skills/list):支持按会话 cwd 传入 `cwds` 并在收到
    * `skills/changed` 后自动带上 `forceReload: true`。
@@ -3073,6 +3159,7 @@ export class CodexAdapter {
   ): Promise<Array<{ name: string; description: string; path: string; scope: string; enabled: boolean; cwd?: string }>> {
     await this.connect();
     let cwds: string[] | undefined;
+    const startVersion = this.skillsVersion;
     let forceReload = this.skillsDirty;
 
     if (typeof options === 'string') {
@@ -3093,7 +3180,9 @@ export class CodexAdapter {
     if (forceReload) params.forceReload = true;
 
     const raw = await this.request('skills/list', params);
-    this.skillsDirty = false;
+    if (this.skillsVersion === startVersion) {
+      this.skillsDirty = false;
+    }
     const groups = (raw as { data?: unknown }).data;
     const out: Array<{ name: string; description: string; path: string; scope: string; enabled: boolean; cwd?: string }> = [];
     if (!Array.isArray(groups)) return out;
@@ -3127,63 +3216,40 @@ export class CodexAdapter {
     limit?: number;
   }): Promise<Array<Record<string, unknown>>> {
     await this.connect();
-    const out: Array<Record<string, unknown>> = [];
-    const seenCursors = new Set<string>();
-    let cursor: string | null = null;
-
-    for (let page = 0; page < 50; page++) {
-      const params: Record<string, unknown> = {};
-      if (cursor !== null) params.cursor = cursor;
-      if (options?.detail !== undefined) params.detail = options.detail;
-      if (options?.threadId !== undefined) params.threadId = options.threadId;
-      if (options?.serverName !== undefined) params.serverName = options.serverName;
-      if (options?.environmentId !== undefined) params.environmentId = options.environmentId;
-      if (options?.limit !== undefined) params.limit = options.limit;
-
-      const raw = await this.request('mcpServerStatus/list', params);
-      const data = (raw as { data?: unknown })?.data;
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          if (item && typeof item === 'object') {
-            out.push(item as Record<string, unknown>);
-          }
-        }
-      }
-      const nextCursor = (raw as { nextCursor?: unknown })?.nextCursor;
-      if (typeof nextCursor !== 'string' || !nextCursor || seenCursors.has(nextCursor)) break;
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
-    }
-    return out;
+    return this.collectCursorPages(
+      'mcpServerStatus/list',
+      (cursor) => {
+        const params: Record<string, unknown> = {};
+        if (cursor !== null) params.cursor = cursor;
+        if (options?.detail !== undefined) params.detail = options.detail;
+        if (options?.threadId !== undefined) params.threadId = options.threadId;
+        if (options?.serverName !== undefined) params.serverName = options.serverName;
+        if (options?.environmentId !== undefined) params.environmentId = options.environmentId;
+        if (options?.limit !== undefined) params.limit = options.limit;
+        return params;
+      },
+      (raw) => {
+        const data = (raw as { data?: unknown })?.data;
+        return Array.isArray(data)
+          ? data.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+          : [];
+      },
+    );
   }
 
   /** 后台终端(thread/backgroundTerminals/list)，支持 `nextCursor` 翻页。 */
   async backgroundTerminals(threadId: string): Promise<Array<Record<string, unknown>>> {
     await this.connect();
-    const out: Array<Record<string, unknown>> = [];
-    const seenCursors = new Set<string>();
-    let cursor: string | null = null;
-
-    for (let page = 0; page < 50; page++) {
-      const raw = await this.request('thread/backgroundTerminals/list', {
-        threadId,
-        cursor,
-        limit: null,
-      });
-      const data = (raw as { data?: unknown })?.data;
-      if (Array.isArray(data)) {
-        for (const item of data) {
-          if (item && typeof item === 'object') {
-            out.push(item as Record<string, unknown>);
-          }
-        }
-      }
-      const nextCursor = (raw as { nextCursor?: unknown })?.nextCursor;
-      if (typeof nextCursor !== 'string' || !nextCursor || seenCursors.has(nextCursor)) break;
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
-    }
-    return out;
+    return this.collectCursorPages(
+      'thread/backgroundTerminals/list',
+      (cursor) => ({ threadId, cursor, limit: null }),
+      (raw) => {
+        const data = (raw as { data?: unknown })?.data;
+        return Array.isArray(data)
+          ? data.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+          : [];
+      },
+    );
   }
 
   /** 线程有效模型:显式设置过的优先,否则读 config/read 的全局默认(缓存)。 */
@@ -3231,7 +3297,10 @@ export class CodexAdapter {
    *   `turn.id`，合成 `turn-started` 并排空注册前已到达的同帧事件。
    * - 兼容旧版(0.147.0 返回 `{}`):等待 `turn/started` 通知并在 30s 超时时报错。
    */
-  async reviewTurn(threadId: string, options?: ReviewStartOptions): Promise<CodexTurnHandle> {
+  async reviewTurn(
+    threadId: string,
+    options?: ReviewStartOptions & { timeoutMs?: number },
+  ): Promise<CodexTurnHandle> {
     await this.connect();
     const queue = new TurnEventQueue();
     const trackedThreads = new Set<string>([threadId]);
@@ -3239,6 +3308,7 @@ export class CodexAdapter {
     let firstTurnId = '';
     let resolvedTurn: CodexTurn | undefined;
     let settled = false;
+    let startAborted = false;
     let off: () => void = () => undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let resolveTurnStarted!: (turnId: string) => void;
@@ -3250,22 +3320,25 @@ export class CodexAdapter {
       }
     };
 
+    const budget = options?.timeoutMs ?? 30_000;
     const turnStarted = new Promise<string>((resolve, reject) => {
+      const failWith = (error: Error): void => {
+        startAborted = true;
+        clearTimeout(timer);
+        off();
+        if (firstTurnId) cleanupTurnKeys(firstTurnId);
+        reject(error);
+        queue.fail(error);
+      };
       resolveTurnStarted = resolve;
       timer = setTimeout(() => {
-        off();
-        reject(new Error('review turn did not start within 30s'));
-      }, 30_000);
+        failWith(new Error(`review turn did not start within ${budget}ms`));
+      }, budget);
       timer.unref?.();
 
       off = this.onEvent((ev) => {
         if (ev.type === 'disconnected') {
-          clearTimeout(timer);
-          off();
-          if (firstTurnId) cleanupTurnKeys(firstTurnId);
-          const error = new Error('codex app-server disconnected during review turn');
-          reject(error);
-          queue.fail(error);
+          failWith(new Error('codex app-server disconnected during review turn'));
           return;
         }
         if (!('threadId' in ev) || !ev.threadId || !trackedThreads.has(ev.threadId)) return;
@@ -3290,6 +3363,8 @@ export class CodexAdapter {
         }
       });
     });
+    // Guard against unhandled rejection if timeout/disconnect fires while withThreadRetry is still pending.
+    turnStarted.catch(() => undefined);
 
     const target: ReviewTargetOption = options?.target
       ? options.target
@@ -3309,8 +3384,11 @@ export class CodexAdapter {
     } catch (err) {
       clearTimeout(timer);
       off();
-      turnStarted.catch(() => undefined);
       throw err;
+    }
+
+    if (startAborted) {
+      await turnStarted;
     }
 
     const parsedResp = ReviewStartResponseSchema.safeParse(raw);
@@ -3332,6 +3410,7 @@ export class CodexAdapter {
           turn: respTurn,
         };
         queue.push(startedEv);
+        this.notifyListeners(startedEv);
         if (!settled) {
           settled = true;
           resolveTurnStarted(respTurn.id);
