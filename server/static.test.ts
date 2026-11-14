@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createStaticServer } from './static.js';
-import type { WebShell } from './web-assets.js';
+import { loadWebShell, type WebShell } from './web-assets.js';
 
 async function listen(server: Server): Promise<{ url: string; close: () => Promise<void> }> {
   await new Promise<void>((resolve) => server.listen(0, 'localhost', resolve));
@@ -107,5 +108,62 @@ test('serves the injected shell and real assets with safe HTTP behavior', async 
     }
   } finally {
     await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('serves the official 2.6.2 bundle byte-for-byte with matching MIME types and runtime-only injection', async () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+  const root = join(repoRoot, 'web-dist');
+  const shell = await loadWebShell({
+    root,
+    extensionDir: join(repoRoot, 'web-extension'),
+    manifestPath: join(repoRoot, 'web-origin-manifest.json'),
+  });
+  assert.equal(shell.injectionEnabled, true);
+  assert.equal(shell.reason, '2.6.2 (6a8493d)');
+  const handler = createStaticServer(root, shell);
+  const server = await listen(createServer((req, res) => {
+    if (!handler(req, res)) res.writeHead(404).end();
+  }));
+  const mime: Record<string, string> = {
+    '.js': 'text/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.ttf': 'font/ttf',
+  };
+  try {
+    const home = await fetch(`${server.url}/`);
+    assert.equal(home.status, 200);
+    assert.equal(await home.text(), shell.indexHtml.toString('utf8'));
+    const boot = await fetch(`${server.url}/boot.js`);
+    assert.equal(boot.status, 200);
+    assert.equal(boot.headers.get('content-type'), mime['.js']);
+    assert.deepEqual(Buffer.from(await boot.arrayBuffer()), await readFile(join(root, 'boot.js')));
+    for (const name of await readdir(join(root, 'assets'))) {
+      assert.ok(mime[extname(name)], `unsupported official asset type: ${name}`);
+      const response = await fetch(`${server.url}/assets/${name}`);
+      assert.equal(response.status, 200, name);
+      assert.equal(response.headers.get('content-type'), mime[extname(name)], name);
+      assert.equal(response.headers.get('cache-control'), 'public, max-age=31536000, immutable', name);
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), await readFile(join(root, 'assets', name)), name);
+    }
+    for (const name of ['index--0t1wzw_.js', 'index-DDrI0Pxr.css']) {
+      const stale = await fetch(`${server.url}/assets/${name}`);
+      assert.equal(stale.status, 404, name);
+      await stale.arrayBuffer();
+    }
+    for (const name of ['boot.js', 'style.css']) {
+      const extension = await fetch(`${server.url}/__multi_agent/${name}`);
+      assert.equal(extension.status, 200);
+      assert.deepEqual(Buffer.from(await extension.arrayBuffer()), await readFile(join(repoRoot, 'web-extension', name)));
+    }
+    const head = await fetch(`${server.url}/`, { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-length'), String(shell.indexHtml.byteLength));
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+    assert.deepEqual(await readFile(join(root, 'index.html')), shell.originalIndexHtml);
+  } finally {
+    await server.close();
   }
 });
