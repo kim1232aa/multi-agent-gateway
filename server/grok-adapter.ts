@@ -1,5 +1,5 @@
 /**
- * GrokAdapter — wraps the Grok CLI (tested with 1.0.5; ACP rechecked on 1.0.13) as a ProviderAdapter.
+ * GrokAdapter — wraps the Grok CLI (verified against 1.0.77) as a ProviderAdapter.
  *
  * Main path: ACP (`grok agent stdio`, see grok-acp.ts). One long-lived JSON-RPC
  * process, multiple sessions. Headless `-p` is the fallback when ACP spawn or
@@ -9,12 +9,14 @@
  *   grok -p PROMPT --output-format streaming-messages-json --include-partial-messages
  *        [--session-id UUID | --resume UUID] [--model] [--effort] [--permission-mode]
  *
- * The prompt is an argv flag (`-p` / `--prompt-json` / `--prompt-file`). Grok does
- * NOT read a piped stdin user-JSON line as the prompt (unlike Claude stream-json),
- * so stdin is unused (stdio ignore) / never written.
+ * The prompt is an argv flag (`-p` / `--prompt-json` / `--prompt-file`). Large
+ * prompts / images go through a 0600 temp `--prompt-file` so argv never hits E2BIG.
+ * Grok does NOT read a piped stdin user-JSON line as the prompt (unlike Claude
+ * stream-json), so stdin is unused (stdio ignore) / never written.
  *
  * Session files live under ~/.grok/sessions/<urlencoded-cwd>/<session-id>/
- * (summary.json + chat_history.jsonl, plus ACP updates.jsonl).
+ * (summary.json + chat_history.jsonl, plus updates.jsonl / usage.json /
+ * rewind_points.jsonl / goal/state.json written by the CLI).
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -23,7 +25,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { listGrokCommands } from './native-commands.js';
+import {
+  discoverClaudeDiskCommands,
+  expandGrokSkill,
+  listGrokCommands,
+  type ClaudeCatalogCommand,
+  type SkillCommandInput,
+} from './native-commands.js';
 import { GrokAcpClient, pickPermissionOption, type GrokAcpEvent } from './grok-acp.js';
 import { SettingsStore } from './settings-store.js';
 import {
@@ -50,6 +58,117 @@ import {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DEFAULT_GROK_BIN = path.join(os.homedir(), '.local', 'bin', 'grok');
+/** Prompts / JSON payloads above this many bytes go through --prompt-file (argv E2BIG guard). */
+const MAX_INLINE_PROMPT_BYTES = 32 * 1024;
+/** getHistory / usage readers only look at the tail of large session files. */
+const MAX_SESSION_FILE_TAIL_BYTES = 16 * 1024 * 1024;
+const MAX_SMALL_FILE_BYTES = 1024 * 1024;
+const FORK_TIMEOUT_MS = 20_000;
+const NO_FOLLOW_READ_FLAGS =
+  fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
+function isExecutableFile(file: string): boolean {
+  try {
+    if (!fs.statSync(file).isFile()) return false;
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Binary priority: explicit option > GROK_BIN > ~/.local/bin/grok > PATH lookup. */
+export function resolveGrokBin(explicit?: string): string {
+  if (explicit) return explicit;
+  const fromEnv = process.env.GROK_BIN?.trim();
+  if (fromEnv) return fromEnv;
+  if (isExecutableFile(DEFAULT_GROK_BIN)) return DEFAULT_GROK_BIN;
+  for (const dir of String(process.env.PATH ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, 'grok');
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return DEFAULT_GROK_BIN;
+}
+
+/** Child env: inherit the user's env (incl. proxy), drop gateway secrets, keep loopback out of the proxy. */
+function grokChildEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('GATEWAY_')) delete env[key];
+  }
+  const loopback = ['127.0.0.1', 'localhost', '::1'];
+  const current = String(env.NO_PROXY ?? env.no_proxy ?? '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const merged = [...new Set([...current, ...loopback])].join(',');
+  env.NO_PROXY = merged;
+  env.no_proxy = merged;
+  return env;
+}
+
+/** Bounded O_NOFOLLOW read of (at most) the last `maxBytes` of a regular file. */
+function readTailNoFollow(file: string, maxBytes: number): string | null {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, NO_FOLLOW_READ_FLAGS);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    const start = Math.max(0, st.size - maxBytes);
+    const length = st.size - start;
+    if (length <= 0) return '';
+    const buf = Buffer.alloc(length);
+    let offset = 0;
+    while (offset < length) {
+      const n = fs.readSync(fd, buf, offset, length - offset, start + offset);
+      if (n === 0) break;
+      offset += n;
+    }
+    let text = buf.subarray(0, offset).toString('utf8');
+    if (start > 0) {
+      const nl = text.indexOf('\n');
+      text = nl >= 0 ? text.slice(nl + 1) : '';
+    }
+    return text;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function readJsonNoFollow(file: string): Record<string, unknown> | null {
+  const text = readTailNoFollow(file, MAX_SMALL_FILE_BYTES);
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonl(text: string | null): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  if (!text) return out;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (isRecord(parsed)) out.push(parsed);
+    } catch {
+      // skip malformed / partial line
+    }
+  }
+  return out;
+}
 
 export interface GrokSessionSummary {
   sessionId: string;
@@ -128,7 +247,7 @@ export class GrokAdapter {
   private modelsInflight: Promise<{ defaultModel?: string; models: string[] }> | null = null;
 
   constructor(options: GrokAdapterOptions = {}) {
-    this.grokBin = options.grokBin ?? process.env.GROK_BIN ?? DEFAULT_GROK_BIN;
+    this.grokBin = resolveGrokBin(options.grokBin);
     this.env = { ...(options.env ?? {}) };
     const grokHome = process.env.GROK_HOME ?? path.join(os.homedir(), '.grok');
     this.sessionsDir = options.sessionsDir ?? path.join(grokHome, 'sessions');
@@ -142,10 +261,14 @@ export class GrokAdapter {
     toolEvents: true,
     interrupt: true,
     resume: true,
-    fork: false,
-    approvals: false,
-    questions: false,
+    fork: true,
+    approvals: true,
+    questions: true,
   };
+
+  get binPath(): string {
+    return this.grokBin;
+  }
 
   async list(): Promise<GrokSessionSummary[]> {
     const out: GrokSessionSummary[] = [];
@@ -167,22 +290,19 @@ export class GrokAdapter {
       for (const sessEnt of sessionDirs) {
         if (!sessEnt.isDirectory() || !UUID_RE.test(sessEnt.name)) continue;
         const summaryPath = path.join(cwdPath, sessEnt.name, 'summary.json');
-        try {
-          const raw = JSON.parse(fs.readFileSync(summaryPath, 'utf8')) as Record<string, unknown>;
-          const info = (raw.info ?? {}) as Record<string, unknown>;
-          const sessionId = typeof info.id === 'string' && UUID_RE.test(info.id) ? info.id : sessEnt.name;
-          const cwd = typeof info.cwd === 'string'
-            ? info.cwd
-            : decodeUriComponentSafe(cwdEnt.name);
-          const title = pickString(raw.session_summary, raw.generated_title) || '(session)';
-          const updatedAt = pickString(raw.updated_at, raw.last_active_at) || new Date().toISOString();
-          const createdAt = pickString(raw.created_at) || updatedAt;
-          const model = typeof raw.current_model_id === 'string' ? raw.current_model_id : undefined;
-          if (cwd) this.sessionCwd.set(sessionId, cwd);
-          out.push({ sessionId, title: title.slice(0, 120), cwd, createdAt, updatedAt, ...(model ? { model } : {}) });
-        } catch {
-          // unreadable / malformed summary — skip
-        }
+        const raw = readJsonNoFollow(summaryPath);
+        if (!raw) continue;
+        const info = isRecord(raw.info) ? raw.info : {};
+        const sessionId = typeof info.id === 'string' && UUID_RE.test(info.id) ? info.id : sessEnt.name;
+        const cwd = typeof info.cwd === 'string'
+          ? info.cwd
+          : decodeUriComponentSafe(cwdEnt.name);
+        const title = pickString(raw.session_summary, raw.generated_title) || '(session)';
+        const updatedAt = pickString(raw.updated_at, raw.last_active_at) || new Date().toISOString();
+        const createdAt = pickString(raw.created_at) || updatedAt;
+        const model = typeof raw.current_model_id === 'string' ? raw.current_model_id : undefined;
+        if (cwd) this.sessionCwd.set(sessionId, cwd);
+        out.push({ sessionId, title: title.slice(0, 120), cwd, createdAt, updatedAt, ...(model ? { model } : {}) });
       }
     }
     out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
@@ -206,28 +326,31 @@ export class GrokAdapter {
   async getHistory(sessionId: string): Promise<GrokHistoryMessage[]> {
     const dir = this.findSessionDir(sessionId);
     if (!dir) throw new Error(`grok-adapter: session not found: ${sessionId}`);
-    const filePath = path.join(dir, 'chat_history.jsonl');
-    let text: string;
-    try {
-      text = fs.readFileSync(filePath, 'utf8');
-    } catch {
+    const chatPath = path.join(dir, 'chat_history.jsonl');
+    const updatesPath = path.join(dir, 'updates.jsonl');
+    const pointsPath = path.join(dir, 'rewind_points.jsonl');
+    const chatText = readTailNoFollow(chatPath, MAX_SESSION_FILE_TAIL_BYTES);
+    const updates = parseJsonl(readTailNoFollow(updatesPath, MAX_SESSION_FILE_TAIL_BYTES));
+    const points = parseJsonl(readTailNoFollow(pointsPath, MAX_SMALL_FILE_BYTES));
+    if (chatText === null && updates.length === 0) {
       throw new Error(`grok-adapter: session not found: ${sessionId}`);
     }
+    const rewind = effectiveRewind(updates, points);
+
     const messages: GrokHistoryMessage[] = [];
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      let entry: any;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
+    for (const entry of parseJsonl(chatText)) {
       const mapped = mapHistoryEntry(entry);
       if (!mapped) continue;
       const timestamp = pickString(entry.timestamp);
       if (timestamp) mapped.timestamp = timestamp;
       messages.push(mapped);
     }
+    applyRewind(messages, rewind);
+
+    if (messages.length === 0 && updates.length > 0) {
+      messages.push(...historyFromUpdates(updates, rewind));
+    }
+
     const { createdAt, updatedAt } = readSessionTimes(dir);
     const missing = messages.filter((m) => !m.timestamp);
     for (let i = 0; i < missing.length; i++) {
@@ -266,8 +389,12 @@ export class GrokAdapter {
     const cwd = opts.cwd ?? this.sessionCwd.get(sessionId) ?? os.homedir();
     this.sessionCwd.set(sessionId, cwd);
 
+    // Large prompts/images must not land in argv: Linux rejects them with E2BIG.
+    const promptFile = materializePromptFile(prompt, opts.contentBlocks);
     const args: string[] = [];
-    if (opts.contentBlocks && opts.contentBlocks.length > 0) {
+    if (promptFile) {
+      args.push('--prompt-file', promptFile.path);
+    } else if (opts.contentBlocks && opts.contentBlocks.length > 0) {
       args.push('--prompt-json', JSON.stringify(opts.contentBlocks));
     } else {
       args.push('-p', prompt);
@@ -290,6 +417,7 @@ export class GrokAdapter {
       detached: true,
     });
     this.running.set(sessionId, child);
+    const cleanupPromptFile = (): void => promptFile?.cleanup();
 
     let stderrTail = '';
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -314,6 +442,7 @@ export class GrokAdapter {
       });
 
       child.on('error', (err) => {
+        cleanupPromptFile();
         this.running.delete(sessionId);
         this.resolveExitWaiters(sessionId);
         onEvent({ type: 'error', message: `spawn failed: ${err.message}` });
@@ -321,6 +450,7 @@ export class GrokAdapter {
       });
 
       child.on('close', (code, signal) => {
+        cleanupPromptFile();
         this.running.delete(sessionId);
         this.resolveExitWaiters(sessionId);
         const wasInterrupted =
@@ -394,21 +524,187 @@ export class GrokAdapter {
     });
   }
 
-  /**
-   * CLI 子进程继承当前环境(含用户自己的代理),不在项目里写死代理地址。
-   * 只把 loopback 补进 NO_PROXY,避免 grok 把 127.0.0.1 也送进代理。
-   */
+  /** CLI 子进程继承用户环境(含代理),去掉 GATEWAY_* 并补 loopback NO_PROXY。 */
   private childEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env, ...this.env };
-    const extra = ['127.0.0.1', 'localhost', '::1'];
-    const current = String(env.NO_PROXY ?? env.no_proxy ?? '')
-      .split(',')
-      .map((part) => part.trim())
-      .filter(Boolean);
-    const merged = [...new Set([...current, ...extra])].join(',');
-    env.NO_PROXY = merged;
-    env.no_proxy = merged;
-    return env;
+    return grokChildEnv(this.env);
+  }
+
+  /**
+   * Fork via the CLI (`grok --resume <id> --fork-session --session-id <new>`);
+   * when the binary is missing (unit fixtures) clone the session directory.
+   */
+  async forkSession(sessionId: string, cwd: string): Promise<{ sessionId: string }> {
+    const sourceDir = this.findSessionDir(sessionId);
+    const newId = randomUUID();
+    const forked = await this.forkViaCli(sessionId, newId, cwd);
+    if (forked) {
+      this.sessionCwd.set(newId, cwd);
+      return { sessionId: newId };
+    }
+    if (!sourceDir) throw new Error(`grok-adapter: session not found: ${sessionId}`);
+    const targetDir = path.join(this.sessionsDir, encodeURIComponent(cwd), newId);
+    fs.mkdirSync(targetDir, { recursive: true });
+    for (const name of ['chat_history.jsonl', 'updates.jsonl', 'rewind_points.jsonl', 'usage.json']) {
+      const src = path.join(sourceDir, name);
+      try {
+        if (fs.statSync(src).isFile()) fs.copyFileSync(src, path.join(targetDir, name));
+      } catch {
+        // optional file
+      }
+    }
+    const goalSrc = path.join(sourceDir, 'goal', 'state.json');
+    try {
+      if (fs.statSync(goalSrc).isFile()) {
+        fs.mkdirSync(path.join(targetDir, 'goal'), { recursive: true });
+        fs.copyFileSync(goalSrc, path.join(targetDir, 'goal', 'state.json'));
+      }
+    } catch {
+      // no goal state
+    }
+    const now = new Date().toISOString();
+    const sourceSummary = readJsonNoFollow(path.join(sourceDir, 'summary.json')) ?? {};
+    const sourceInfo = isRecord(sourceSummary.info) ? sourceSummary.info : {};
+    fs.writeFileSync(path.join(targetDir, 'summary.json'), JSON.stringify({
+      ...sourceSummary,
+      info: { ...sourceInfo, id: newId, cwd },
+      parent_session_id: sessionId,
+      forked_at: now,
+      created_at: now,
+      updated_at: now,
+    }));
+    this.sessionCwd.set(newId, cwd);
+    return { sessionId: newId };
+  }
+
+  private forkViaCli(sessionId: string, newId: string, cwd: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      let child: ChildProcess;
+      try {
+        child = spawn(this.grokBin, [
+          '--resume', sessionId,
+          '--fork-session',
+          '--session-id', newId,
+          '-p', '/session-info',
+          '--output-format', 'streaming-messages-json',
+        ], {
+          cwd,
+          env: this.childEnv(),
+          stdio: ['ignore', 'pipe', 'ignore'],
+          detached: true,
+        });
+      } catch {
+        resolve(false);
+        return;
+      }
+      let stdout = '';
+      child.stdout?.on('data', (chunk: Buffer) => { stdout = (stdout + chunk.toString('utf8')).slice(-16_000); });
+      let settled = false;
+      const finish = (ok: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => {
+        this.killGroup(child, 'SIGKILL');
+        finish(false);
+      }, FORK_TIMEOUT_MS);
+      timer.unref();
+      child.on('error', () => finish(false));
+      child.on('close', () => {
+        const created = this.findSessionDir(newId) !== null;
+        const announced = stdout.includes(newId);
+        finish(created || announced);
+      });
+    });
+  }
+
+  /**
+   * Rewind by appending the CLI's own `rewind_marker` (target prompt index) and
+   * truncating rewind_points.jsonl to the surviving prefix.
+   */
+  rollbackSession(sessionId: string, numTurns: number): void {
+    if (!Number.isInteger(numTurns) || numTurns < 1) {
+      throw new ProviderError('invalid_request', 'grok-adapter: numTurns must be a positive integer', 400);
+    }
+    const dir = this.findSessionDir(sessionId);
+    if (!dir) throw new ProviderError('not_found', `grok-adapter: session not found: ${sessionId}`, 404);
+    const updatesPath = path.join(dir, 'updates.jsonl');
+    const pointsPath = path.join(dir, 'rewind_points.jsonl');
+    const chatPath = path.join(dir, 'chat_history.jsonl');
+    const updates = parseJsonl(readTailNoFollow(updatesPath, MAX_SESSION_FILE_TAIL_BYTES));
+    const points = parseJsonl(readTailNoFollow(pointsPath, MAX_SMALL_FILE_BYTES));
+    const chatEntries = parseJsonl(readTailNoFollow(chatPath, MAX_SESSION_FILE_TAIL_BYTES));
+    const userTurns = chatEntries.filter((entry) => entry.type === 'user' && mapHistoryEntry(entry) !== null).length;
+    const promptIndexes = updates
+      .map((entry) => updateOf(entry))
+      .filter((update) => String(update.sessionUpdate ?? update.type ?? '') === 'user_message_chunk')
+      .map((update) => promptIndexOf(update))
+      .filter((index): index is number => index !== undefined);
+    const totalPrompts = Math.max(userTurns, promptIndexes.length, points.length);
+    if (totalPrompts === 0) {
+      throw new ProviderError('invalid_request', 'grok-adapter: session has no turns to roll back', 400);
+    }
+    const previous = effectiveRewind(updates, points);
+    const base = previous ?? totalPrompts;
+    const target = Math.max(0, base - numTurns);
+
+    const marker = {
+      timestamp: Math.floor(Date.now() / 1000),
+      method: '_x.ai/session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'rewind_marker', target_prompt_index: target },
+      },
+    };
+    const isSafeRegularOrMissing = (file: string): boolean => {
+      try {
+        const st = fs.lstatSync(file);
+        return st.isFile() && !st.isSymbolicLink();
+      } catch (err) {
+        return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+      }
+    };
+    if (!isSafeRegularOrMissing(updatesPath) || !isSafeRegularOrMissing(pointsPath)) {
+      throw new ProviderError('invalid_request', 'grok-adapter: refusing to mutate non-regular session file', 400);
+    }
+    fs.appendFileSync(updatesPath, JSON.stringify(marker) + '\n');
+    const kept = points.filter((point) => {
+      const index = point.prompt_index ?? point.promptIndex;
+      return typeof index === 'number' && index < target;
+    });
+    fs.writeFileSync(pointsPath, kept.map((point) => JSON.stringify(point)).join('\n') + (kept.length > 0 ? '\n' : ''));
+    if (chatEntries.length > 0 && isSafeRegularOrMissing(chatPath)) {
+      let seenUserTurns = 0;
+      let cutIdx = chatEntries.length;
+      for (let i = 0; i < chatEntries.length; i += 1) {
+        if (chatEntries[i].type === 'user' && mapHistoryEntry(chatEntries[i]) !== null) {
+          if (seenUserTurns >= target) {
+            cutIdx = i;
+            break;
+          }
+          seenUserTurns += 1;
+        }
+      }
+      const surviving = chatEntries.slice(0, cutIdx);
+      fs.writeFileSync(chatPath, surviving.map((entry) => JSON.stringify(entry)).join('\n') + (surviving.length > 0 ? '\n' : ''));
+    }
+  }
+
+  /** usage.json written by the CLI (costUsdTicks is USD * 1e10). */
+  readUsage(sessionId: string): SessionUsage | null {
+    const dir = this.findSessionDir(sessionId);
+    if (!dir) return null;
+    const raw = readJsonNoFollow(path.join(dir, 'usage.json'));
+    return raw ? usageFromFile(raw) : null;
+  }
+
+  /** goal/state.json written by the CLI's /goal tracker. */
+  readGoal(sessionId: string): Record<string, unknown> | null {
+    const dir = this.findSessionDir(sessionId);
+    if (!dir) return null;
+    const raw = readJsonNoFollow(path.join(dir, 'goal', 'state.json'));
+    return raw ? normalizeGoal(raw, sessionId) : null;
   }
 
   private findSessionDir(sessionId: string): string | null {
@@ -490,16 +786,23 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
   private readonly sessionUsage = new Map<string, SessionUsage>();
   private readonly acpTurns = new Map<string, EventStream<GatewayEvent>>();
-  /** Gateway session id → ACP session id. Grok 1.0.13 ignores session/new.sessionId. */
+  /** Gateway session id → ACP session id. Grok 1.0.77 may assign its own id. */
   private readonly acpSessionIds = new Map<string, string>();
+  /** Reverse map: ACP session id → Gateway session id. */
+  private readonly gatewaySessionIds = new Map<string, string>();
+  private readonly acpClients = new Map<boolean, GrokAcpClient>();
+  private readonly acpConnecting = new Map<boolean, Promise<GrokAcpClient | null>>();
+  private readonly sessionClient = new Map<string, GrokAcpClient>();
+  private readonly sessionGoals = new Map<string, Record<string, unknown>>();
+  private readonly skillCache = new Map<string, { ts: number; skills: SkillCommandInput[] }>();
   private defaultModel: string | undefined;
-  private acp: GrokAcpClient | null = null;
+  private static readonly SKILL_CACHE_TTL_MS = 30_000;
 
   constructor(options?: GrokAdapterOptions & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
     this.inner = new GrokAdapter(innerOptions);
     this.settings = new SettingsStore(settingsPath);
-    this.grokBin = innerOptions.grokBin ?? process.env.GROK_BIN ?? DEFAULT_GROK_BIN;
+    this.grokBin = this.inner.binPath;
     this.grokEnv = innerOptions.env ?? {};
   }
 
@@ -509,19 +812,39 @@ export class GrokProviderAdapter implements ProviderAdapter {
       thinking: true,
       tools: true,
       approvals: true,
-      questions: false,
+      questions: true,
       interrupt: true,
       history: true,
+      attachments: true,
+      compact: true,
+      fork: true,
+      rollback: true,
+      rename: true,
+      archive: true,
+      delete: true,
+      planMode: true,
+      permissionModes: ['default', 'auto', 'bypassPermissions', 'plan'],
+      manualApproval: true,
+      goals: true,
+      models: true,
+      thinkingLevels: true,
+      commands: true,
+      skills: true,
+      usage: true,
     };
   }
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
     const sessions = (await this.inner.list()).filter((session) => {
       if (query.cwd && session.cwd !== query.cwd) return false;
-      const isArchived = this.settings.getBoolean('archived', session.sessionId) === true;
+      const effectiveId = this.gatewaySessionIds.get(session.sessionId) ?? session.sessionId;
+      const isArchived = this.settings.getBoolean('archived', effectiveId) === true
+        || this.settings.getBoolean('archived', session.sessionId) === true;
       return query.archived === true ? isArchived : !isArchived;
     });
-    const start = query.cursor ? sessions.findIndex((session) => session.sessionId === query.cursor) + 1 : 0;
+    const start = query.cursor
+      ? sessions.findIndex((session) => (this.gatewaySessionIds.get(session.sessionId) ?? session.sessionId) === query.cursor || session.sessionId === query.cursor) + 1
+      : 0;
     if (query.cursor && start === 0) return { items: [] };
     const limit = query.limit ?? 50;
     const page = sessions.slice(start, start + limit);
@@ -529,7 +852,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return {
       items,
       ...(start + limit < sessions.length && page.length > 0
-        ? { next_cursor: page[page.length - 1].sessionId }
+        ? { next_cursor: items[items.length - 1]!.id }
         : {}),
     };
   }
@@ -551,7 +874,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
-    const history = await this.inner.getHistory(sessionId);
+    const storageId = this.storageSessionId(sessionId);
+    const history = await this.inner.getHistory(storageId);
     return history.map((m, index) => {
       const content: Message['content'] = m.blocks && m.blocks.length > 0
         ? m.blocks.map((b) => {
@@ -587,6 +911,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
     const sessionId = input.sessionId;
     let prompt = textOfInput(input.input);
+    const skills = await this.discoverSkills(this.getCwd(sessionId));
+    const expandable = skills.filter((skill): skill is SkillCommandInput & { path: string } => typeof skill.path === 'string');
+    const expanded = expandGrokSkill(prompt, expandable);
+    if (expanded !== null) prompt = expanded;
     const blocks: Array<Record<string, unknown>> = [];
     const notes: string[] = [];
     for (const a of input.attachments ?? []) {
@@ -603,8 +931,9 @@ export class GrokProviderAdapter implements ProviderAdapter {
       }
     }
     if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
-    const isNew = !this.inner.hasSessionFile(sessionId);
-    const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId);
+    const storageId = this.storageSessionId(sessionId);
+    const isNew = !this.inner.hasSessionFile(storageId);
+    const cwd = this.getCwd(sessionId);
     const model = this.settings.getString('model', sessionId);
     const thinking = this.settings.getString('thinking', sessionId);
     const effort = grokEffort(thinking);
@@ -799,27 +1128,61 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   private async ensureAcp(alwaysApprove: boolean): Promise<GrokAcpClient | null> {
-    if (this.acp?.ready && this.acp.alwaysApproveEnabled === alwaysApprove) return this.acp;
-    if (this.acp) {
-      await this.acp.close().catch(() => undefined);
-      this.acp = null;
-    }
-    const client = new GrokAcpClient({
-      grokBin: this.grokBin,
-      env: this.grokEnv,
-      alwaysApprove,
-      requestTimeoutMs: 6_000,
-      promptTimeoutMs: 20_000,
+    const existing = this.acpClients.get(alwaysApprove);
+    if (existing?.ready) return existing;
+    const inflight = this.acpConnecting.get(alwaysApprove);
+    if (inflight) return inflight;
+
+    const pending = (async (): Promise<GrokAcpClient | null> => {
+      if (existing) {
+        this.acpClients.delete(alwaysApprove);
+        await existing.close().catch(() => undefined);
+      }
+      const client = new GrokAcpClient({
+        grokBin: this.grokBin,
+        env: this.grokEnv,
+        alwaysApprove,
+        requestTimeoutMs: 6_000,
+        // Turns can legitimately run for minutes; the old 20s cap killed live turns.
+        promptTimeoutMs: 0,
+      });
+      try {
+        await client.connect();
+        this.acpClients.set(alwaysApprove, client);
+        client.onEvent((ev) => this.onAcpProcessEvent(client, alwaysApprove, ev));
+        return client;
+      } catch {
+        await client.close().catch(() => undefined);
+        return null;
+      }
+    })().finally(() => {
+      if (this.acpConnecting.get(alwaysApprove) === pending) {
+        this.acpConnecting.delete(alwaysApprove);
+      }
     });
-    try {
-      await client.connect();
-      this.acp = client;
-      client.onEvent((ev) => this.onAcpProcessEvent(ev));
-      return client;
-    } catch {
-      await client.close().catch(() => undefined);
-      return null;
+    this.acpConnecting.set(alwaysApprove, pending);
+    return pending;
+  }
+
+  private clientForSession(sessionId: string): GrokAcpClient | null {
+    const bound = this.sessionClient.get(sessionId);
+    if (bound?.ready) return bound;
+    for (const client of this.acpClients.values()) {
+      if (client.ready) return client;
     }
+    return null;
+  }
+
+  private matchesSessionId(evSessionId: string | undefined, gatewaySessionId: string): boolean {
+    if (!evSessionId) return false;
+    return evSessionId === gatewaySessionId || evSessionId === this.acpId(gatewaySessionId);
+  }
+
+  private storageSessionId(sessionId: string): string {
+    if (this.inner.hasSessionFile(sessionId)) return sessionId;
+    const mapped = this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId);
+    if (mapped && this.inner.hasSessionFile(mapped)) return mapped;
+    return mapped ?? sessionId;
   }
 
   private async runAcpTurn(
@@ -841,9 +1204,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
   ): Promise<void> {
     const cwd = opts.cwd ?? os.homedir();
     this.acpTurns.set(opts.sessionId, opts.stream);
+    this.sessionClient.set(opts.sessionId, acp);
     const unsub = acp.onEvent((ev) => this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev));
     try {
-      let acpSessionId = this.acpSessionIds.get(opts.sessionId) ?? opts.sessionId;
+      let acpSessionId = this.acpId(opts.sessionId);
       if (opts.isNew) {
         const created = await acp.sessionNew({
           cwd,
@@ -864,6 +1228,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
           this.rememberAcpSession(opts.sessionId, acpSessionId, cwd);
         }
       }
+      // session/new _meta hints are advisory on 1.0.77; the standard RPCs are authoritative.
+      await this.applyLiveConfig(acp, acpSessionId, {
+        model: opts.model,
+        effort: opts.effort,
+        plan: opts.plan,
+      });
       const prompt = acpPrompt(opts.prompt, opts.contentBlocks);
       const { stopReason } = await acp.sessionPrompt({ sessionId: acpSessionId, prompt });
       const cancelled = stopReason === 'cancelled' || stopReason === 'max_tokens';
@@ -885,7 +1255,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private rememberAcpSession(gatewayId: string, acpId: string, cwd: string): void {
     this.acpSessionIds.set(gatewayId, acpId);
     this.sessionCwd.set(gatewayId, cwd);
-    if (acpId !== gatewayId) this.sessionCwd.set(acpId, cwd);
+    if (acpId && acpId !== gatewayId) {
+      this.gatewaySessionIds.set(acpId, gatewayId);
+      this.sessionCwd.set(acpId, cwd);
+      this.settings.set('acpId', gatewayId, acpId);
+    }
   }
 
   private mapAcpEvent(
@@ -897,7 +1271,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const ts = Date.now();
     switch (ev.type) {
       case 'message_chunk':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'message',
           status: 'delta',
@@ -908,7 +1282,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'thought_chunk':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'thinking',
           status: 'delta',
@@ -919,7 +1293,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'tool_call':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'tool',
           status: 'started',
@@ -930,7 +1304,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'tool_call_update':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'tool',
           status: ev.status === 'failed' ? 'failed' : 'completed',
@@ -945,8 +1319,42 @@ export class GrokProviderAdapter implements ProviderAdapter {
           },
         });
         break;
+      case 'question_request':
+        if (ev.sessionId && !this.matchesSessionId(ev.sessionId, sessionId)) return;
+        stream.push({
+          kind: 'question',
+          status: 'started',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: {
+            questionId: ev.questionId,
+            prompt: ev.prompt,
+            options: ev.options,
+            isBlocking: true,
+            questions: ev.questions,
+            rawQuestions: ev.rawQuestions,
+            ...(ev.toolCallId ? { itemId: ev.toolCallId } : {}),
+          },
+        });
+        break;
+      case 'goal_update':
+        if (ev.sessionId && !this.matchesSessionId(ev.sessionId, sessionId)) return;
+        this.sessionGoals.set(sessionId, normalizeGoal(ev.goal, sessionId));
+        break;
+      case 'plan':
+        if (ev.sessionId && !this.matchesSessionId(ev.sessionId, sessionId)) return;
+        stream.push({
+          kind: 'plan',
+          status: 'updated',
+          sessionId,
+          turnId,
+          timestamp: ts,
+          payload: { raw: ev.plan },
+        });
+        break;
       case 'permission_request':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'approval',
           status: 'started',
@@ -965,7 +1373,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'usage':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         this.sessionUsage.set(sessionId, usageFromAcp(ev.usage, this.sessionUsage.get(sessionId)));
         break;
       default:
@@ -973,50 +1381,108 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
   }
 
-  private onAcpProcessEvent(ev: GrokAcpEvent): void {
+  private onAcpProcessEvent(client: GrokAcpClient, alwaysApprove: boolean, ev: GrokAcpEvent): void {
     if (ev.type === 'disconnected') {
-      this.acp = null;
+      if (this.acpClients.get(alwaysApprove) === client) {
+        this.acpClients.delete(alwaysApprove);
+      }
+      for (const [sid, bound] of this.sessionClient) {
+        if (bound === client) this.sessionClient.delete(sid);
+      }
     }
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    if (this.acp?.ready) {
-      await this.acp.sessionCancel(sessionId).catch(() => undefined);
+    const client = this.clientForSession(sessionId);
+    if (client?.ready) {
+      await client.sessionCancel(this.acpId(sessionId)).catch(() => undefined);
     }
     this.inner.interrupt(sessionId);
   }
 
   async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
-    const pending = this.acp?.getPendingPermission(approvalId);
-    if (!this.acp || !pending || pending.sessionId !== sessionId) {
-      throw new ProviderError('not_found', `grok-adapter: no pending approval ${approvalId}`, 404);
-    }
-    if (decision === 'reject') {
-      this.acp.cancelPermission(pending.id);
+    const acpId = this.acpId(sessionId);
+    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
+      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    for (const client of candidates) {
+      const pending = client.getPendingPermission(approvalId);
+      if (!pending) continue;
+      if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
+      if (decision === 'reject') {
+        client.cancelPermission(pending.id);
+        return;
+      }
+      const optionId = pickPermissionOption(pending.options, decision);
+      if (!optionId) {
+        client.cancelPermission(pending.id);
+        throw new ProviderError('invalid_request', 'grok-adapter: no matching permission option', 400);
+      }
+      client.resolvePermission(pending.id, optionId);
       return;
     }
-    const optionId = pickPermissionOption(pending.options, decision);
-    if (!optionId) {
-      this.acp.cancelPermission(pending.id);
-      throw new ProviderError('invalid_request', 'grok-adapter: no matching permission option', 400);
+    throw new ProviderError('not_found', `grok-adapter: no pending approval ${approvalId}`, 404);
+  }
+
+  async resolveQuestion(
+    sessionId: string,
+    questionId: string,
+    answer: string | Record<string, string[]>,
+  ): Promise<void> {
+    const acpId = this.acpId(sessionId);
+    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
+      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    for (const client of candidates) {
+      const pending = client.getPendingQuestion(questionId);
+      if (!pending) continue;
+      if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
+      const dismissed = isRecord(answer) && Object.keys(answer).length === 0;
+      const ok = dismissed
+        ? client.cancelQuestion(questionId)
+        : client.resolveQuestion(questionId, answer);
+      if (ok) return;
     }
-    this.acp.resolvePermission(pending.id, optionId);
+    throw new ProviderError('not_found', `grok-adapter: no pending question ${questionId}`, 404);
   }
 
-  async resolveQuestion(): Promise<void> {
-    throw new ProviderError('unsupported', 'Grok 非交互模式不支持代答提问', 400);
+  async setGoal(sessionId: string, objective: string): Promise<Record<string, unknown> | null> {
+    const trimmed = objective.trim();
+    if (!trimmed) {
+      throw new ProviderError('invalid_request', 'Goal objective cannot be empty', 400);
+    }
+    const optimistic = normalizeGoal({ objective: trimmed, status: 'active' }, sessionId);
+    this.sessionGoals.set(sessionId, optimistic);
+    const observed = await this.runGoalCommand(sessionId, `/goal ${trimmed}`);
+    const goal = observed ?? this.inner.readGoal(this.storageSessionId(sessionId)) ?? optimistic;
+    this.sessionGoals.set(sessionId, goal);
+    return goal;
   }
 
-  async setGoal(_sessionId: string, _objective: string): Promise<Record<string, unknown> | null> {
-    throw new ProviderError('unsupported', 'Grok 不支持 goal 能力', 400);
+  async getGoal(sessionId: string): Promise<Record<string, unknown> | null> {
+    const fromDisk = this.inner.readGoal(this.storageSessionId(sessionId));
+    const cached = this.sessionGoals.get(sessionId) ?? null;
+    const goal = fromDisk ? { ...cached, ...fromDisk } : cached;
+    if (!goal) return null;
+    const status = String(goal.status ?? '');
+    if (status === 'cleared' || status === 'cancelled') return null;
+    return goal;
   }
 
-  async getGoal(_sessionId: string): Promise<Record<string, unknown> | null> {
-    throw new ProviderError('unsupported', 'Grok 不支持 goal 能力', 400);
-  }
-
-  async controlGoal(_sessionId: string, _control: 'pause' | 'resume' | 'cancel'): Promise<Record<string, unknown> | null> {
-    throw new ProviderError('unsupported', 'Grok 不支持 goal 能力', 400);
+  async controlGoal(
+    sessionId: string,
+    control: 'pause' | 'resume' | 'cancel',
+  ): Promise<Record<string, unknown> | null> {
+    const subcmd = control === 'cancel' ? '/goal clear' : control === 'pause' ? '/goal pause' : '/goal resume';
+    const observed = await this.runGoalCommand(sessionId, subcmd);
+    if (control === 'cancel') {
+      const cleared = observed ?? normalizeGoal({ status: 'cleared' }, sessionId);
+      this.sessionGoals.set(sessionId, { ...cleared, status: 'cleared' });
+      return null;
+    }
+    const status = control === 'pause' ? 'paused' : 'active';
+    const base = observed ?? this.inner.readGoal(this.storageSessionId(sessionId)) ?? this.sessionGoals.get(sessionId) ?? {};
+    const goal = normalizeGoal({ ...base, status }, sessionId);
+    this.sessionGoals.set(sessionId, goal);
+    return goal;
   }
 
   async steer(_sessionId: string, _turnId: string, _text: string): Promise<void> {
@@ -1028,14 +1494,25 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async dispose(): Promise<void> {
-    await this.acp?.close().catch(() => undefined);
-    this.acp = null;
+    const clients = [...this.acpClients.values()];
+    this.acpClients.clear();
+    this.acpConnecting.clear();
+    this.sessionClient.clear();
     this.acpSessionIds.clear();
+    this.gatewaySessionIds.clear();
+    await Promise.allSettled(clients.map((client) => client.close()));
     await this.inner.close();
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
     this.settings.set('model', sessionId, model);
+    const client = this.clientForSession(sessionId);
+    const acpId = this.acpSessionIds.get(sessionId);
+    if (client?.ready && acpId) {
+      await client.sessionSetModel(acpId, model).catch(async () => {
+        await client.sessionSetConfigOption(acpId, 'model', model).catch(() => undefined);
+      });
+    }
   }
 
   getModel(sessionId: string): string | undefined {
@@ -1046,6 +1523,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
     this.settings.set('thinking', sessionId, thinking);
+    const effort = grokEffort(thinking);
+    const client = this.clientForSession(sessionId);
+    const acpId = this.acpSessionIds.get(sessionId);
+    if (effort && client?.ready && acpId) {
+      await client.sessionSetConfigOption(acpId, 'reasoning_effort', effort).catch(() => undefined);
+    }
   }
 
   getThinking(sessionId: string): string | undefined {
@@ -1063,6 +1546,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async setPlanMode(sessionId: string, on: boolean): Promise<void> {
     if (on) this.settings.set('plan', sessionId, true);
     else this.settings.delete('plan', sessionId);
+    const client = this.clientForSession(sessionId);
+    const acpId = this.acpSessionIds.get(sessionId);
+    if (client?.ready && acpId) {
+      await client.sessionSetMode(acpId, on ? 'plan' : 'default').catch(() => undefined);
+    }
   }
 
   getPlanMode(sessionId: string): boolean | undefined {
@@ -1071,43 +1559,107 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   async rename(sessionId: string, title: string): Promise<void> {
     this.renames.set(sessionId, title);
+    const client = this.clientForSession(sessionId);
+    const acpId = this.acpId(sessionId);
+    if (client?.ready) {
+      await client.sessionRename(acpId, title).catch(() => undefined);
+    }
   }
 
   async listModels(): Promise<NativeModel[]> {
-    const { defaultModel, models } = await this.inner.listModels();
-    if (defaultModel) this.defaultModel = defaultModel;
-    return models.map((model) => ({
-      provider: 'grok',
-      model,
-      display_name: model,
-      max_context_size: grokContextWindow(model),
-      capabilities: ['thinking'],
-      support_efforts: [...GROK_EFFORTS],
-      default_effort: 'high',
+    try {
+      const { defaultModel, models } = await this.inner.listModels();
+      if (defaultModel) this.defaultModel = defaultModel;
+      return models.map((model) => ({
+        provider: 'grok',
+        model,
+        display_name: model,
+        max_context_size: grokContextWindow(model),
+        capabilities: ['thinking'],
+        support_efforts: [...GROK_EFFORTS],
+        default_effort: 'high',
+      }));
+    } catch (err) {
+      for (const client of this.acpClients.values()) {
+        const state = client.modelState;
+        if (client.ready && state && state.availableModels.length > 0) {
+          if (state.currentModelId) this.defaultModel = state.currentModelId;
+          return state.availableModels.map((m) => ({
+            provider: 'grok',
+            model: m.modelId,
+            display_name: m.name ?? m.modelId,
+            ...(m.description ? { description: m.description } : {}),
+            max_context_size: m.totalContextTokens ?? grokContextWindow(m.modelId),
+            capabilities: m.supportsReasoningEffort === false ? [] : ['thinking'],
+            support_efforts: m.reasoningEfforts?.length
+              ? m.reasoningEfforts.map((e) => e.value)
+              : [...GROK_EFFORTS],
+            default_effort: m.reasoningEffort ?? 'high',
+            isDefault: state.currentModelId === m.modelId,
+            raw: m,
+          }));
+        }
+      }
+      throw err;
+    }
+  }
+
+  async listCommands(sessionId?: string): Promise<NativeCommand[]> {
+    const cwd = sessionId ? this.getCwd(sessionId) : undefined;
+    const skills = await this.discoverSkills(cwd);
+    const targetClient = sessionId ? this.clientForSession(sessionId) : this.clientForSession('');
+    let native = targetClient?.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined) ?? [];
+    if (native.length === 0) {
+      for (const client of this.acpClients.values()) {
+        native = client.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined);
+        if (native.length > 0) break;
+      }
+    }
+    return listGrokCommands(skills, native);
+  }
+
+  async listSkills(sessionId?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>> {
+    const cwd = sessionId ? this.getCwd(sessionId) : undefined;
+    return (await this.discoverSkills(cwd)).map((skill) => ({
+      name: skill.name,
+      description: skill.description,
+      ...(skill.path ? { path: skill.path } : {}),
+      ...(skill.scope ? { scope: skill.scope } : {}),
+      enabled: true,
     }));
   }
 
-  async listCommands(_sessionId?: string): Promise<NativeCommand[]> {
-    return listGrokCommands();
-  }
-
   private acpId(sessionId: string): string {
-    return this.acpSessionIds.get(sessionId) ?? sessionId;
+    return this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId) ?? sessionId;
   }
 
+  /** Compact is a native slash command on 1.0.77 — there is no compact RPC. */
   async compact(sessionId: string): Promise<void> {
-    const acp = await this.ensureAcp(false);
-    if (!acp) throw new ProviderError('unsupported', 'Grok ACP compact 不可用(CLI 未提供 grok agent stdio)', 400);
-    await acp.compact(this.acpId(sessionId));
+    await this.promptSlashCommand(sessionId, '/compact');
   }
 
   async fork(sessionId: string): Promise<Session> {
-    const acp = await this.ensureAcp(false);
-    if (!acp) throw new ProviderError('unsupported', 'Grok ACP fork 不可用(CLI 未提供 grok agent stdio)', 400);
-    const { sessionId: newId } = await acp.fork(this.acpId(sessionId));
-    const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId) ?? process.cwd();
+    const cwd = this.getCwd(sessionId) ?? process.cwd();
+    const storageId = this.storageSessionId(sessionId);
+    let newId: string | null = null;
+    const client = this.clientForSession(sessionId);
+    if (client?.ready && (this.acpSessionIds.has(sessionId) || this.inner.hasSessionFile(storageId))) {
+      const acpFork = await client
+        .sessionFork({ sourceSessionId: storageId, sourceCwd: cwd, newCwd: cwd })
+        .catch(() => null);
+      if (acpFork?.newSessionId) {
+        newId = acpFork.newSessionId;
+        this.rememberAcpSession(newId, newId, cwd);
+      }
+    }
+    if (!newId) {
+      const forked = await this.inner.forkSession(storageId, cwd);
+      newId = forked.sessionId;
+    }
     this.sessionCwd.set(newId, cwd);
     this.settings.copySession(sessionId, newId);
+    const goal = this.sessionGoals.get(sessionId);
+    if (goal) this.sessionGoals.set(newId, { ...goal, threadId: newId });
     return {
       id: newId,
       workspace_id: workspaceIdFromCwd(cwd, 'grok'),
@@ -1120,28 +1672,127 @@ export class GrokProviderAdapter implements ProviderAdapter {
     };
   }
 
+  /** Rewind via the CLI's append-only rewind_marker (no rewind RPC on 1.0.77). */
   async rollback(sessionId: string, numTurns: number): Promise<void> {
-    const acp = await this.ensureAcp(false);
-    if (!acp) throw new ProviderError('unsupported', 'Grok ACP rewind 不可用(CLI 未提供 grok agent stdio)', 400);
-    await acp.rewind(this.acpId(sessionId), numTurns);
+    this.inner.rollbackSession(this.storageSessionId(sessionId), numTurns);
   }
 
   async delete(sessionId: string): Promise<void> {
+    const acpId = this.acpId(sessionId);
+    const client = this.clientForSession(sessionId);
+    if (client?.ready) {
+      await client.sessionDelete(acpId).catch(() => undefined);
+    }
     this.inner.interrupt(sessionId);
     this.renames.delete(sessionId);
     this.sessionCwd.delete(sessionId);
+    this.sessionCwd.delete(acpId);
+    this.sessionClient.delete(sessionId);
     this.acpSessionIds.delete(sessionId);
+    this.gatewaySessionIds.delete(acpId);
     this.sessionUsage.delete(sessionId);
+    this.sessionGoals.delete(sessionId);
+    this.settings.delete('acpId', sessionId);
     this.settings.delete('model', sessionId);
     this.settings.delete('thinking', sessionId);
     this.settings.delete('permission', sessionId);
     this.settings.delete('plan', sessionId);
     this.settings.delete('archived', sessionId);
     this.inner.deleteSession(sessionId);
+    if (acpId !== sessionId) this.inner.deleteSession(acpId);
   }
 
   getUsage(sessionId: string): SessionUsage | undefined {
-    return this.sessionUsage.get(sessionId);
+    const fromDisk = this.inner.readUsage(this.storageSessionId(sessionId));
+    const cached = this.sessionUsage.get(sessionId);
+    if (!fromDisk) return cached;
+    if (!cached) return fromDisk;
+    return {
+      ...cached,
+      ...fromDisk,
+      input_tokens: Math.max(fromDisk.input_tokens, cached.input_tokens),
+      output_tokens: Math.max(fromDisk.output_tokens, cached.output_tokens),
+      cache_read_tokens: Math.max(fromDisk.cache_read_tokens, cached.cache_read_tokens),
+      cache_creation_tokens: Math.max(fromDisk.cache_creation_tokens, cached.cache_creation_tokens),
+      turn_count: Math.max(fromDisk.turn_count, cached.turn_count),
+      reasoning_output_tokens: Math.max(
+        fromDisk.reasoning_output_tokens ?? 0,
+        cached.reasoning_output_tokens ?? 0,
+      ) || undefined,
+    };
+  }
+
+  private async discoverSkills(cwd?: string): Promise<SkillCommandInput[]> {
+    const key = cwd ?? '';
+    const cached = this.skillCache.get(key);
+    if (cached && Date.now() - cached.ts < GrokProviderAdapter.SKILL_CACHE_TTL_MS) return cached.skills;
+    const skills = await discoverGrokDiskSkills(cwd);
+    this.skillCache.set(key, { ts: Date.now(), skills });
+    return skills;
+  }
+
+  /** Best-effort live sync; a missing RPC must not fail the turn. */
+  private async applyLiveConfig(
+    acp: GrokAcpClient,
+    acpSessionId: string,
+    opts: { model?: string; effort?: string; plan: boolean },
+  ): Promise<void> {
+    if (opts.plan) await acp.sessionSetMode(acpSessionId, 'plan').catch(() => undefined);
+    if (opts.model) {
+      await acp.sessionSetModel(acpSessionId, opts.model).catch(async () => {
+        await acp.sessionSetConfigOption(acpSessionId, 'model', opts.model as string).catch(() => undefined);
+      });
+    }
+    if (opts.effort) {
+      await acp.sessionSetConfigOption(acpSessionId, 'reasoning_effort', opts.effort).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Run a native slash command through ACP when the CLI speaks it, otherwise
+   * through the headless fallback. Returns goal snapshots observed on the way.
+   */
+  private async promptSlashCommand(sessionId: string, command: string): Promise<Record<string, unknown> | null> {
+    const cwd = this.getCwd(sessionId) ?? process.cwd();
+    const acp = await this.ensureAcp(false);
+    const storageId = this.storageSessionId(sessionId);
+    if (!acp) {
+      await this.inner.startTurn({ sessionId: storageId, prompt: command, cwd, isNew: !this.inner.hasSessionFile(storageId), onEvent: () => undefined });
+      return this.inner.readGoal(storageId);
+    }
+    this.sessionClient.set(sessionId, acp);
+    let acpSessionId = this.acpId(sessionId);
+    if (!this.inner.hasSessionFile(storageId) && !this.acpSessionIds.has(sessionId)) {
+      const created = await acp.sessionNew({ cwd, sessionId });
+      acpSessionId = created.sessionId || sessionId;
+      this.rememberAcpSession(sessionId, acpSessionId, cwd);
+    } else {
+      await acp.sessionLoad({ sessionId: acpSessionId, cwd }).catch(async () => {
+        const created = await acp.sessionNew({ cwd, sessionId });
+        acpSessionId = created.sessionId || sessionId;
+        this.rememberAcpSession(sessionId, acpSessionId, cwd);
+      });
+    }
+    let observed: Record<string, unknown> | null = null;
+    const unsub = acp.onEvent((ev) => {
+      if (ev.type === 'goal_update' && (!ev.sessionId || this.matchesSessionId(ev.sessionId, sessionId))) {
+        observed = normalizeGoal(ev.goal, sessionId);
+      }
+    });
+    try {
+      await acp.sessionPrompt({ sessionId: acpSessionId, prompt: [{ type: 'text', text: command }] });
+    } finally {
+      unsub();
+    }
+    return observed;
+  }
+
+  private async runGoalCommand(sessionId: string, command: string): Promise<Record<string, unknown> | null> {
+    try {
+      return await this.promptSlashCommand(sessionId, command);
+    } catch {
+      return this.inner.readGoal(this.storageSessionId(sessionId));
+    }
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
@@ -1150,15 +1801,24 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   getCwd(sessionId: string): string | undefined {
-    return this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId);
+    const acpId = this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId);
+    return this.sessionCwd.get(sessionId)
+      ?? (acpId ? this.sessionCwd.get(acpId) : undefined)
+      ?? this.inner.getCwd(sessionId)
+      ?? (acpId ? this.inner.getCwd(acpId) : undefined);
   }
 
   private toSession(s: GrokSessionSummary): Session {
-    if (s.cwd) this.sessionCwd.set(s.sessionId, s.cwd);
-    const title = this.renames.get(s.sessionId) ?? (s.title || `Grok ${s.sessionId.slice(0, 8)}`);
-    const archived = this.settings.getBoolean('archived', s.sessionId) === true;
+    const id = this.gatewaySessionIds.get(s.sessionId) ?? s.sessionId;
+    if (s.cwd) {
+      this.sessionCwd.set(s.sessionId, s.cwd);
+      this.sessionCwd.set(id, s.cwd);
+    }
+    const title = this.renames.get(id) ?? this.renames.get(s.sessionId) ?? (s.title || `Grok ${id.slice(0, 8)}`);
+    const archived = this.settings.getBoolean('archived', id) === true
+      || this.settings.getBoolean('archived', s.sessionId) === true;
     return {
-      id: s.sessionId,
+      id,
       workspace_id: workspaceIdFromCwd(s.cwd, 'grok'),
       title,
       created_at: s.createdAt,
@@ -1214,20 +1874,310 @@ function acpPrompt(prompt: string, contentBlocks?: Array<Record<string, unknown>
 }
 
 function usageFromAcp(raw: Record<string, unknown>, prev?: SessionUsage): SessionUsage {
-  const used = isRecord(raw.used) ? raw.used : raw;
+  const used = isRecord(raw.used) ? raw.used : isRecord(raw.session) ? raw.session : raw;
   const input = num(used.input_tokens ?? used.inputTokens ?? used.input);
   const output = num(used.output_tokens ?? used.outputTokens ?? used.output);
+  const cacheRead = num(used.cachedReadTokens ?? used.cache_read_tokens ?? used.cached_read_tokens);
+  const cacheCreate = num(used.cacheCreationTokens ?? used.cache_creation_tokens ?? used.cache_creation_input_tokens);
+  const reasoning = num(used.reasoningTokens ?? used.reasoning_output_tokens ?? used.reasoning_tokens);
+  const turnCount = num(used.turnCount ?? used.turn_count);
+  const cost = num(used.total_cost_usd ?? used.costUsd ?? used.cost_usd)
+    || num(used.costUsdTicks) / 1e10;
   return {
     input_tokens: (prev?.input_tokens ?? 0) + input,
     output_tokens: (prev?.output_tokens ?? 0) + output,
-    cache_read_tokens: prev?.cache_read_tokens ?? 0,
-    cache_creation_tokens: prev?.cache_creation_tokens ?? 0,
-    total_cost_usd: prev?.total_cost_usd ?? 0,
+    cache_read_tokens: (prev?.cache_read_tokens ?? 0) + cacheRead,
+    cache_creation_tokens: (prev?.cache_creation_tokens ?? 0) + cacheCreate,
+    total_cost_usd: (prev?.total_cost_usd ?? 0) + cost,
     context_tokens: input + output,
     context_limit: grokContextWindow(),
-    turn_count: (prev?.turn_count ?? 0) + 1,
+    turn_count: turnCount > 0 ? turnCount : (prev?.turn_count ?? 0) + 1,
+    ...(reasoning > 0 || prev?.reasoning_output_tokens
+      ? { reasoning_output_tokens: (prev?.reasoning_output_tokens ?? 0) + reasoning }
+      : {}),
   };
 }
+
+/** usage.json is cumulative, so its numbers replace (not add to) the cache. */
+function usageFromFile(raw: Record<string, unknown>): SessionUsage | null {
+  const session = isRecord(raw.session) ? raw.session : raw;
+  if (!('inputTokens' in session) && !('input_tokens' in session) && !('totalTokens' in session)) return null;
+  const input = num(session.inputTokens ?? session.input_tokens);
+  const output = num(session.outputTokens ?? session.output_tokens);
+  const reasoning = num(session.reasoningTokens ?? session.reasoning_output_tokens);
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_tokens: num(session.cachedReadTokens ?? session.cache_read_tokens),
+    cache_creation_tokens: num(session.cacheCreationTokens ?? session.cache_creation_tokens),
+    total_cost_usd: num(session.costUsd ?? session.total_cost_usd) || num(session.costUsdTicks) / 1e10,
+    context_tokens: input + output,
+    context_limit: grokContextWindow(),
+    turn_count: num(session.turnCount ?? session.turn_count),
+    ...(reasoning > 0 ? { reasoning_output_tokens: reasoning } : {}),
+    authoritative: true,
+  };
+}
+
+/**
+ * Goal snapshot that satisfies both direct callers and gateway.ts
+ * `codexGoalToWire` (which reads threadId / tokensUsed / timeUsedSeconds / tokenBudget).
+ */
+function normalizeGoal(raw: Record<string, unknown>, sessionId: string): Record<string, unknown> {
+  const nested = isRecord(raw.goal) ? raw.goal : isRecord(raw.state) ? raw.state : raw;
+  const goalId = pickString(nested.goal_id, nested.goalId, nested.id) || sessionId;
+  const objective = pickString(nested.objective, nested.goal, nested.text);
+  const status = pickString(nested.status) || 'active';
+  const tokensUsed = num(nested.tokens_used ?? nested.tokensUsed);
+  const tokenBudget = num(nested.token_budget ?? nested.tokenBudget);
+  const elapsedMs = num(nested.elapsed_ms ?? nested.elapsedMs ?? nested.wall_clock_ms);
+  return {
+    ...nested,
+    goal_id: goalId,
+    goalId,
+    threadId: goalId,
+    objective,
+    status,
+    tokens_used: tokensUsed,
+    tokensUsed,
+    token_budget: tokenBudget || undefined,
+    tokenBudget: tokenBudget || undefined,
+    elapsed_ms: elapsedMs,
+    timeUsedSeconds: elapsedMs / 1000,
+    ...(typeof nested.phase === 'string' ? { phase: nested.phase } : {}),
+  };
+}
+
+function updateOf(entry: Record<string, unknown>): Record<string, unknown> {
+  const params = isRecord(entry.params) ? entry.params : entry;
+  return isRecord(params.update) ? params.update : params;
+}
+
+function promptIndexOf(update: Record<string, unknown>): number | undefined {
+  const meta = isRecord(update._meta) ? update._meta : {};
+  const value = update.promptIndex ?? update.prompt_index ?? meta.promptIndex ?? meta.prompt_index;
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Latest un-superseded rewind_marker wins; rewind_points.jsonl alone never truncates un-rewound history. */
+function effectiveRewind(
+  updates: Array<Record<string, unknown>>,
+  _points: Array<Record<string, unknown>>,
+): number | undefined {
+  let target: number | undefined;
+  for (const entry of updates) {
+    const update = updateOf(entry);
+    const kind = String(update.sessionUpdate ?? update.type ?? '');
+    if (kind === 'rewind_marker' || kind === 'rewind') {
+      const value = update.target_prompt_index ?? update.targetPromptIndex ?? update.prompt_index;
+      if (typeof value === 'number' && Number.isFinite(value)) target = value;
+      continue;
+    }
+    if (kind === 'user_message_chunk' && target !== undefined) {
+      target = undefined;
+    }
+  }
+  return target;
+}
+
+/**
+ * Drop the rewound user turns and everything that belongs to them. User turns
+ * are counted in file order (banner-only synthetic entries are not turns).
+ */
+function applyRewind(messages: GrokHistoryMessage[], target: number | undefined): void {
+  if (target === undefined) return;
+  let userTurns = 0;
+  let cutAt = messages.length;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role !== 'user') continue;
+    if (userTurns >= target) {
+      cutAt = i;
+      break;
+    }
+    userTurns += 1;
+  }
+  messages.splice(cutAt);
+}
+
+/** Reconstruct a transcript from ACP updates when chat_history.jsonl is absent. */
+function historyFromUpdates(
+  updates: Array<Record<string, unknown>>,
+  _rewindTarget: number | undefined,
+): GrokHistoryMessage[] {
+  const messages: GrokHistoryMessage[] = [];
+  let userTurns = 0;
+  const flush = (role: GrokHistoryMessage['role'], text: string): void => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const last = messages[messages.length - 1];
+    if (role === 'assistant' && last && last.role === 'assistant') {
+      last.text += trimmed;
+      last.blocks = [...(last.blocks ?? []), { type: 'text', text: trimmed }];
+      return;
+    }
+    messages.push({ role, text: trimmed, blocks: [{ type: 'text', text: trimmed }] });
+  };
+  let pending = '';
+  let pendingRole: 'user' | 'assistant' | null = null;
+  let pendingPromptIndex: number | undefined;
+  const commit = (): void => {
+    if (pendingRole) flush(pendingRole, pending);
+    pending = '';
+    pendingRole = null;
+    pendingPromptIndex = undefined;
+  };
+  for (const entry of updates) {
+    const update = updateOf(entry);
+    const kind = String(update.sessionUpdate ?? update.type ?? '');
+    if (kind === 'rewind_marker' || kind === 'rewind') {
+      commit();
+      const value = update.target_prompt_index ?? update.targetPromptIndex ?? update.prompt_index;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const target = Math.max(0, Math.trunc(value));
+        applyRewind(messages, target);
+        userTurns = target;
+      }
+      continue;
+    }
+    if (kind === 'user_message_chunk') {
+      const index = promptIndexOf(update);
+      if (pendingRole && (pendingRole !== 'user' || index === undefined || index !== pendingPromptIndex)) {
+        commit();
+      }
+      if (index === undefined) userTurns += 1;
+      else if (index >= userTurns) userTurns = index + 1;
+      pendingRole = 'user';
+      pendingPromptIndex = index;
+      pending += textOfContent(update.content);
+      continue;
+    }
+    if (kind === 'agent_message_chunk') {
+      if (pendingRole && pendingRole !== 'assistant') commit();
+      pendingRole = 'assistant';
+      pending += textOfContent(update.content);
+      continue;
+    }
+    if (kind === 'agent_thought_chunk') {
+      commit();
+      const text = textOfContent(update.content).trim();
+      if (text) messages.push({ role: 'assistant', text: '', blocks: [{ type: 'thinking', text }] });
+      continue;
+    }
+    if (kind === 'tool_call') {
+      commit();
+      const id = String(update.toolCallId ?? update.id ?? '');
+      const name = String(update.title ?? update.toolName ?? 'tool');
+      messages.push({
+        role: 'assistant',
+        text: '',
+        blocks: [{ type: 'tool_use', id, name, input: update.rawInput ?? update.input ?? {} }],
+      });
+    }
+  }
+  commit();
+  return messages;
+}
+
+function textOfContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (isRecord(content) && typeof content.text === 'string') return content.text;
+  if (Array.isArray(content)) return content.map((part) => textOfContent(part)).join('');
+  return '';
+}
+
+interface PromptFile {
+  path: string;
+  cleanup: () => void;
+}
+
+/**
+ * Payloads that would blow the argv limit (large text or base64 images) are
+ * handed to the CLI as a 0600 temp file via --prompt-file.
+ */
+function materializePromptFile(
+  prompt: string,
+  contentBlocks?: Array<Record<string, unknown>>,
+): PromptFile | null {
+  const json = contentBlocks && contentBlocks.length > 0 ? JSON.stringify(contentBlocks) : '';
+  const oversized = Buffer.byteLength(json || prompt, 'utf8') > MAX_INLINE_PROMPT_BYTES;
+  if (!oversized) return null;
+  const ext = json ? '.json' : '.txt';
+  const filePath = path.join(os.tmpdir(), `grok-prompt-${randomUUID()}${ext}`);
+  fs.writeFileSync(filePath, json || prompt, { mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // mode on writeFile is enough on POSIX
+  }
+  let cleaned = false;
+  return {
+    path: filePath,
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        fs.rmSync(filePath, { force: true });
+      } catch {
+        // already gone
+      }
+    },
+  };
+}
+
+/** Disk skills: Grok's own dirs plus the Claude/agents dirs it also loads. */
+async function discoverGrokDiskSkills(cwd?: string): Promise<SkillCommandInput[]> {
+  const home = os.homedir();
+  const claude = await discoverClaudeDiskCommands(cwd, path.join(home, '.claude')).catch(
+    () => [] as ClaudeCatalogCommand[],
+  );
+  const grokDirs: Array<{ dir: string; scope: string }> = [
+    ...(cwd ? [{ dir: path.join(cwd, '.grok', 'skills'), scope: 'project' }] : []),
+    ...(cwd ? [{ dir: path.join(cwd, '.grok', 'commands'), scope: 'project' }] : []),
+    { dir: path.join(home, '.grok', 'skills'), scope: 'user' },
+    { dir: path.join(home, '.grok', 'commands'), scope: 'user' },
+  ];
+  const out: SkillCommandInput[] = claude
+    .filter((entry) => entry.source === 'skill' || entry.source === 'command')
+    .map((entry) => ({
+      name: entry.name,
+      description: entry.description,
+      ...(entry.argumentHint ? { argumentHint: entry.argumentHint } : {}),
+      ...(entry.aliases ? { aliases: entry.aliases } : {}),
+      ...(entry.path ? { path: entry.path } : {}),
+      ...(entry.scope ? { scope: entry.scope } : {}),
+    }));
+  const seen = new Set(out.map((skill) => skill.name));
+  for (const { dir, scope } of grokDirs) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() || seen.size >= 500) continue;
+      const full = path.join(dir, entry.name);
+      let file = '';
+      if (entry.isDirectory()) {
+        const skillMd = path.join(full, 'SKILL.md');
+        if (fs.existsSync(skillMd)) file = skillMd;
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+        file = full;
+      }
+      if (!file) continue;
+      const text = readTailNoFollow(file, 64 * 1024);
+      if (text === null) continue;
+      const name = entry.isDirectory() ? entry.name : entry.name.replace(/\.md$/i, '');
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      const description = text.split('\n').map((line) => line.trim()).find((line) => line && !line.startsWith('---')) ?? name;
+      out.push({ name, description: description.replace(/^#+\s*/, '').slice(0, 200), path: file, scope });
+    }
+  }
+  return out;
+}
+
+
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -1523,14 +2473,11 @@ function unwrapUserQuery(text: string): string | null {
 }
 
 function readSessionTimes(dir: string): { createdAt: string; updatedAt: string } {
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'summary.json'), 'utf8')) as Record<string, unknown>;
-    const updatedAt = pickString(raw.updated_at, raw.last_active_at);
-    const createdAt = pickString(raw.created_at) || updatedAt;
-    return { createdAt, updatedAt };
-  } catch {
-    return { createdAt: '', updatedAt: '' };
-  }
+  const raw = readJsonNoFollow(path.join(dir, 'summary.json'));
+  if (!raw) return { createdAt: '', updatedAt: '' };
+  const updatedAt = pickString(raw.updated_at, raw.last_active_at);
+  const createdAt = pickString(raw.created_at) || updatedAt;
+  return { createdAt, updatedAt };
 }
 
 function interpolateIso(createdAt: string, updatedAt: string, index: number, count: number): string {
@@ -1558,8 +2505,12 @@ function decodeUriComponentSafe(value: string): string {
 }
 
 function workspaceIdFromCwd(cwd: string, provider: string): string {
-  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
-  return `wd_${provider}_${slug}`.slice(0, 60);
+  const normalized = path.resolve(cwd).replace(/[\\/]+$/, '') || '/';
+  const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
+  const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  const prefix = `wd_${provider}_`;
+  const maxSlug = Math.max(1, 60 - prefix.length - 1 - hash.length);
+  return `${prefix}${slug.slice(0, maxSlug)}_${hash}`;
 }
 
 function nowIso(): string {

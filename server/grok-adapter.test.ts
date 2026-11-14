@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { GrokAdapter, GrokProviderAdapter, grokContextWindow, grokEffort } from './grok-adapter.js';
+import { GrokAdapter, GrokProviderAdapter, grokContextWindow, grokEffort, resolveGrokBin } from './grok-adapter.js';
 import { ProviderError } from './types.js';
 
 async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: string; stdinLog: string }> {
@@ -14,9 +16,15 @@ async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: strin
 import json, os, select, sys
 
 args = sys.argv[1:]
+if args[:1] == ["--resume"] and "--fork-session" in args:
+    new_id = args[args.index("--session-id") + 1] if "--session-id" in args else ""
+    sys.stdout.write('{"type":"system","subtype":"init","session_id":"%s"}\\n' % new_id)
+    sys.stdout.write('{"type":"result","subtype":"success","result":"forked","is_error":false,"session_id":"%s"}\\n' % new_id)
+    sys.exit(0)
 argv_log = os.environ.get("GROK_ARGV_LOG")
 stdin_log = os.environ.get("GROK_STDIN_LOG")
 spawn_log = os.environ.get("GROK_SPAWN_LOG")
+rpc_log = os.environ.get("GROK_RPC_LOG")
 if spawn_log:
     with open(spawn_log, "a", encoding="utf-8") as f:
         f.write("x")
@@ -25,13 +33,72 @@ if argv_log:
         json.dump(args, f)
 
 stdin = ""
-if not sys.stdin.isatty():
+if args[:2] == ["agent", "stdio"]:
+    pass
+elif not sys.stdin.isatty():
     ready, _, _ = select.select([sys.stdin], [], [], 0.15)
     if ready:
         stdin = sys.stdin.read()
 if stdin_log:
     with open(stdin_log, "w", encoding="utf-8") as f:
         f.write(stdin)
+
+# ACP is opt-in and answered inline so headless -p tests exit immediately.
+if args[:2] == ["agent", "stdio"]:
+    if os.environ.get("GROK_FAKE_ACP") != "1":
+        sys.exit(1)
+    sys.stdout.reconfigure(line_buffering=True)
+    pending_prompt = None
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        msg = json.loads(line)
+        method, mid = msg.get("method"), msg.get("id")
+        params = msg.get("params") or {}
+        if method is None and mid is not None:
+            if rpc_log:
+                with open(rpc_log, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"id": mid, "result": msg.get("result"), "error": msg.get("error")}) + "\\n")
+            if pending_prompt is not None and str(mid) == "ask-req-1":
+                print(json.dumps({"jsonrpc": "2.0", "id": pending_prompt, "result": {"stopReason": "end_turn"}}), flush=True)
+                pending_prompt = None
+            continue
+        if rpc_log and method:
+            with open(rpc_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"method": method, "params": params}) + "\\n")
+        if method == "initialize":
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "_meta": {
+                "modelState": {"currentModelId": "grok-4.6", "availableModels": [{"modelId": "grok-4.6"}]},
+                "availableCommands": [{"name": n} for n in ["compact", "always-approve", "context", "session-info", "feedback", "deep-research", "workflow", "goal", "loop"]],
+            }}}), flush=True)
+        elif method == "session/new":
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": params.get("sessionId") or "acp-assigned"}}), flush=True)
+        elif method == "session/prompt":
+            sid = params.get("sessionId") or ""
+            blocks = params.get("prompt")
+            text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict)) if isinstance(blocks, list) else ""
+            if text.startswith("/goal "):
+                print(json.dumps({"jsonrpc": "2.0", "method": "_x.ai/session_notification", "params": {"sessionId": sid, "update": {
+                    "sessionUpdate": "goal_updated", "goal_id": "g1", "objective": text[6:].strip(),
+                    "status": "active", "tokens_used": 7, "elapsed_ms": 2000, "token_budget": 500,
+                }}}), flush=True)
+            if os.environ.get("GROK_FAKE_QUESTION") == "1":
+                pending_prompt = mid
+                print(json.dumps({"jsonrpc": "2.0", "id": "ask-req-1", "method": "_x.ai/ask_user_question", "params": {
+                    "sessionId": sid, "toolCallId": "ask-1",
+                    "questions": [{"id": "q_0", "question": "Pick one", "options": [{"id": "a", "label": "Alpha"}]}],
+                }}), flush=True)
+            else:
+                print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "acp-ok"}}}}), flush=True)
+                print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}), flush=True)
+        elif method == "session/cancel":
+            pass
+        elif mid is not None:
+            print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": [
+                {"id": params.get("configId") or "mode", "currentValue": params.get("value") or params.get("modeId") or params.get("modelId")},
+            ]}}), flush=True)
+    sys.exit(0)
 
 if args[:1] == ["models"]:
     sys.stdout.write(
@@ -430,14 +497,6 @@ test('steer rejects because grok has no stdin channel', async () => {
       return true;
     },
   );
-  await assert.rejects(
-    adapter.setGoal('session-1', 'do the thing'),
-    (err: unknown) => err instanceof ProviderError && err.code === 'unsupported' && err.httpStatus === 400,
-  );
-  await assert.rejects(
-    adapter.controlGoal('session-1', 'pause'),
-    (err: unknown) => err instanceof ProviderError && err.code === 'unsupported' && err.httpStatus === 400,
-  );
 });
 
 test('provider startTurn forwards image attachments as --prompt-json', async () => {
@@ -554,3 +613,597 @@ sys.exit(0)
     await rm(base, { recursive: true, force: true });
   }
 });
+
+const SID = '33333333-3333-4333-8333-333333333333';
+
+async function seedSession(sessionsDir: string, sessionId: string, files: Record<string, string>): Promise<string> {
+  const dir = join(sessionsDir, encodeURIComponent('/tmp/work'), sessionId);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, 'summary.json'), JSON.stringify({
+    info: { id: sessionId, cwd: '/tmp/work' },
+    created_at: '2026-08-16T06:20:33Z',
+    updated_at: '2026-08-16T16:32:39Z',
+  }));
+  for (const [name, content] of Object.entries(files)) {
+    await mkdir(join(dir, ...name.split('/').slice(0, -1)), { recursive: true });
+    await writeFile(join(dir, name), content);
+  }
+  return dir;
+}
+
+test('capabilities advertise the 1.0.77 surface', () => {
+  const caps = new GrokProviderAdapter().capabilities();
+  assert.equal(caps.questions, true);
+  assert.equal(caps.goals, true);
+  assert.equal(caps.fork, true);
+  assert.equal(caps.rollback, true);
+  assert.equal(caps.compact, true);
+  assert.equal(caps.skills, true);
+  assert.equal(caps.usage, true);
+  assert.equal(caps.manualApproval, true);
+  assert.deepEqual(caps.permissionModes, ['default', 'auto', 'bypassPermissions', 'plan']);
+  assert.equal(new GrokAdapter().capabilities.questions, true);
+  assert.equal(new GrokAdapter().capabilities.fork, true);
+});
+
+test('binary resolution prefers GROK_BIN over ~/.local/bin/grok and PATH', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-bin-'));
+  const savedBin = process.env.GROK_BIN;
+  const savedPath = process.env.PATH;
+  try {
+    const explicit = join(base, 'explicit');
+    const fromEnv = join(base, 'from-env');
+    const onPath = join(base, 'pathbin', 'grok');
+    await writeFile(explicit, '#!/bin/sh\n');
+    await writeFile(fromEnv, '#!/bin/sh\n');
+    await mkdir(join(base, 'pathbin'), { recursive: true });
+    await writeFile(onPath, '#!/bin/sh\n');
+    await chmod(onPath, 0o755);
+    assert.equal(resolveGrokBin(explicit), explicit);
+    process.env.GROK_BIN = fromEnv;
+    assert.equal(resolveGrokBin(), fromEnv);
+    delete process.env.GROK_BIN;
+    process.env.PATH = `${join(base, 'pathbin')}${savedPath ? `:${savedPath}` : ''}`;
+    const resolved = resolveGrokBin();
+    assert.ok(resolved === onPath || resolved.endsWith(`${join('.local', 'bin', 'grok')}`), resolved);
+  } finally {
+    if (savedBin === undefined) delete process.env.GROK_BIN;
+    else process.env.GROK_BIN = savedBin;
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('child env strips GATEWAY_* and keeps loopback out of the proxy', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-env-'));
+  const saved = process.env.GATEWAY_TOKEN;
+  try {
+    process.env.GATEWAY_TOKEN = 'super-secret';
+    const { bin, argvLog } = await writeFakeGrok(base);
+    const envDump = join(base, 'env.json');
+    const script = await readFile(bin, 'utf8');
+    await writeFile(bin, script.replace(
+      'args = sys.argv[1:]',
+      `args = sys.argv[1:]\nif os.environ.get("GROK_ENV_DUMP"):\n    open(os.environ["GROK_ENV_DUMP"], "w").write(json.dumps({k: os.environ.get(k) for k in ("GATEWAY_TOKEN", "NO_PROXY")}))`,
+    ));
+    const adapter = new GrokAdapter({ grokBin: bin, env: { GROK_ARGV_LOG: argvLog, GROK_ENV_DUMP: envDump, NO_PROXY: 'example.com' } });
+    const { sessionId } = await adapter.create(base);
+    await adapter.startTurn({ sessionId, prompt: 'env-check', cwd: base, isNew: true, onEvent: () => undefined });
+    const dumped = JSON.parse(await readFile(envDump, 'utf8')) as { GATEWAY_TOKEN?: string; NO_PROXY?: string };
+    assert.ok(dumped.GATEWAY_TOKEN == null, `GATEWAY_TOKEN leaked: ${dumped.GATEWAY_TOKEN}`);
+    assert.ok(String(dumped.NO_PROXY).split(',').includes('127.0.0.1'), dumped.NO_PROXY);
+    assert.ok(String(dumped.NO_PROXY).includes('example.com'), dumped.NO_PROXY);
+  } finally {
+    if (saved === undefined) delete process.env.GATEWAY_TOKEN;
+    else process.env.GATEWAY_TOKEN = saved;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('large prompts go through --prompt-file and the temp file is removed', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-e2big-'));
+  try {
+    const { bin, argvLog } = await writeFakeGrok(base);
+    const adapter = new GrokAdapter({ grokBin: bin, env: { GROK_ARGV_LOG: argvLog } });
+    const { sessionId } = await adapter.create(base);
+    const big = 'x'.repeat(40 * 1024);
+    await adapter.startTurn({ sessionId, prompt: big, cwd: base, isNew: true, onEvent: () => undefined });
+    const argv = JSON.parse(await readFile(argvLog, 'utf8')) as string[];
+    const fileIdx = argv.indexOf('--prompt-file');
+    assert.ok(fileIdx >= 0, JSON.stringify(argv.slice(0, 4)));
+    assert.equal(argv.includes('-p'), false);
+    const promptFile = argv[fileIdx + 1];
+    assert.equal(await readFile(promptFile, 'utf8').catch(() => 'gone'), 'gone');
+
+    const bigBlocks = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'a'.repeat(40 * 1024) } }];
+    await adapter.startTurn({ sessionId, prompt: 'img', cwd: base, isNew: false, contentBlocks: bigBlocks, onEvent: () => undefined });
+    const argv2 = JSON.parse(await readFile(argvLog, 'utf8')) as string[];
+    assert.ok(argv2.includes('--prompt-file'), JSON.stringify(argv2.slice(0, 4)));
+    assert.equal(argv2.includes('--prompt-json'), false);
+    assert.equal(await readFile(argv2[argv2.indexOf('--prompt-file') + 1], 'utf8').catch(() => 'gone'), 'gone');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('getHistory honors rewind_marker and rewind_points within a 16MiB tail window', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-rewind-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    const updates = [
+      JSON.stringify({ method: '_x.ai/session/update', params: { sessionId: SID, update: { sessionUpdate: 'user_message_chunk', _meta: { promptIndex: 0 } } } }),
+      JSON.stringify({ method: '_x.ai/session/update', params: { sessionId: SID, update: { sessionUpdate: 'rewind_marker', target_prompt_index: 1 } } }),
+    ].join('\n') + '\n';
+    await seedSession(sessionsDir, SID, {
+      'chat_history.jsonl': [
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'keep me' }] }),
+        JSON.stringify({ type: 'assistant', content: 'kept reply' }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'drop me' }] }),
+        JSON.stringify({ type: 'assistant', content: 'dropped reply' }),
+      ].join('\n') + '\n',
+      'updates.jsonl': updates,
+      'rewind_points.jsonl': JSON.stringify({ prompt_index: 0 }) + '\n' + JSON.stringify({ prompt_index: 1 }) + '\n',
+    });
+    const history = await new GrokProviderAdapter({ sessionsDir }).getHistory(SID);
+    const texts = history.flatMap((m) => m.content).map((p) => 'text' in p ? p.text : '').filter(Boolean);
+    assert.deepEqual(texts, ['keep me', 'kept reply']);
+
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    await adapter.rollback(SID, 1);
+    const after = await adapter.getHistory(SID);
+    assert.equal(after.length, 0);
+    const marker = (await readFile(join(sessionsDir, encodeURIComponent('/tmp/work'), SID, 'updates.jsonl'), 'utf8'))
+      .trim().split('\n').pop() ?? '';
+    assert.equal(JSON.parse(marker).params.update.target_prompt_index, 0);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('getHistory refuses to follow a symlinked session file', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-nofollow-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    const outside = join(base, 'secret.jsonl');
+    await writeFile(outside, JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'leaked' }] }) + '\n');
+    const dir = await seedSession(sessionsDir, SID, {});
+    await symlink(outside, join(dir, 'chat_history.jsonl'));
+    await assert.rejects(new GrokProviderAdapter({ sessionsDir }).getHistory(SID), /not found/);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('usage.json feeds getUsage with cache, reasoning and turn counts', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-usage-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    await seedSession(sessionsDir, SID, {
+      'usage.json': JSON.stringify({
+        sessionId: SID,
+        session: {
+          inputTokens: 100, outputTokens: 40, cachedReadTokens: 25, cacheCreationTokens: 5,
+          reasoningTokens: 9, turnCount: 3, costUsdTicks: 15_000_000_000,
+        },
+      }),
+    });
+    const usage = new GrokProviderAdapter({ sessionsDir }).getUsage(SID);
+    assert.equal(usage?.input_tokens, 100);
+    assert.equal(usage?.output_tokens, 40);
+    assert.equal(usage?.cache_read_tokens, 25);
+    assert.equal(usage?.cache_creation_tokens, 5);
+    assert.equal(usage?.reasoning_output_tokens, 9);
+    assert.equal(usage?.turn_count, 3);
+    assert.equal(usage?.total_cost_usd, 1.5);
+    assert.equal(usage?.authoritative, true);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('fork clones the session directory when the CLI cannot fork', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-fork-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    await seedSession(sessionsDir, SID, {
+      'chat_history.jsonl': JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'origin' }] }) + '\n',
+    });
+    const adapter = new GrokProviderAdapter({ sessionsDir, grokBin: join(base, 'missing-grok') });
+    await adapter.list();
+    const forked = await adapter.fork(SID);
+    assert.notEqual(forked.id, SID);
+    assert.equal(forked.metadata.cwd, '/tmp/work');
+    const history = await adapter.getHistory(forked.id);
+    assert.equal(history[0]?.content[0] && 'text' in history[0].content[0] ? history[0].content[0].text : '', 'origin');
+    const summary = JSON.parse(await readFile(
+      join(sessionsDir, encodeURIComponent('/tmp/work'), forked.id, 'summary.json'), 'utf8',
+    )) as { parent_session_id?: string };
+    assert.equal(summary.parent_session_id, SID);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('goal commands report a snapshot through the ACP slash command', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-goal-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const bin = join(base, 'grok');
+    const rpcLog = join(base, 'rpc.log');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, os, sys
+sys.stdout.reconfigure(line_buffering=True)
+rpc_log = os.environ.get("GROK_RPC_LOG")
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if rpc_log and method:
+        open(rpc_log, "a").write(json.dumps({"method": method, "params": params}) + "\\n")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "acp-goal"}}), flush=True)
+    elif method == "session/load":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+    elif method == "session/prompt":
+        text = ""
+        prompt = params.get("prompt")
+        if isinstance(prompt, list):
+            text = "".join(b.get("text", "") for b in prompt if isinstance(b, dict))
+        assert isinstance(prompt, list), "prompt must be a content block array"
+        sid = params.get("sessionId") or ""
+        if text.startswith("/goal "):
+            print(json.dumps({"jsonrpc": "2.0", "method": "_x.ai/session_notification", "params": {"sessionId": sid, "update": {
+                "sessionUpdate": "goal_updated", "goal_id": "g1", "objective": text[6:].strip(),
+                "status": "active", "tokens_used": 7, "elapsed_ms": 2000, "token_budget": 500,
+            }}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}), flush=True)
+    elif mid is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+`);
+    await chmod(bin, 0o755);
+    adapter = new GrokProviderAdapter({ grokBin: bin, env: { GROK_RPC_LOG: rpcLog } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    const goal = await adapter.setGoal(session.id, 'ship the adapter');
+    assert.equal(goal?.objective, 'ship the adapter');
+    assert.equal(goal?.threadId, 'g1');
+    assert.equal(goal?.tokensUsed, 7);
+    assert.equal(goal?.timeUsedSeconds, 2);
+    assert.equal(goal?.tokenBudget, 500);
+    assert.equal((await adapter.getGoal(session.id))?.status, 'active');
+    await assert.rejects(adapter.setGoal(session.id, '   '), (err: unknown) => err instanceof ProviderError && err.httpStatus === 400);
+    const rpcs = (await readFile(rpcLog, 'utf8')).trim().split('\n').map((l) => JSON.parse(l) as { method: string; params: { prompt?: unknown } });
+    const prompt = rpcs.find((r) => r.method === 'session/prompt');
+    assert.ok(Array.isArray(prompt?.params.prompt), 'session/prompt must send a content block array');
+    assert.equal(await adapter.controlGoal(session.id, 'cancel'), null);
+    assert.equal(await adapter.getGoal(session.id), null);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('resolveQuestion answers and dismisses pending ask_user_question requests', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-question-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const rpcLog = join(base, 'rpc.log');
+    adapter = new GrokProviderAdapter({ grokBin: bin, env: { GROK_RPC_LOG: rpcLog, GROK_FAKE_ACP: '1', GROK_FAKE_QUESTION: '1' } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'ask me' });
+    const events = [];
+    for await (const event of handle.events) {
+      events.push(event);
+      if ((event as { kind?: string }).kind === 'question') break;
+    }
+    const question = events.find((e) => (e as { kind?: string }).kind === 'question') as { payload?: { questionId?: string } } | undefined;
+    assert.equal(question?.payload?.questionId, 'ask-1');
+    await adapter.resolveQuestion(session.id, 'ask-1', { q_0: ['Alpha'] });
+    const answered = (await readFile(rpcLog, 'utf8')).trim().split('\n').map((l) => JSON.parse(l) as { id?: number; result?: { outcome?: string } });
+    assert.equal(answered.at(-1)?.id, 'ask-req-1');
+    assert.equal(answered.at(-1)?.result?.outcome, 'accepted');
+
+    await assert.rejects(
+      adapter.resolveQuestion(session.id, 'missing', 'x'),
+      (err: unknown) => err instanceof ProviderError && err.code === 'not_found',
+    );
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('listCommands merges ACP native commands with disk skills', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-skills-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    await mkdir(join(base, '.grok', 'skills', 'ship-it'), { recursive: true });
+    await writeFile(join(base, '.grok', 'skills', 'ship-it', 'SKILL.md'), '---\nname: ship-it\n---\nShip $ARGUMENTS now\n');
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, env: { GROK_FAKE_ACP: '1' } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'hi' }));
+    const commands = await adapter.listCommands(session.id);
+    for (const name of ['compact', 'always-approve', 'context', 'session-info', 'feedback', 'deep-research', 'workflow', 'goal', 'loop']) {
+      assert.ok(commands.some((c) => c.name === name), `missing native command ${name}`);
+    }
+    assert.ok(commands.some((c) => c.name === 'ship-it'), 'disk skill missing');
+    const skills = await adapter.listSkills(session.id);
+    assert.ok(skills.some((s) => s.name === 'ship-it' && s.enabled === true && s.scope === 'project'));
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('live ACP sync sends set_mode, set_model and set_config_option', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-config-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const rpcLog = join(base, 'rpc.log');
+    adapter = new GrokProviderAdapter({ grokBin: bin, env: { GROK_FAKE_ACP: '1', GROK_RPC_LOG: rpcLog } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await adapter.setModel(session.id, 'grok-4.6');
+    await adapter.setThinking(session.id, 'xhigh');
+    await adapter.setPlanMode(session.id, true);
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'configure' }));
+    const methods = (await readFile(rpcLog, 'utf8')).trim().split('\n')
+      .map((l) => JSON.parse(l) as { method: string; params: Record<string, unknown> });
+    const setMode = methods.find((m) => m.method === 'session/set_mode');
+    const setModel = methods.find((m) => m.method === 'session/set_model');
+    const setConfig = methods.find((m) => m.method === 'session/set_config_option');
+    assert.equal(setMode?.params.modeId, 'plan');
+    assert.equal(setModel?.params.modelId, 'grok-4.6');
+    assert.equal(setConfig?.params.configId, 'reasoning_effort');
+    assert.equal(setConfig?.params.value, 'xhigh');
+    const prompt = methods.find((m) => m.method === 'session/prompt');
+    assert.ok(Array.isArray(prompt?.params.prompt));
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+const LIVE_GROK_BIN = process.env.GROK_LIVE_BIN ?? '/tmp/grok-survey-80NQ6R/bin-1.0.77/grok';
+
+test('live 1.0.77 binary speaks the ACP surface this adapter targets', { skip: !existsSync(LIVE_GROK_BIN) }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'multi-agent-grok-live-'));
+  const child = spawn(LIVE_GROK_BIN, ['agent', 'stdio'], {
+    cwd: home,
+    env: { ...process.env, HOME: home, GROK_HOME: join(home, '.grok'), XAI_API_KEY: 'xai-test-key' },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  const lines: string[] = [];
+  let buffer = '';
+  child.stdout?.on('data', (chunk: Buffer) => {
+    buffer += chunk.toString('utf8');
+    let nl = buffer.indexOf('\n');
+    while (nl >= 0) {
+      lines.push(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+      nl = buffer.indexOf('\n');
+    }
+  });
+  const waitFor = async (predicate: (msg: Record<string, unknown>) => boolean): Promise<Record<string, unknown>> => {
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      for (const line of lines) {
+        try {
+          const msg = JSON.parse(line) as Record<string, unknown>;
+          if (predicate(msg)) return msg;
+        } catch {
+          // partial line
+        }
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ACP response; tail=${lines.slice(-3).join(' | ')}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+  const send = (msg: Record<string, unknown>): void => {
+    child.stdin?.write(JSON.stringify(msg) + '\n');
+  };
+  try {
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1, clientInfo: { name: 'probe', version: '0' } } });
+    const init = await waitFor((msg) => msg.id === 1);
+    const result = init.result as { _meta?: { modelState?: { currentModelId?: string } } } | undefined;
+    assert.equal(typeof result?._meta?.modelState?.currentModelId, 'string');
+    send({ jsonrpc: '2.0', method: 'initialized', params: {} });
+    send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: home, mcpServers: [] } });
+    const created = await waitFor((msg) => msg.id === 2);
+    const sessionId = (created.result as { sessionId?: string } | undefined)?.sessionId;
+    assert.equal(typeof sessionId, 'string');
+    send({ jsonrpc: '2.0', id: 3, method: 'session/set_mode', params: { sessionId, modeId: 'plan' } });
+    send({ jsonrpc: '2.0', id: 4, method: 'session/set_model', params: { sessionId, modelId: 'grok-4.5' } });
+    send({ jsonrpc: '2.0', id: 5, method: 'session/set_config_option', params: { sessionId, configId: 'reasoning_effort', value: 'high' } });
+    const config = await waitFor((msg) => msg.id === 5);
+    assert.equal(config.error, undefined, JSON.stringify(config.error));
+    send({ jsonrpc: '2.0', id: 6, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: '/goal status' }] } });
+    const prompt = await waitFor((msg) => msg.id === 6);
+    assert.equal(prompt.error, undefined, JSON.stringify(prompt.error));
+  } finally {
+    child.kill('SIGKILL');
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test('maps ACP-assigned sessionId across events, approvals, history and usage', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-acpid-'));
+  const sessionsDir = join(base, 'sessions');
+  const assignedId = '01999999-9999-7999-8999-999999999999';
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const bin = join(base, 'grok');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, os, sys
+sys.stdout.reconfigure(line_buffering=True)
+sessions_dir = os.environ["TEST_SESSIONS_DIR"]
+assigned = os.environ["TEST_ASSIGNED_ID"]
+cwd = os.environ["TEST_CWD"]
+pending_prompt = None
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line: continue
+    msg = json.loads(line)
+    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if method is None and mid == "perm-1":
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": assigned, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "approved-reply"}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": pending_prompt, "result": {"stopReason": "end_turn"}}), flush=True)
+        pending_prompt = None
+        continue
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        sdir = os.path.join(sessions_dir, "%2Ftmp%2Fwork", assigned)
+        os.makedirs(sdir, exist_ok=True)
+        open(os.path.join(sdir, "summary.json"), "w").write(json.dumps({"info": {"id": assigned, "cwd": cwd}, "created_at": "2026-08-16T06:20:33Z", "updated_at": "2026-08-16T06:21:00Z"}))
+        open(os.path.join(sdir, "chat_history.jsonl"), "w").write(json.dumps({"type": "user", "content": [{"type": "text", "text": "hi"}]}) + "\\n")
+        open(os.path.join(sdir, "usage.json"), "w").write(json.dumps({"session": {"inputTokens": 12, "outputTokens": 5, "turnCount": 1}}))
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": assigned}}), flush=True)
+    elif method == "session/prompt":
+        pending_prompt = mid
+        print(json.dumps({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission", "params": {"sessionId": assigned, "toolCall": {"toolCallId": "tc-1", "title": "Bash"}, "options": [{"optionId": "allow_once", "kind": "allow_once"}]}}), flush=True)
+    elif mid is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+`);
+    await chmod(bin, 0o755);
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      sessionsDir,
+      settingsPath: join(base, 'settings.json'),
+      env: { TEST_SESSIONS_DIR: sessionsDir, TEST_ASSIGNED_ID: assignedId, TEST_CWD: base },
+    });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    assert.notEqual(session.id, assignedId);
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'hi' });
+    const seen: string[] = [];
+    for await (const ev of handle.events) {
+      seen.push(`${ev.kind}:${ev.status}`);
+      if (ev.kind === 'approval') {
+        await adapter.resolveApproval(session.id, 'perm-1', 'approve');
+      }
+      if (ev.kind === 'message') {
+        assert.equal((ev.payload as { delta?: string }).delta, 'approved-reply');
+      }
+    }
+    assert.ok(seen.includes('approval:started'), seen.join(','));
+    assert.ok(seen.includes('message:delta'), seen.join(','));
+    assert.ok(seen.includes('turn:completed'), seen.join(','));
+    const history = await adapter.getHistory(session.id);
+    assert.equal(history.length, 1);
+    assert.equal(history[0]?.session_id, session.id);
+    assert.equal(adapter.getUsage(session.id)?.input_tokens, 12);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('rewind_points without rewind_marker does not truncate history and post-rewind updates survive', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-points-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    await seedSession(sessionsDir, SID, {
+      'chat_history.jsonl': [
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'turn 0' }] }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'turn 1' }] }),
+      ].join('\n') + '\n',
+      'rewind_points.jsonl': JSON.stringify({ prompt_index: 0 }) + '\n',
+    });
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const history = await adapter.getHistory(SID);
+    const texts = history.flatMap((m) => m.content).map((p) => ('text' in p ? p.text : '')).filter(Boolean);
+    assert.deepEqual(texts, ['turn 0', 'turn 1']);
+
+    // Updates-only fallback with rewind_marker followed by a new user turn keeps the new turn.
+    const sid2 = '44444444-4444-4444-8444-444444444444';
+    await seedSession(sessionsDir, sid2, {
+      'updates.jsonl': [
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'keep' } } } }),
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'rewound' } } } }),
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'rewind_marker', target_prompt_index: 1 } } }),
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'after-rewind' } } } }),
+      ].join('\n') + '\n',
+    });
+    const history2 = await adapter.getHistory(sid2);
+    const texts2 = history2.flatMap((m) => m.content).map((p) => ('text' in p ? p.text : '')).filter(Boolean);
+    assert.deepEqual(texts2, ['keep', 'after-rewind']);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('alwaysApprove isolation prevents slash command ACP calls from killing active yolo turn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-yolo-iso-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const bin = join(base, 'grok');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, sys
+sys.stdout.reconfigure(line_buffering=True)
+always = "--always-approve" in sys.argv[1:]
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line: continue
+    msg = json.loads(line)
+    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": params.get("sessionId") or "s"}}), flush=True)
+    elif method == "session/prompt":
+        sid = params.get("sessionId") or ""
+        text = "".join(b.get("text", "") for b in (params.get("prompt") or []) if isinstance(b, dict))
+        if always:
+            import time
+            time.sleep(0.15)
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "yolo-ok" if always else "norm-ok"}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}), flush=True)
+    elif mid is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+`);
+    await chmod(bin, 0o755);
+    adapter = new GrokProviderAdapter({ grokBin: bin, settingsPath: join(base, 'settings.json') });
+    const sYolo = await adapter.create({ provider: 'grok', cwd: base });
+    await adapter.setPermission(sYolo.id, 'yolo');
+    const sNorm = await adapter.create({ provider: 'grok', cwd: base });
+    const yoloTurn = await adapter.startTurn({ sessionId: sYolo.id, input: 'slow yolo' });
+    const compactPromise = adapter.compact(sNorm.id);
+    const [yoloEvents] = await Promise.all([drain(yoloTurn), compactPromise]);
+    const text = yoloEvents.filter((e: any) => e.kind === 'message').map((e: any) => e.payload?.delta ?? '').join('');
+    assert.equal(text, 'yolo-ok');
+    assert.ok(yoloEvents.some((e: any) => e.kind === 'turn' && e.status === 'completed'));
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('list skips symlinked summary.json and creates collision-resistant workspace ids', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-list-nofollow-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    const cwd1 = join(base, 'very-long-workspace-prefix-segment-alpha-one');
+    const cwd2 = join(base, 'very-long-workspace-prefix-segment-alpha-two');
+    const outside = join(base, 'outside.json');
+    await writeFile(outside, JSON.stringify({ info: { id: SID, cwd: cwd1 }, session_summary: 'secret' }));
+    const dir = join(sessionsDir, encodeURIComponent(cwd1), SID);
+    await mkdir(dir, { recursive: true });
+    await symlink(outside, join(dir, 'summary.json'));
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    assert.equal((await adapter.list()).items.length, 0);
+    const s1 = await adapter.create({ provider: 'grok', cwd: cwd1 });
+    const s2 = await adapter.create({ provider: 'grok', cwd: cwd2 });
+    assert.notEqual(s1.workspace_id, s2.workspace_id);
+    assert.ok(s1.workspace_id.length <= 60 && s2.workspace_id.length <= 60);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+
