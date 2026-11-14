@@ -20,7 +20,7 @@ import { constants as fsConstants, promises as fsp } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { FsError, openBound } from "./fs-local.js";
+import { FsError, openBound, type OpenBoundOptions } from "./fs-local.js";
 import { discoverClaudeDiskCommands } from "./native-commands.js";
 import { ProviderError } from "./types.js";
 
@@ -35,7 +35,23 @@ const MAX_UNMATCHED_CONTROL_RESPONSES = 256;
 const BOUNDED_APPEND_FLAGS =
   fsConstants.O_WRONLY |
   fsConstants.O_APPEND |
+  (fsConstants.O_NONBLOCK ?? 0) |
   (fsConstants.O_NOFOLLOW ?? 0);
+
+const OPEN_DIR_FLAGS =
+  fsConstants.O_RDONLY |
+  (fsConstants.O_DIRECTORY ?? 0) |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const CREATE_BOUND_FLAGS =
+  fsConstants.O_WRONLY |
+  fsConstants.O_CREAT |
+  fsConstants.O_EXCL |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const HAS_PROC_SELF_FD = process.platform === "linux" && fs.existsSync("/proc/self/fd");
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -381,6 +397,13 @@ export interface GetHistoryOptions {
   followContinuedIn?: boolean;
   /** Include subagent transcripts under `<sessionId>/subagents/agent-*.jsonl`. */
   includeSubagents?: boolean;
+  /** Test/verification hook invoked inside `openBound` after preflight checks. */
+  beforeAnchoredOpen?: () => void | Promise<void>;
+}
+
+export interface AnchoredOpOptions {
+  /** Test/verification hook invoked after discovery and before anchored handle traversal. */
+  beforeAnchoredOp?: () => void | Promise<void>;
 }
 
 export interface ListSlashCommandsOptions {
@@ -501,8 +524,8 @@ export function buildClaudeChildEnv(
   return {
     ...inherited,
     ...DEFAULT_ENV,
-    ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
     ...(envOverrides ?? {}),
+    ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
   };
 }
 
@@ -789,7 +812,11 @@ export class ClaudeAdapter {
     const realRoot = await this.realProjectsRoot();
     let opened: { fh: fsp.FileHandle; stat: fs.Stats };
     try {
-      opened = await this.openTranscriptBound(filePath, realRoot);
+      opened = await this.openTranscriptBound(
+        filePath,
+        realRoot,
+        options.beforeAnchoredOpen ? { beforeAnchoredOpen: options.beforeAnchoredOpen } : undefined,
+      );
     } catch (err) {
       if (err instanceof FsError && err.code === "not_found") {
         throw new Error(`claude-adapter: session not found: ${sessionId}`);
@@ -966,9 +993,9 @@ export class ClaudeAdapter {
 
   /**
    * Persist a custom session title by appending a `custom-title` entry to the
-   * session JSONL transcript (O_WRONLY | O_APPEND | O_NOFOLLOW with dev/ino check).
+   * session JSONL transcript via anchored directory handles (O_WRONLY | O_APPEND | O_NONBLOCK | O_NOFOLLOW).
    */
-  async rename(sessionId: string, title: string): Promise<void> {
+  async rename(sessionId: string, title: string, options?: AnchoredOpOptions): Promise<void> {
     if (!UUID_RE.test(sessionId)) {
       throw new ProviderError("invalid_request", `claude-adapter: invalid sessionId: ${sessionId}`, 400);
     }
@@ -992,53 +1019,74 @@ export class ClaudeAdapter {
     }
 
     const realRoot = await this.realProjectsRoot();
-    await this.assertParentWithinRoot(filePath, realRoot);
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const relSegments = splitSafeRelSegments(path.relative(realRoot, anchoredTarget));
+    if (relSegments.length < 2) {
+      throw new ProviderError("invalid_request", "claude-adapter: invalid transcript location", 400);
+    }
+    const leafName = relSegments[relSegments.length - 1]!;
+    const dirSegments = relSegments.slice(0, -1);
 
-    const expectedLst = await fsp.lstat(filePath).catch((err: unknown) => {
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      if (code === "ENOENT" || code === "ENOTDIR") {
-        throw new ProviderError("not_found", `claude-adapter: session not found: ${sessionId}`, 404);
-      }
-      throw err;
-    });
-    if (expectedLst.isSymbolicLink() || !expectedLst.isFile()) {
-      throw new ProviderError("invalid_request", `claude-adapter: refusing to append to non-regular file`, 400);
+    if (options?.beforeAnchoredOp) {
+      await options.beforeAnchoredOp();
     }
 
-    const fh = await fsp.open(filePath, BOUNDED_APPEND_FLAGS);
+    const dirHandle = await openAnchoredDir(realRoot, dirSegments);
     try {
-      const st = await fh.stat();
-      if (
-        !st.isFile() ||
-        st.dev !== expectedLst.dev ||
-        (process.platform !== "win32" && st.ino !== expectedLst.ino)
-      ) {
-        throw new ProviderError("invalid_request", "claude-adapter: transcript changed during rename", 400);
-      }
-      const line =
-        JSON.stringify({
-          type: "custom-title",
-          customTitle: trimmed,
-          sessionId,
-          timestamp: new Date().toISOString(),
-        }) + "\n";
-      const buf = Buffer.from(line, "utf8");
-      let written = 0;
-      const position = process.platform === "win32" ? st.size : null;
-      while (written < buf.length) {
-        const { bytesWritten } = await fh.write(
-          buf,
-          written,
-          buf.length - written,
-          position === null ? null : position + written,
-        );
-        if (bytesWritten <= 0) {
-          throw new ProviderError("upstream_error", "claude-adapter: short write during rename", 500);
+      const leafTarget = dirChildPath(dirHandle, leafName);
+      const expectedLst = await fsp.lstat(leafTarget).catch((err: unknown) => {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          throw new ProviderError("not_found", `claude-adapter: session not found: ${sessionId}`, 404);
         }
-        written += bytesWritten;
+        throw err;
+      });
+      if (expectedLst.isSymbolicLink() || !expectedLst.isFile()) {
+        throw new ProviderError("invalid_request", "claude-adapter: refusing to append to non-regular file", 400);
+      }
+
+      let fh: fsp.FileHandle;
+      try {
+        fh = await fsp.open(leafTarget, BOUNDED_APPEND_FLAGS);
+      } catch (err) {
+        throw mapAppendOpenError(err, anchoredTarget);
+      }
+      try {
+        const st = await fh.stat();
+        if (
+          !st.isFile() ||
+          st.dev !== expectedLst.dev ||
+          (process.platform !== "win32" && st.ino !== expectedLst.ino)
+        ) {
+          throw new ProviderError("invalid_request", "claude-adapter: transcript changed during rename", 400);
+        }
+        const line =
+          JSON.stringify({
+            type: "custom-title",
+            customTitle: trimmed,
+            sessionId,
+            timestamp: new Date().toISOString(),
+          }) + "\n";
+        const buf = Buffer.from(line, "utf8");
+        let written = 0;
+        const position = process.platform === "win32" ? st.size : null;
+        while (written < buf.length) {
+          const { bytesWritten } = await fh.write(
+            buf,
+            written,
+            buf.length - written,
+            position === null ? null : position + written,
+          );
+          if (bytesWritten <= 0) {
+            throw new ProviderError("upstream_error", "claude-adapter: short write during rename", 500);
+          }
+          written += bytesWritten;
+        }
+      } finally {
+        await fh.close().catch(() => undefined);
       }
     } finally {
-      await fh.close().catch(() => undefined);
+      await dirHandle.dirFd.close().catch(() => undefined);
     }
 
     this.summarizeCache.delete(filePath);
@@ -1056,9 +1104,9 @@ export class ClaudeAdapter {
 
   /**
    * Synchronize native archive state to `<projectDir>/<sessionId>/archived.json`
-   * within the validated projects root.
+   * through anchored directory handles within the validated projects root.
    */
-  async setArchived(sessionId: string, archived: boolean): Promise<void> {
+  async setArchived(sessionId: string, archived: boolean, options?: AnchoredOpOptions): Promise<void> {
     if (!UUID_RE.test(sessionId)) {
       throw new ProviderError("invalid_request", `claude-adapter: invalid sessionId: ${sessionId}`, 400);
     }
@@ -1068,30 +1116,51 @@ export class ClaudeAdapter {
     }
 
     const realRoot = await this.realProjectsRoot();
-    await this.assertParentWithinRoot(filePath, realRoot);
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const relSegments = splitSafeRelSegments(path.relative(realRoot, anchoredTarget));
+    if (relSegments.length < 2) {
+      throw new ProviderError("invalid_request", "claude-adapter: invalid transcript location", 400);
+    }
+    const dirSegments = relSegments.slice(0, -1);
 
-    const projectDir = path.dirname(filePath);
-    const sessionDir = path.join(projectDir, sessionId);
-    await this.ensureSafeDirectoryWithinRoot(sessionDir, realRoot);
-
-    const archiveFile = path.join(sessionDir, "archived.json");
-    const lst = await fsp.lstat(archiveFile).catch(() => null);
-    if (lst && lst.isSymbolicLink()) {
-      throw new ProviderError("invalid_request", "claude-adapter: archived.json must not be a symlink", 400);
+    if (options?.beforeAnchoredOp) {
+      await options.beforeAnchoredOp();
     }
 
-    const payload = JSON.stringify({
-      archived: Boolean(archived),
-      at: new Date().toISOString(),
-      by: "gateway",
-    });
-    const tmpFile = path.join(sessionDir, `.archived.${randomUUID()}.tmp`);
-    await fsp.writeFile(tmpFile, payload, { encoding: "utf8", mode: 0o600 });
+    const projectHandle = await openAnchoredDir(realRoot, dirSegments);
     try {
-      await fsp.rename(tmpFile, archiveFile);
-    } catch (err) {
-      await fsp.unlink(tmpFile).catch(() => undefined);
-      throw err;
+      const sessionHandle = await ensureAnchoredDirChild(projectHandle, sessionId);
+      try {
+        const archiveTarget = dirChildPath(sessionHandle, "archived.json");
+        const lst = await fsp.lstat(archiveTarget).catch(() => null);
+        if (lst && lst.isSymbolicLink()) {
+          throw new ProviderError("invalid_request", "claude-adapter: archived.json must not be a symlink", 400);
+        }
+
+        const payload = JSON.stringify({
+          archived: Boolean(archived),
+          at: new Date().toISOString(),
+          by: "gateway",
+        });
+        const tmpName = `.archived.${randomUUID()}.tmp`;
+        const tmpTarget = dirChildPath(sessionHandle, tmpName);
+        const tmpFh = await fsp.open(tmpTarget, CREATE_BOUND_FLAGS, 0o600);
+        try {
+          await tmpFh.writeFile(payload, "utf8");
+        } finally {
+          await tmpFh.close().catch(() => undefined);
+        }
+        try {
+          await fsp.rename(tmpTarget, archiveTarget);
+        } catch (err) {
+          await fsp.unlink(tmpTarget).catch(() => undefined);
+          throw err;
+        }
+      } finally {
+        await sessionHandle.dirFd.close().catch(() => undefined);
+      }
+    } finally {
+      await projectHandle.dirFd.close().catch(() => undefined);
     }
 
     this.summarizeCache.delete(filePath);
@@ -1099,10 +1168,11 @@ export class ClaudeAdapter {
 
   /**
    * Unlink the session transcript `.jsonl` and safely remove its validated
-   * `subagents` directory (and owned session artifact dir) within `projectsDir`.
-   * Missing file is a no-op (idempotent). Refuses symlink escapes outside root.
+   * `subagents` directory (and owned session artifact dir) through anchored
+   * `O_DIRECTORY | O_NOFOLLOW` handles within `projectsDir`. Missing file is a
+   * no-op (idempotent). Refuses symlink escapes outside root.
    */
-  async delete(sessionId: string): Promise<void> {
+  async delete(sessionId: string, options?: AnchoredOpOptions): Promise<void> {
     this.interrupt(sessionId);
     this.invalidateHistoryCacheForSession(sessionId);
     if (!UUID_RE.test(sessionId)) return;
@@ -1113,71 +1183,70 @@ export class ClaudeAdapter {
     this.summarizeCache.delete(filePath);
 
     const realRoot = await this.realProjectsRoot();
-    const projectDir = path.dirname(filePath);
-    await this.assertParentWithinRoot(filePath, realRoot);
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const relSegments = splitSafeRelSegments(path.relative(realRoot, anchoredTarget));
+    if (relSegments.length < 2) {
+      throw new ProviderError("invalid_request", "claude-adapter: invalid transcript location", 400);
+    }
+    const leafName = relSegments[relSegments.length - 1]!;
+    const dirSegments = relSegments.slice(0, -1);
 
-    // Validate `<projectDir>/<sessionId>` and `subagents/` before deleting anything.
-    const sessionDir = path.join(projectDir, sessionId);
-    const subagentsDir = path.join(sessionDir, "subagents");
-
-    const sessionLst = await fsp.lstat(sessionDir).catch((err: unknown) => {
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      if (code === "ENOENT" || code === "ENOTDIR") return null;
-      throw err;
-    });
-    if (sessionLst) {
-      if (sessionLst.isSymbolicLink()) {
-        throw new ProviderError("invalid_request", "claude-adapter: refusing to delete symlinked session directory", 400);
-      }
-      if (sessionLst.isDirectory()) {
-        const realSessionDir = await fsp.realpath(sessionDir);
-        if (!isWithinDir(realRoot, realSessionDir) || path.basename(realSessionDir) !== sessionId) {
-          throw new ProviderError("invalid_request", "claude-adapter: session directory escapes projectsDir", 400);
-        }
-        const subLst = await fsp.lstat(subagentsDir).catch((err: unknown) => {
-          const code = (err as NodeJS.ErrnoException | undefined)?.code;
-          if (code === "ENOENT" || code === "ENOTDIR") return null;
-          throw err;
-        });
-        if (subLst) {
-          if (subLst.isSymbolicLink()) {
-            throw new ProviderError("invalid_request", "claude-adapter: refusing to delete symlinked subagents directory", 400);
-          }
-          if (subLst.isDirectory()) {
-            const realSubDir = await fsp.realpath(subagentsDir);
-            if (!isWithinDir(realSessionDir, realSubDir)) {
-              throw new ProviderError("invalid_request", "claude-adapter: subagents directory escapes session root", 400);
-            }
-          }
-        }
-      }
+    if (options?.beforeAnchoredOp) {
+      await options.beforeAnchoredOp();
     }
 
-    const fileLst = await fsp.lstat(filePath).catch((err: unknown) => {
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      if (code === "ENOENT" || code === "ENOTDIR") return null;
-      throw err;
-    });
-    if (fileLst) {
-      if (fileLst.isSymbolicLink()) {
-        throw new ProviderError("invalid_request", "claude-adapter: refusing to delete symlinked transcript", 400);
-      }
-      try {
-        await fsp.unlink(filePath);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException)?.code;
-        if (code !== "ENOENT") throw err;
-      }
-    }
-
-    if (sessionLst && sessionLst.isDirectory()) {
-      await fsp.rm(subagentsDir, { recursive: true, force: true }).catch((err: unknown) => {
+    const projectHandle = await openAnchoredDir(realRoot, dirSegments);
+    let sessionHandle: AnchoredDirHandle | null = null;
+    let subagentsHandle: AnchoredDirHandle | null = null;
+    try {
+      const leafTarget = dirChildPath(projectHandle, leafName);
+      const fileLst = await fsp.lstat(leafTarget).catch((err: unknown) => {
         const code = (err as NodeJS.ErrnoException | undefined)?.code;
-        if (code !== "ENOENT") throw err;
+        if (code === "ENOENT" || code === "ENOTDIR") return null;
+        throw err;
       });
-      await fsp.rm(path.join(sessionDir, "archived.json"), { force: true }).catch(() => undefined);
-      await fsp.rm(path.join(sessionDir, "custom-title.json"), { force: true }).catch(() => undefined);
-      await fsp.rmdir(sessionDir).catch(() => undefined);
+      if (fileLst && (fileLst.isSymbolicLink() || !fileLst.isFile())) {
+        throw new ProviderError("invalid_request", "claude-adapter: refusing to delete symlinked or non-regular transcript", 400);
+      }
+
+      sessionHandle = await openAnchoredDirChildOptional(projectHandle, sessionId, "session directory");
+      if (sessionHandle) {
+        subagentsHandle = await openAnchoredDirChildOptional(sessionHandle, "subagents", "subagents directory");
+      }
+
+      if (fileLst) {
+        try {
+          await fsp.unlink(leafTarget);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code !== "ENOENT") throw err;
+        }
+      }
+
+      if (sessionHandle) {
+        if (subagentsHandle) {
+          await purgeAnchoredDirContents(subagentsHandle);
+          await subagentsHandle.dirFd.close().catch(() => undefined);
+          subagentsHandle = null;
+          await fsp.rmdir(dirChildPath(sessionHandle, "subagents")).catch((err: unknown) => {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code;
+            if (code !== "ENOENT") throw err;
+          });
+        }
+        for (const sidecar of ["archived.json", "custom-title.json"]) {
+          await fsp.unlink(dirChildPath(sessionHandle, sidecar)).catch((err: unknown) => {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code;
+            if (code !== "ENOENT") throw err;
+          });
+        }
+        await sessionHandle.dirFd.close().catch(() => undefined);
+        sessionHandle = null;
+        await fsp.rmdir(dirChildPath(projectHandle, sessionId)).catch(() => undefined);
+      }
+    } finally {
+      if (subagentsHandle) await subagentsHandle.dirFd.close().catch(() => undefined);
+      if (sessionHandle) await sessionHandle.dirFd.close().catch(() => undefined);
+      await projectHandle.dirFd.close().catch(() => undefined);
     }
   }
 
@@ -2071,22 +2140,17 @@ export class ClaudeAdapter {
     }
   }
 
-  private async assertParentWithinRoot(filePath: string, realRoot: string): Promise<void> {
-    const parentDir = path.dirname(filePath);
-    const lst = await fsp.lstat(parentDir).catch((err: unknown) => {
-      const code = (err as NodeJS.ErrnoException | undefined)?.code;
-      if (code === "ENOENT" || code === "ENOTDIR") {
-        throw new ProviderError("not_found", `claude-adapter: project directory missing`, 404);
-      }
-      throw err;
-    });
-    if (lst.isSymbolicLink() || !lst.isDirectory()) {
-      throw new ProviderError("invalid_request", `claude-adapter: project directory is not a safe directory`, 400);
+  private anchorTargetToRoot(targetPath: string, realRoot: string): string {
+    const resolvedRoot = path.resolve(realRoot);
+    const resolvedTarget = path.resolve(targetPath);
+    if (isWithinDir(resolvedRoot, resolvedTarget)) {
+      return resolvedTarget;
     }
-    const realParent = await fsp.realpath(parentDir);
-    if (!isWithinDir(realRoot, realParent)) {
-      throw new ProviderError("invalid_request", `claude-adapter: path escapes projectsDir`, 400);
+    const resolvedProjects = path.resolve(this.projectsDir);
+    if (isWithinDir(resolvedProjects, resolvedTarget)) {
+      return path.join(resolvedRoot, path.relative(resolvedProjects, resolvedTarget));
     }
+    throw new ProviderError("invalid_request", "claude-adapter: path escapes projectsDir", 400);
   }
 
   private async isSafeDirectoryWithinRoot(dirPath: string, realRoot: string): Promise<boolean> {
@@ -2100,36 +2164,17 @@ export class ClaudeAdapter {
     }
   }
 
-  private async ensureSafeDirectoryWithinRoot(dirPath: string, realRoot: string): Promise<void> {
-    const parent = path.dirname(dirPath);
-    const parentLst = await fsp.lstat(parent);
-    if (parentLst.isSymbolicLink() || !parentLst.isDirectory()) {
-      throw new ProviderError("invalid_request", "claude-adapter: unsafe parent directory", 400);
-    }
-    const realParent = await fsp.realpath(parent);
-    if (!isWithinDir(realRoot, realParent)) {
-      throw new ProviderError("invalid_request", "claude-adapter: directory escapes projectsDir", 400);
-    }
-    const lst = await fsp.lstat(dirPath).catch(() => null);
-    if (lst) {
-      if (lst.isSymbolicLink() || !lst.isDirectory()) {
-        throw new ProviderError("invalid_request", "claude-adapter: session artifact path is not a safe directory", 400);
-      }
-      const realDir = await fsp.realpath(dirPath);
-      if (!isWithinDir(realRoot, realDir)) {
-        throw new ProviderError("invalid_request", "claude-adapter: session artifact dir escapes projectsDir", 400);
-      }
-      return;
-    }
-    await fsp.mkdir(dirPath, { recursive: true, mode: 0o700 });
-  }
-
   private async openTranscriptBound(
     filePath: string,
     realRoot: string,
+    openOptions?: OpenBoundOptions,
   ): Promise<{ fh: fsp.FileHandle; stat: fs.Stats }> {
-    await this.assertParentWithinRoot(filePath, realRoot);
-    const opened = await openBound(filePath);
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const opened = await openBound(anchoredTarget, realRoot, openOptions);
+    if (path.resolve(opened.realPath) !== anchoredTarget) {
+      await opened.fh.close().catch(() => undefined);
+      throw new ProviderError("invalid_request", "claude-adapter: refusing symlinked transcript or ancestor", 400);
+    }
     return { fh: opened.fh, stat: opened.stat };
   }
 
@@ -2139,9 +2184,13 @@ export class ClaudeAdapter {
     maxBytes: number,
   ): Promise<string | null> {
     try {
-      const parentDir = path.dirname(sidecarPath);
-      if (!(await this.isSafeDirectoryWithinRoot(parentDir, realRoot))) return null;
-      const { fh, stat } = await openBound(sidecarPath);
+      const anchoredTarget = this.anchorTargetToRoot(sidecarPath, realRoot);
+      const opened = await openBound(anchoredTarget, realRoot);
+      if (path.resolve(opened.realPath) !== anchoredTarget) {
+        await opened.fh.close().catch(() => undefined);
+        return null;
+      }
+      const { fh, stat } = opened;
       try {
         if (stat.size <= 0 || stat.size > maxBytes) return null;
         const buf = Buffer.allocUnsafe(stat.size);
@@ -2374,7 +2423,7 @@ export class ClaudeAdapter {
 
       const sessionArtifactsDir = path.join(path.dirname(filePath), sessionId);
       let sidecarCustomTitle = "";
-      if (!tailCustomTitle && !headCustomTitle) {
+      if (!tailCustomTitle) {
         const rawCt = await this.readBoundedSidecarText(
           path.join(sessionArtifactsDir, "custom-title.json"),
           realRoot,
@@ -2460,6 +2509,210 @@ function isWithinDir(baseDir: string, targetPath: string): boolean {
   if (t === b) return true;
   const prefix = b.endsWith(path.sep) ? b : b + path.sep;
   return t.startsWith(prefix);
+}
+
+interface AnchoredDirHandle {
+  dirFd: fsp.FileHandle;
+  fallbackDir: string;
+}
+
+function splitSafeRelSegments(rel: string): string[] {
+  if (!rel || rel === "." || path.isAbsolute(rel)) return [];
+  const parts = rel.split(path.sep).filter(Boolean);
+  for (const seg of parts) {
+    if (seg === "." || seg === ".." || seg.includes("/") || seg.includes("\\") || seg.includes("\0")) {
+      throw new ProviderError("invalid_request", `claude-adapter: invalid path segment: ${seg}`, 400);
+    }
+  }
+  return parts;
+}
+
+function dirChildPath(handle: AnchoredDirHandle, childName: string): string {
+  return HAS_PROC_SELF_FD
+    ? `/proc/self/fd/${handle.dirFd.fd}/${childName}`
+    : path.join(handle.fallbackDir, childName);
+}
+
+function mapDirOpenError(err: unknown, label: string): ProviderError {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT") {
+    return new ProviderError("not_found", `claude-adapter: directory missing: ${label}`, 404, err);
+  }
+  if (code === "ELOOP") {
+    return new ProviderError("invalid_request", `claude-adapter: refusing symlinked ${label}`, 400, err);
+  }
+  if (code === "ENOTDIR" || code === "ENXIO") {
+    return new ProviderError("invalid_request", `claude-adapter: invalid directory (${code}): ${label}`, 400, err);
+  }
+  return new ProviderError("invalid_request", `claude-adapter: directory open failed: ${(err as Error).message}`, 400, err);
+}
+
+function mapAppendOpenError(err: unknown, target: string): ProviderError {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT" || code === "ENOTDIR") {
+    return new ProviderError("not_found", `claude-adapter: session file missing: ${target}`, 404, err);
+  }
+  if (code === "ELOOP" || code === "ENXIO" || code === "EISDIR") {
+    return new ProviderError("invalid_request", `claude-adapter: refusing non-regular or symlinked file (${code}): ${target}`, 400, err);
+  }
+  return new ProviderError("invalid_request", `claude-adapter: open failed (${code ?? "ERR"}): ${(err as Error).message}`, 400, err);
+}
+
+async function openAnchoredDirChildOptional(
+  parentHandle: AnchoredDirHandle,
+  childName: string,
+  label: string,
+): Promise<AnchoredDirHandle | null> {
+  if (!childName || childName === "." || childName === ".." || childName.includes("/") || childName.includes("\\") || childName.includes("\0")) {
+    throw new ProviderError("invalid_request", `claude-adapter: invalid directory name: ${childName}`, 400);
+  }
+  const childTarget = dirChildPath(parentHandle, childName);
+  const childFallback = path.join(parentHandle.fallbackDir, childName);
+
+  if (!HAS_PROC_SELF_FD) {
+    const lst = await fsp.lstat(childTarget).catch((err: unknown) => {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") return null;
+      throw mapDirOpenError(err, label);
+    });
+    if (!lst) return null;
+    if (lst.isSymbolicLink()) {
+      throw new ProviderError("invalid_request", `claude-adapter: refusing symlinked ${label}`, 400);
+    }
+    if (!lst.isDirectory()) {
+      throw new ProviderError("invalid_request", `claude-adapter: ${label} is not a directory`, 400);
+    }
+  }
+
+  let dirFd: fsp.FileHandle;
+  try {
+    dirFd = await fsp.open(childTarget, OPEN_DIR_FLAGS);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP" || code === "ENOTDIR") {
+      const lst = await fsp.lstat(childTarget).catch(() => null);
+      if (lst?.isSymbolicLink()) {
+        throw new ProviderError("invalid_request", `claude-adapter: refusing symlinked ${label}`, 400, err);
+      }
+    }
+    throw mapDirOpenError(err, label);
+  }
+
+  try {
+    const st = await dirFd.stat();
+    if (!st.isDirectory()) {
+      throw new ProviderError("invalid_request", `claude-adapter: ${label} is not a directory`, 400);
+    }
+    return { dirFd, fallbackDir: childFallback };
+  } catch (err) {
+    await dirFd.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+async function openAnchoredDir(realRoot: string, segments: string[]): Promise<AnchoredDirHandle> {
+  const actualRoot = await fsp.realpath(path.resolve(realRoot)).catch((err: unknown) => {
+    throw mapDirOpenError(err, "projectsDir");
+  });
+  const rootLst = await fsp.lstat(actualRoot).catch((err: unknown) => {
+    throw mapDirOpenError(err, "projectsDir");
+  });
+  if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+    throw new ProviderError("invalid_request", "claude-adapter: invalid projects root", 400);
+  }
+  const rootFd = await fsp.open(actualRoot, OPEN_DIR_FLAGS).catch((err: unknown) => {
+    throw mapDirOpenError(err, "projectsDir");
+  });
+
+  let current: AnchoredDirHandle = { dirFd: rootFd, fallbackDir: actualRoot };
+  try {
+    const rootSt = await rootFd.stat();
+    if (
+      !rootSt.isDirectory() ||
+      rootSt.dev !== rootLst.dev ||
+      (process.platform !== "win32" && rootSt.ino !== rootLst.ino)
+    ) {
+      throw new ProviderError("invalid_request", "claude-adapter: projects root changed during open", 400);
+    }
+
+    for (const seg of segments) {
+      const next = await openAnchoredDirChildOptional(current, seg, `directory ${seg}`);
+      if (!next) {
+        throw new ProviderError("not_found", `claude-adapter: directory missing: ${seg}`, 404);
+      }
+      await current.dirFd.close().catch(() => undefined);
+      current = next;
+    }
+    return current;
+  } catch (err) {
+    await current.dirFd.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+async function ensureAnchoredDirChild(
+  parentHandle: AnchoredDirHandle,
+  childName: string,
+): Promise<AnchoredDirHandle> {
+  const existing = await openAnchoredDirChildOptional(parentHandle, childName, "session directory");
+  if (existing) return existing;
+
+  const target = dirChildPath(parentHandle, childName);
+  try {
+    await fsp.mkdir(target, { mode: 0o700 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "EEXIST") throw err;
+  }
+  const created = await openAnchoredDirChildOptional(parentHandle, childName, "session directory");
+  if (!created) {
+    throw new ProviderError("not_found", `claude-adapter: failed to open session directory ${childName}`, 404);
+  }
+  return created;
+}
+
+async function purgeAnchoredDirContents(handle: AnchoredDirHandle): Promise<void> {
+  const dirRef = HAS_PROC_SELF_FD ? `/proc/self/fd/${handle.dirFd.fd}` : handle.fallbackDir;
+  let dirents: fs.Dirent[];
+  try {
+    dirents = await fsp.readdir(dirRef, { withFileTypes: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return;
+    throw err;
+  }
+
+  for (const entry of dirents) {
+    if (entry.name === "." || entry.name === "..") continue;
+    const childTarget = dirChildPath(handle, entry.name);
+    const lst = await fsp.lstat(childTarget).catch((err: unknown) => {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") return null;
+      throw err;
+    });
+    if (!lst) continue;
+    if (lst.isDirectory()) {
+      const childHandle = await openAnchoredDirChildOptional(handle, entry.name, "subagents directory");
+      if (childHandle) {
+        try {
+          await purgeAnchoredDirContents(childHandle);
+        } finally {
+          await childHandle.dirFd.close().catch(() => undefined);
+        }
+        await fsp.rmdir(childTarget).catch((err: unknown) => {
+          const code = (err as NodeJS.ErrnoException | undefined)?.code;
+          if (code !== "ENOENT") throw err;
+        });
+      }
+    } else {
+      // Regular files, symlinks (unlinks link itself without traversing), FIFOs, etc.
+      await fsp.unlink(childTarget).catch((err: unknown) => {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "ENOENT") throw err;
+      });
+    }
+  }
 }
 
 function isSafeAgentId(agentId: string): boolean {

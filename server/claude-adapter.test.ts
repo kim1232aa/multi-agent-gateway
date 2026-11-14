@@ -38,7 +38,11 @@ test('initialize handshake resolves fast when the CLI exits immediately', async 
     const bin = join(base, 'claude-fast-exit');
     await writeFile(bin, '#!/bin/sh\nexit 1\n');
     await chmod(bin, 0o755);
-    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    const adapter = new ClaudeAdapter({
+      claudeBin: bin,
+      configDir: join(base, 'config'),
+      env: { HOME: base },
+    });
 
     const modelsStart = Date.now();
     await assert.rejects(adapter.listBuiltinModels(), /no models/);
@@ -1435,6 +1439,272 @@ test('listSlashCommands falls back to zero-spawn discoverClaudeDiskCommands when
     );
     assert.deepEqual(cmds[0]?.aliases, ['chk']);
     assert.equal(cmds[0]?.argumentHint, '[env]');
+
+    // Explicit opt-out skips disk fallback and surfaces handshake failure
+    await assert.rejects(adapter.listSlashCommands(cwd, { diskFallback: false }), /no commands/);
+    const diskOnly = await adapter.listSlashCommands(cwd, { diskOnly: true });
+    assert.deepEqual(diskOnly.map((c) => c.name), ['ops:check', 'deploy', 'user-cmd']);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('options.configDir overrides options.env.CLAUDE_CONFIG_DIR in discovery and child env', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-config-prec-'));
+  try {
+    const optConfig = join(base, 'opt-config');
+    const envConfig = join(base, 'env-config');
+    await mkdir(join(optConfig, 'projects', 'p'), { recursive: true });
+    await mkdir(join(envConfig, 'projects', 'p'), { recursive: true });
+
+    const optSession = '11111111-1111-4111-8111-900000000001';
+    const envSession = '11111111-1111-4111-8111-900000000002';
+    await writeFile(
+      join(optConfig, 'projects', 'p', `${optSession}.jsonl`),
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'from opt' } }) + '\n',
+    );
+    await writeFile(
+      join(envConfig, 'projects', 'p', `${envSession}.jsonl`),
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'from env' } }) + '\n',
+    );
+
+    const envLog = join(base, 'child-env.json');
+    const bin = join(base, 'claude');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(envLog)}, JSON.stringify({
+  configDir: process.env.CLAUDE_CONFIG_DIR ?? null,
+}));
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  result: 'ok',
+  is_error: false,
+  session_id: ${JSON.stringify(optSession)},
+}) + '\\n');
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({
+      claudeBin: bin,
+      configDir: optConfig,
+      env: { CLAUDE_CONFIG_DIR: envConfig, HOME: base },
+    });
+    const listed = await adapter.list();
+    assert.deepEqual(listed.map((s) => s.sessionId), [optSession]);
+
+    await adapter.startTurn({ sessionId: optSession, prompt: 'hi', onEvent: () => {} });
+    const captured = JSON.parse(await readFile(envLog, 'utf8'));
+    assert.equal(captured.configDir, optConfig);
+    await adapter.close();
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('custom-title.json sidecar overrides head custom-title on >256 KiB transcripts while tail wins', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-sidecar-title-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const sessionId = '11111111-1111-4111-8111-900000000003';
+  try {
+    await mkdir(join(projDir, sessionId), { recursive: true });
+    const file = join(projDir, `${sessionId}.jsonl`);
+    const padLine = JSON.stringify({
+      type: 'user',
+      uuid: 'u_pad',
+      parentUuid: null,
+      message: { role: 'user', content: 'x'.repeat(32 * 1024) },
+    }) + '\n';
+    const lines = [
+      JSON.stringify({ type: 'custom-title', customTitle: 'Early Head Title', sessionId }) + '\n',
+    ];
+    for (let i = 0; i < 12; i += 1) lines.push(padLine);
+    lines.push(
+      JSON.stringify({ type: 'user', uuid: 'u_end', parentUuid: null, message: { role: 'user', content: 'tail msg' } }) + '\n',
+    );
+    await writeFile(file, lines.join(''));
+    await writeFile(
+      join(projDir, sessionId, 'custom-title.json'),
+      JSON.stringify({ customTitle: 'Newer Sidecar Title' }),
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    let listed = await adapter.list();
+    assert.equal(listed[0]?.title, 'Newer Sidecar Title');
+    assert.equal(listed[0]?.customTitle, 'Newer Sidecar Title');
+
+    // Now append a tail custom-title -> tail outranks sidecar
+    await writeFile(
+      file,
+      (await readFile(file, 'utf8')) +
+        JSON.stringify({ type: 'custom-title', customTitle: 'Latest Tail Title', sessionId }) + '\n',
+    );
+    await utimes(file, new Date(Date.now() + 5_000), new Date(Date.now() + 5_000));
+    listed = await adapter.list();
+    assert.equal(listed[0]?.title, 'Latest Tail Title');
+    assert.equal(listed[0]?.customTitle, 'Latest Tail Title');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('getHistory openBound rejects parent-swap TOCTOU outside projectsDir and intra-root leaf symlinks', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-toctou-read-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const outsideDir = join(base, 'outside');
+  const sessionId = '11111111-1111-4111-8111-900000000004';
+  const intraId = '11111111-1111-4111-8111-900000000005';
+  try {
+    await mkdir(projDir, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    const realFile = join(projDir, `${sessionId}.jsonl`);
+    const otherFile = join(projDir, `${intraId}.jsonl`);
+    await writeFile(
+      realFile,
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'inside' } }) + '\n',
+    );
+    await writeFile(
+      otherFile,
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: null, message: { role: 'user', content: 'other' } }) + '\n',
+    );
+    await writeFile(
+      join(outsideDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', uuid: 'u3', parentUuid: null, message: { role: 'user', content: 'escaped!' } }) + '\n',
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+
+    // 1) Swap leaf file to intra-root symlink right before anchored open
+    await assert.rejects(
+      adapter.getHistory(sessionId, {
+        beforeAnchoredOpen: async () => {
+          await rm(realFile);
+          await symlink(otherFile, realFile);
+        },
+      }),
+      /symlinked/,
+    );
+
+    // Restore regular file, then swap parent project dir to external symlink right before anchored open
+    await rm(realFile);
+    await writeFile(
+      realFile,
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'inside' } }) + '\n',
+    );
+    await assert.rejects(
+      adapter.getHistory(sessionId, {
+        beforeAnchoredOpen: async () => {
+          await rm(projDir, { recursive: true, force: true });
+          await symlink(outsideDir, projDir);
+        },
+      }),
+      /符号链接|symlink/i,
+    );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('delete() anchored traversal refuses symlink-swapped sessionDir without touching external targets', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-toctou-del-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const outsideVictim = join(base, 'outside-victim');
+  const sessionId = '11111111-1111-4111-8111-900000000006';
+  try {
+    await mkdir(join(projDir, sessionId, 'subagents'), { recursive: true });
+    await mkdir(join(outsideVictim, 'subagents'), { recursive: true });
+    await writeFile(join(outsideVictim, 'subagents', 'secret.txt'), 'do not delete');
+    await writeFile(
+      join(projDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'hi' } }) + '\n',
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    await assert.rejects(
+      adapter.delete(sessionId, {
+        beforeAnchoredOp: async () => {
+          await rm(join(projDir, sessionId), { recursive: true, force: true });
+          await symlink(outsideVictim, join(projDir, sessionId));
+        },
+      }),
+      /symlink/,
+    );
+
+    assert.equal(await readFile(join(outsideVictim, 'subagents', 'secret.txt'), 'utf8'), 'do not delete');
+    assert.equal(existsSync(join(projDir, `${sessionId}.jsonl`)), true);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('rename() anchored open rejects symlink-swapped, parent-swapped, and FIFO-swapped transcripts without blocking', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-toctou-ren-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const outsideDir = join(base, 'outside');
+  const sessionId = '11111111-1111-4111-8111-900000000007';
+  const sessionId2 = '11111111-1111-4111-8111-900000000008';
+  try {
+    await mkdir(projDir, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    const file1 = join(projDir, `${sessionId}.jsonl`);
+    const file2 = join(projDir, `${sessionId2}.jsonl`);
+    const outsideTarget = join(outsideDir, 'outside.jsonl');
+    await writeFile(file1, JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'hi' } }) + '\n');
+    await writeFile(file2, JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: null, message: { role: 'user', content: 'hi2' } }) + '\n');
+    await writeFile(outsideTarget, 'untouched\n');
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+
+    // 1) Swap transcript to symlink -> must refuse and leave outsideTarget untouched
+    await assert.rejects(
+      adapter.rename(sessionId, 'Hacked', {
+        beforeAnchoredOp: async () => {
+          await rm(file1);
+          await symlink(outsideTarget, file1);
+        },
+      }),
+      /non-regular|symlink/,
+    );
+    assert.equal(await readFile(outsideTarget, 'utf8'), 'untouched\n');
+
+    // 2) Swap transcript to FIFO -> O_NONBLOCK fails fast instead of blocking event loop
+    let fifoSupported = true;
+    await assert.rejects(
+      adapter.rename(sessionId2, 'FifoTitle', {
+        beforeAnchoredOp: async () => {
+          await rm(file2);
+          try {
+            execFileSync('mkfifo', [file2]);
+          } catch {
+            fifoSupported = false;
+            await symlink(outsideTarget, file2);
+          }
+        },
+      }),
+      fifoSupported ? /non-regular|ENXIO/ : /non-regular|symlink/,
+    );
+
+    // 3) Swap parent projectDir to external symlink -> O_DIRECTORY | O_NOFOLLOW rejects
+    await rm(file2, { force: true });
+    await writeFile(file2, JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: null, message: { role: 'user', content: 'hi2' } }) + '\n');
+    await writeFile(join(outsideDir, `${sessionId2}.jsonl`), 'untouched\n');
+    await assert.rejects(
+      adapter.rename(sessionId2, 'EscapedParent', {
+        beforeAnchoredOp: async () => {
+          await rm(projDir, { recursive: true, force: true });
+          await symlink(outsideDir, projDir);
+        },
+      }),
+      /symlink/,
+    );
+    assert.equal(await readFile(join(outsideDir, `${sessionId2}.jsonl`), 'utf8'), 'untouched\n');
   } finally {
     await rm(base, { recursive: true, force: true });
   }
