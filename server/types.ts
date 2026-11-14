@@ -2,22 +2,22 @@
  * 多 Agent 网关的统一 provider 抽象。
  *
  * gateway 对官方 kimi-web 前端讲 Kimi kap-server 协议(`/api/v1` REST + WS),
- * 内部按 provider 分流到 Kimi(无损代理)/ Codex(JSON-RPC)/ Claude(CLI stream-json)/ Grok(CLI)。
+ * 内部按 provider 分流到 Kimi(无损代理)/ Codex(JSON-RPC)/ Claude(CLI stream-json)/ Grok(CLI/ACP)/ Pi(RPC)。
  * 本文件是 adapter 与 facade 共用的契约:类型形状贴近 Kimi wire 协议
  * (snake_case 字段、ISO 时间戳),让 Kimi 路径可以几乎零映射透传,
- * 同时保留 Codex / Claude 能映射进来的最小扩展点(`provider`、`extras`)。
+ * 同时保留 Codex / Claude / Grok / Pi 能映射进来的最小扩展点(`provider`、`extras`)。
  */
 
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
-export type ProviderName = 'kimi' | 'claude' | 'codex' | 'grok';
+export type ProviderName = 'kimi' | 'claude' | 'codex' | 'grok' | 'pi';
 
-export const PROVIDER_NAMES: readonly ProviderName[] = ['kimi', 'claude', 'codex', 'grok'];
+export const PROVIDER_NAMES: readonly ProviderName[] = ['kimi', 'claude', 'codex', 'grok', 'pi'];
 
 export function isProviderName(value: unknown): value is ProviderName {
-  return value === 'kimi' || value === 'claude' || value === 'codex' || value === 'grok';
+  return value === 'kimi' || value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi';
 }
 
 // ---------------------------------------------------------------------------
@@ -82,10 +82,40 @@ export type MessageRole = 'user' | 'assistant' | 'system' | 'tool';
 export type MessageContentPart =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text?: string; thinking?: string }
-  | { type: 'tool_call'; id: string; name: string; input: unknown }
-  | { type: 'tool_use'; tool_call_id: string; tool_name: string; input: unknown }
-  | { type: 'tool_result'; tool_call_id: string; content?: string; output?: string; is_error?: boolean }
-  | { type: 'image'; mime_type: string; data: string };
+  | { type: 'tool_call'; id: string; name: string; input: unknown; phase?: string; parent_tool_use_id?: string }
+  | { type: 'tool_use'; tool_call_id: string; tool_name: string; input: unknown; phase?: string; parent_tool_use_id?: string }
+  | {
+      type: 'tool_result';
+      tool_call_id: string;
+      content?: unknown;
+      output?: unknown;
+      is_error?: boolean;
+      structured_output?: unknown;
+      structuredOutput?: unknown;
+      parent_tool_use_id?: string;
+    }
+  | {
+      type: 'image';
+      mime_type?: string;
+      mimeType?: string;
+      data?: string;
+      url?: string;
+      image_url?: string;
+      ref?: string;
+      name?: string;
+      path?: string;
+    }
+  | {
+      type: 'file' | 'document' | 'audio';
+      mime_type?: string;
+      mimeType?: string;
+      data?: string;
+      url?: string;
+      ref?: string;
+      name?: string;
+      path?: string;
+      text?: string;
+    };
 
 export interface Message {
   id: string;
@@ -113,7 +143,17 @@ export type GatewayEventKind =
   | 'thinking'
   | 'tool'
   | 'approval'
-  | 'question';
+  | 'question'
+  | 'plan'
+  | 'diff'
+  | 'notice'
+  | 'usage'
+  | 'subagent'
+  | 'task'
+  | 'interaction_resolved'
+  | 'session'
+  | 'passthrough'
+  | 'raw';
 
 export type EventStatus =
   | 'started'
@@ -135,23 +175,39 @@ export interface GatewayEvent<
   payload: P;
   /** epoch ms。 */
   timestamp: number;
+  /** 可选原生透传载荷(未映射或需要保留的原始通知/事件)。 */
+  raw?: unknown;
+  /** 可选子代理/阶段归属元数据。 */
+  parentToolUseId?: string;
+  agentId?: string;
+  phase?: string;
 }
 
 export interface TurnPayload {
   reason?: 'completed' | 'cancelled' | 'failed';
   error?: string;
+  usage?: SessionUsage;
+  raw?: unknown;
 }
 
 export interface MessagePayload {
   message: Message;
   /** status='delta' 时的增量文本(assistant 输出流)。 */
   delta?: string;
+  phase?: string;
+  parentToolUseId?: string;
+  agentId?: string;
+  raw?: unknown;
 }
 
 export interface ThinkingPayload {
   text: string;
   /** status='delta' 时的增量思考文本。 */
   delta?: string;
+  phase?: string;
+  parentToolUseId?: string;
+  agentId?: string;
+  raw?: unknown;
 }
 
 export interface ToolPayload {
@@ -159,26 +215,177 @@ export interface ToolPayload {
   name: string;
   input?: unknown;
   output?: string;
+  /** 结构化/非字符串工具输出(如 MCP structuredContent、dynamic contentItems)。 */
+  structuredOutput?: unknown;
   is_error?: boolean;
+  /** 子代理工具归属的父工具调用 ID(如 Claude parent_tool_use_id)。 */
+  parentToolUseId?: string;
+  /** 工具或输出阶段标记(如 commentary / final_answer)。 */
+  phase?: string;
+  agentId?: string;
+  raw?: unknown;
 }
+
+export type ApprovalKind =
+  | 'commandExecution'
+  | 'fileChange'
+  | 'permissions'
+  | 'mcpElicitation'
+  | 'tool'
+  | string;
+
+export type GranularApprovalKind =
+  | 'approve'
+  | 'approve_always'
+  | 'reject'
+  | 'cancel'
+  | 'accept_with_execpolicy_amendment'
+  | 'apply_network_policy_amendment'
+  | 'accept_with_permissions'
+  | 'accept_elicitation'
+  | 'decline_elicitation';
 
 export interface ApprovalPayload {
   approvalId: string;
   /** 请求审批的工具/命令描述。 */
   tool: string;
+  /** 审批类别(命令、改文件、权限升级、MCP elicitation 等)。 */
+  kind?: ApprovalKind;
   input?: unknown;
   options?: string[];
   /** codex 审批挂在具体 item 上;前端据此把审批卡贴到对应工具卡。 */
   itemId?: string;
+  /** 后端允许呈现的细粒度决策选项(如 Codex availableDecisions)。 */
+  availableDecisions?: Array<GranularApprovalKind | string | Record<string, unknown>>;
+  /** 权限持久化建议(如 Claude permission_suggestions / Codex proposed amendment)。 */
+  suggestions?: unknown[];
+  /** 被拒绝/拦截的目标路径(Claude blocked_path)。 */
+  blockedPath?: string;
+  /** 触发审批的原因说明(Claude decision_reason / Codex reason)。 */
+  reason?: string;
+  reasonType?: string;
+  /** 禁止提供"总是允许"选项(Claude suppress_always_allow_rule)。 */
+  suppressAlwaysAllow?: boolean;
+  /** 默认聚焦拒绝、禁止单键误批(Claude default_to_no)。 */
+  defaultToNo?: boolean;
+  /** 需要显式人工交互,禁止一键静默放行(Claude requires_user_interaction)。 */
+  requiresUserInteraction?: boolean;
+  title?: string;
+  displayName?: string;
+  description?: string;
+  cwd?: string;
+  agentId?: string;
+  commandActions?: unknown[];
+  networkContext?: unknown;
+  additionalPermissions?: unknown;
+  proposedExecpolicyAmendment?: unknown;
+  proposedNetworkPolicyAmendments?: unknown[];
+  elicitation?: {
+    serverName?: string;
+    mode?: string;
+    url?: string;
+    requestedSchema?: unknown;
+    message?: string;
+    elicitationId?: string;
+  };
+  raw?: unknown;
+}
+
+export interface StructuredQuestionOption {
+  id?: string;
+  label: string;
+  description?: string;
+}
+
+export interface StructuredQuestion {
+  id: string;
+  question: string;
+  header?: string;
+  options?: StructuredQuestionOption[];
+  multiSelect?: boolean;
+  isOther?: boolean;
+  isSecret?: boolean;
 }
 
 export interface QuestionPayload {
   questionId: string;
   prompt: string;
   options?: string[];
-  /** codex 原始结构化问题数组(ToolRequestUserInput 的 questions)。 */
+  /** 是否阻塞当前 turn 继续执行(Codex ToolRequestUserInputParams.isBlocking)。 */
+  isBlocking?: boolean;
+  /** 归一化后的结构化提问列表。 */
+  questions?: StructuredQuestion[];
+  /** codex/claude 原始结构化问题数组(ToolRequestUserInput 的 questions)。 */
   rawQuestions?: unknown[];
+  itemId?: string;
+  agentId?: string;
+  raw?: unknown;
 }
+
+export interface PlanStepItem {
+  step: string;
+  status: 'pending' | 'in_progress' | 'completed' | string;
+}
+
+export interface PlanPayload {
+  planId?: string;
+  explanation?: string | null;
+  steps?: PlanStepItem[];
+  delta?: string;
+  text?: string;
+  raw?: unknown;
+}
+
+export interface DiffPayload {
+  diff: string;
+  files?: Array<{ path: string; diff?: string; kind?: string }>;
+  raw?: unknown;
+}
+
+export interface NoticePayload {
+  level?: 'info' | 'warning' | 'error';
+  message: string;
+  code?: string;
+  title?: string;
+  raw?: unknown;
+}
+
+export interface SubagentPayload {
+  agentId: string;
+  parentToolUseId?: string;
+  name?: string;
+  status?: string;
+  summary?: string;
+  raw?: unknown;
+}
+
+export interface InteractionResolvedPayload {
+  interactionId: string;
+  interactionKind?: 'approval' | 'question' | 'elicitation' | 'permissions';
+  resolution?: string;
+  raw?: unknown;
+}
+
+export interface PassthroughPayload {
+  method: string;
+  data: unknown;
+  source?: ProviderName | string;
+}
+
+export type GatewayEventPayload =
+  | TurnPayload
+  | MessagePayload
+  | ThinkingPayload
+  | ToolPayload
+  | ApprovalPayload
+  | QuestionPayload
+  | PlanPayload
+  | DiffPayload
+  | NoticePayload
+  | SubagentPayload
+  | InteractionResolvedPayload
+  | PassthroughPayload
+  | Record<string, unknown>;
 
 // ---------------------------------------------------------------------------
 // Turn 控制
@@ -211,6 +418,12 @@ export interface StartTurnInput {
   metadata?: Record<string, unknown>;
 }
 
+/** 多模态插话输入(兼容纯文本 string 与富内容/附件)。 */
+export interface SteerInput {
+  input: string | MessageContentPart[];
+  attachments?: TurnAttachment[];
+}
+
 export interface TurnHandle {
   turnId: string;
   /**
@@ -221,6 +434,45 @@ export interface TurnHandle {
 }
 
 export type ApprovalDecision = 'approve' | 'approve_always' | 'reject';
+
+export interface GranularApprovalDetails {
+  decision?: ApprovalDecision | 'cancel';
+  execpolicyAmendment?: string[];
+  networkPolicyAmendment?: { host: string; action: 'allow' | 'deny' | string };
+  updatedPermissions?: unknown[];
+  updatedInput?: unknown;
+  message?: string;
+  permissions?: Record<string, unknown>;
+  scope?: 'once' | 'turn' | 'session' | 'always' | string;
+  elicitation?: {
+    action: 'accept' | 'decline' | 'cancel';
+    content?: Record<string, unknown>;
+    _meta?: unknown;
+  };
+  nativeDecision?: unknown;
+}
+
+export type GranularApprovalDecision =
+  | ApprovalDecision
+  | 'cancel'
+  | ({ decision: ApprovalDecision | 'cancel' } & Omit<GranularApprovalDetails, 'decision'>);
+
+export function normalizeApprovalDecision(
+  input: GranularApprovalDecision,
+  extra?: GranularApprovalDetails,
+): { decision: ApprovalDecision; details?: GranularApprovalDetails } {
+  if (typeof input === 'string') {
+    if (input === 'cancel') {
+      return { decision: 'reject', details: { ...extra, decision: 'cancel' } };
+    }
+    return extra ? { decision: input, details: extra } : { decision: input };
+  }
+  const base: ApprovalDecision = input.decision === 'cancel' ? 'reject' : input.decision;
+  return {
+    decision: base,
+    details: { ...extra, ...input },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // 能力声明 —— 前端/facade 据此决定 UI 是否显示审批、打断等入口
@@ -234,21 +486,67 @@ export interface ProviderCapabilities {
   questions: boolean;
   interrupt: boolean;
   history: boolean;
+  steer?: boolean;
+  steerAttachments?: boolean;
+  attachments?: boolean;
+  compact?: boolean;
+  fork?: boolean;
+  clone?: boolean;
+  rollback?: boolean;
+  rename?: boolean;
+  archive?: boolean;
+  nativeArchive?: boolean;
+  delete?: boolean;
+  planMode?: boolean;
+  permissionModes?: string[];
+  manualApproval?: boolean;
+  goals?: boolean;
+  swarm?: boolean;
+  tower?: boolean;
+  btw?: boolean;
+  subagents?: boolean;
+  mcp?: boolean;
+  terminals?: boolean;
+  review?: boolean;
+  models?: boolean;
+  thinkingLevels?: boolean;
+  commands?: boolean;
+  skills?: boolean;
+  usage?: boolean;
+  elicitation?: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // 原生目录:模型 / 斜杠命令(对齐前端 WireModel 与命令描述)
 // ---------------------------------------------------------------------------
 
+export interface ModelServiceTierInfo {
+  id: string;
+  name: string;
+  description?: string;
+}
+
 /** 对齐 kimi-web 的 WireModel(src/api/daemon/wire.ts),由 /models 透传。 */
 export interface NativeModel {
   provider: string;
   model: string;
   display_name?: string;
+  description?: string;
   max_context_size: number;
+  max_output_tokens?: number;
   capabilities?: string[];
   support_efforts?: string[];
   default_effort?: string;
+  aliases?: string[];
+  supportsAdaptiveThinking?: boolean;
+  supportsThinkingOff?: boolean;
+  fastMode?: boolean;
+  supportsAutoMode?: boolean;
+  serviceTiers?: Array<string | ModelServiceTierInfo>;
+  defaultServiceTier?: string | null;
+  isDefault?: boolean;
+  hidden?: boolean;
+  raw?: unknown;
 }
 
 /**
@@ -262,6 +560,12 @@ export interface NativeCommand {
   description: string;
   kind: 'client' | 'prompt';
   acceptsInput?: boolean;
+  aliases?: string[];
+  argumentHint?: string;
+  source?: string;
+  builtin?: boolean;
+  path?: string;
+  scope?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +594,7 @@ export class ProviderError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// ProviderAdapter —— 三个 adapter 统一实现的接口
+// ProviderAdapter —— 各家 adapter 统一实现的接口
 // ---------------------------------------------------------------------------
 
 export interface ProviderAdapter {
@@ -323,6 +627,7 @@ export interface ProviderAdapter {
     sessionId: string,
     approvalId: string,
     decision: ApprovalDecision,
+    details?: GranularApprovalDetails,
   ): Promise<void>;
 
   /** 回应一次提问。结构化提问传 {questionId: string[]};简单提问传字符串。 */
@@ -356,8 +661,8 @@ export interface ProviderAdapter {
   /** 当前生效的会话级模型(未设置返回 undefined → DTO 回退默认)。 */
   getModel?(sessionId: string): string | undefined;
 
-  /** 记录会话级 thinking 档位(内存态;影响后续 startTurn,如 codex 的 effort)。
-   * 'off' 表示不显式指定(回落到 provider 默认)。未实现 = 该 provider 不支持。
+  /** 记录会话级 thinking 档位(内存态;影响后续 startTurn,如 codex 的 effort / pi 的 thinkingLevel)。
+   * 'off' 语义取决于 provider(回落默认或显式关闭)。未实现 = 该 provider 不支持。
    */
   setThinking?(sessionId: string, thinking: string): Promise<void>;
 
@@ -382,8 +687,13 @@ export interface ProviderAdapter {
   /** 当前 plan 模式(未设置返回 undefined → DTO 回 false)。 */
   getPlanMode?(sessionId: string): boolean | undefined;
 
-  /** 插话:向进行中的 turn 注入用户消息(codex turn/steer)。 */
-  steer?(sessionId: string, turnId: string, text: string): Promise<void>;
+  /** 插话:向进行中的 turn 注入用户消息(兼容纯文本与多模态内容/附件)。 */
+  steer?(
+    sessionId: string,
+    turnId: string,
+    input: string | MessageContentPart[] | SteerInput,
+    attachments?: TurnAttachment[],
+  ): Promise<void>;
 
   /** 压缩会话上下文。 */
   compact?(sessionId: string): Promise<void>;
@@ -396,6 +706,9 @@ export interface ProviderAdapter {
 
   /** 分叉会话,返回新会话。 */
   fork?(sessionId: string): Promise<Session>;
+
+  /** 克隆当前分支为新会话(如 Pi clone)。 */
+  clone?(sessionId: string): Promise<Session>;
 
   /** 回滚最后 numTurns 轮。 */
   rollback?(sessionId: string, numTurns: number): Promise<void>;
@@ -429,6 +742,21 @@ export interface ProviderAdapter {
   review?(sessionId: string): Promise<TurnHandle>;
 }
 
+export interface ModelUsageEntry {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens?: number;
+  cache_creation_tokens?: number;
+  reasoning_output_tokens?: number;
+  total_cost_usd?: number;
+  context_window?: number;
+  max_output_tokens?: number;
+  canonical_model?: string;
+  provider?: string;
+  cost_basis?: 'list' | 'managed' | 'unknown' | string;
+  raw?: unknown;
+}
+
 /** 会话 token 用量(对齐 kimi wire usage 字段)。 */
 export interface SessionUsage {
   input_tokens: number;
@@ -439,4 +767,12 @@ export interface SessionUsage {
   context_tokens: number;
   context_limit: number;
   turn_count: number;
+  /** 推理输出 tokens(Codex reasoningOutputTokens / Claude thinkingTokens / Grok reasoningTokens)。 */
+  reasoning_output_tokens?: number;
+  /** 按模型维度的用量明细(对齐 Claude SDK modelUsage)。 */
+  model_usage?: Record<string, ModelUsageEntry | Record<string, unknown>>;
+  /** 上下文/用量是否来自 provider 权威接口(false/undefined 表示本地推算)。 */
+  authoritative?: boolean;
+  /** 上下文占用当前不可用(如 compact 后尚未有有效 usage),避免把未知误报为 0%。 */
+  context_unavailable?: boolean;
 }

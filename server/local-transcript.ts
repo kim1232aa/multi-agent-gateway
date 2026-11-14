@@ -26,6 +26,9 @@ export interface TranscriptStep {
   frames: TranscriptFrame[];
   startedAt?: string;
   endedAt?: string;
+  phase?: string;
+  parentToolUseId?: string;
+  agentId?: string;
 }
 
 export interface TranscriptTurn {
@@ -35,10 +38,67 @@ export interface TranscriptTurn {
   state: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   origin: { kind: 'user' | 'other' };
   prompt?: string;
+  attachmentIds?: string[];
   steps: TranscriptStep[];
   startedAt?: string;
   endedAt?: string;
   durationMs?: number;
+  phase?: string;
+  parentToolUseId?: string;
+  agentId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TranscriptAttachment extends Record<string, unknown> {
+  attachmentId: string;
+  mediaType: string;
+  name?: string;
+  size?: number;
+  source?:
+    | { kind: 'url'; url: string }
+    | { kind: 'file'; fileId: string }
+    | { kind: 'session_media'; fileId: string };
+  placeholder?: string;
+}
+
+export interface TranscriptTask extends Record<string, unknown> {
+  taskId: string;
+  kind: 'shell' | 'subagent' | 'tool' | 'other';
+  state: 'running' | 'completed' | 'failed' | 'timed_out' | 'killed' | 'lost';
+  detached: boolean;
+  description?: string;
+  agentId?: string;
+  parentToolUseId?: string;
+  outputTail: string;
+  startedAt?: string;
+  endedAt?: string;
+  resultSummary?: string;
+  error?: string;
+}
+
+export interface InvalidateHistoryOptions {
+  /** Freshly fetched persisted messages after undo/compact (optional). */
+  messages?: readonly Message[];
+  /** Activity reported on emitted reset snapshot (defaults to active turn presence). */
+  activity?: TranscriptActivity;
+  /** Whether to emit transcript.reset to active seeded subscribers (default true). */
+  notify?: boolean;
+  /** Explicit override for has_more_older on reset frames. */
+  hasMoreOlder?: boolean;
+  /** Clear recorded prompts as well (default false). */
+  clearPrompts?: boolean;
+  /** Clear recorded interactions as well (default false). */
+  clearInteractions?: boolean;
+  /** Optional invalidation reason (e.g. 'undo' | 'compact'). */
+  reason?: string;
+}
+
+export interface FrameMeta {
+  phase?: string;
+  parentToolUseId?: string;
+  agentId?: string;
+  taskId?: string;
+  agentRefs?: Array<{ agentId: string; role?: 'child' | 'member' }>;
 }
 
 export type TranscriptOperation = Record<string, unknown> & { op: string };
@@ -74,6 +134,8 @@ export interface TranscriptPrompt extends Record<string, unknown> {
 
 interface TranscriptSessionState {
   seq: number;
+  lastResetSeq: number;
+  generation: number;
   nextOrdinal: number;
   historyObserved: boolean;
   journal: TranscriptBatch[];
@@ -85,13 +147,17 @@ interface TranscriptSessionState {
   unbasedTurns: Set<string>;
   interactions: Map<string, TranscriptInteraction>;
   prompts: Map<string, TranscriptPrompt>;
+  tasks: Map<string, TranscriptTask>;
+  meta: Record<string, unknown>;
+  plans: unknown[];
 }
 
 interface TranscriptSubscriber {
   closed: boolean;
   seeded: boolean;
   startSeq: number;
-  baselineItems: TranscriptTurn[];
+  baselineActiveItems: TranscriptTurn[];
+  hasCompletedBaseline: boolean;
   baselineInteractions: TranscriptInteraction[];
   baselinePrompts: TranscriptPrompt[];
   pending: TranscriptBatch[];
@@ -103,13 +169,17 @@ export interface LocalTranscriptSubscription {
   close(): void;
 }
 
-/** In-memory transcript-v2 journal for local Claude/Codex sessions. */
+/** In-memory transcript-v2 journal for local Claude/Codex/Grok/Pi sessions. */
 export class LocalTranscriptHub {
   private readonly sessions = new Map<string, TranscriptSessionState>();
   private static readonly JOURNAL_CAP = 200;
 
   currentSeq(sessionId: string): number {
     return this.state(sessionId).seq;
+  }
+
+  currentGeneration(sessionId: string): number {
+    return this.state(sessionId).generation;
   }
 
   hasObservedHistory(sessionId: string): boolean {
@@ -119,7 +189,7 @@ export class LocalTranscriptHub {
   observeHistory(sessionId: string, messages: readonly Message[]): void {
     const state = this.state(sessionId);
     state.historyObserved = true;
-    const persistedTurns = historyTurns(messages);
+    const persistedTurns = historyTurns(messages).turns;
     state.nextOrdinal = Math.max(state.nextOrdinal, persistedTurns.length + 1);
     for (const [turnId, turn] of state.recentTurns) {
       // 未基准的 turn 不能按 ordinal 驱逐——它的 ordinal 是在历史未知时分配的,
@@ -174,7 +244,7 @@ export class LocalTranscriptHub {
     if (turnRemap.size > 0) this.rewriteJournalIds(state, turnRemap, stepRemap);
   }
 
-  /** 重编号后把 journal 里旧 turnId/stepId 的 op 改写到新号,重放不产生幽灵。 */
+  /** 重编号后把 journal 与未 seed 订阅方缓存里旧 turnId/stepId 改写到新号,重放不产生幽灵。 */
   private rewriteJournalIds(
     state: TranscriptSessionState,
     turnRemap: Map<string, string>,
@@ -186,7 +256,24 @@ export class LocalTranscriptHub {
       }
       return frameId;
     };
-    for (const batch of state.journal) {
+    const rewriteTurnObj = (turn: TranscriptTurn | undefined): void => {
+      if (!turn || typeof turn.turnId !== 'string' || !turnRemap.has(turn.turnId)) return;
+      turn.turnId = turnRemap.get(turn.turnId) as string;
+      turn.ordinal = Number.parseInt(turn.turnId.slice(1), 10);
+      for (const step of turn.steps ?? []) {
+        if (stepRemap.has(step.stepId)) {
+          step.turnId = turn.turnId;
+          step.stepId = stepRemap.get(step.stepId) as string;
+        }
+        for (const frame of step.frames ?? []) {
+          if (typeof frame.frameId === 'string') frame.frameId = mapFrameId(frame.frameId);
+        }
+      }
+    };
+    const visitedBatches = new Set<TranscriptBatch>();
+    const rewriteBatch = (batch: TranscriptBatch): void => {
+      if (visitedBatches.has(batch)) return;
+      visitedBatches.add(batch);
       for (const op of batch.ops) {
         if (typeof op.turnId === 'string' && turnRemap.has(op.turnId)) op.turnId = turnRemap.get(op.turnId);
         if (typeof op.stepId === 'string' && stepRemap.has(op.stepId)) op.stepId = stepRemap.get(op.stepId);
@@ -197,17 +284,7 @@ export class LocalTranscriptHub {
           if (typeof target.stepId === 'string' && stepRemap.has(target.stepId)) target.stepId = stepRemap.get(target.stepId);
           if (typeof target.frameId === 'string') target.frameId = mapFrameId(target.frameId);
         }
-        const turn = op.turn as TranscriptTurn | undefined;
-        if (turn && typeof turn.turnId === 'string' && turnRemap.has(turn.turnId)) {
-          turn.turnId = turnRemap.get(turn.turnId) as string;
-          turn.ordinal = Number.parseInt(turn.turnId.slice(1), 10);
-          for (const step of turn.steps ?? []) {
-            if (stepRemap.has(step.stepId)) {
-              step.turnId = turn.turnId;
-              step.stepId = stepRemap.get(step.stepId) as string;
-            }
-          }
-        }
+        rewriteTurnObj(op.turn as TranscriptTurn | undefined);
         const step = op.step as TranscriptStep | undefined;
         if (step && typeof step.stepId === 'string' && stepRemap.has(step.stepId)) {
           if (typeof step.turnId === 'string' && turnRemap.has(step.turnId)) step.turnId = turnRemap.get(step.turnId) as string;
@@ -215,6 +292,18 @@ export class LocalTranscriptHub {
         }
         const frame = op.frame as TranscriptFrame | undefined;
         if (frame && typeof frame.frameId === 'string') frame.frameId = mapFrameId(frame.frameId);
+      }
+    };
+
+    for (const batch of state.journal) {
+      rewriteBatch(batch);
+    }
+    for (const subscriber of state.subscribers) {
+      for (const turn of subscriber.baselineActiveItems) {
+        rewriteTurnObj(turn);
+      }
+      for (const batch of subscriber.pending) {
+        rewriteBatch(batch);
       }
     }
   }
@@ -225,6 +314,40 @@ export class LocalTranscriptHub {
 
   currentPrompts(sessionId: string): TranscriptPrompt[] {
     return structuredClone([...this.state(sessionId).prompts.values()]) as TranscriptPrompt[];
+  }
+
+  currentTasks(sessionId: string): TranscriptTask[] {
+    return structuredClone([...this.state(sessionId).tasks.values()]) as TranscriptTask[];
+  }
+
+  currentMeta(sessionId: string): Record<string, unknown> {
+    return structuredClone(this.state(sessionId).meta) as Record<string, unknown>;
+  }
+
+  currentPlans(sessionId: string): unknown[] {
+    return structuredClone(this.state(sessionId).plans) as unknown[];
+  }
+
+  mergeMeta(sessionId: string, meta: Record<string, unknown>): void {
+    const state = this.state(sessionId);
+    mergeMetaInto(state.meta, meta);
+    this.publish(sessionId, [{ op: 'meta.merge', meta }]);
+  }
+
+  upsertTask(sessionId: string, task: TranscriptTask): void {
+    const state = this.state(sessionId);
+    state.tasks.set(task.taskId, structuredClone(task) as TranscriptTask);
+    this.publish(sessionId, [{ op: 'task.upsert', task }]);
+  }
+
+  setPlans(sessionId: string, plans: readonly unknown[], modeMeta?: Record<string, unknown>): void {
+    const state = this.state(sessionId);
+    state.plans = structuredClone([...plans]) as unknown[];
+    if (modeMeta !== undefined) {
+      const meta = { modes: { plan: modeMeta } };
+      mergeMetaInto(state.meta, meta);
+      this.publish(sessionId, [{ op: 'meta.merge', meta }]);
+    }
   }
 
   submitPrompt(
@@ -334,7 +457,8 @@ export class LocalTranscriptHub {
       closed: false,
       seeded: false,
       startSeq: state.seq,
-      baselineItems: cloneTurns([...state.recentTurns.values(), ...state.activeTurns.values()]),
+      baselineActiveItems: cloneTurns([...state.activeTurns.values()]),
+      hasCompletedBaseline: state.recentTurns.size > 0,
       baselineInteractions: structuredClone([...state.interactions.values()]) as TranscriptInteraction[],
       baselinePrompts: structuredClone([...state.prompts.values()]) as TranscriptPrompt[],
       pending: [],
@@ -352,13 +476,20 @@ export class LocalTranscriptHub {
         if (catchup?.complete) {
           for (const batch of catchup.batches) send(opsEmission(batch));
         } else {
-          const hasOlder = historyTurns(messages).length > 0 || subscriber.baselineItems.length > 0;
+          const hasOlder = historyTurns(messages).turns.length > 0 || subscriber.hasCompletedBaseline;
           send({
             type: 'transcript.reset',
             payload: {
               type: 'transcript.reset',
               agent_id: 'main',
-              snapshot: emptySnapshot([], subscriber.baselineInteractions, subscriber.baselinePrompts, activity),
+              snapshot: snapshotFromState(
+                subscriber.baselineActiveItems,
+                subscriber.baselineInteractions,
+                subscriber.baselinePrompts,
+                [...state.tasks.values()],
+                state.meta,
+                activity,
+              ),
               has_more_older: hasOlder,
               seq: subscriber.startSeq,
             },
@@ -386,7 +517,19 @@ export class LocalTranscriptHub {
     return this.opsSince(state, since, state.seq);
   }
 
-  beginTurn(sessionId: string, prompt: string, startedAt = new Date().toISOString()): LocalTranscriptTurn {
+  beginTurn(
+    sessionId: string,
+    prompt: string,
+    startedAt = new Date().toISOString(),
+    meta?: {
+      origin?: TranscriptTurn['origin'];
+      attachmentIds?: string[];
+      phase?: string;
+      parentToolUseId?: string;
+      agentId?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): LocalTranscriptTurn {
     const state = this.state(sessionId);
     const ordinal = state.nextOrdinal++;
     const turn: TranscriptTurn = {
@@ -394,8 +537,13 @@ export class LocalTranscriptHub {
       turnId: `t${ordinal}`,
       ordinal,
       state: 'running',
-      origin: { kind: 'user' },
+      origin: meta?.origin ?? { kind: 'user' },
       prompt,
+      ...(meta?.attachmentIds && meta.attachmentIds.length > 0 ? { attachmentIds: [...meta.attachmentIds] } : {}),
+      ...(meta?.phase ? { phase: meta.phase } : {}),
+      ...(meta?.parentToolUseId ? { parentToolUseId: meta.parentToolUseId } : {}),
+      ...(meta?.agentId ? { agentId: meta.agentId } : {}),
+      ...(meta?.metadata ? { metadata: structuredClone(meta.metadata) as Record<string, unknown> } : {}),
       steps: [],
       startedAt,
     };
@@ -403,7 +551,7 @@ export class LocalTranscriptHub {
     // 的风险记入 unbasedTurns,首次成功观察时重编号。
     if (!state.historyObserved) state.unbasedTurns.add(turn.turnId);
     state.activeTurns.set(turn.turnId, turn);
-    this.publish(sessionId, [{ op: 'meta.merge', meta: { activity: 'turn' } }]);
+    this.mergeMeta(sessionId, { activity: 'turn' });
     this.publish(sessionId, [{ op: 'turn.upsert', turn: turnHeader(turn) }]);
     return new LocalTranscriptTurn(this, sessionId, turn);
   }
@@ -440,17 +588,70 @@ export class LocalTranscriptHub {
     this.sessions.delete(sessionId);
   }
 
-  /** undo/compact 后让该会话回到未观察态;订阅方重新走 seed 拿真实历史,
-   *  否则已回滚的 turn 一直留在投影里。 */
-  invalidateHistory(sessionId: string): void {
+  /**
+   * undo/compact 后使旧投影失效并协调活跃订阅方:
+   * - 保持 seq 严格单调递增并设置 lastResetSeq 边界,防止失效前游标误判为 complete;
+   * - 若传入新鲜历史 messages 则立刻重新 observeHistory(含在途 turn 重编号);
+   * - 清理未 seed 订阅方挂起的过期批并更新其基线,向已 seed 订阅方推送包含当前
+   *   activeTurns 的 `transcript.reset`(除非 options.notify === false)。
+   */
+  invalidateHistory(sessionId: string, options?: InvalidateHistoryOptions): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    state.generation += 1;
     state.historyObserved = false;
     state.recentTurns.clear();
     state.unbasedTurns.clear();
+    let maxActiveOrdinal = 0;
+    for (const [turnId, turn] of state.activeTurns) {
+      state.unbasedTurns.add(turnId);
+      if (turn.ordinal > maxActiveOrdinal) maxActiveOrdinal = turn.ordinal;
+    }
     state.journal = [];
-    state.seq = 0;
-    state.nextOrdinal = 1;
+    state.seq += 1;
+    state.lastResetSeq = state.seq;
+    state.nextOrdinal = options?.messages !== undefined ? 1 : maxActiveOrdinal + 1;
+    if (options?.clearPrompts) state.prompts.clear();
+    if (options?.clearInteractions) state.interactions.clear();
+
+    if (options?.messages !== undefined) {
+      this.observeHistory(sessionId, options.messages);
+    }
+
+    const activity: TranscriptActivity = options?.activity ?? (state.activeTurns.size > 0 ? 'turn' : 'idle');
+    const activeList = cloneTurns([...state.activeTurns.values()]);
+    const hasMoreOlder = options?.hasMoreOlder
+      ?? (options?.messages !== undefined
+        ? historyTurns(options.messages).turns.length > 0
+        : true);
+
+    const notify = options?.notify !== false;
+    const interactions = [...state.interactions.values()];
+    const prompts = [...state.prompts.values()];
+    const tasks = [...state.tasks.values()];
+
+    for (const subscriber of state.subscribers) {
+      if (subscriber.closed) continue;
+      subscriber.pending = [];
+      subscriber.startSeq = state.seq;
+      subscriber.baselineActiveItems = cloneTurns(activeList);
+      subscriber.hasCompletedBaseline = false;
+      subscriber.baselineInteractions = structuredClone(interactions) as TranscriptInteraction[];
+      subscriber.baselinePrompts = structuredClone(prompts) as TranscriptPrompt[];
+      if (subscriber.seeded && notify) {
+        subscriber.send({
+          type: 'transcript.reset',
+          payload: {
+            type: 'transcript.reset',
+            agent_id: 'main',
+            snapshot: snapshotFromState(activeList, interactions, prompts, tasks, state.meta, activity),
+            has_more_older: hasMoreOlder,
+            seq: state.seq,
+            ...(options?.reason ? { reason: options.reason } : {}),
+          },
+        });
+      }
+    }
   }
 
   private state(sessionId: string): TranscriptSessionState {
@@ -458,6 +659,8 @@ export class LocalTranscriptHub {
     if (!state) {
       state = {
         seq: 0,
+        lastResetSeq: 0,
+        generation: 0,
         nextOrdinal: 1,
         historyObserved: false,
         journal: [],
@@ -467,6 +670,9 @@ export class LocalTranscriptHub {
         unbasedTurns: new Set(),
         interactions: new Map(),
         prompts: new Map(),
+        tasks: new Map(),
+        meta: {},
+        plans: [],
       };
       this.sessions.set(sessionId, state);
     }
@@ -478,7 +684,7 @@ export class LocalTranscriptHub {
     since: number,
     through: number,
   ): { batches: TranscriptBatch[]; latestSeq: number; complete: boolean } {
-    if (!Number.isInteger(since) || since < 0 || since > through) {
+    if (!Number.isInteger(since) || since < 0 || since > through || since < state.lastResetSeq) {
       return { batches: [], latestSeq: through, complete: false };
     }
     const batches = state.journal.filter((batch) => batch.seq > since && batch.seq <= through);
@@ -489,9 +695,9 @@ export class LocalTranscriptHub {
 
 export class LocalTranscriptTurn {
   private stepOrdinal = 0;
+  private noticeOrdinal = 0;
   private step: TranscriptStep | undefined;
-  private assistantText = '';
-  private thinkingText = '';
+  private streamText = new Map<string, string>();
   private readonly tools = new Map<string, TranscriptFrame>();
   private ended = false;
 
@@ -501,15 +707,17 @@ export class LocalTranscriptTurn {
     private readonly turn: TranscriptTurn,
   ) {}
 
-  append(kind: 'assistant' | 'thinking', text: string): void {
+  append(kind: 'assistant' | 'thinking', text: string, meta?: FrameMeta): void {
     if (!text || this.ended) return;
-    const step = this.ensureStep();
-    const frameId = `${step.stepId}.${kind}`;
-    const current = kind === 'assistant' ? this.assistantText : this.thinkingText;
+    const step = this.ensureStep(meta);
+    const suffix = streamKeySuffix(meta);
+    const streamKey = suffix ? `${kind}.${suffix}` : kind;
+    const frameId = `${step.stepId}.${streamKey}`;
+    const current = this.streamText.get(streamKey) ?? '';
     if (current.length === 0) {
       const frame: TranscriptFrame = kind === 'assistant'
-        ? { kind: 'text', frameId, role: 'assistant', text: '' }
-        : { kind: 'thinking', frameId, text: '' };
+        ? { kind: 'text', frameId, role: 'assistant', text: '', ...compactFrameMeta(meta) }
+        : { kind: 'thinking', frameId, text: '', ...compactFrameMeta(meta) };
       step.frames.push(frame);
       this.hub.publish(this.sessionId, [{ op: 'frame.upsert', turnId: this.turn.turnId, stepId: step.stepId, frame }]);
     }
@@ -519,15 +727,45 @@ export class LocalTranscriptTurn {
       offset: current.length,
       text,
     }]);
-    if (kind === 'assistant') this.assistantText += text;
-    else this.thinkingText += text;
+    const next = current + text;
+    this.streamText.set(streamKey, next);
     const frame = step.frames.find((item) => item.frameId === frameId);
-    if (frame) frame.text = kind === 'assistant' ? this.assistantText : this.thinkingText;
+    if (frame) frame.text = next;
   }
 
-  toolStarted(toolCallId: string, name: string, input: unknown): void {
+  notice(
+    message: string,
+    options?: { level?: 'info' | 'warning' | 'error'; source?: string; detail?: unknown } & FrameMeta,
+  ): void {
+    if (!message || this.ended) return;
+    const step = this.ensureStep(options);
+    const frameId = `${step.stepId}.notice.${++this.noticeOrdinal}`;
+    const frame: TranscriptFrame = {
+      kind: 'notice',
+      frameId,
+      level: options?.level ?? 'info',
+      ...(options?.source ? { source: options.source } : {}),
+      message,
+      ...(options?.detail !== undefined ? { detail: options.detail } : {}),
+      ...compactFrameMeta(options),
+    };
+    step.frames.push(frame);
+    this.hub.publish(this.sessionId, [{ op: 'frame.upsert', turnId: this.turn.turnId, stepId: step.stepId, frame }]);
+  }
+
+  setPhase(phase: Record<string, unknown> | string): void {
     if (this.ended) return;
-    const step = this.ensureStep();
+    const patch = typeof phase === 'string'
+      ? { agent: { phase: { kind: phase } } }
+      : { agent: { phase } };
+    this.hub.mergeMeta(this.sessionId, patch);
+  }
+
+  toolStarted(toolCallId: string, name: string, input: unknown, meta?: FrameMeta): void {
+    if (this.ended) return;
+    const step = this.ensureStep(meta);
+    const agentRefs = meta?.agentRefs
+      ?? (meta?.agentId && meta.agentId !== 'main' ? [{ agentId: meta.agentId, role: 'child' as const }] : undefined);
     const frame: TranscriptFrame = {
       kind: 'tool',
       frameId: `${step.stepId}.${toolCallId}`,
@@ -535,16 +773,28 @@ export class LocalTranscriptTurn {
       name,
       state: 'running',
       input,
+      ...compactFrameMeta(meta),
+      ...(agentRefs && agentRefs.length > 0 ? { agentRefs } : {}),
     };
     this.tools.set(toolCallId, frame);
     step.frames.push(frame);
     this.hub.publish(this.sessionId, [{ op: 'frame.upsert', turnId: this.turn.turnId, stepId: step.stepId, frame }]);
   }
 
-  toolResult(toolCallId: string, output: unknown, isError: boolean): void {
+  toolResult(
+    toolCallId: string,
+    output: unknown,
+    isError: boolean,
+    extra?: { structuredOutput?: unknown } & FrameMeta,
+  ): void {
     if (this.ended) return;
-    const step = this.ensureStep();
+    const step = this.ensureStep(extra);
     const existing = this.tools.get(toolCallId);
+    const resolvedOutput = output === '' && extra?.structuredOutput !== undefined
+      ? extra.structuredOutput
+      : output;
+    const agentRefs = extra?.agentRefs
+      ?? (extra?.agentId && extra.agentId !== 'main' ? [{ agentId: extra.agentId, role: 'child' as const }] : undefined);
     const frame: TranscriptFrame = {
       ...(existing ?? {
         kind: 'tool',
@@ -553,8 +803,13 @@ export class LocalTranscriptTurn {
         name: 'tool',
       }),
       state: isError ? 'error' : 'done',
-      output,
-      ...(isError && typeof output === 'string' ? { error: output } : {}),
+      output: resolvedOutput,
+      ...(extra?.structuredOutput !== undefined && extra.structuredOutput !== resolvedOutput
+        ? { structuredOutput: extra.structuredOutput }
+        : {}),
+      ...(isError ? { error: toolErrorText(resolvedOutput) } : {}),
+      ...compactFrameMeta(extra),
+      ...(agentRefs && agentRefs.length > 0 ? { agentRefs } : {}),
     };
     this.tools.set(toolCallId, frame);
     const frameIndex = step.frames.findIndex((item) => item.frameId === frame.frameId);
@@ -577,8 +832,7 @@ export class LocalTranscriptTurn {
     ops.push({ op: 'step.upsert', turnId: this.turn.turnId, step: stepHeader(step) });
     this.hub.publish(this.sessionId, ops);
     this.step = undefined;
-    this.assistantText = '';
-    this.thinkingText = '';
+    this.streamText.clear();
     this.tools.clear();
   }
 
@@ -590,11 +844,11 @@ export class LocalTranscriptTurn {
     this.turn.endedAt = new Date().toISOString();
     if (durationMs !== undefined) this.turn.durationMs = durationMs;
     this.hub.publish(this.sessionId, [{ op: 'turn.upsert', turn: turnHeader(this.turn) }]);
-    this.hub.publish(this.sessionId, [{ op: 'meta.merge', meta: { activity: 'idle' } }]);
+    this.hub.mergeMeta(this.sessionId, { activity: 'idle' });
     this.hub.finishTurn(this.sessionId, this.turn);
   }
 
-  private ensureStep(): TranscriptStep {
+  private ensureStep(meta?: FrameMeta): TranscriptStep {
     if (this.step) return this.step;
     const ordinal = ++this.stepOrdinal;
     this.step = {
@@ -605,6 +859,9 @@ export class LocalTranscriptTurn {
       state: 'running',
       frames: [],
       startedAt: new Date().toISOString(),
+      ...(meta?.phase ? { phase: meta.phase } : {}),
+      ...(meta?.parentToolUseId ? { parentToolUseId: meta.parentToolUseId } : {}),
+      ...(meta?.agentId ? { agentId: meta.agentId } : {}),
     };
     this.turn.steps.push(this.step);
     this.hub.publish(this.sessionId, [{ op: 'step.upsert', turnId: this.turn.turnId, step: stepHeader(this.step) }]);
@@ -621,13 +878,14 @@ export interface LocalTranscriptPage {
   attachments: unknown[];
   todos: unknown[];
   prompts: unknown[];
-  meta: { activity: TranscriptActivity };
-  agents: Array<{ agentId: string; type: 'main' }>;
+  meta: { activity: TranscriptActivity; [key: string]: unknown };
+  agents: Array<{ agentId: string; type: 'main' | 'subagent' | string }>;
   pending_interactions: string[];
   seq: number;
+  plans?: unknown[];
 }
 
-/** Convert provider history into the turn-shaped transcript consumed by Kimi Web 0.37.2. */
+/** Convert provider history into the turn-shaped transcript consumed by Kimi Web. */
 export function buildLocalTranscriptPage(
   messages: readonly Message[],
   query: LocalTranscriptQuery,
@@ -636,8 +894,13 @@ export function buildLocalTranscriptPage(
   liveItems: readonly TranscriptTurn[] = [],
   interactions: readonly TranscriptInteraction[] = [],
   prompts: readonly TranscriptPrompt[] = [],
+  extras?: {
+    tasks?: readonly TranscriptTask[];
+    meta?: Record<string, unknown>;
+    plans?: readonly unknown[];
+  },
 ): LocalTranscriptPage {
-  const persisted = historyTurns(messages);
+  const { turns: persisted, attachments, subagentIds, plans: historyPlans } = historyTurns(messages);
   const persistedIds = new Set(persisted.map((turn) => turn.turnId));
   const turns = [...persisted, ...cloneTurns(liveItems).filter((turn) => !persistedIds.has(turn.turnId))]
     .sort((a, b) => a.ordinal - b.ordinal);
@@ -658,46 +921,107 @@ export function buildLocalTranscriptPage(
     ? candidates.slice(0, pageSize)
     : candidates.slice(-pageSize);
 
+  const discoveredAgents = new Set<string>(subagentIds);
+  for (const turn of liveItems) {
+    if (turn.agentId && turn.agentId !== 'main') discoveredAgents.add(turn.agentId);
+    for (const step of turn.steps) {
+      if (step.agentId && step.agentId !== 'main') discoveredAgents.add(step.agentId);
+      for (const frame of step.frames) {
+        if (typeof frame.agentId === 'string' && frame.agentId && frame.agentId !== 'main') {
+          discoveredAgents.add(frame.agentId);
+        }
+      }
+    }
+  }
+  const tasks = extras?.tasks ? structuredClone([...extras.tasks]) as TranscriptTask[] : [];
+  for (const task of tasks) {
+    if (task.agentId && task.agentId !== 'main') discoveredAgents.add(task.agentId);
+  }
+  const agents: Array<{ agentId: string; type: 'main' | 'subagent' | string }> = [
+    { agentId: 'main', type: 'main' },
+    ...[...discoveredAgents].map((agentId) => ({ agentId, type: 'subagent' as const })),
+  ];
+
+  const meta: { activity: TranscriptActivity; [key: string]: unknown } = {
+    ...(extras?.meta ? (structuredClone(extras.meta) as Record<string, unknown>) : {}),
+    activity,
+  };
+  const allPlans = [...historyPlans, ...(extras?.plans ?? [])];
+
   return {
     agent_id: query.agentId,
     items,
     has_more: candidates.length > items.length && items.length > 0,
-    tasks: [],
+    tasks,
     interactions: structuredClone([...interactions]) as TranscriptInteraction[],
-    attachments: [],
+    attachments,
     todos: [],
     prompts: structuredClone([...prompts]) as TranscriptPrompt[],
-    meta: { activity },
-    agents: [{ agentId: 'main', type: 'main' }],
+    meta,
+    agents,
     pending_interactions: interactions.filter((item) => item.state === 'pending').map((item) => item.interactionId),
     seq,
+    ...(allPlans.length > 0 ? { plans: structuredClone(allPlans) as unknown[] } : {}),
   };
 }
 
-function historyTurns(messages: readonly Message[]): TranscriptTurn[] {
+function historyTurns(messages: readonly Message[]): {
+  turns: TranscriptTurn[];
+  attachments: TranscriptAttachment[];
+  subagentIds: string[];
+  plans: unknown[];
+} {
   const ordered = messages
     .map((message, index) => ({ message, index }))
     .sort((a, b) => timestamp(a.message.created_at) - timestamp(b.message.created_at) || a.index - b.index)
     .map(({ message }) => message);
 
   const turns: TranscriptTurn[] = [];
+  const attachmentsById = new Map<string, TranscriptAttachment>();
+  const subagentIds = new Set<string>();
+  const plans: unknown[] = [];
   let current: TranscriptTurn | undefined;
 
+  const collectAttachments = (message: Message): string[] => {
+    const ids: string[] = [];
+    message.content.forEach((part, index) => {
+      const att = toTranscriptAttachment(message.id, index, part);
+      if (att) {
+        attachmentsById.set(att.attachmentId, att);
+        ids.push(att.attachmentId);
+      }
+    });
+    return ids;
+  };
+
   for (const message of ordered) {
+    const meta = messageMeta(message);
+    if (meta.agentId && meta.agentId !== 'main') subagentIds.add(meta.agentId);
+    if (message.metadata?.plan !== undefined) plans.push(message.metadata.plan);
+
     const prompt = messageText(message.content);
-    const isToolOnlyUser = message.role === 'user' && !prompt && message.content.some((part) =>
+    const hasMedia = message.content.some((part) =>
+      part.type === 'image' || part.type === 'file' || part.type === 'document' || part.type === 'audio');
+    const isToolOnlyUser = message.role === 'user' && !prompt && !hasMedia && message.content.some((part) =>
       part.type === 'tool_result' || part.type === 'tool_use' || part.type === 'tool_call');
     if (message.role === 'user' && !isToolOnlyUser) {
-      current = newTurn(turns.length + 1, 'user', message.created_at, prompt);
+      const attachmentIds = collectAttachments(message);
+      current = newTurn(turns.length + 1, 'user', message.created_at, prompt, attachmentIds, meta);
       turns.push(current);
       continue;
     }
     if (current === undefined) {
-      current = newTurn(turns.length + 1, 'other', message.created_at);
+      current = newTurn(turns.length + 1, 'other', message.created_at, undefined, undefined, meta);
       turns.push(current);
     }
 
+    collectAttachments(message);
     const frames = contentFrames(message);
+    for (const frame of frames) {
+      if (typeof frame.agentId === 'string' && frame.agentId && frame.agentId !== 'main') {
+        subagentIds.add(frame.agentId);
+      }
+    }
     const isError = message.metadata?.is_error === true;
     if (frames.length > 0) {
       const ordinal = current.steps.length + 1;
@@ -710,6 +1034,9 @@ function historyTurns(messages: readonly Message[]): TranscriptTurn[] {
         frames,
         startedAt: message.created_at,
         endedAt: message.created_at,
+        ...(meta.phase ? { phase: meta.phase } : {}),
+        ...(meta.parentToolUseId ? { parentToolUseId: meta.parentToolUseId } : {}),
+        ...(meta.agentId ? { agentId: meta.agentId } : {}),
       });
     }
     if (isError) current.state = 'failed';
@@ -717,7 +1044,12 @@ function historyTurns(messages: readonly Message[]): TranscriptTurn[] {
     current.durationMs = durationMs(current.startedAt, current.endedAt);
   }
 
-  return turns;
+  return {
+    turns,
+    attachments: [...attachmentsById.values()],
+    subagentIds: [...subagentIds],
+    plans,
+  };
 }
 
 function newTurn(
@@ -725,6 +1057,8 @@ function newTurn(
   origin: 'user' | 'other',
   startedAt: string,
   prompt?: string,
+  attachmentIds?: string[],
+  meta?: FrameMeta,
 ): TranscriptTurn {
   return {
     kind: 'turn',
@@ -733,6 +1067,10 @@ function newTurn(
     state: 'completed',
     origin: { kind: origin },
     ...(prompt === undefined ? {} : { prompt }),
+    ...(attachmentIds && attachmentIds.length > 0 ? { attachmentIds } : {}),
+    ...(meta?.phase ? { phase: meta.phase } : {}),
+    ...(meta?.parentToolUseId ? { parentToolUseId: meta.parentToolUseId } : {}),
+    ...(meta?.agentId ? { agentId: meta.agentId } : {}),
     steps: [],
     startedAt,
     endedAt: startedAt,
@@ -740,35 +1078,367 @@ function newTurn(
   };
 }
 
-function contentFrames(message: Message): TranscriptFrame[] {
+export function contentFrames(message: Message): TranscriptFrame[] {
   const frames: TranscriptFrame[] = [];
+  const msgMeta = messageMeta(message);
+  const isNoticeMsg = message.role === 'system'
+    || message.metadata?.notice === true
+    || typeof message.metadata?.notice_level === 'string';
+  const noticeLevel = resolveNoticeLevel(message);
+  const noticeSource = typeof message.metadata?.notice_source === 'string'
+    ? message.metadata.notice_source
+    : typeof message.metadata?.source === 'string'
+      ? message.metadata.source
+      : undefined;
+  const noticeDetail = message.metadata?.detail ?? message.metadata?.plan;
+
   message.content.forEach((part, index) => {
     const frameId = `${message.id}.${part.type}.${index}`;
+    const partMeta = mergeFrameMeta(msgMeta, part);
+
     if (part.type === 'text') {
-      if (message.role === 'system') {
-        frames.push({ kind: 'notice', frameId, level: 'info', message: part.text });
+      if (isNoticeMsg) {
+        frames.push({
+          kind: 'notice',
+          frameId,
+          level: noticeLevel,
+          ...(noticeSource ? { source: noticeSource } : {}),
+          message: part.text,
+          ...(noticeDetail !== undefined ? { detail: noticeDetail } : {}),
+          ...compactFrameMeta(partMeta),
+        });
       } else {
-        frames.push({ kind: 'text', frameId, role: message.role === 'user' ? 'user' : 'assistant', text: part.text });
+        frames.push({
+          kind: 'text',
+          frameId,
+          role: message.role === 'user' ? 'user' : 'assistant',
+          text: part.text,
+          ...compactFrameMeta(partMeta),
+        });
       }
     } else if (part.type === 'thinking') {
-      frames.push({ kind: 'thinking', frameId, text: part.thinking ?? part.text ?? '' });
+      frames.push({
+        kind: 'thinking',
+        frameId,
+        text: part.thinking ?? part.text ?? '',
+        ...compactFrameMeta(partMeta),
+      });
     } else if (part.type === 'tool_call' || part.type === 'tool_use') {
       const toolCallId = part.type === 'tool_use' ? part.tool_call_id : part.id;
       const name = part.type === 'tool_use' ? part.tool_name : part.name;
+      const agentRefs = partMeta.agentId && partMeta.agentId !== 'main'
+        ? [{ agentId: partMeta.agentId, role: 'child' as const }]
+        : undefined;
       frames.push({
-        kind: 'tool', frameId, toolCallId, name,
-        state: 'running', input: part.input,
+        kind: 'tool',
+        frameId,
+        toolCallId,
+        name,
+        state: 'running',
+        input: part.input,
+        ...compactFrameMeta(partMeta),
+        ...(agentRefs ? { agentRefs } : {}),
       });
     } else if (part.type === 'tool_result') {
-      const output = part.output ?? part.content ?? '';
+      const output = resolveToolResultOutput(part);
+      const structured = part.structured_output ?? part.structuredOutput;
+      const agentRefs = partMeta.agentId && partMeta.agentId !== 'main'
+        ? [{ agentId: partMeta.agentId, role: 'child' as const }]
+        : undefined;
       frames.push({
-        kind: 'tool', frameId, toolCallId: part.tool_call_id, name: 'tool',
-        state: part.is_error ? 'error' : 'done', output,
-        ...(part.is_error ? { error: output } : {}),
+        kind: 'tool',
+        frameId,
+        toolCallId: part.tool_call_id,
+        name: 'tool',
+        state: part.is_error ? 'error' : 'done',
+        output,
+        ...(structured !== undefined && structured !== output ? { structuredOutput: structured } : {}),
+        ...(part.is_error ? { error: toolErrorText(output) } : {}),
+        ...compactFrameMeta(partMeta),
+        ...(agentRefs ? { agentRefs } : {}),
       });
+    } else if (part.type === 'image' || part.type === 'file' || part.type === 'document' || part.type === 'audio') {
+      const info = safeMediaInfo(message.id, index, part);
+      if (isNoticeMsg) {
+        frames.push({
+          kind: 'notice',
+          frameId,
+          level: noticeLevel,
+          source: part.type,
+          message: info.label,
+          detail: info.detail,
+          ...compactFrameMeta(partMeta),
+        });
+      } else {
+        frames.push({
+          kind: 'text',
+          frameId,
+          role: message.role === 'user' ? 'user' : 'assistant',
+          text: info.label,
+          mediaType: info.mediaType,
+          ...(info.attachmentId ? { attachmentIds: [info.attachmentId] } : {}),
+          ...(info.safeUrl ? { url: info.safeUrl } : {}),
+          ...(info.ref ? { ref: info.ref } : {}),
+          ...(info.name ? { name: info.name } : {}),
+          ...(info.path ? { path: info.path } : {}),
+          ...(info.inlineOmitted ? { inlineOmitted: true } : {}),
+          ...compactFrameMeta(partMeta),
+        });
+      }
     }
   });
   return frames;
+}
+
+function resolveToolResultOutput(part: {
+  output?: unknown;
+  content?: unknown;
+  structured_output?: unknown;
+  structuredOutput?: unknown;
+}): unknown {
+  const candidates = [part.output, part.content, part.structured_output, part.structuredOutput];
+  for (const candidate of candidates) {
+    if (candidate !== undefined && candidate !== null && candidate !== '') {
+      return candidate;
+    }
+  }
+  for (const candidate of candidates) {
+    if (candidate !== undefined && candidate !== null) {
+      return candidate;
+    }
+  }
+  return '';
+}
+
+function toolErrorText(output: unknown): string {
+  if (typeof output === 'string') return output;
+  if (output === undefined || output === null) return 'Tool execution failed';
+  if (typeof output === 'object' && !Array.isArray(output)) {
+    const rec = output as Record<string, unknown>;
+    if (typeof rec.error === 'string' && rec.error) return rec.error;
+    if (typeof rec.message === 'string' && rec.message) return rec.message;
+  }
+  if (Array.isArray(output)) {
+    const texts = output
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && typeof (item as Record<string, unknown>).text === 'string') {
+          return (item as Record<string, unknown>).text as string;
+        }
+        return '';
+      })
+      .filter(Boolean);
+    if (texts.length > 0) return texts.join('\n');
+  }
+  try {
+    return JSON.stringify(output);
+  } catch {
+    return String(output);
+  }
+}
+
+const ALLOWED_MEDIA_PROTOCOLS = new Set(['http:', 'https:', 'blob:']);
+
+function safeMediaUrl(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  // Reject ASCII control chars (including \t, \n, \r, \0, DEL) before parsing,
+  // because WHATWG URL() strips ASCII tabs/newlines inside schemes.
+  if (/[\u0000-\u001f\u007f]/.test(raw)) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.startsWith('//') || trimmed.startsWith('/\\') || trimmed.startsWith('\\')) {
+    return undefined;
+  }
+  if (trimmed.startsWith('/')) {
+    try {
+      const parsed = new URL(trimmed, 'https://gateway.local');
+      return parsed.origin === 'https://gateway.local' ? trimmed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const hasSchemeLikePrefix = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed);
+  if (!hasSchemeLikePrefix) {
+    if (trimmed.includes('\\')) return undefined;
+    const colonIdx = trimmed.indexOf(':');
+    if (colonIdx !== -1) {
+      const firstDelim = trimmed.search(/[/?#]/);
+      if (firstDelim === -1 || colonIdx < firstDelim) return undefined;
+    }
+    try {
+      const parsed = new URL(trimmed, 'https://gateway.local');
+      return parsed.origin === 'https://gateway.local' ? trimmed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!ALLOWED_MEDIA_PROTOCOLS.has(parsed.protocol)) return undefined;
+    if (parsed.protocol === 'blob:') {
+      const inner = trimmed.slice(5);
+      const innerScheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(inner)?.[1]?.toLowerCase();
+      if (innerScheme && innerScheme !== 'http' && innerScheme !== 'https') {
+        return undefined;
+      }
+    }
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeMediaInfo(
+  messageId: string,
+  index: number,
+  part: Extract<MessageContentPart, { type: 'image' | 'file' | 'document' | 'audio' }>,
+): {
+  mediaType: string;
+  name?: string;
+  path?: string;
+  ref?: string;
+  safeUrl?: string;
+  attachmentId?: string;
+  label: string;
+  inlineOmitted: boolean;
+  detail: Record<string, unknown>;
+} {
+  const mediaType = part.mime_type
+    ?? part.mimeType
+    ?? (part.type === 'image' ? 'image/png' : 'application/octet-stream');
+  const rawPath = typeof part.path === 'string' && part.path ? part.path : undefined;
+  const name = typeof part.name === 'string' && part.name
+    ? part.name
+    : rawPath
+      ? path.posix.basename(rawPath.replace(/\\/g, '/'))
+      : undefined;
+  const ref = typeof part.ref === 'string' && part.ref ? part.ref : undefined;
+  const rawUrl = 'image_url' in part ? (part.url ?? part.image_url) : part.url;
+  const safeUrl = safeMediaUrl(rawUrl);
+  const hasUnsafeUrl = typeof rawUrl === 'string' && rawUrl.trim().length > 0 && safeUrl === undefined;
+  const inlineOmitted = Boolean(part.data) || hasUnsafeUrl;
+  const attachmentId = safeUrl || ref ? `${messageId}.att.${index}` : undefined;
+  const label = name ? `[${part.type}: ${name}]` : `[${part.type}: ${mediaType}]`;
+  const detail: Record<string, unknown> = {
+    kind: part.type,
+    mediaType,
+    ...(name ? { name } : {}),
+    ...(rawPath ? { path: rawPath } : {}),
+    ...(ref ? { ref } : {}),
+    ...(safeUrl ? { url: safeUrl } : {}),
+    ...(inlineOmitted ? { inlineOmitted: true } : {}),
+  };
+  return { mediaType, name, path: rawPath, ref, safeUrl, attachmentId, label, inlineOmitted, detail };
+}
+
+function toTranscriptAttachment(
+  messageId: string,
+  index: number,
+  part: MessageContentPart,
+): TranscriptAttachment | null {
+  if (part.type !== 'image' && part.type !== 'file' && part.type !== 'document' && part.type !== 'audio') {
+    return null;
+  }
+  const info = safeMediaInfo(messageId, index, part);
+  if (!info.attachmentId) return null;
+  const source: TranscriptAttachment['source'] = info.safeUrl
+    ? { kind: 'url', url: info.safeUrl }
+    : info.ref
+      ? { kind: 'session_media', fileId: info.ref }
+      : undefined;
+  return {
+    attachmentId: info.attachmentId,
+    mediaType: info.mediaType,
+    ...(info.name ? { name: info.name } : {}),
+    ...(source ? { source } : {}),
+    placeholder: info.label,
+  };
+}
+
+function messageMeta(message: Message): FrameMeta {
+  const m = message.metadata ?? {};
+  const phase = typeof m.phase === 'string' && m.phase ? m.phase : undefined;
+  const parentToolUseId = typeof m.parent_tool_use_id === 'string' && m.parent_tool_use_id
+    ? m.parent_tool_use_id
+    : typeof m.parentToolUseId === 'string' && m.parentToolUseId
+      ? m.parentToolUseId
+      : undefined;
+  const agentId = typeof m.agent_id === 'string' && m.agent_id
+    ? m.agent_id
+    : typeof m.agentId === 'string' && m.agentId
+      ? m.agentId
+      : typeof m.subagent_id === 'string' && m.subagent_id
+        ? m.subagent_id
+        : undefined;
+  const taskId = typeof m.task_id === 'string' && m.task_id
+    ? m.task_id
+    : typeof m.taskId === 'string' && m.taskId
+      ? m.taskId
+      : undefined;
+  return { phase, parentToolUseId, agentId, taskId };
+}
+
+function mergeFrameMeta(base: FrameMeta, part: MessageContentPart): FrameMeta {
+  const rec = part as unknown as Record<string, unknown>;
+  const phase = typeof rec.phase === 'string' && rec.phase ? rec.phase : base.phase;
+  const parentToolUseId = typeof rec.parent_tool_use_id === 'string' && rec.parent_tool_use_id
+    ? rec.parent_tool_use_id
+    : typeof rec.parentToolUseId === 'string' && rec.parentToolUseId
+      ? rec.parentToolUseId
+      : base.parentToolUseId;
+  const agentId = typeof rec.agent_id === 'string' && rec.agent_id
+    ? rec.agent_id
+    : typeof rec.agentId === 'string' && rec.agentId
+      ? rec.agentId
+      : base.agentId;
+  const taskId = typeof rec.task_id === 'string' && rec.task_id
+    ? rec.task_id
+    : typeof rec.taskId === 'string' && rec.taskId
+      ? rec.taskId
+      : base.taskId;
+  return { phase, parentToolUseId, agentId, taskId };
+}
+
+function compactFrameMeta(meta?: FrameMeta): Record<string, unknown> {
+  if (!meta) return {};
+  return {
+    ...(meta.phase ? { phase: meta.phase } : {}),
+    ...(meta.parentToolUseId ? { parentToolUseId: meta.parentToolUseId } : {}),
+    ...(meta.agentId ? { agentId: meta.agentId } : {}),
+    ...(meta.taskId ? { taskId: meta.taskId } : {}),
+  };
+}
+
+function streamKeySuffix(meta?: FrameMeta): string {
+  if (!meta) return '';
+  const parts: string[] = [];
+  if (meta.agentId && meta.agentId !== 'main') parts.push(meta.agentId);
+  if (meta.parentToolUseId) parts.push(meta.parentToolUseId);
+  if (meta.phase) parts.push(meta.phase);
+  return parts.join('.');
+}
+
+function resolveNoticeLevel(message: Message): 'info' | 'warning' | 'error' {
+  const raw = message.metadata?.notice_level;
+  if (raw === 'error' || raw === 'warning' || raw === 'info') return raw;
+  return message.metadata?.is_error === true ? 'error' : 'info';
+}
+
+function mergeMetaInto(target: Record<string, unknown>, patch: Record<string, unknown>): void {
+  for (const [k, v] of Object.entries(patch)) {
+    if (
+      v !== null
+      && typeof v === 'object'
+      && !Array.isArray(v)
+      && target[k] !== null
+      && typeof target[k] === 'object'
+      && !Array.isArray(target[k])
+    ) {
+      mergeMetaInto(target[k] as Record<string, unknown>, v as Record<string, unknown>);
+    } else {
+      target[k] = structuredClone(v);
+    }
+  }
 }
 
 function messageText(content: readonly MessageContentPart[]): string {
@@ -813,20 +1483,22 @@ function cloneTurns(turns: readonly TranscriptTurn[]): TranscriptTurn[] {
   return structuredClone(turns) as TranscriptTurn[];
 }
 
-function emptySnapshot(
+function snapshotFromState(
   items: readonly TranscriptTurn[],
   interactions: readonly TranscriptInteraction[],
   prompts: readonly TranscriptPrompt[],
+  tasks: readonly TranscriptTask[],
+  meta: Record<string, unknown>,
   activity: TranscriptActivity,
 ): Record<string, unknown> {
   return {
     items: cloneTurns(items),
-    tasks: [],
+    tasks: structuredClone([...tasks]),
     interactions: structuredClone(interactions),
     attachments: [],
     todos: [],
     prompts: structuredClone([...prompts]),
-    meta: { activity },
+    meta: { ...(structuredClone(meta) as Record<string, unknown>), activity },
   };
 }
 

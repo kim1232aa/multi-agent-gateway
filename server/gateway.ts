@@ -132,7 +132,7 @@ const API = '/api/v1';
 // provider 路由:id 前缀 ↔ provider
 // ---------------------------------------------------------------------------
 
-const ID_PREFIX: Record<Exclude<ProviderName, 'kimi'>, string> = {
+const ID_PREFIX: Record<Exclude<ProviderName, 'kimi' | 'pi'>, string> = {
   codex: 'codex_',
   claude: 'claude_',
   grok: 'grok_',
@@ -204,7 +204,7 @@ function kimiDemoAdapter(): ProviderAdapter {
   };
 }
 
-function isLocalProvider(value: string | null): value is Exclude<ProviderName, 'kimi'> {
+function isLocalProvider(value: string | null | undefined): value is Exclude<ProviderName, 'kimi' | 'pi'> {
   return value === 'claude' || value === 'codex' || value === 'grok';
 }
 
@@ -214,7 +214,7 @@ function grokStatusContextFallback(): number {
 }
 
 function prefixedId(provider: ProviderName, nativeId: string): string {
-  return provider === 'kimi' ? nativeId : `${ID_PREFIX[provider]}${nativeId}`;
+  return !isLocalProvider(provider) ? nativeId : `${ID_PREFIX[provider]}${nativeId}`;
 }
 
 function firstUserText(messages: Message[]): string {
@@ -238,8 +238,8 @@ async function generateLocalSessionTitle(adapter: ProviderAdapter, nativeId: str
   return existing || 'New session';
 }
 
-function providerFromSessionId(id: string): { provider: ProviderName; nativeId: string } {
-  for (const [provider, prefix] of Object.entries(ID_PREFIX) as [Exclude<ProviderName, 'kimi'>, string][]) {
+function providerFromSessionId(id: string): { provider: Exclude<ProviderName, 'pi'>; nativeId: string } {
+  for (const [provider, prefix] of Object.entries(ID_PREFIX) as [Exclude<ProviderName, 'kimi' | 'pi'>, string][]) {
     if (id.startsWith(prefix)) {
       return { provider, nativeId: id.slice(prefix.length) };
     }
@@ -420,7 +420,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const settingsDir = options.settingsDir
     ?? process.env.GATEWAY_SETTINGS_DIR
     ?? path.join(os.homedir(), '.config', 'multi-agent-gateway');
-  const adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter> = {
+  const adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter> = {
     codex: options.codex ?? new CodexProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.codex.json') }),
     claude: options.claude ?? new ClaudeProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.claude.json') }),
     grok: options.grok ?? new GrokProviderAdapter({
@@ -620,7 +620,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === 'string' && id.length > 0) : [];
       if (ids.length === 0) throw new ProviderError('invalid_request', 'ids required', 400);
       // 先全量校验,避免中途抛错造成"前面已归档、响应却是失败"。
-      const planned: Array<{ id: string; provider: Exclude<ProviderName, 'kimi'>; nativeId: string }> = [];
+      const planned: Array<{ id: string; provider: Exclude<ProviderName, 'kimi' | 'pi'>; nativeId: string }> = [];
       for (const id of ids) {
         const { provider: sp, nativeId } = providerFromSessionId(id);
         if (sp === 'kimi') {
@@ -713,7 +713,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       return ok(res, { region }, requestId);
     }
     if (sub === '/config' && (req.method === 'GET' || req.method === 'POST')) {
-      if (provider && provider !== 'kimi') {
+      if (isLocalProvider(provider)) {
         const patch = req.method === 'POST'
           ? ((await readBody(req)) as Record<string, unknown>)
           : {};
@@ -733,10 +733,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }, requestId);
       }
     }
-    if (provider && provider !== 'kimi' && sub === '/providers' && req.method === 'GET') {
+    if (isLocalProvider(provider) && sub === '/providers' && req.method === 'GET') {
       return ok(res, { items: [await providerDto(provider, adapters[provider])] }, requestId);
     }
-    if (provider && provider !== 'kimi' && isProviderRefreshRoute(sub) && req.method === 'POST') {
+    if (isLocalProvider(provider) && isProviderRefreshRoute(sub) && req.method === 'POST') {
       try {
         await adapters[provider].listModels?.();
         return ok(res, { changed: [], unchanged: [provider], failed: [] }, requestId);
@@ -751,7 +751,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/models' && req.method === 'GET') {
       // claude/codex/grok → 各自 adapter 的原生目录。失败必须如实报错(500),
       // 不能吞成空列表或演示目录——那会把"没装好/握手失败"显示成"有模型"。
-      if (provider && provider !== 'kimi') {
+      if (isLocalProvider(provider)) {
         const adapter = adapters[provider];
         const items = adapter.listModels ? await adapter.listModels() : [];
         return ok(res, { items }, requestId);
@@ -764,7 +764,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
     // 新建会话草稿(还没有 session id)时的原生命令目录,按 ?provider= 分流。
     if (sub === '/commands' && req.method === 'GET') {
-      if (!provider || provider === 'kimi') return ok(res, { items: [] }, requestId);
+      if (!isLocalProvider(provider)) return ok(res, { items: [] }, requestId);
       const adapter = adapters[provider];
       const items = adapter.listCommands ? await adapter.listCommands(undefined) : [];
       return ok(res, { items }, requestId);
@@ -807,7 +807,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
 
     const workspaceSkills = /^\/workspaces\/([^/:]+)\/skills$/.exec(sub);
-    if (workspaceSkills && provider && provider !== 'kimi' && req.method === 'GET') {
+    if (workspaceSkills && isLocalProvider(provider) && req.method === 'GET') {
       return ok(res, { skills: await adapterSkills(adapters[provider], provider) }, requestId);
     }
 
@@ -824,7 +824,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const wid = decodeURIComponent(workspaceIdMatch[1]);
       // Local ids are `wd_${slug}_${hash}` (no provider infix). Prefix-gated
       // no-ops never matched Claude/Codex/Grok workspaces from workspaceDto.
-      if (isLocalProvider(provider ?? null)) {
+      if (isLocalProvider(provider)) {
         if (req.method === 'DELETE') {
           return ok(res, { deleted: wid }, requestId);
         }
@@ -851,6 +851,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/sessions' && req.method === 'POST') {
       if (!provider || provider === 'kimi') {
         throw new ProviderError('upstream_error', 'Kimi session creation must be handled by the transparent proxy', 500);
+      }
+      if (!isLocalProvider(provider)) {
+        throw new ProviderError('unsupported', `${provider} is not wired in gateway yet`, 400);
       }
       return ok(res, await createLocalSession(adapters, await readBody(req), provider), requestId);
     }
@@ -1483,7 +1486,7 @@ function isProviderRefreshRoute(sub: string): boolean {
   return sub === '/providers:refresh' || sub === '/providers:refresh_oauth' || /^\/providers\/[^/:]+:refresh$/.test(sub);
 }
 
-async function providerDto(provider: Exclude<ProviderName, 'kimi'>, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
+async function providerDto(provider: Exclude<ProviderName, 'kimi' | 'pi'>, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
   // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
   const models = adapter.listModels ? await adapter.listModels() : [];
   return {
@@ -1497,7 +1500,7 @@ async function providerDto(provider: Exclude<ProviderName, 'kimi'>, adapter: Pro
 }
 
 async function providerConfigView(
-  provider: Exclude<ProviderName, 'kimi'>,
+  provider: Exclude<ProviderName, 'kimi' | 'pi'>,
   adapter: ProviderAdapter,
   kimiFetch: KimiFetch,
   patch: Record<string, unknown>,
@@ -1531,7 +1534,7 @@ async function providerConfigView(
   };
 }
 
-function skillDto(command: NativeCommand, provider: Exclude<ProviderName, 'kimi'>): Record<string, unknown> {
+function skillDto(command: NativeCommand, provider: Exclude<ProviderName, 'kimi' | 'pi'>): Record<string, unknown> {
   return {
     name: command.name,
     description: command.description,
@@ -1544,7 +1547,7 @@ function skillDto(command: NativeCommand, provider: Exclude<ProviderName, 'kimi'
 
 async function adapterSkills(
   adapter: ProviderAdapter,
-  provider: Exclude<ProviderName, 'kimi'>,
+  provider: Exclude<ProviderName, 'kimi' | 'pi'>,
   sessionId?: string,
 ): Promise<Record<string, unknown>[]> {
   const byName = new Map<string, Record<string, unknown>>();
@@ -1597,7 +1600,7 @@ async function listAllSessions(adapter: ProviderAdapter): Promise<Session[]> {
 }
 
 async function listWorkspaces(
-  adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
+  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
   provider: ProviderName | undefined,
   demoActive: boolean,
@@ -1623,14 +1626,14 @@ async function listWorkspaces(
   }
   // Codex/Claude:沿各自原生 cursor 聚合全部主会话。固定上限会漏掉老项目,
   // 还会让前端的 session_count 与“加载更多”不一致。
-  const localProviders: Exclude<ProviderName, 'kimi'>[] = ['codex', 'claude', 'grok'];
-  const targets: Exclude<ProviderName, 'kimi'>[] = !provider
+  const localProviders: Exclude<ProviderName, 'kimi' | 'pi'>[] = ['codex', 'claude', 'grok'];
+  const targets: Exclude<ProviderName, 'kimi' | 'pi'>[] = !provider
     ? localProviders
-    : provider === 'kimi'
-      ? []
-      : [provider];
+    : isLocalProvider(provider)
+      ? [provider]
+      : [];
   for (const p of targets) {
-    const adapter = adapters[p as Exclude<ProviderName, 'kimi'>];
+    const adapter = adapters[p as Exclude<ProviderName, 'kimi' | 'pi'>];
     const sessions = mergeDemoSessions(
       p,
       await listAllSessions(adapter).catch((err) => {
@@ -1754,7 +1757,7 @@ function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<stri
 }
 
 async function listSessions(
-  adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
+  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
   url: URL,
   provider: ProviderName | undefined,
@@ -1786,7 +1789,7 @@ async function listSessions(
     workspaceRoot = typeof hit?.root === 'string' && hit.root ? hit.root : undefined;
   }
   const rootNorm = workspaceRoot?.replace(/\/+$/, '');
-  if (provider && provider !== 'kimi') {
+  if (isLocalProvider(provider)) {
     const adapter = adapters[provider];
     // Open/Done 翻页游标必须带 archived 维度,否则两边页尾 id 相同时会串用。
     const archiveLane = archivedOnly ? 'ar' : 'op';
@@ -1879,8 +1882,8 @@ async function listSessions(
     }
     return { items: items.slice(start, start + limit), has_more: start + limit < items.length };
   }
-  const targets: Exclude<ProviderName, 'kimi'>[] =
-    provider && provider !== 'kimi' ? [provider] : ['codex', 'claude', 'grok'];
+  const targets: Exclude<ProviderName, 'kimi' | 'pi'>[] =
+    provider === 'pi' ? [] : ['codex', 'claude', 'grok'];
   for (const p of targets) {
     const page = await adapters[p].list({ limit: FETCH_ALL }).catch((err) => {
       console.error(`[gateway] listSessions: ${p}.list 失败:`, err instanceof Error ? err.message : err);
@@ -1908,9 +1911,9 @@ async function listSessions(
 }
 
 async function createLocalSession(
-  adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
+  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
   body: unknown,
-  provider: Exclude<ProviderName, 'kimi'>,
+  provider: Exclude<ProviderName, 'kimi' | 'pi'>,
 ): Promise<Record<string, unknown>> {
   const b = body as { metadata?: { cwd?: string }; cwd?: string; title?: string };
   const cwd = b.metadata?.cwd ?? b.cwd ?? process.env.HOME ?? '/home/ubuntu';
@@ -2914,7 +2917,7 @@ function attachGatewayWebSocket(
   server: ReturnType<typeof createServer>,
   token: string,
   hub: SessionHub,
-  adapters: Record<Exclude<ProviderName, 'kimi'>, ProviderAdapter>,
+  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
   resolveKimiWs: () => Promise<ReturnType<typeof createKimiWsUpgrader> | null>,
   gatewaySockets: Set<Duplex>,
   kimiSockets: Set<Duplex>,
