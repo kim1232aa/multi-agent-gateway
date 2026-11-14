@@ -67,7 +67,7 @@ async function writeContractFakePi(dir: string): Promise<{
   const spawnCountLog = join(dir, 'spawn.count');
 
   const script = `#!/usr/bin/env python3
-import json, os, signal, sys, time
+import json, os, signal, sys, threading, time
 
 args = sys.argv[1:]
 pid = os.getpid()
@@ -89,9 +89,12 @@ mode = os.environ.get("FAKE_PI_MODE", "standard")
 if mode == "ignore_eof_and_sigterm":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
+send_lock = threading.Lock()
+
 def send(obj):
-    sys.stdout.buffer.write((json.dumps(obj, ensure_ascii=False) + "\\n").encode("utf-8"))
-    sys.stdout.buffer.flush()
+    with send_lock:
+        sys.stdout.buffer.write((json.dumps(obj, ensure_ascii=False) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
 
 def send_raw_bytes(b):
     sys.stdout.buffer.write(b)
@@ -307,7 +310,8 @@ while True:
         send({"id": cid, "type": "response", "command": "follow_up", "success": True, "data": {"disposition": "queued"}})
     elif ctype == "abort":
         send({"id": cid, "type": "response", "command": "abort", "success": True})
-        send({"type": "agent_settled", "aborted": True})
+        if mode != "handled_idle_abort":
+            send({"type": "agent_settled", "aborted": True})
     elif ctype == "prompt":
         message_count += 2
         if mode == "early_events_before_response":
@@ -321,6 +325,19 @@ while True:
         elif mode == "handled_disposition":
             send({"type": "message_start", "message": {"role": "assistant", "content": []}})
             send({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "handled-by-ext"}], "stopReason": "stop"}})
+            send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "handled"}})
+        elif mode == "handled_late_run":
+            send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "handled"}})
+            def delayed_run():
+                time.sleep(0.05)
+                send({"type": "agent_start"})
+                send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+                send({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "late-run"}})
+                send({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "late-run"}], "stopReason": "stop"}})
+                send({"type": "agent_end", "messages": []})
+                send({"type": "agent_settled", "aborted": False})
+            threading.Thread(target=delayed_run, daemon=True).start()
+        elif mode == "handled_idle_abort":
             send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "handled"}})
         elif mode == "agent_end_not_settled":
             send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
@@ -1911,6 +1928,61 @@ test('symlinked sessionsRoot works, intermediate symlinked dir fails, string con
     assert.equal(usage?.context_unavailable, true);
   } finally {
     await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('keeps turn active after disposition=handled for delayed agent_start runs and supports idle abort', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-handled-late-'));
+  let lateAdapter: PiProviderAdapter | undefined;
+  let abortAdapter: PiProviderAdapter | undefined;
+  try {
+    const { bin } = await writeContractFakePi(base);
+
+    // 1. Extension command returns disposition=handled, then fires async agent_start 50ms later
+    lateAdapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir: join(base, 'sessions-late'),
+      handledGraceMs: 200,
+      env: { FAKE_PI_MODE: 'handled_late_run' },
+    });
+    const s1 = await lateAdapter.create({ provider: 'pi', cwd: base });
+    const handle1 = await lateAdapter.startTurn({ sessionId: s1.id, input: '/ext-async' });
+
+    // Session must remain busy (409) until the delayed run emits agent_settled
+    await assert.rejects(
+      lateAdapter.startTurn({ sessionId: s1.id, input: 'overlap' }),
+      (e: unknown) => e instanceof ProviderError && e.httpStatus === 409,
+    );
+
+    const events1 = await drainEvents(handle1);
+    const deltas1 = events1
+      .filter((e) => e.kind === 'message' && e.status === 'delta')
+      .map((e) => (e.payload as { delta: string }).delta);
+    assert.deepEqual(deltas1, ['late-run']);
+    assert.equal(events1.at(-1)?.kind, 'turn');
+    assert.equal(events1.at(-1)?.status, 'completed');
+
+    // After agent_settled, a subsequent turn is allowed
+    const events1Followup = await drainEvents(await lateAdapter.startTurn({ sessionId: s1.id, input: '/ext-async-2' }));
+    assert.equal(events1Followup.at(-1)?.status, 'completed');
+
+    // 2. Abort during the disposition=handled grace window settles cancelled without hanging
+    abortAdapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir: join(base, 'sessions-abort'),
+      handledGraceMs: 500,
+      env: { FAKE_PI_MODE: 'handled_idle_abort' },
+    });
+    const s2 = await abortAdapter.create({ provider: 'pi', cwd: base });
+    const handle2 = await abortAdapter.startTurn({ sessionId: s2.id, input: '/ext-idle' });
+    await abortAdapter.interrupt(s2.id, handle2.turnId);
+    const events2 = await drainEvents(handle2);
+    assert.equal(events2.at(-1)?.kind, 'turn');
+    assert.equal(events2.at(-1)?.status, 'cancelled');
+  } finally {
+    await lateAdapter?.dispose().catch(() => undefined);
+    await abortAdapter?.dispose().catch(() => undefined);
     await rm(base, { recursive: true, force: true });
   }
 });

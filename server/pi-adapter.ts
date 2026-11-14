@@ -60,6 +60,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_COMPACT_TIMEOUT_MS = 120_000;
 const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
+const DEFAULT_HANDLED_GRACE_MS = 200;
 const MODELS_TTL_MS = 5 * 60_000;
 const COMMANDS_TTL_MS = 5 * 60_000;
 const SUMMARY_HEAD_BYTES = 64 * 1024;
@@ -197,6 +198,8 @@ export interface PiAdapterOptions {
   maxImageBytes?: number;
   /** Maximum tail window size when reading session JSONL history. Default 16 MiB. */
   maxHistoryTailBytes?: number;
+  /** Grace period after `disposition: "handled"` before completing if no `agent_start` arrives. Default 200ms. */
+  handledGraceMs?: number;
   /** Optional stderr line callback for diagnostics. */
   onStderr?: (line: string) => void;
   /** Optional preference resolver (used by PiProviderAdapter to sync SettingsStore). */
@@ -789,6 +792,7 @@ interface ActiveTurnState {
   lastAssistantMessage: Record<string, unknown> | null;
   lastError: string | null;
   unsubscribe: (() => void) | null;
+  handledTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export class PiAdapter {
@@ -803,6 +807,7 @@ export class PiAdapter {
   private readonly dialogTimeoutMs: number;
   private readonly maxImageBytes: number;
   private readonly maxHistoryTailBytes: number;
+  private readonly handledGraceMs: number;
   private readonly onStderr?: (line: string) => void;
   private readonly resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
 
@@ -836,6 +841,7 @@ export class PiAdapter {
     this.dialogTimeoutMs = options.dialogTimeoutMs ?? 0;
     this.maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
     this.maxHistoryTailBytes = options.maxHistoryTailBytes ?? DEFAULT_HISTORY_TAIL_BYTES;
+    this.handledGraceMs = Math.max(0, options.handledGraceMs ?? DEFAULT_HANDLED_GRACE_MS);
     this.onStderr = options.onStderr;
     this.resolveSessionPreferences = options.resolveSessionPreferences;
   }
@@ -1318,6 +1324,7 @@ export class PiAdapter {
       lastAssistantMessage: null,
       lastError: null,
       unsubscribe: null,
+      handledTimer: null,
     };
     this.activeTurns.set(sessionId, turn);
 
@@ -1334,10 +1341,12 @@ export class PiAdapter {
       });
       const disposition = response?.disposition ?? 'started';
 
-      // If an extension command/input handler handled the prompt synchronously and no
-      // agent run is active, complete the turn immediately without waiting for agent_settled.
-      if (disposition === 'handled' && !turn.inAgentRun && !turn.settled) {
-        this.settleTurn(turn, 'completed');
+      // `disposition: "handled"` only means no run started synchronously for the
+      // submitted prompt; an extension command/input handler can still trigger an
+      // asynchronous `agent_start` -> `agent_settled` run right after returning.
+      // Keep the listener open for a short grace window before completing.
+      if (disposition === 'handled' && !turn.inAgentRun && !turn.sawAgentStart && !turn.settled) {
+        this.scheduleHandledGraceSettle(turn);
       }
 
       return { turnId, disposition, events: stream };
@@ -1397,13 +1406,25 @@ export class PiAdapter {
     const turn = this.activeTurns.get(sessionId);
     if (turn) {
       turn.abortRequested = true;
+      if (turn.handledTimer) {
+        clearTimeout(turn.handledTimer);
+        turn.handledTimer = null;
+      }
     }
     this.failCloseSessionQuestions(sessionId);
 
     const client = this.processes.get(sessionId);
-    if (!client || !client.isAlive) return;
+    if (!client || !client.isAlive) {
+      if (turn && !turn.settled) {
+        this.settleTurn(turn, 'cancelled');
+      }
+      return;
+    }
     try {
       await client.request({ type: 'abort' });
+      if (turn && !turn.settled && !turn.inAgentRun) {
+        this.settleTurn(turn, 'cancelled');
+      }
     } catch {
       if (turn && !turn.settled) {
         this.settleTurn(turn, 'cancelled');
@@ -1756,6 +1777,10 @@ export class PiAdapter {
 
     switch (type) {
       case 'agent_start':
+        if (turn.handledTimer) {
+          clearTimeout(turn.handledTimer);
+          turn.handledTimer = null;
+        }
         turn.inAgentRun = true;
         turn.sawAgentStart = true;
         break;
@@ -2322,7 +2347,54 @@ export class PiAdapter {
     turn.stream.end();
   }
 
+  private scheduleHandledGraceSettle(turn: ActiveTurnState): void {
+    if (turn.settled || turn.inAgentRun || turn.sawAgentStart) return;
+    if (turn.handledTimer) {
+      clearTimeout(turn.handledTimer);
+      turn.handledTimer = null;
+    }
+    const finalize = async (): Promise<void> => {
+      turn.handledTimer = null;
+      if (turn.settled || turn.inAgentRun || turn.sawAgentStart) return;
+      if (turn.abortRequested) {
+        this.settleTurn(turn, 'cancelled');
+        return;
+      }
+      if (turn.client.isAlive) {
+        const probeMs = Math.min(100, this.requestTimeoutMs || 100);
+        const state = await turn.client
+          .request<PiSessionState>({ type: 'get_state' }, probeMs)
+          .catch(() => null);
+        if (turn.settled || turn.inAgentRun || turn.sawAgentStart) return;
+        if (turn.abortRequested) {
+          this.settleTurn(turn, 'cancelled');
+          return;
+        }
+        if (
+          state &&
+          (state.isStreaming === true ||
+            state.isCompacting === true ||
+            (state.pendingMessageCount ?? 0) > 0)
+        ) {
+          this.scheduleHandledGraceSettle(turn);
+          return;
+        }
+      }
+      if (!turn.settled && !turn.inAgentRun && !turn.sawAgentStart) {
+        this.settleTurn(turn, 'completed');
+      }
+    };
+    turn.handledTimer = setTimeout(() => {
+      void finalize();
+    }, this.handledGraceMs);
+    turn.handledTimer.unref?.();
+  }
+
   private cleanupTurn(turn: ActiveTurnState): void {
+    if (turn.handledTimer) {
+      clearTimeout(turn.handledTimer);
+      turn.handledTimer = null;
+    }
     turn.unsubscribe?.();
     turn.unsubscribe = null;
     if (this.activeTurns.get(turn.sessionId) === turn) {
