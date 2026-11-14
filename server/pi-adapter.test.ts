@@ -11,7 +11,7 @@ import {
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
+import { PassThrough, Writable } from 'node:stream';
 import test from 'node:test';
 import {
   JsonlLineFramer,
@@ -1728,6 +1728,38 @@ test('StdinLineWriter endAndFlush timeout and abort reject both in-flight and qu
   await new Promise((r) => setTimeout(r, 10));
   writer2.abort(new Error('stream aborted'));
   await assert.rejects(p, /stream aborted/);
+
+  // 3. Microtask race: Writable invokes cb() synchronously/on nextTick while abort() runs on nextTick
+  const fastWritable = new Writable({
+    write(_chunk, _enc, cb) {
+      cb();
+    },
+  });
+  const writer3 = new StdinLineWriter(fastWritable);
+  const p3 = writer3.writeLine('{"id":"d"}\n');
+  process.nextTick(() => writer3.abort(new Error('boom')));
+  await p3; // Must settle (resolve once cb() ran) rather than staying pending indefinitely
+
+  // 4. Microtask race: abort() runs on nextTick BEFORE deferred Writable cb() runs
+  const deferredCbs: Array<(err?: Error | null) => void> = [];
+  const slowWritable = new Writable({
+    write(_chunk, _enc, cb) {
+      deferredCbs.push(cb);
+    },
+  });
+  const writer4 = new StdinLineWriter(slowWritable);
+  const p4 = writer4.writeLine('{"id":"e"}\n');
+  process.nextTick(() => writer4.abort(new Error('boom')));
+  await assert.rejects(p4, /boom/);
+  deferredCbs[0]?.();
+
+  // 5. Synchronous throw inside stream.write rejects cleanly
+  const throwingStream = new PassThrough();
+  (throwingStream as any).write = () => {
+    throw new Error('sync write boom');
+  };
+  const writer5 = new StdinLineWriter(throwingStream);
+  await assert.rejects(writer5.writeLine('{"id":"f"}\n'), /sync write boom/);
 });
 
 test('symlinked sessionsRoot works, intermediate symlinked dir fails, string context_edit on toolResult and compaction_end usage work', async () => {

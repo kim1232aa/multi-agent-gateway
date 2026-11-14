@@ -281,7 +281,20 @@ export class StdinLineWriter {
       return Promise.reject(this.closeError ?? new Error('stdin is closed'));
     }
     return new Promise<void>((resolve, reject) => {
-      this.queue.push({ line, resolve, reject });
+      let settled = false;
+      this.queue.push({
+        line,
+        resolve: () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        },
+        reject: (err: Error) => {
+          if (settled) return;
+          settled = true;
+          reject(err);
+        },
+      });
       if (!this.flushing) {
         void this.pump();
       }
@@ -296,8 +309,8 @@ export class StdinLineWriter {
     const activeReject = this.inFlightReject;
     this.inFlight = null;
     this.inFlightReject = null;
-    if (activeReject) activeReject(err);
-    else active?.reject(err);
+    active?.reject(err);
+    activeReject?.(err);
     this.wakeDrain();
     while (this.queue.length > 0) {
       const item = this.queue.shift()!;
@@ -375,15 +388,20 @@ export class StdinLineWriter {
           await new Promise<void>((resolveWrite, rejectWrite) => {
             this.inFlightReject = rejectWrite;
             ok = writable.write(item.line, 'utf8', (err) => {
-              if (err) rejectWrite(err);
-              else resolveWrite();
+              if (this.inFlight === item) {
+                this.inFlight = null;
+                this.inFlightReject = null;
+              }
+              if (err) {
+                const writeErr = err instanceof Error ? err : new Error(String(err));
+                item.reject(writeErr);
+                rejectWrite(writeErr);
+              } else {
+                item.resolve();
+                resolveWrite();
+              }
             });
           });
-          if (this.inFlight === item) {
-            this.inFlight = null;
-            this.inFlightReject = null;
-            item.resolve();
-          }
         } catch (err) {
           if (this.inFlight === item) {
             this.inFlight = null;
