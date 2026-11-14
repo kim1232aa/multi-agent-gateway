@@ -337,6 +337,47 @@ export class GrokAcpClient {
     });
   }
 
+  async sessionFork(params: {
+    sourceSessionId: string;
+    sourceCwd: string;
+    newCwd: string;
+  }): Promise<{ newSessionId: string }> {
+    await this.connect();
+    const result = await this.request('_x.ai/session/fork', params);
+    const rec = isRecord(result) ? result : {};
+    const newSessionId = pickSessionId(rec) ?? (typeof rec.newSessionId === 'string' ? rec.newSessionId : '');
+    if (!newSessionId) throw new Error('ACP _x.ai/session/fork did not return newSessionId');
+    return { newSessionId };
+  }
+
+  async sessionRename(sessionId: string, title: string): Promise<void> {
+    await this.connect();
+    await this.request('_x.ai/session/rename', { sessionId, title });
+  }
+
+  async sessionDelete(sessionId: string): Promise<void> {
+    await this.connect();
+    await this.request('_x.ai/session/delete', { sessionId });
+  }
+
+  async rewindExecute(params: {
+    sessionId: string;
+    targetPromptIndex: number;
+    mode?: 'conversation_only' | 'code_and_conversation';
+  }): Promise<{ success: boolean; error?: string }> {
+    await this.connect();
+    const result = await this.request('_x.ai/rewind/execute', {
+      sessionId: params.sessionId,
+      target_prompt_index: params.targetPromptIndex,
+      mode: params.mode ?? 'conversation_only',
+    });
+    const rec = isRecord(result) ? result : {};
+    return {
+      success: rec.success === true,
+      ...(typeof rec.error === 'string' ? { error: rec.error } : {}),
+    };
+  }
+
   async sessionSetMode(sessionId: string, modeId: string): Promise<void> {
     await this.connect();
     await this.request('session/set_mode', { sessionId, modeId });

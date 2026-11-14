@@ -1032,4 +1032,178 @@ test('live 1.0.77 binary speaks the ACP surface this adapter targets', { skip: !
   }
 });
 
+test('maps ACP-assigned sessionId across events, approvals, history and usage', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-acpid-'));
+  const sessionsDir = join(base, 'sessions');
+  const assignedId = '01999999-9999-7999-8999-999999999999';
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const bin = join(base, 'grok');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, os, sys
+sys.stdout.reconfigure(line_buffering=True)
+sessions_dir = os.environ["TEST_SESSIONS_DIR"]
+assigned = os.environ["TEST_ASSIGNED_ID"]
+cwd = os.environ["TEST_CWD"]
+pending_prompt = None
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line: continue
+    msg = json.loads(line)
+    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if method is None and mid == "perm-1":
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": assigned, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "approved-reply"}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": pending_prompt, "result": {"stopReason": "end_turn"}}), flush=True)
+        pending_prompt = None
+        continue
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        sdir = os.path.join(sessions_dir, "%2Ftmp%2Fwork", assigned)
+        os.makedirs(sdir, exist_ok=True)
+        open(os.path.join(sdir, "summary.json"), "w").write(json.dumps({"info": {"id": assigned, "cwd": cwd}, "created_at": "2026-08-16T06:20:33Z", "updated_at": "2026-08-16T06:21:00Z"}))
+        open(os.path.join(sdir, "chat_history.jsonl"), "w").write(json.dumps({"type": "user", "content": [{"type": "text", "text": "hi"}]}) + "\\n")
+        open(os.path.join(sdir, "usage.json"), "w").write(json.dumps({"session": {"inputTokens": 12, "outputTokens": 5, "turnCount": 1}}))
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": assigned}}), flush=True)
+    elif method == "session/prompt":
+        pending_prompt = mid
+        print(json.dumps({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission", "params": {"sessionId": assigned, "toolCall": {"toolCallId": "tc-1", "title": "Bash"}, "options": [{"optionId": "allow_once", "kind": "allow_once"}]}}), flush=True)
+    elif mid is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+`);
+    await chmod(bin, 0o755);
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      sessionsDir,
+      settingsPath: join(base, 'settings.json'),
+      env: { TEST_SESSIONS_DIR: sessionsDir, TEST_ASSIGNED_ID: assignedId, TEST_CWD: base },
+    });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    assert.notEqual(session.id, assignedId);
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'hi' });
+    const seen: string[] = [];
+    for await (const ev of handle.events) {
+      seen.push(`${ev.kind}:${ev.status}`);
+      if (ev.kind === 'approval') {
+        await adapter.resolveApproval(session.id, 'perm-1', 'approve');
+      }
+      if (ev.kind === 'message') {
+        assert.equal((ev.payload as { delta?: string }).delta, 'approved-reply');
+      }
+    }
+    assert.ok(seen.includes('approval:started'), seen.join(','));
+    assert.ok(seen.includes('message:delta'), seen.join(','));
+    assert.ok(seen.includes('turn:completed'), seen.join(','));
+    const history = await adapter.getHistory(session.id);
+    assert.equal(history.length, 1);
+    assert.equal(history[0]?.session_id, session.id);
+    assert.equal(adapter.getUsage(session.id)?.input_tokens, 12);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('rewind_points without rewind_marker does not truncate history and post-rewind updates survive', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-points-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    await seedSession(sessionsDir, SID, {
+      'chat_history.jsonl': [
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'turn 0' }] }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'turn 1' }] }),
+      ].join('\n') + '\n',
+      'rewind_points.jsonl': JSON.stringify({ prompt_index: 0 }) + '\n',
+    });
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const history = await adapter.getHistory(SID);
+    const texts = history.flatMap((m) => m.content).map((p) => ('text' in p ? p.text : '')).filter(Boolean);
+    assert.deepEqual(texts, ['turn 0', 'turn 1']);
+
+    // Updates-only fallback with rewind_marker followed by a new user turn keeps the new turn.
+    const sid2 = '44444444-4444-4444-8444-444444444444';
+    await seedSession(sessionsDir, sid2, {
+      'updates.jsonl': [
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'keep' } } } }),
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'rewound' } } } }),
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'rewind_marker', target_prompt_index: 1 } } }),
+        JSON.stringify({ params: { sessionId: sid2, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'after-rewind' } } } }),
+      ].join('\n') + '\n',
+    });
+    const history2 = await adapter.getHistory(sid2);
+    const texts2 = history2.flatMap((m) => m.content).map((p) => ('text' in p ? p.text : '')).filter(Boolean);
+    assert.deepEqual(texts2, ['keep', 'after-rewind']);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('alwaysApprove isolation prevents slash command ACP calls from killing active yolo turn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-yolo-iso-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const bin = join(base, 'grok');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, sys
+sys.stdout.reconfigure(line_buffering=True)
+always = "--always-approve" in sys.argv[1:]
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line: continue
+    msg = json.loads(line)
+    method, mid, params = msg.get("method"), msg.get("id"), msg.get("params") or {}
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": params.get("sessionId") or "s"}}), flush=True)
+    elif method == "session/prompt":
+        sid = params.get("sessionId") or ""
+        text = "".join(b.get("text", "") for b in (params.get("prompt") or []) if isinstance(b, dict))
+        if always:
+            import time
+            time.sleep(0.15)
+        print(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "yolo-ok" if always else "norm-ok"}}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}}), flush=True)
+    elif mid is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+`);
+    await chmod(bin, 0o755);
+    adapter = new GrokProviderAdapter({ grokBin: bin, settingsPath: join(base, 'settings.json') });
+    const sYolo = await adapter.create({ provider: 'grok', cwd: base });
+    await adapter.setPermission(sYolo.id, 'yolo');
+    const sNorm = await adapter.create({ provider: 'grok', cwd: base });
+    const yoloTurn = await adapter.startTurn({ sessionId: sYolo.id, input: 'slow yolo' });
+    const compactPromise = adapter.compact(sNorm.id);
+    const [yoloEvents] = await Promise.all([drain(yoloTurn), compactPromise]);
+    const text = yoloEvents.filter((e: any) => e.kind === 'message').map((e: any) => e.payload?.delta ?? '').join('');
+    assert.equal(text, 'yolo-ok');
+    assert.ok(yoloEvents.some((e: any) => e.kind === 'turn' && e.status === 'completed'));
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('list skips symlinked summary.json and creates collision-resistant workspace ids', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-list-nofollow-'));
+  const sessionsDir = join(base, 'sessions');
+  try {
+    const cwd1 = join(base, 'very-long-workspace-prefix-segment-alpha-one');
+    const cwd2 = join(base, 'very-long-workspace-prefix-segment-alpha-two');
+    const outside = join(base, 'outside.json');
+    await writeFile(outside, JSON.stringify({ info: { id: SID, cwd: cwd1 }, session_summary: 'secret' }));
+    const dir = join(sessionsDir, encodeURIComponent(cwd1), SID);
+    await mkdir(dir, { recursive: true });
+    await symlink(outside, join(dir, 'summary.json'));
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    assert.equal((await adapter.list()).items.length, 0);
+    const s1 = await adapter.create({ provider: 'grok', cwd: cwd1 });
+    const s2 = await adapter.create({ provider: 'grok', cwd: cwd2 });
+    assert.notEqual(s1.workspace_id, s2.workspace_id);
+    assert.ok(s1.workspace_id.length <= 60 && s2.workspace_id.length <= 60);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 

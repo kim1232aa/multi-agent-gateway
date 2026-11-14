@@ -290,22 +290,19 @@ export class GrokAdapter {
       for (const sessEnt of sessionDirs) {
         if (!sessEnt.isDirectory() || !UUID_RE.test(sessEnt.name)) continue;
         const summaryPath = path.join(cwdPath, sessEnt.name, 'summary.json');
-        try {
-          const raw = JSON.parse(fs.readFileSync(summaryPath, 'utf8')) as Record<string, unknown>;
-          const info = (raw.info ?? {}) as Record<string, unknown>;
-          const sessionId = typeof info.id === 'string' && UUID_RE.test(info.id) ? info.id : sessEnt.name;
-          const cwd = typeof info.cwd === 'string'
-            ? info.cwd
-            : decodeUriComponentSafe(cwdEnt.name);
-          const title = pickString(raw.session_summary, raw.generated_title) || '(session)';
-          const updatedAt = pickString(raw.updated_at, raw.last_active_at) || new Date().toISOString();
-          const createdAt = pickString(raw.created_at) || updatedAt;
-          const model = typeof raw.current_model_id === 'string' ? raw.current_model_id : undefined;
-          if (cwd) this.sessionCwd.set(sessionId, cwd);
-          out.push({ sessionId, title: title.slice(0, 120), cwd, createdAt, updatedAt, ...(model ? { model } : {}) });
-        } catch {
-          // unreadable / malformed summary — skip
-        }
+        const raw = readJsonNoFollow(summaryPath);
+        if (!raw) continue;
+        const info = isRecord(raw.info) ? raw.info : {};
+        const sessionId = typeof info.id === 'string' && UUID_RE.test(info.id) ? info.id : sessEnt.name;
+        const cwd = typeof info.cwd === 'string'
+          ? info.cwd
+          : decodeUriComponentSafe(cwdEnt.name);
+        const title = pickString(raw.session_summary, raw.generated_title) || '(session)';
+        const updatedAt = pickString(raw.updated_at, raw.last_active_at) || new Date().toISOString();
+        const createdAt = pickString(raw.created_at) || updatedAt;
+        const model = typeof raw.current_model_id === 'string' ? raw.current_model_id : undefined;
+        if (cwd) this.sessionCwd.set(sessionId, cwd);
+        out.push({ sessionId, title: title.slice(0, 120), cwd, createdAt, updatedAt, ...(model ? { model } : {}) });
       }
     }
     out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
@@ -660,12 +657,38 @@ export class GrokAdapter {
         update: { sessionUpdate: 'rewind_marker', target_prompt_index: target },
       },
     };
+    const isSafeRegularOrMissing = (file: string): boolean => {
+      try {
+        const st = fs.lstatSync(file);
+        return st.isFile() && !st.isSymbolicLink();
+      } catch (err) {
+        return (err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
+      }
+    };
+    if (!isSafeRegularOrMissing(updatesPath) || !isSafeRegularOrMissing(pointsPath)) {
+      throw new ProviderError('invalid_request', 'grok-adapter: refusing to mutate non-regular session file', 400);
+    }
     fs.appendFileSync(updatesPath, JSON.stringify(marker) + '\n');
     const kept = points.filter((point) => {
       const index = point.prompt_index ?? point.promptIndex;
       return typeof index === 'number' && index < target;
     });
     fs.writeFileSync(pointsPath, kept.map((point) => JSON.stringify(point)).join('\n') + (kept.length > 0 ? '\n' : ''));
+    if (chatEntries.length > 0 && isSafeRegularOrMissing(chatPath)) {
+      let seenUserTurns = 0;
+      let cutIdx = chatEntries.length;
+      for (let i = 0; i < chatEntries.length; i += 1) {
+        if (chatEntries[i].type === 'user' && mapHistoryEntry(chatEntries[i]) !== null) {
+          if (seenUserTurns >= target) {
+            cutIdx = i;
+            break;
+          }
+          seenUserTurns += 1;
+        }
+      }
+      const surviving = chatEntries.slice(0, cutIdx);
+      fs.writeFileSync(chatPath, surviving.map((entry) => JSON.stringify(entry)).join('\n') + (surviving.length > 0 ? '\n' : ''));
+    }
   }
 
   /** usage.json written by the CLI (costUsdTicks is USD * 1e10). */
@@ -765,10 +788,14 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly acpTurns = new Map<string, EventStream<GatewayEvent>>();
   /** Gateway session id → ACP session id. Grok 1.0.77 may assign its own id. */
   private readonly acpSessionIds = new Map<string, string>();
+  /** Reverse map: ACP session id → Gateway session id. */
+  private readonly gatewaySessionIds = new Map<string, string>();
+  private readonly acpClients = new Map<boolean, GrokAcpClient>();
+  private readonly acpConnecting = new Map<boolean, Promise<GrokAcpClient | null>>();
+  private readonly sessionClient = new Map<string, GrokAcpClient>();
   private readonly sessionGoals = new Map<string, Record<string, unknown>>();
   private readonly skillCache = new Map<string, { ts: number; skills: SkillCommandInput[] }>();
   private defaultModel: string | undefined;
-  private acp: GrokAcpClient | null = null;
   private static readonly SKILL_CACHE_TTL_MS = 30_000;
 
   constructor(options?: GrokAdapterOptions & { settingsPath?: string }) {
@@ -810,10 +837,14 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
     const sessions = (await this.inner.list()).filter((session) => {
       if (query.cwd && session.cwd !== query.cwd) return false;
-      const isArchived = this.settings.getBoolean('archived', session.sessionId) === true;
+      const effectiveId = this.gatewaySessionIds.get(session.sessionId) ?? session.sessionId;
+      const isArchived = this.settings.getBoolean('archived', effectiveId) === true
+        || this.settings.getBoolean('archived', session.sessionId) === true;
       return query.archived === true ? isArchived : !isArchived;
     });
-    const start = query.cursor ? sessions.findIndex((session) => session.sessionId === query.cursor) + 1 : 0;
+    const start = query.cursor
+      ? sessions.findIndex((session) => (this.gatewaySessionIds.get(session.sessionId) ?? session.sessionId) === query.cursor || session.sessionId === query.cursor) + 1
+      : 0;
     if (query.cursor && start === 0) return { items: [] };
     const limit = query.limit ?? 50;
     const page = sessions.slice(start, start + limit);
@@ -821,7 +852,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return {
       items,
       ...(start + limit < sessions.length && page.length > 0
-        ? { next_cursor: page[page.length - 1].sessionId }
+        ? { next_cursor: items[items.length - 1]!.id }
         : {}),
     };
   }
@@ -843,7 +874,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
-    const history = await this.inner.getHistory(sessionId);
+    const storageId = this.storageSessionId(sessionId);
+    const history = await this.inner.getHistory(storageId);
     return history.map((m, index) => {
       const content: Message['content'] = m.blocks && m.blocks.length > 0
         ? m.blocks.map((b) => {
@@ -879,7 +911,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
     const sessionId = input.sessionId;
     let prompt = textOfInput(input.input);
-    const skills = await this.discoverSkills(this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId));
+    const skills = await this.discoverSkills(this.getCwd(sessionId));
     const expandable = skills.filter((skill): skill is SkillCommandInput & { path: string } => typeof skill.path === 'string');
     const expanded = expandGrokSkill(prompt, expandable);
     if (expanded !== null) prompt = expanded;
@@ -899,8 +931,9 @@ export class GrokProviderAdapter implements ProviderAdapter {
       }
     }
     if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
-    const isNew = !this.inner.hasSessionFile(sessionId);
-    const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId);
+    const storageId = this.storageSessionId(sessionId);
+    const isNew = !this.inner.hasSessionFile(storageId);
+    const cwd = this.getCwd(sessionId);
     const model = this.settings.getString('model', sessionId);
     const thinking = this.settings.getString('thinking', sessionId);
     const effort = grokEffort(thinking);
@@ -1095,28 +1128,61 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   private async ensureAcp(alwaysApprove: boolean): Promise<GrokAcpClient | null> {
-    if (this.acp?.ready && this.acp.alwaysApproveEnabled === alwaysApprove) return this.acp;
-    if (this.acp) {
-      await this.acp.close().catch(() => undefined);
-      this.acp = null;
-    }
-    const client = new GrokAcpClient({
-      grokBin: this.grokBin,
-      env: this.grokEnv,
-      alwaysApprove,
-      requestTimeoutMs: 6_000,
-      // Turns can legitimately run for minutes; the old 20s cap killed live turns.
-      promptTimeoutMs: 0,
+    const existing = this.acpClients.get(alwaysApprove);
+    if (existing?.ready) return existing;
+    const inflight = this.acpConnecting.get(alwaysApprove);
+    if (inflight) return inflight;
+
+    const pending = (async (): Promise<GrokAcpClient | null> => {
+      if (existing) {
+        this.acpClients.delete(alwaysApprove);
+        await existing.close().catch(() => undefined);
+      }
+      const client = new GrokAcpClient({
+        grokBin: this.grokBin,
+        env: this.grokEnv,
+        alwaysApprove,
+        requestTimeoutMs: 6_000,
+        // Turns can legitimately run for minutes; the old 20s cap killed live turns.
+        promptTimeoutMs: 0,
+      });
+      try {
+        await client.connect();
+        this.acpClients.set(alwaysApprove, client);
+        client.onEvent((ev) => this.onAcpProcessEvent(client, alwaysApprove, ev));
+        return client;
+      } catch {
+        await client.close().catch(() => undefined);
+        return null;
+      }
+    })().finally(() => {
+      if (this.acpConnecting.get(alwaysApprove) === pending) {
+        this.acpConnecting.delete(alwaysApprove);
+      }
     });
-    try {
-      await client.connect();
-      this.acp = client;
-      client.onEvent((ev) => this.onAcpProcessEvent(ev));
-      return client;
-    } catch {
-      await client.close().catch(() => undefined);
-      return null;
+    this.acpConnecting.set(alwaysApprove, pending);
+    return pending;
+  }
+
+  private clientForSession(sessionId: string): GrokAcpClient | null {
+    const bound = this.sessionClient.get(sessionId);
+    if (bound?.ready) return bound;
+    for (const client of this.acpClients.values()) {
+      if (client.ready) return client;
     }
+    return null;
+  }
+
+  private matchesSessionId(evSessionId: string | undefined, gatewaySessionId: string): boolean {
+    if (!evSessionId) return false;
+    return evSessionId === gatewaySessionId || evSessionId === this.acpId(gatewaySessionId);
+  }
+
+  private storageSessionId(sessionId: string): string {
+    if (this.inner.hasSessionFile(sessionId)) return sessionId;
+    const mapped = this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId);
+    if (mapped && this.inner.hasSessionFile(mapped)) return mapped;
+    return mapped ?? sessionId;
   }
 
   private async runAcpTurn(
@@ -1138,9 +1204,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
   ): Promise<void> {
     const cwd = opts.cwd ?? os.homedir();
     this.acpTurns.set(opts.sessionId, opts.stream);
+    this.sessionClient.set(opts.sessionId, acp);
     const unsub = acp.onEvent((ev) => this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev));
     try {
-      let acpSessionId = this.acpSessionIds.get(opts.sessionId) ?? opts.sessionId;
+      let acpSessionId = this.acpId(opts.sessionId);
       if (opts.isNew) {
         const created = await acp.sessionNew({
           cwd,
@@ -1188,7 +1255,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private rememberAcpSession(gatewayId: string, acpId: string, cwd: string): void {
     this.acpSessionIds.set(gatewayId, acpId);
     this.sessionCwd.set(gatewayId, cwd);
-    if (acpId !== gatewayId) this.sessionCwd.set(acpId, cwd);
+    if (acpId && acpId !== gatewayId) {
+      this.gatewaySessionIds.set(acpId, gatewayId);
+      this.sessionCwd.set(acpId, cwd);
+      this.settings.set('acpId', gatewayId, acpId);
+    }
   }
 
   private mapAcpEvent(
@@ -1200,7 +1271,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const ts = Date.now();
     switch (ev.type) {
       case 'message_chunk':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'message',
           status: 'delta',
@@ -1211,7 +1282,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'thought_chunk':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'thinking',
           status: 'delta',
@@ -1222,7 +1293,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'tool_call':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'tool',
           status: 'started',
@@ -1233,7 +1304,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'tool_call_update':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'tool',
           status: ev.status === 'failed' ? 'failed' : 'completed',
@@ -1249,7 +1320,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'question_request':
-        if (ev.sessionId && ev.sessionId !== sessionId) return;
+        if (ev.sessionId && !this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'question',
           status: 'started',
@@ -1268,11 +1339,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'goal_update':
-        if (ev.sessionId && ev.sessionId !== sessionId) return;
+        if (ev.sessionId && !this.matchesSessionId(ev.sessionId, sessionId)) return;
         this.sessionGoals.set(sessionId, normalizeGoal(ev.goal, sessionId));
         break;
       case 'plan':
-        if (ev.sessionId && ev.sessionId !== sessionId) return;
+        if (ev.sessionId && !this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'plan',
           status: 'updated',
@@ -1283,7 +1354,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'permission_request':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
           kind: 'approval',
           status: 'started',
@@ -1302,7 +1373,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         });
         break;
       case 'usage':
-        if (ev.sessionId !== sessionId) return;
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         this.sessionUsage.set(sessionId, usageFromAcp(ev.usage, this.sessionUsage.get(sessionId)));
         break;
       default:
@@ -1310,34 +1381,46 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
   }
 
-  private onAcpProcessEvent(ev: GrokAcpEvent): void {
+  private onAcpProcessEvent(client: GrokAcpClient, alwaysApprove: boolean, ev: GrokAcpEvent): void {
     if (ev.type === 'disconnected') {
-      this.acp = null;
+      if (this.acpClients.get(alwaysApprove) === client) {
+        this.acpClients.delete(alwaysApprove);
+      }
+      for (const [sid, bound] of this.sessionClient) {
+        if (bound === client) this.sessionClient.delete(sid);
+      }
     }
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    if (this.acp?.ready) {
-      await this.acp.sessionCancel(this.acpId(sessionId)).catch(() => undefined);
+    const client = this.clientForSession(sessionId);
+    if (client?.ready) {
+      await client.sessionCancel(this.acpId(sessionId)).catch(() => undefined);
     }
     this.inner.interrupt(sessionId);
   }
 
   async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
-    const pending = this.acp?.getPendingPermission(approvalId);
-    if (!this.acp || !pending || pending.sessionId !== sessionId) {
-      throw new ProviderError('not_found', `grok-adapter: no pending approval ${approvalId}`, 404);
-    }
-    if (decision === 'reject') {
-      this.acp.cancelPermission(pending.id);
+    const acpId = this.acpId(sessionId);
+    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
+      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    for (const client of candidates) {
+      const pending = client.getPendingPermission(approvalId);
+      if (!pending) continue;
+      if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
+      if (decision === 'reject') {
+        client.cancelPermission(pending.id);
+        return;
+      }
+      const optionId = pickPermissionOption(pending.options, decision);
+      if (!optionId) {
+        client.cancelPermission(pending.id);
+        throw new ProviderError('invalid_request', 'grok-adapter: no matching permission option', 400);
+      }
+      client.resolvePermission(pending.id, optionId);
       return;
     }
-    const optionId = pickPermissionOption(pending.options, decision);
-    if (!optionId) {
-      this.acp.cancelPermission(pending.id);
-      throw new ProviderError('invalid_request', 'grok-adapter: no matching permission option', 400);
-    }
-    this.acp.resolvePermission(pending.id, optionId);
+    throw new ProviderError('not_found', `grok-adapter: no pending approval ${approvalId}`, 404);
   }
 
   async resolveQuestion(
@@ -1345,20 +1428,20 @@ export class GrokProviderAdapter implements ProviderAdapter {
     questionId: string,
     answer: string | Record<string, string[]>,
   ): Promise<void> {
-    const pending = this.acp?.getPendingQuestion(questionId);
-    if (!this.acp || !pending) {
-      throw new ProviderError('not_found', `grok-adapter: no pending question ${questionId}`, 404);
+    const acpId = this.acpId(sessionId);
+    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
+      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    for (const client of candidates) {
+      const pending = client.getPendingQuestion(questionId);
+      if (!pending) continue;
+      if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
+      const dismissed = isRecord(answer) && Object.keys(answer).length === 0;
+      const ok = dismissed
+        ? client.cancelQuestion(questionId)
+        : client.resolveQuestion(questionId, answer);
+      if (ok) return;
     }
-    if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== this.acpId(sessionId)) {
-      throw new ProviderError('not_found', `grok-adapter: no pending question ${questionId}`, 404);
-    }
-    const dismissed = isRecord(answer) && Object.keys(answer).length === 0;
-    const ok = dismissed
-      ? this.acp.cancelQuestion(questionId)
-      : this.acp.resolveQuestion(questionId, answer);
-    if (!ok) {
-      throw new ProviderError('not_found', `grok-adapter: no pending question ${questionId}`, 404);
-    }
+    throw new ProviderError('not_found', `grok-adapter: no pending question ${questionId}`, 404);
   }
 
   async setGoal(sessionId: string, objective: string): Promise<Record<string, unknown> | null> {
@@ -1369,13 +1452,13 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const optimistic = normalizeGoal({ objective: trimmed, status: 'active' }, sessionId);
     this.sessionGoals.set(sessionId, optimistic);
     const observed = await this.runGoalCommand(sessionId, `/goal ${trimmed}`);
-    const goal = observed ?? this.inner.readGoal(sessionId) ?? optimistic;
+    const goal = observed ?? this.inner.readGoal(this.storageSessionId(sessionId)) ?? optimistic;
     this.sessionGoals.set(sessionId, goal);
     return goal;
   }
 
   async getGoal(sessionId: string): Promise<Record<string, unknown> | null> {
-    const fromDisk = this.inner.readGoal(sessionId);
+    const fromDisk = this.inner.readGoal(this.storageSessionId(sessionId));
     const cached = this.sessionGoals.get(sessionId) ?? null;
     const goal = fromDisk ? { ...cached, ...fromDisk } : cached;
     if (!goal) return null;
@@ -1396,7 +1479,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
       return null;
     }
     const status = control === 'pause' ? 'paused' : 'active';
-    const base = observed ?? this.inner.readGoal(sessionId) ?? this.sessionGoals.get(sessionId) ?? {};
+    const base = observed ?? this.inner.readGoal(this.storageSessionId(sessionId)) ?? this.sessionGoals.get(sessionId) ?? {};
     const goal = normalizeGoal({ ...base, status }, sessionId);
     this.sessionGoals.set(sessionId, goal);
     return goal;
@@ -1411,18 +1494,23 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async dispose(): Promise<void> {
-    await this.acp?.close().catch(() => undefined);
-    this.acp = null;
+    const clients = [...this.acpClients.values()];
+    this.acpClients.clear();
+    this.acpConnecting.clear();
+    this.sessionClient.clear();
     this.acpSessionIds.clear();
+    this.gatewaySessionIds.clear();
+    await Promise.allSettled(clients.map((client) => client.close()));
     await this.inner.close();
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
     this.settings.set('model', sessionId, model);
+    const client = this.clientForSession(sessionId);
     const acpId = this.acpSessionIds.get(sessionId);
-    if (this.acp?.ready && acpId) {
-      await this.acp.sessionSetModel(acpId, model).catch(async () => {
-        await this.acp?.sessionSetConfigOption(acpId, 'model', model).catch(() => undefined);
+    if (client?.ready && acpId) {
+      await client.sessionSetModel(acpId, model).catch(async () => {
+        await client.sessionSetConfigOption(acpId, 'model', model).catch(() => undefined);
       });
     }
   }
@@ -1436,9 +1524,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async setThinking(sessionId: string, thinking: string): Promise<void> {
     this.settings.set('thinking', sessionId, thinking);
     const effort = grokEffort(thinking);
+    const client = this.clientForSession(sessionId);
     const acpId = this.acpSessionIds.get(sessionId);
-    if (effort && this.acp?.ready && acpId) {
-      await this.acp.sessionSetConfigOption(acpId, 'reasoning_effort', effort).catch(() => undefined);
+    if (effort && client?.ready && acpId) {
+      await client.sessionSetConfigOption(acpId, 'reasoning_effort', effort).catch(() => undefined);
     }
   }
 
@@ -1457,9 +1546,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async setPlanMode(sessionId: string, on: boolean): Promise<void> {
     if (on) this.settings.set('plan', sessionId, true);
     else this.settings.delete('plan', sessionId);
+    const client = this.clientForSession(sessionId);
     const acpId = this.acpSessionIds.get(sessionId);
-    if (this.acp?.ready && acpId) {
-      await this.acp.sessionSetMode(acpId, on ? 'plan' : 'default').catch(() => undefined);
+    if (client?.ready && acpId) {
+      await client.sessionSetMode(acpId, on ? 'plan' : 'default').catch(() => undefined);
     }
   }
 
@@ -1469,31 +1559,67 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   async rename(sessionId: string, title: string): Promise<void> {
     this.renames.set(sessionId, title);
+    const client = this.clientForSession(sessionId);
+    const acpId = this.acpId(sessionId);
+    if (client?.ready) {
+      await client.sessionRename(acpId, title).catch(() => undefined);
+    }
   }
 
   async listModels(): Promise<NativeModel[]> {
-    const { defaultModel, models } = await this.inner.listModels();
-    if (defaultModel) this.defaultModel = defaultModel;
-    return models.map((model) => ({
-      provider: 'grok',
-      model,
-      display_name: model,
-      max_context_size: grokContextWindow(model),
-      capabilities: ['thinking'],
-      support_efforts: [...GROK_EFFORTS],
-      default_effort: 'high',
-    }));
+    try {
+      const { defaultModel, models } = await this.inner.listModels();
+      if (defaultModel) this.defaultModel = defaultModel;
+      return models.map((model) => ({
+        provider: 'grok',
+        model,
+        display_name: model,
+        max_context_size: grokContextWindow(model),
+        capabilities: ['thinking'],
+        support_efforts: [...GROK_EFFORTS],
+        default_effort: 'high',
+      }));
+    } catch (err) {
+      for (const client of this.acpClients.values()) {
+        const state = client.modelState;
+        if (client.ready && state && state.availableModels.length > 0) {
+          if (state.currentModelId) this.defaultModel = state.currentModelId;
+          return state.availableModels.map((m) => ({
+            provider: 'grok',
+            model: m.modelId,
+            display_name: m.name ?? m.modelId,
+            ...(m.description ? { description: m.description } : {}),
+            max_context_size: m.totalContextTokens ?? grokContextWindow(m.modelId),
+            capabilities: m.supportsReasoningEffort === false ? [] : ['thinking'],
+            support_efforts: m.reasoningEfforts?.length
+              ? m.reasoningEfforts.map((e) => e.value)
+              : [...GROK_EFFORTS],
+            default_effort: m.reasoningEffort ?? 'high',
+            isDefault: state.currentModelId === m.modelId,
+            raw: m,
+          }));
+        }
+      }
+      throw err;
+    }
   }
 
   async listCommands(sessionId?: string): Promise<NativeCommand[]> {
-    const cwd = sessionId ? (this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId)) : undefined;
+    const cwd = sessionId ? this.getCwd(sessionId) : undefined;
     const skills = await this.discoverSkills(cwd);
-    const native = this.acp?.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined) ?? [];
+    const targetClient = sessionId ? this.clientForSession(sessionId) : this.clientForSession('');
+    let native = targetClient?.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined) ?? [];
+    if (native.length === 0) {
+      for (const client of this.acpClients.values()) {
+        native = client.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined);
+        if (native.length > 0) break;
+      }
+    }
     return listGrokCommands(skills, native);
   }
 
   async listSkills(sessionId?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>> {
-    const cwd = sessionId ? (this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId)) : undefined;
+    const cwd = sessionId ? this.getCwd(sessionId) : undefined;
     return (await this.discoverSkills(cwd)).map((skill) => ({
       name: skill.name,
       description: skill.description,
@@ -1504,7 +1630,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   private acpId(sessionId: string): string {
-    return this.acpSessionIds.get(sessionId) ?? sessionId;
+    return this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId) ?? sessionId;
   }
 
   /** Compact is a native slash command on 1.0.77 — there is no compact RPC. */
@@ -1513,8 +1639,23 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async fork(sessionId: string): Promise<Session> {
-    const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId) ?? process.cwd();
-    const { sessionId: newId } = await this.inner.forkSession(sessionId, cwd);
+    const cwd = this.getCwd(sessionId) ?? process.cwd();
+    const storageId = this.storageSessionId(sessionId);
+    let newId: string | null = null;
+    const client = this.clientForSession(sessionId);
+    if (client?.ready && (this.acpSessionIds.has(sessionId) || this.inner.hasSessionFile(storageId))) {
+      const acpFork = await client
+        .sessionFork({ sourceSessionId: storageId, sourceCwd: cwd, newCwd: cwd })
+        .catch(() => null);
+      if (acpFork?.newSessionId) {
+        newId = acpFork.newSessionId;
+        this.rememberAcpSession(newId, newId, cwd);
+      }
+    }
+    if (!newId) {
+      const forked = await this.inner.forkSession(storageId, cwd);
+      newId = forked.sessionId;
+    }
     this.sessionCwd.set(newId, cwd);
     this.settings.copySession(sessionId, newId);
     const goal = this.sessionGoals.get(sessionId);
@@ -1533,26 +1674,36 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   /** Rewind via the CLI's append-only rewind_marker (no rewind RPC on 1.0.77). */
   async rollback(sessionId: string, numTurns: number): Promise<void> {
-    this.inner.rollbackSession(sessionId, numTurns);
+    this.inner.rollbackSession(this.storageSessionId(sessionId), numTurns);
   }
 
   async delete(sessionId: string): Promise<void> {
+    const acpId = this.acpId(sessionId);
+    const client = this.clientForSession(sessionId);
+    if (client?.ready) {
+      await client.sessionDelete(acpId).catch(() => undefined);
+    }
     this.inner.interrupt(sessionId);
     this.renames.delete(sessionId);
     this.sessionCwd.delete(sessionId);
+    this.sessionCwd.delete(acpId);
+    this.sessionClient.delete(sessionId);
     this.acpSessionIds.delete(sessionId);
+    this.gatewaySessionIds.delete(acpId);
     this.sessionUsage.delete(sessionId);
     this.sessionGoals.delete(sessionId);
+    this.settings.delete('acpId', sessionId);
     this.settings.delete('model', sessionId);
     this.settings.delete('thinking', sessionId);
     this.settings.delete('permission', sessionId);
     this.settings.delete('plan', sessionId);
     this.settings.delete('archived', sessionId);
     this.inner.deleteSession(sessionId);
+    if (acpId !== sessionId) this.inner.deleteSession(acpId);
   }
 
   getUsage(sessionId: string): SessionUsage | undefined {
-    const fromDisk = this.inner.readUsage(sessionId);
+    const fromDisk = this.inner.readUsage(this.storageSessionId(sessionId));
     const cached = this.sessionUsage.get(sessionId);
     if (!fromDisk) return cached;
     if (!cached) return fromDisk;
@@ -1602,14 +1753,16 @@ export class GrokProviderAdapter implements ProviderAdapter {
    * through the headless fallback. Returns goal snapshots observed on the way.
    */
   private async promptSlashCommand(sessionId: string, command: string): Promise<Record<string, unknown> | null> {
-    const cwd = this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId) ?? process.cwd();
+    const cwd = this.getCwd(sessionId) ?? process.cwd();
     const acp = await this.ensureAcp(false);
+    const storageId = this.storageSessionId(sessionId);
     if (!acp) {
-      await this.inner.startTurn({ sessionId, prompt: command, cwd, isNew: !this.inner.hasSessionFile(sessionId), onEvent: () => undefined });
-      return this.inner.readGoal(sessionId);
+      await this.inner.startTurn({ sessionId: storageId, prompt: command, cwd, isNew: !this.inner.hasSessionFile(storageId), onEvent: () => undefined });
+      return this.inner.readGoal(storageId);
     }
+    this.sessionClient.set(sessionId, acp);
     let acpSessionId = this.acpId(sessionId);
-    if (!this.inner.hasSessionFile(sessionId) && !this.acpSessionIds.has(sessionId)) {
+    if (!this.inner.hasSessionFile(storageId) && !this.acpSessionIds.has(sessionId)) {
       const created = await acp.sessionNew({ cwd, sessionId });
       acpSessionId = created.sessionId || sessionId;
       this.rememberAcpSession(sessionId, acpSessionId, cwd);
@@ -1622,7 +1775,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
     let observed: Record<string, unknown> | null = null;
     const unsub = acp.onEvent((ev) => {
-      if (ev.type === 'goal_update' && (!ev.sessionId || ev.sessionId === acpSessionId || ev.sessionId === sessionId)) {
+      if (ev.type === 'goal_update' && (!ev.sessionId || this.matchesSessionId(ev.sessionId, sessionId))) {
         observed = normalizeGoal(ev.goal, sessionId);
       }
     });
@@ -1638,7 +1791,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     try {
       return await this.promptSlashCommand(sessionId, command);
     } catch {
-      return this.inner.readGoal(sessionId);
+      return this.inner.readGoal(this.storageSessionId(sessionId));
     }
   }
 
@@ -1648,15 +1801,24 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   getCwd(sessionId: string): string | undefined {
-    return this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId);
+    const acpId = this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId);
+    return this.sessionCwd.get(sessionId)
+      ?? (acpId ? this.sessionCwd.get(acpId) : undefined)
+      ?? this.inner.getCwd(sessionId)
+      ?? (acpId ? this.inner.getCwd(acpId) : undefined);
   }
 
   private toSession(s: GrokSessionSummary): Session {
-    if (s.cwd) this.sessionCwd.set(s.sessionId, s.cwd);
-    const title = this.renames.get(s.sessionId) ?? (s.title || `Grok ${s.sessionId.slice(0, 8)}`);
-    const archived = this.settings.getBoolean('archived', s.sessionId) === true;
+    const id = this.gatewaySessionIds.get(s.sessionId) ?? s.sessionId;
+    if (s.cwd) {
+      this.sessionCwd.set(s.sessionId, s.cwd);
+      this.sessionCwd.set(id, s.cwd);
+    }
+    const title = this.renames.get(id) ?? this.renames.get(s.sessionId) ?? (s.title || `Grok ${id.slice(0, 8)}`);
+    const archived = this.settings.getBoolean('archived', id) === true
+      || this.settings.getBoolean('archived', s.sessionId) === true;
     return {
-      id: s.sessionId,
+      id,
       workspace_id: workspaceIdFromCwd(s.cwd, 'grok'),
       title,
       created_at: s.createdAt,
@@ -1797,24 +1959,23 @@ function promptIndexOf(update: Record<string, unknown>): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
-/** Latest rewind target wins; points file only narrows the window. */
+/** Latest un-superseded rewind_marker wins; rewind_points.jsonl alone never truncates un-rewound history. */
 function effectiveRewind(
   updates: Array<Record<string, unknown>>,
-  points: Array<Record<string, unknown>>,
+  _points: Array<Record<string, unknown>>,
 ): number | undefined {
   let target: number | undefined;
   for (const entry of updates) {
     const update = updateOf(entry);
     const kind = String(update.sessionUpdate ?? update.type ?? '');
-    if (kind !== 'rewind_marker' && kind !== 'rewind') continue;
-    const value = update.target_prompt_index ?? update.targetPromptIndex ?? update.prompt_index;
-    if (typeof value === 'number' && Number.isFinite(value)) target = value;
-  }
-  if (target === undefined && points.length > 0) {
-    const indexes = points
-      .map((point) => point.prompt_index ?? point.promptIndex)
-      .filter((index): index is number => typeof index === 'number');
-    if (indexes.length > 0) target = Math.max(...indexes) + 1;
+    if (kind === 'rewind_marker' || kind === 'rewind') {
+      const value = update.target_prompt_index ?? update.targetPromptIndex ?? update.prompt_index;
+      if (typeof value === 'number' && Number.isFinite(value)) target = value;
+      continue;
+    }
+    if (kind === 'user_message_chunk' && target !== undefined) {
+      target = undefined;
+    }
   }
   return target;
 }
@@ -1841,16 +2002,15 @@ function applyRewind(messages: GrokHistoryMessage[], target: number | undefined)
 /** Reconstruct a transcript from ACP updates when chat_history.jsonl is absent. */
 function historyFromUpdates(
   updates: Array<Record<string, unknown>>,
-  rewindTarget: number | undefined,
+  _rewindTarget: number | undefined,
 ): GrokHistoryMessage[] {
   const messages: GrokHistoryMessage[] = [];
   let userTurns = 0;
-  let skipping = false;
   const flush = (role: GrokHistoryMessage['role'], text: string): void => {
     const trimmed = text.trim();
     if (!trimmed) return;
     const last = messages[messages.length - 1];
-    if (last && last.role === role) {
+    if (role === 'assistant' && last && last.role === 'assistant') {
       last.text += trimmed;
       last.blocks = [...(last.blocks ?? []), { type: 'text', text: trimmed }];
       return;
@@ -1859,32 +2019,38 @@ function historyFromUpdates(
   };
   let pending = '';
   let pendingRole: 'user' | 'assistant' | null = null;
+  let pendingPromptIndex: number | undefined;
   const commit = (): void => {
     if (pendingRole) flush(pendingRole, pending);
     pending = '';
     pendingRole = null;
+    pendingPromptIndex = undefined;
   };
   for (const entry of updates) {
     const update = updateOf(entry);
     const kind = String(update.sessionUpdate ?? update.type ?? '');
     if (kind === 'rewind_marker' || kind === 'rewind') {
       commit();
-      const value = update.target_prompt_index ?? update.targetPromptIndex;
-      skipping = typeof value === 'number' ? userTurns >= value : true;
+      const value = update.target_prompt_index ?? update.targetPromptIndex ?? update.prompt_index;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const target = Math.max(0, Math.trunc(value));
+        applyRewind(messages, target);
+        userTurns = target;
+      }
       continue;
     }
     if (kind === 'user_message_chunk') {
       const index = promptIndexOf(update);
-      if (index === undefined || index === userTurns) userTurns += 1;
-      else if (index > userTurns) userTurns = index + 1;
-      skipping = rewindTarget !== undefined && (index ?? userTurns - 1) >= rewindTarget;
-      if (skipping) continue;
-      if (pendingRole && pendingRole !== 'user') commit();
+      if (pendingRole && (pendingRole !== 'user' || index === undefined || index !== pendingPromptIndex)) {
+        commit();
+      }
+      if (index === undefined) userTurns += 1;
+      else if (index >= userTurns) userTurns = index + 1;
       pendingRole = 'user';
+      pendingPromptIndex = index;
       pending += textOfContent(update.content);
       continue;
     }
-    if (skipping) continue;
     if (kind === 'agent_message_chunk') {
       if (pendingRole && pendingRole !== 'assistant') commit();
       pendingRole = 'assistant';
@@ -2307,14 +2473,11 @@ function unwrapUserQuery(text: string): string | null {
 }
 
 function readSessionTimes(dir: string): { createdAt: string; updatedAt: string } {
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dir, 'summary.json'), 'utf8')) as Record<string, unknown>;
-    const updatedAt = pickString(raw.updated_at, raw.last_active_at);
-    const createdAt = pickString(raw.created_at) || updatedAt;
-    return { createdAt, updatedAt };
-  } catch {
-    return { createdAt: '', updatedAt: '' };
-  }
+  const raw = readJsonNoFollow(path.join(dir, 'summary.json'));
+  if (!raw) return { createdAt: '', updatedAt: '' };
+  const updatedAt = pickString(raw.updated_at, raw.last_active_at);
+  const createdAt = pickString(raw.created_at) || updatedAt;
+  return { createdAt, updatedAt };
 }
 
 function interpolateIso(createdAt: string, updatedAt: string, index: number, count: number): string {
@@ -2342,8 +2505,12 @@ function decodeUriComponentSafe(value: string): string {
 }
 
 function workspaceIdFromCwd(cwd: string, provider: string): string {
-  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
-  return `wd_${provider}_${slug}`.slice(0, 60);
+  const normalized = path.resolve(cwd).replace(/[\\/]+$/, '') || '/';
+  const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
+  const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  const prefix = `wd_${provider}_`;
+  const maxSlug = Math.max(1, 60 - prefix.length - 1 - hash.length);
+  return `${prefix}${slug.slice(0, maxSlug)}_${hash}`;
 }
 
 function nowIso(): string {
