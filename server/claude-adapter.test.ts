@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { ClaudeAdapter } from './claude-adapter.js';
+import {
+  ClaudeAdapter,
+  encodeAskUserQuestionAnswers,
+  followClaudeBranch,
+  mapControlPermissionMode,
+  resolveClaudeBin,
+  type ClaudeAdapterEvent,
+} from './claude-adapter.js';
 
 test('rejects traversal session ids before reading transcript paths', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-adapter-'));
@@ -416,7 +425,1067 @@ rl.on('close', () => process.exit(0));
       assert.deepEqual(response?.response?.response?.updatedInput, { command: 'pwd' });
     } finally {
       await adapter.close();
-    }  } finally {
+    }
+  } finally {
     await rm(base, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// 1. Executable resolution, env isolation (strip GATEWAY_*), CLAUDE_CONFIG_DIR
+// ---------------------------------------------------------------------------
+
+test('resolveClaudeBin honors claudeBin > CLAUDE_BIN > PATH > ~/.local/bin/claude', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-bin-res-'));
+  const saved = {
+    CLAUDE_BIN: process.env.CLAUDE_BIN,
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+  };
+  try {
+    const fakeHome = join(base, 'home');
+    const localBinDir = join(fakeHome, '.local', 'bin');
+    const pathDir = join(base, 'path-bin');
+    const nonExecDir = join(base, 'non-exec');
+    await mkdir(localBinDir, { recursive: true });
+    await mkdir(pathDir, { recursive: true });
+    await mkdir(join(nonExecDir, 'claude'), { recursive: true }); // directory named 'claude' must be skipped
+
+    const localBin = join(localBinDir, 'claude');
+    const pathBin = join(pathDir, 'claude');
+    const envBin = join(base, 'env-claude');
+    const optBin = join(base, 'opt-claude');
+    for (const p of [localBin, pathBin, envBin, optBin]) {
+      await writeFile(p, '#!/bin/sh\nexit 0\n');
+      await chmod(p, 0o755);
+    }
+
+    process.env.HOME = fakeHome;
+    process.env.PATH = `${nonExecDir}:${pathDir}`;
+    process.env.CLAUDE_BIN = envBin;
+
+    assert.equal(resolveClaudeBin({ claudeBin: optBin }), optBin);
+    assert.equal(resolveClaudeBin({}), envBin);
+    assert.equal(resolveClaudeBin({ env: { CLAUDE_BIN: optBin } }), optBin);
+
+    // Explicit empty CLAUDE_BIN in options.env falls through to PATH, skipping directory 'claude'
+    assert.equal(resolveClaudeBin({ env: { CLAUDE_BIN: '' } }), pathBin);
+
+    delete process.env.CLAUDE_BIN;
+    assert.equal(resolveClaudeBin({}), pathBin);
+
+    // Without PATH match, falls back to ~/.local/bin/claude
+    assert.equal(resolveClaudeBin({ env: { PATH: nonExecDir, HOME: fakeHome } }), localBin);
+  } finally {
+    if (saved.CLAUDE_BIN === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = saved.CLAUDE_BIN;
+    if (saved.PATH === undefined) delete process.env.PATH;
+    else process.env.PATH = saved.PATH;
+    if (saved.HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = saved.HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('strips GATEWAY_* env from spawned claude child and honors custom CLAUDE_CONFIG_DIR', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-env-strip-'));
+  const savedGatewayToken = process.env.GATEWAY_TOKEN;
+  const savedGatewayPort = process.env.GATEWAY_PORT;
+  const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+  try {
+    process.env.GATEWAY_TOKEN = 'secret-gateway-token';
+    process.env.GATEWAY_PORT = '58629';
+    const customConfig = join(base, 'custom-claude-config');
+    const projDir = join(customConfig, 'projects', 'my-proj');
+    await mkdir(projDir, { recursive: true });
+    const sessionId = '11111111-2222-4333-8444-555555555555';
+    await writeFile(
+      join(projDir, `${sessionId}.jsonl`),
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u1',
+        parentUuid: null,
+        cwd: '/tmp/work',
+        timestamp: '2026-05-01T00:00:00.000Z',
+        message: { role: 'user', content: 'from custom config' },
+      }) + '\n',
+    );
+
+    const envLog = join(base, 'child-env.json');
+    const bin = join(base, 'claude');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(envLog)}, JSON.stringify({
+  gatewayToken: process.env.GATEWAY_TOKEN ?? null,
+  gatewayPort: process.env.GATEWAY_PORT ?? null,
+  configDir: process.env.CLAUDE_CONFIG_DIR ?? null,
+  customKeep: process.env.CUSTOM_KEEP ?? null,
+  noTraffic: process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ?? null,
+}));
+process.stdout.write(JSON.stringify({
+  type: 'result',
+  subtype: 'success',
+  result: 'ok',
+  is_error: false,
+  session_id: ${JSON.stringify(sessionId)},
+}) + '\\n');
+`,
+    );
+    await chmod(bin, 0o755);
+
+    process.env.CLAUDE_CONFIG_DIR = customConfig;
+    const adapter = new ClaudeAdapter({ claudeBin: bin, env: { CUSTOM_KEEP: 'yes' } });
+    const listed = await adapter.list();
+    assert.deepEqual(listed.map((s) => s.sessionId), [sessionId]);
+    assert.equal(listed[0]?.title, 'from custom config');
+    assert.equal(adapter.hasSessionFile(sessionId), true);
+
+    await adapter.startTurn({ sessionId, prompt: 'hi', onEvent: () => {} });
+    const captured = JSON.parse(await readFile(envLog, 'utf8'));
+    assert.equal(captured.gatewayToken, null);
+    assert.equal(captured.gatewayPort, null);
+    assert.equal(captured.configDir, customConfig);
+    assert.equal(captured.customKeep, 'yes');
+    assert.equal(captured.noTraffic, '1');
+    await adapter.close();
+  } finally {
+    if (savedGatewayToken === undefined) delete process.env.GATEWAY_TOKEN;
+    else process.env.GATEWAY_TOKEN = savedGatewayToken;
+    if (savedGatewayPort === undefined) delete process.env.GATEWAY_PORT;
+    else process.env.GATEWAY_PORT = savedGatewayPort;
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2. AskUserQuestion encoding & can_use_tool metadata / responses
+// ---------------------------------------------------------------------------
+
+test('encodeAskUserQuestionAnswers maps q_N indices, comma-joins multiSelect, and validates bounds', () => {
+  const questions = [
+    { question: 'Pick a color?', header: 'Color', multiSelect: false },
+    { question: 'Which DBs?', header: 'DB', multiSelect: true },
+    { question: 'Special options?', header: 'Special', multiSelect: true },
+  ];
+
+  const mapped = encodeAskUserQuestionAnswers(questions, {
+    q_0: ['Blue'],
+    q_1: ['Postgres', 'Redis'],
+    q_2: ['A, B', 'Normal'],
+  });
+  assert.deepEqual(mapped, {
+    'Pick a color?': 'Blue',
+    'Which DBs?': 'Postgres, Redis',
+    'Special options?': '"A, B", Normal',
+  });
+
+  assert.deepEqual(encodeAskUserQuestionAnswers(questions, 'Green'), {
+    'Pick a color?': 'Green',
+  });
+
+  assert.throws(() => encodeAskUserQuestionAnswers(questions, { q_3: ['x'] }), /out of bounds/);
+  assert.throws(() => encodeAskUserQuestionAnswers(questions, { 'q_-1': ['x'] }), /out of bounds/);
+  assert.throws(() => encodeAskUserQuestionAnswers(questions, { bogus: ['x'] }), /unknown question key/);
+});
+
+test('AskUserQuestion control_request preserves original input and translates q_N answers', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-ask-'));
+  try {
+    const bin = join(base, 'claude-ask');
+    const log = join(base, 'stdin.log');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174050';
+    const rawQuestions = [
+      { question: 'Target runtime?', header: 'Runtime', multiSelect: false, options: [{ label: 'Node' }, { label: 'Bun' }] },
+      { question: 'Features?', header: 'Features', multiSelect: true, options: [{ label: 'Auth' }, { label: 'Cache' }] },
+    ];
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+const sessionId = ${JSON.stringify(sessionId)};
+const questions = ${JSON.stringify(rawQuestions)};
+const rl = readline.createInterface({ input: process.stdin });
+let sent = false;
+rl.on('line', (line) => {
+  fs.appendFileSync(log, line + '\\n');
+  const msg = JSON.parse(line);
+  if (!sent && msg.type === 'user') {
+    sent = true;
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_ask_1',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: 'toolu_ask_1',
+        input: { questions, metadata: { source: 'wizard' } },
+      },
+    }) + '\\n');
+    return;
+  }
+  if (msg.type === 'control_response') {
+    process.stdout.write(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'done',
+      is_error: false,
+      session_id: sessionId,
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const events: ClaudeAdapterEvent[] = [];
+      const turn = adapter.startTurn({
+        sessionId,
+        prompt: 'ask me',
+        onEvent: (ev) => events.push(ev),
+      });
+
+      let questionEv: Extract<ClaudeAdapterEvent, { type: 'question' }> | undefined;
+      for (let i = 0; i < 100; i += 1) {
+        questionEv = events.find((e) => e.type === 'question') as typeof questionEv;
+        if (questionEv) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(questionEv);
+
+      await assert.rejects(
+        adapter.resolveQuestion(sessionId, 'req_ask_1', { q_5: ['invalid'] }),
+        /out of bounds/,
+      );
+      await adapter.resolveQuestion(sessionId, 'req_ask_1', {
+        q_0: ['Node'],
+        q_1: ['Auth', 'Cache'],
+      });
+      await turn;
+
+      const lines = (await readFile(log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const ctrlResp = lines.find((m) => m.type === 'control_response');
+      assert.equal(ctrlResp?.response?.subtype, 'success');
+      assert.equal(ctrlResp?.response?.response?.behavior, 'allow');
+      assert.equal(ctrlResp?.response?.response?.toolUseID, 'toolu_ask_1');
+      assert.deepEqual(ctrlResp?.response?.response?.updatedInput, {
+        questions: rawQuestions,
+        metadata: { source: 'wizard' },
+        answers: {
+          'Target runtime?': 'Node',
+          'Features?': 'Auth, Cache',
+        },
+      });
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('can_use_tool preserves granular metadata, enforces suppressAlwaysAllow on approve_always, and sends required deny message', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-perms-'));
+  try {
+    const bin = join(base, 'claude-perms');
+    const log = join(base, 'stdin.log');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174051';
+    const suggestions = [{ type: 'addRules', rules: [{ toolName: 'Bash', ruleContent: 'ls *' }], behavior: 'allow', destination: 'session' }];
+
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+const sessionId = ${JSON.stringify(sessionId)};
+const suggestions = ${JSON.stringify(suggestions)};
+const rl = readline.createInterface({ input: process.stdin });
+let step = 0;
+rl.on('line', (line) => {
+  fs.appendFileSync(log, line + '\\n');
+  const msg = JSON.parse(line);
+  if (step === 0 && msg.type === 'user') {
+    step = 1;
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_p1',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Bash',
+        tool_use_id: 'toolu_p1',
+        input: { command: 'ls' },
+        permission_suggestions: suggestions,
+        blocked_path: '/etc/shadow',
+        decision_reason: 'Reads outside workspace',
+        decision_reason_type: 'safetyCheck',
+        suppress_always_allow_rule: false,
+        default_to_no: true,
+        requires_user_interaction: false,
+      },
+    }) + '\\n');
+    return;
+  }
+  if (step === 1 && msg.type === 'control_response') {
+    step = 2;
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_p2',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Bash',
+        tool_use_id: 'toolu_p2',
+        input: { command: 'rm -rf /tmp/x' },
+        permission_suggestions: suggestions,
+        suppress_always_allow_rule: true,
+        default_to_no: true,
+        requires_user_interaction: true,
+      },
+    }) + '\\n');
+    return;
+  }
+  if (step === 2 && msg.type === 'control_response') {
+    step = 3;
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_p3',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Write',
+        tool_use_id: 'toolu_p3',
+        input: { file_path: '/tmp/a.txt' },
+      },
+    }) + '\\n');
+    return;
+  }
+  if (step === 3 && msg.type === 'control_response') {
+    process.stdout.write(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'done',
+      is_error: false,
+      session_id: sessionId,
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const events: ClaudeAdapterEvent[] = [];
+      const turn = adapter.startTurn({ sessionId, prompt: 'test', onEvent: (ev) => events.push(ev) });
+
+      const waitForApproval = async (id: string) => {
+        for (let i = 0; i < 100; i += 1) {
+          const hit = events.find((e) => e.type === 'approval' && e.approvalId === id);
+          if (hit && hit.type === 'approval') return hit;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        throw new Error(`timeout waiting for approval ${id}`);
+      };
+
+      const a1 = await waitForApproval('req_p1');
+      assert.deepEqual(a1.suggestions, suggestions);
+      assert.equal(a1.blockedPath, '/etc/shadow');
+      assert.equal(a1.decisionReason, 'Reads outside workspace');
+      assert.equal(a1.decisionReasonType, 'safetyCheck');
+      assert.equal(a1.suppressAlwaysAllow, false);
+      assert.equal(a1.defaultToNo, true);
+      assert.equal(a1.requiresUserInteraction, false);
+      await adapter.resolveApproval(sessionId, 'req_p1', 'approve_always');
+
+      const a2 = await waitForApproval('req_p2');
+      assert.equal(a2.suppressAlwaysAllow, true);
+      assert.equal(a2.requiresUserInteraction, true);
+      // Even if approve_always is requested, suppress_always_allow_rule/requires_user_interaction forbids updatedPermissions
+      await adapter.resolveApproval(sessionId, 'req_p2', 'approve_always');
+
+      await waitForApproval('req_p3');
+      await adapter.resolveApproval(sessionId, 'req_p3', 'deny');
+
+      await turn;
+
+      const lines = (await readFile(log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const r1 = lines.find((m) => m.response?.request_id === 'req_p1')?.response?.response;
+      const r2 = lines.find((m) => m.response?.request_id === 'req_p2')?.response?.response;
+      const r3 = lines.find((m) => m.response?.request_id === 'req_p3')?.response?.response;
+
+      assert.equal(r1?.behavior, 'allow');
+      assert.deepEqual(r1?.updatedPermissions, suggestions);
+      assert.equal(r1?.decisionClassification, 'user_permanent');
+
+      assert.equal(r2?.behavior, 'allow');
+      assert.equal(r2?.updatedPermissions, undefined);
+      assert.equal(r2?.decisionClassification, 'user_temporary');
+
+      assert.equal(r3?.behavior, 'deny');
+      assert.equal(typeof r3?.message, 'string');
+      assert.ok(r3.message.length > 0);
+      assert.equal(r3?.decisionClassification, 'user_reject');
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 3. Bidirectional control transport, correlation, cancel, unknown subtype, 2.1.325 models/events
+// ---------------------------------------------------------------------------
+
+test('correlates out-of-order control_responses by request_id, handles cancel & rejects unknown inbound subtypes', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-ctrl-'));
+  try {
+    const bin = join(base, 'claude-ctrl');
+    const log = join(base, 'stdin.log');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174052';
+
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+const sessionId = ${JSON.stringify(sessionId)};
+const rl = readline.createInterface({ input: process.stdin });
+const held = [];
+rl.on('line', (line) => {
+  fs.appendFileSync(log, line + '\\n');
+  const msg = JSON.parse(line);
+  if (msg.type === 'user') {
+    // Emit unknown inbound control_request, plus an approval that gets cancelled
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_unknown_1',
+      request: { subtype: 'future_unknown_widget', foo: 1 },
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'control_request',
+      request_id: 'req_cancel_me',
+      request: { subtype: 'can_use_tool', tool_name: 'Bash', tool_use_id: 'tu_c', input: { command: 'date' } },
+    }) + '\\n');
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ type: 'control_cancel_request', request_id: 'req_cancel_me' }) + '\\n');
+    }, 30);
+    return;
+  }
+  if (msg.type === 'control_request') {
+    const subtype = msg.request?.subtype;
+    if (subtype === 'set_model' || subtype === 'mcp_status') {
+      held.push(msg);
+      if (held.length === 2) {
+        // Reply OUT OF ORDER: second request first, first request second!
+        const [first, second] = held;
+        const replyFor = (req) =>
+          req.request?.subtype === 'mcp_status'
+            ? { mcpServers: [{ name: 'fs', status: 'connected' }] }
+            : { model: 'claude-sonnet-5-5' };
+        process.stdout.write(JSON.stringify({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: second.request_id, response: replyFor(second) },
+        }) + '\\n');
+        process.stdout.write(JSON.stringify({
+          type: 'control_response',
+          response: { subtype: 'success', request_id: first.request_id, response: replyFor(first) },
+        }) + '\\n');
+      }
+    } else if (subtype === 'interrupt') {
+      process.stdout.write(JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: msg.request_id, response: { still_queued: [] } },
+      }) + '\\n');
+      process.stdout.write(JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        result: 'interrupted-ok',
+        is_error: false,
+        session_id: sessionId,
+        total_cost_usd: 0.42,
+        modelUsage: {
+          'claude-sonnet-5-5': { inputTokens: 100, outputTokens: 50, cacheReadInputTokens: 20, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.42, contextWindow: 200000, maxOutputTokens: 16384 },
+        },
+        usage: { input_tokens: 10, output_tokens: 5 },
+      }) + '\\n');
+    } else {
+      process.stdout.write(JSON.stringify({
+        type: 'control_response',
+        response: { subtype: 'success', request_id: msg.request_id, response: {} },
+      }) + '\\n');
+    }
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const events: ClaudeAdapterEvent[] = [];
+      const turn = adapter.startTurn({ sessionId, prompt: 'go', onEvent: (ev) => events.push(ev) });
+
+      // Wait for control_cancelled event
+      for (let i = 0; i < 100; i += 1) {
+        if (events.some((e) => e.type === 'control_cancelled' && e.requestId === 'req_cancel_me')) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(events.some((e) => e.type === 'control_cancelled' && e.requestId === 'req_cancel_me'));
+      await assert.rejects(adapter.resolveApproval(sessionId, 'req_cancel_me', 'allow'), /no pending approval/);
+
+      // Concurrent outbound requests answered out of order
+      const [modelResp, mcpList] = await Promise.all([
+        adapter.setModel(sessionId, 'sonnet'),
+        adapter.mcpStatus(sessionId),
+      ]);
+      assert.equal(modelResp.model, 'claude-sonnet-5-5');
+      assert.deepEqual(mcpList, [{ name: 'fs', status: 'connected' }]);
+
+      await adapter.setPermissionMode(sessionId, 'manual');
+      await adapter.setMaxThinkingTokens(sessionId, 8192, 'summarized');
+      await adapter.setEffortLevel(sessionId, 'high');
+
+      assert.equal(adapter.interrupt(sessionId), true);
+      await turn;
+
+      const lines = (await readFile(log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const unknownReply = lines.find((m) => m.type === 'control_response' && m.response?.request_id === 'req_unknown_1');
+      assert.equal(unknownReply?.response?.subtype, 'error');
+      assert.equal(unknownReply?.response?.error_code, 'unsupported_request');
+
+      const permReq = lines.find((m) => m.type === 'control_request' && m.request?.subtype === 'set_permission_mode');
+      assert.equal(permReq?.request?.mode, 'default'); // CLI-only 'manual' mapped to 'default'
+
+      const flagReq = lines.find((m) => m.type === 'control_request' && m.request?.subtype === 'apply_flag_settings');
+      assert.deepEqual(flagReq?.request?.settings, { effortLevel: 'high' });
+
+      const doneEv = events.find((e) => e.type === 'done');
+      assert.ok(doneEv && doneEv.type === 'done');
+      assert.equal(doneEv.totalCostUsd, 0.42);
+      assert.ok(doneEv.modelUsage && 'claude-sonnet-5-5' in doneEv.modelUsage);
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('mapControlPermissionMode explicitly maps 2.1.325 modes without sending CLI-only manual', () => {
+  assert.equal(mapControlPermissionMode('default'), 'default');
+  assert.equal(mapControlPermissionMode('manual'), 'default');
+  assert.equal(mapControlPermissionMode('yolo'), 'bypassPermissions');
+  assert.equal(mapControlPermissionMode('acceptEdits'), 'acceptEdits');
+  assert.equal(mapControlPermissionMode('plan'), 'plan');
+  assert.equal(mapControlPermissionMode('auto'), 'auto');
+  assert.equal(mapControlPermissionMode('dontAsk'), 'dontAsk');
+  assert.equal(mapControlPermissionMode('bypassPermissions'), 'bypassPermissions');
+  assert.throws(() => mapControlPermissionMode('bogusMode'), /unsupported permission mode/);
+});
+
+test('preserves 2.1.325 model capability fields, full IDs, and parent_tool_use_id subagent/task events', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-21325-events-'));
+  try {
+    const bin = join(base, 'claude-21325');
+    const sessionId = '123e4567-e89b-12d3-a456-426614174053';
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const readline = require('node:readline');
+const sessionId = ${JSON.stringify(sessionId)};
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === 'control_request' && msg.request?.subtype === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: { request_id: 'wrong_id', subtype: 'success', response: { models: [{ value: 'bad' }], commands: [] } },
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: {
+        request_id: msg.request_id,
+        subtype: 'success',
+        response: {
+          fast_mode_state: 'off',
+          fast_mode_disabled_reason: 'sdk_opt_in_required',
+          commands: [{ name: 'compact', description: 'Compact', argumentHint: '', aliases: [] }],
+          models: [
+            {
+              value: 'claude-opus-5-5',
+              resolvedModel: 'claude-opus-5-5',
+              displayName: 'Opus 5.5',
+              supportsEffort: true,
+              supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+              supportsAdaptiveThinking: true,
+              supportsThinkingOff: false,
+              supportsFastMode: true,
+              supportsAutoMode: true,
+            },
+            {
+              value: 'qwen3.6-flash[1m]',
+              displayName: 'qwen3.6-flash[1m]',
+            },
+          ],
+        },
+      },
+    }) + '\\n');
+    return;
+  }
+  if (msg.type === 'user') {
+    process.stdout.write(JSON.stringify({
+      type: 'system', subtype: 'task_started', session_id: sessionId,
+      task_id: 'task_1', tool_use_id: 'toolu_agent_1', description: 'Explore repo', subagent_type: 'Explore', uuid: 'u_ts',
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'system', subtype: 'task_progress', session_id: sessionId,
+      task_id: 'task_1', tool_use_id: 'toolu_agent_1', description: 'Reading', last_tool_name: 'Read', summary: 'Scanning files', uuid: 'u_tp',
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'assistant',
+      parent_tool_use_id: 'toolu_agent_1',
+      agent_id: 'agent_1',
+      subagent_type: 'Explore',
+      uuid: 'u_sub_asst',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'checking files' },
+          { type: 'text', text: 'Found match in foo.ts' },
+          { type: 'tool_use', id: 'toolu_sub_read', name: 'Read', input: { file_path: 'foo.ts' } },
+        ],
+      },
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'tool_progress',
+      tool_use_id: 'toolu_sub_read',
+      tool_name: 'Read',
+      parent_tool_use_id: 'toolu_agent_1',
+      elapsed_time_seconds: 1.5,
+      task_id: 'task_1',
+      uuid: 'u_tprog',
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'system', subtype: 'task_notification', session_id: sessionId,
+      task_id: 'task_1', tool_use_id: 'toolu_agent_1', status: 'completed', summary: 'Done exploring', uuid: 'u_tn',
+    }) + '\\n');
+    process.stdout.write(JSON.stringify({
+      type: 'result', subtype: 'success', result: 'ok', is_error: false, session_id: sessionId,
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const models = await adapter.listBuiltinModels();
+      assert.deepEqual(models.map((m) => m.value), ['claude-opus-5-5']);
+      assert.equal(models[0]?.supportsAdaptiveThinking, true);
+      assert.equal(models[0]?.supportsThinkingOff, false);
+      assert.equal(models[0]?.fastMode, true);
+      assert.equal(models[0]?.supportsAutoMode, true);
+      assert.equal(models[0]?.fastModeState, 'off');
+      assert.equal(models[0]?.fastModeDisabledReason, 'sdk_opt_in_required');
+
+      const events: ClaudeAdapterEvent[] = [];
+      await adapter.startTurn({ sessionId, prompt: 'go', onEvent: (ev) => events.push(ev) });
+
+      const subThinking = events.find((e) => e.type === 'thinking_delta' && e.parentToolUseId === 'toolu_agent_1');
+      const subText = events.find((e) => e.type === 'text_delta' && e.parentToolUseId === 'toolu_agent_1');
+      const subTool = events.find((e) => e.type === 'tool_use' && e.parentToolUseId === 'toolu_agent_1');
+      assert.ok(subThinking && subThinking.type === 'thinking_delta' && subThinking.text === 'checking files');
+      assert.ok(subText && subText.type === 'text_delta' && subText.text === 'Found match in foo.ts');
+      assert.equal(subText.uuid, 'u_sub_asst');
+      assert.ok(subTool && subTool.type === 'tool_use' && subTool.agentId === 'agent_1');
+      assert.ok(events.some((e) => e.type === 'task_started' && e.taskId === 'task_1'));
+      assert.ok(events.some((e) => e.type === 'task_progress' && e.lastToolName === 'Read'));
+      assert.ok(events.some((e) => e.type === 'tool_progress' && e.parentToolUseId === 'toolu_agent_1'));
+      assert.ok(events.some((e) => e.type === 'task_notification' && e.status === 'completed'));
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4. Session & history upgrades (16 MiB tail, openBound, branch, continued-in,
+//    custom-title, archive, safe delete, tags, subagents, disk command fallback)
+// ---------------------------------------------------------------------------
+
+test('followClaudeBranch prunes abandoned branches via parentUuid and logicalParentUuid', () => {
+  const pruned = followClaudeBranch([
+    { type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'start' } },
+    { type: 'assistant', uuid: 'a1', parentUuid: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'r1' }] } },
+    { type: 'user', uuid: 'u_dead', parentUuid: 'a1', message: { role: 'user', content: 'abandoned' } },
+    { type: 'assistant', uuid: 'a_dead', parentUuid: 'u_dead', message: { role: 'assistant', content: [{ type: 'text', text: 'dead' }] } },
+    { type: 'system', subtype: 'compact_boundary', uuid: 'cb', parentUuid: null, logicalParentUuid: 'a1' },
+    { type: 'user', uuid: 'cs', parentUuid: 'cb', isCompactSummary: true, message: { role: 'user', content: 'summary' } },
+    { type: 'user', uuid: 'u2', parentUuid: 'cs', message: { role: 'user', content: 'after compact' } },
+    { type: 'assistant', uuid: 'a2', parentUuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'r2' }] } },
+  ]);
+  assert.deepEqual(
+    pruned.map((e) => e.uuid),
+    ['u1', 'a1', 'cb', 'cs', 'u2', 'a2'],
+  );
+});
+
+test('getHistory enforces 16 MiB tail-window, handles <pasted_content>/<bash-input>/<bash-stdout>/isCompactSummary', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-16mib-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const sessionId = '11111111-1111-4111-8111-222222222222';
+  try {
+    await mkdir(projDir, { recursive: true });
+    const file = join(projDir, `${sessionId}.jsonl`);
+
+    // Build > 16 MiB transcript: old padding entries + recent entries in tail 16 MiB
+    const oldPadLine = JSON.stringify({
+      type: 'user',
+      uuid: 'old_0',
+      parentUuid: null,
+      message: { role: 'user', content: 'x'.repeat(32 * 1024) },
+    }) + '\n';
+    const chunks: string[] = [];
+    let totalBytes = 0;
+    while (totalBytes < 16 * 1024 * 1024 + 512 * 1024) {
+      chunks.push(oldPadLine);
+      totalBytes += Buffer.byteLength(oldPadLine);
+    }
+
+    chunks.push(
+      JSON.stringify({
+        type: 'user',
+        uuid: 'cs_1',
+        parentUuid: null,
+        isCompactSummary: true,
+        message: { role: 'user', content: 'Summary of earlier work' },
+      }) + '\n',
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u_paste',
+        parentUuid: 'cs_1',
+        message: {
+          role: 'user',
+          content: 'Check:\n<pasted_content id="1a2b">\nconst a = 1;\n</pasted_content id="1a2b">',
+        },
+      }) + '\n',
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u_bash_in',
+        parentUuid: 'u_paste',
+        message: { role: 'user', content: '<bash-input>echo hi</bash-input>' },
+      }) + '\n',
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u_bash_out',
+        parentUuid: 'u_bash_in',
+        message: { role: 'user', content: '<bash-stdout>hi\n</bash-stdout><bash-stderr></bash-stderr>' },
+      }) + '\n',
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'a_end',
+        parentUuid: 'u_bash_out',
+        message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'Done!' }] },
+      }) + '\n',
+    );
+    await writeFile(file, chunks.join(''));
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    const history = await adapter.getHistory(sessionId);
+    assert.deepEqual(
+      history.map((m) => ({ role: m.role, text: m.text, isCompactSummary: m.isCompactSummary })),
+      [
+        { role: 'user', text: 'Summary of earlier work', isCompactSummary: true },
+        { role: 'user', text: 'Check:\nconst a = 1;', isCompactSummary: undefined },
+        { role: 'user', text: '! echo hi', isCompactSummary: undefined },
+        { role: 'user', text: 'hi', isCompactSummary: undefined },
+        { role: 'assistant', text: 'Done!', isCompactSummary: undefined },
+      ],
+    );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('openBound blocks symlinked transcript files and FIFOs', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-bound-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const outside = join(base, 'outside.jsonl');
+  const symId = '11111111-1111-4111-8111-333333333333';
+  const fifoId = '11111111-1111-4111-8111-444444444444';
+  try {
+    await mkdir(projDir, { recursive: true });
+    await writeFile(
+      outside,
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'secret' } }) + '\n',
+    );
+    await symlink(outside, join(projDir, `${symId}.jsonl`));
+    try {
+      execFileSync('mkfifo', [join(projDir, `${fifoId}.jsonl`)]);
+    } catch {
+      // mkfifo optional if missing on host
+    }
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    const items = await adapter.list();
+    assert.deepEqual(items, []);
+    await assert.rejects(adapter.getHistory(symId), /session not found/);
+    if (existsSync(join(projDir, `${fifoId}.jsonl`))) {
+      await assert.rejects(adapter.getHistory(fifoId), /session not found/);
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('supports continued-in chain, custom-title reading & rename persistence, and native archive sync', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-meta-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const s1 = '11111111-1111-4111-8111-555555555551';
+  const s2 = '11111111-1111-4111-8111-555555555552';
+  const s3 = '11111111-1111-4111-8111-555555555553';
+  try {
+    await mkdir(projDir, { recursive: true });
+
+    await writeFile(
+      join(projDir, `${s1}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, cwd: '/tmp/p', timestamp: '2026-01-01T00:00:00.000Z', message: { role: 'user', content: 'first' } }),
+        JSON.stringify({ type: 'continued-in', sessionId: s1, continuedInSessionId: s2 }),
+      ].join('\n') + '\n',
+    );
+    await writeFile(
+      join(projDir, `${s2}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, cwd: '/tmp/p', timestamp: '2026-01-01T00:00:00.000Z', message: { role: 'user', content: 'first' } }),
+        JSON.stringify({ type: 'continued-in', sessionId: s2, continuedInSessionId: s3 }),
+      ].join('\n') + '\n',
+    );
+    await writeFile(
+      join(projDir, `${s3}.jsonl`),
+      [
+        JSON.stringify({ type: 'ai-title', aiTitle: 'AI auto title', cwd: '/tmp/p' }),
+        JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, cwd: '/tmp/p', timestamp: '2026-01-01T00:00:00.000Z', message: { role: 'user', content: 'first' } }),
+        JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1', timestamp: '2026-01-01T00:00:01.000Z', message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'final' }] } }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    assert.equal(await adapter.resolveContinuedSessionId(s1), s3);
+    const followedHistory = await adapter.getHistory(s1, { followContinuedIn: true });
+    assert.equal(followedHistory[1]?.text, 'final');
+
+    let listed = await adapter.list();
+    assert.deepEqual(listed.map((s) => s.sessionId), [s3]);
+    assert.equal(listed[0]?.title, 'AI auto title');
+
+    // Rename persists JSONL custom-title and survives a fresh adapter instance
+    await adapter.rename(s3, 'My Custom Session Title');
+    const adapter2 = new ClaudeAdapter({ projectsDir });
+    listed = await adapter2.list();
+    assert.equal(listed[0]?.title, 'My Custom Session Title');
+    assert.equal(listed[0]?.customTitle, 'My Custom Session Title');
+
+    // Native archive metadata sync + auto-unarchive on newer human prompt
+    await adapter2.setArchived(s3, true);
+    listed = await adapter2.list();
+    assert.equal(listed[0]?.archived, true);
+
+    await adapter2.setArchived(s3, false);
+    listed = await adapter2.list();
+    assert.equal(listed[0]?.archived, false);
+
+    // Re-archive, then append a newer user message -> must automatically appear unarchived
+    await adapter2.setArchived(s3, true);
+    const futureTs = new Date(Date.now() + 60_000).toISOString();
+    await writeFile(
+      join(projDir, `${s3}.jsonl`),
+      (await readFile(join(projDir, `${s3}.jsonl`), 'utf8')) +
+        JSON.stringify({
+          type: 'user',
+          uuid: 'u2',
+          parentUuid: 'a1',
+          timestamp: futureTs,
+          message: { role: 'user', content: 'resumed later' },
+        }) + '\n',
+    );
+    await utimes(join(projDir, `${s3}.jsonl`), new Date(Date.now() + 60_000), new Date(Date.now() + 60_000));
+    listed = await adapter2.list();
+    assert.equal(listed[0]?.archived, false);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('reads subagents/agent-*.jsonl and safely deletes main jsonl + subagents dir within validated root', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-subagents-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const sessionId = '11111111-1111-4111-8111-666666666666';
+  const symSessionId = '11111111-1111-4111-8111-777777777777';
+  const victimDir = join(base, 'victim');
+  try {
+    await mkdir(join(projDir, sessionId, 'subagents'), { recursive: true });
+    await mkdir(victimDir, { recursive: true });
+    await writeFile(join(victimDir, 'keep.txt'), 'must not be deleted');
+
+    await writeFile(
+      join(projDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null, message: { role: 'user', content: 'main' } }) + '\n',
+    );
+    await writeFile(
+      join(projDir, sessionId, 'subagents', 'agent-worker1.jsonl'),
+      [
+        JSON.stringify({ type: 'user', isSidechain: true, uuid: 'su1', parentUuid: null, message: { role: 'user', content: 'sub task' } }),
+        JSON.stringify({ type: 'assistant', isSidechain: true, uuid: 'sa_dead', parentUuid: 'su1', message: { role: 'assistant', content: [{ type: 'text', text: 'dead branch' }] } }),
+        JSON.stringify({ type: 'assistant', isSidechain: true, uuid: 'sa1', parentUuid: 'su1', message: { role: 'assistant', content: [{ type: 'text', text: 'sub answer' }] } }),
+      ].join('\n') + '\n',
+    );
+    await writeFile(
+      join(projDir, sessionId, 'subagents', 'agent-worker1.meta.json'),
+      JSON.stringify({ toolUseId: 'toolu_parent_1', agentType: 'Explore' }),
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    assert.deepEqual(await adapter.listSubagents(sessionId), ['worker1']);
+    const subMsgs = await adapter.getSubagentMessages(sessionId, 'worker1');
+    assert.deepEqual(
+      subMsgs.map((m) => ({ role: m.role, text: m.text, agentId: m.agentId, parentToolUseId: m.parentToolUseId })),
+      [
+        { role: 'user', text: 'sub task', agentId: 'worker1', parentToolUseId: 'toolu_parent_1' },
+        { role: 'assistant', text: 'sub answer', agentId: 'worker1', parentToolUseId: 'toolu_parent_1' },
+      ],
+    );
+    await assert.rejects(adapter.getSubagentMessages(sessionId, '../evil'), /invalid subagent id/);
+
+    await adapter.setArchived(sessionId, true);
+    await adapter.delete(sessionId);
+    assert.equal(existsSync(join(projDir, `${sessionId}.jsonl`)), false);
+    assert.equal(existsSync(join(projDir, sessionId, 'subagents')), false);
+    assert.equal(existsSync(join(projDir, sessionId)), false);
+
+    // Symlinked subagents dir escaping root must be refused without touching victimDir
+    await mkdir(join(projDir, symSessionId), { recursive: true });
+    await writeFile(
+      join(projDir, `${symSessionId}.jsonl`),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 's' } }) + '\n',
+    );
+    await symlink(victimDir, join(projDir, symSessionId, 'subagents'));
+    await assert.rejects(adapter.delete(symSessionId), /symlinked subagents/);
+    assert.equal(await readFile(join(victimDir, 'keep.txt'), 'utf8'), 'must not be deleted');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('listSlashCommands falls back to zero-spawn discoverClaudeDiskCommands when CLI is unavailable', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-disk-cmds-'));
+  try {
+    const cwd = join(base, 'repo');
+    const configDir = join(base, 'config');
+    await mkdir(join(cwd, '.claude', 'commands', 'ops'), { recursive: true });
+    await mkdir(join(cwd, '.claude', 'skills', 'deploy'), { recursive: true });
+    await mkdir(join(configDir, 'commands'), { recursive: true });
+
+    await writeFile(
+      join(cwd, '.claude', 'commands', 'ops', 'check.md'),
+      '---\ndescription: Run ops check\nargument-hint: "[env]"\naliases: [chk]\n---\nBody\n',
+    );
+    await writeFile(
+      join(cwd, '.claude', 'skills', 'deploy', 'SKILL.md'),
+      '---\ndescription: Deploy service\n---\nInstructions\n',
+    );
+    await writeFile(
+      join(configDir, 'commands', 'user-cmd.md'),
+      '# User level command\n',
+    );
+
+    const adapter = new ClaudeAdapter({
+      claudeBin: join(base, 'nonexistent-claude'),
+      configDir,
+      env: { HOME: base },
+    });
+
+    const cmds = await adapter.listSlashCommands(cwd);
+    assert.deepEqual(
+      cmds.map((c) => ({ name: c.name, description: c.description, source: c.source, scope: c.scope })),
+      [
+        { name: 'ops:check', description: 'Run ops check', source: 'command', scope: 'project' },
+        { name: 'deploy', description: 'Deploy service', source: 'skill', scope: 'project' },
+        { name: 'user-cmd', description: 'User level command', source: 'command', scope: 'user' },
+      ],
+    );
+    assert.deepEqual(cmds[0]?.aliases, ['chk']);
+    assert.equal(cmds[0]?.argumentHint, '[env]');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 5. Live unauthenticated @anthropic-ai/claude-code@2.1.325 handshake test
+// ---------------------------------------------------------------------------
+
+const LIVE_21325_BIN = '/tmp/claude-survey.nCx4IC/native/package/claude';
+
+test(
+  'live unauthenticated 2.1.325 initialize handshake exposes dynamic models, commands, and mcpStatus',
+  { skip: !existsSync(LIVE_21325_BIN) },
+  async () => {
+    const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-live-21325-'));
+    try {
+      const configDir = join(base, 'config');
+      await mkdir(configDir, { recursive: true });
+
+      const adapter = new ClaudeAdapter({
+        claudeBin: LIVE_21325_BIN,
+        configDir,
+        env: {
+          HOME: base,
+          ANTHROPIC_API_KEY: '',
+          ANTHROPIC_AUTH_TOKEN: '',
+          ANTHROPIC_BASE_URL: '',
+          CLAUDE_CODE_USE_BEDROCK: '',
+          CLAUDE_CODE_USE_VERTEX: '',
+          CLAUDE_CODE_USE_FOUNDRY: '',
+        },
+      });
+
+      const models = await adapter.listBuiltinModels();
+      assert.ok(models.length >= 4, `expected at least 4 models, got ${models.length}`);
+      const first = models[0]!;
+      assert.equal(typeof first.value, 'string');
+      assert.equal(typeof first.supportsAdaptiveThinking, 'boolean');
+      assert.equal(typeof first.supportsThinkingOff, 'boolean');
+      assert.equal(typeof first.fastMode, 'boolean');
+
+      const commands = await adapter.listSlashCommands(base);
+      assert.ok(commands.length >= 5, `expected built-in commands, got ${commands.length}`);
+      assert.ok(commands.some((c) => c.name === 'compact'));
+
+      const mcpServers = await adapter.mcpStatus(undefined, base);
+      assert.ok(Array.isArray(mcpServers));
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  },
+);
+
