@@ -4,6 +4,7 @@
  * 一律 git -C <cwd>;遍历/搜索排除 .git、node_modules,限条目数与文件大小。
  */
 import { spawn } from 'node:child_process';
+import { constants as fsConstants, type Stats } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { ProviderError, type ProviderErrorCode } from './types.js';
@@ -18,11 +19,50 @@ export class FsError extends ProviderError {
   }
 }
 
+function isWindowsPath(p: string): boolean {
+  return /^[a-zA-Z]:(?:[\\/]|$)|^\\\\/.test(p);
+}
+
+function stripWindowsDevicePrefix(p: string): string {
+  if (p.startsWith('\\\\?\\UNC\\')) return `\\\\${p.slice(8)}`;
+  if (p.startsWith('\\\\?\\')) return p.slice(4);
+  return p;
+}
+
+function useWin32Paths(cwd: string, other?: string): boolean {
+  return process.platform === 'win32' || isWindowsPath(cwd) || (other !== undefined && isWindowsPath(other));
+}
+
+function normalizeForCompare(p: string, win32: boolean): string {
+  const cleaned = stripWindowsDevicePrefix(p);
+  const resolved = win32 ? path.win32.resolve(cleaned) : path.resolve(cleaned);
+  return win32 ? resolved.toLowerCase() : resolved;
+}
+
+function isWithinNormalized(base: string, target: string, win32: boolean): boolean {
+  const b = normalizeForCompare(base, win32);
+  const t = normalizeForCompare(target, win32);
+  if (t === b) return true;
+  const sep = win32 ? path.win32.sep : path.sep;
+  const prefix = b.endsWith(sep) ? b : b + sep;
+  return t.startsWith(prefix);
+}
+
 /** 把用户路径 resolve 到 cwd 沙箱内;越界抛 400。 */
 export function resolveInCwd(cwd: string, p?: string): string {
-  const base = path.resolve(cwd);
-  const target = path.resolve(base, p ?? '.');
-  if (target !== base && !target.startsWith(base + path.sep)) {
+  if (p && p.includes('\0')) {
+    throw new FsError(400, 40001, 'path 包含非法空字节');
+  }
+  const win32 = useWin32Paths(cwd);
+  if (!win32 && p && isWindowsPath(p)) {
+    throw new FsError(400, 40001, `path 越出会话目录: ${p}`);
+  }
+  const pMod = win32 ? path.win32 : path;
+  const base = pMod.resolve(stripWindowsDevicePrefix(cwd));
+  const rawInput = p ?? '.';
+  const normalizedInput = !win32 && rawInput.includes('\\') ? rawInput.replace(/\\/g, '/') : rawInput;
+  const target = pMod.resolve(base, normalizedInput);
+  if (!isWithinNormalized(base, target, win32)) {
     throw new FsError(400, 40001, `path 越出会话目录: ${p ?? ''}`);
   }
   return target;
@@ -31,22 +71,59 @@ export function resolveInCwd(cwd: string, p?: string): string {
 /**
  * realpath 二次校验:symlink 目标也必须落在 cwd 内(词法校验拦不住
  * `cwd/evil -> /etc` 这种;审查实测 fsRead/fsList 曾跟随 symlink 读出沙箱)。
- * 路径不存在(如 diff 已删文件)时 realpath 失败,退化为只信词法校验。
+ * 路径不存在(如 diff 已删文件)时向上回溯到最近存在的祖先做 realpath 校验。
  */
 export async function assertRealInCwd(cwd: string, abs: string): Promise<void> {
-  const realBase = await fsp.realpath(path.resolve(cwd)).catch(() => path.resolve(cwd));
-  const realTarget = await fsp.realpath(abs).catch(() => null);
-  if (realTarget && realTarget !== realBase && !realTarget.startsWith(realBase + path.sep)) {
-    throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+  const win32 = useWin32Paths(cwd, abs);
+  const pMod = win32 ? path.win32 : path;
+  const resolvedBase = pMod.resolve(stripWindowsDevicePrefix(cwd));
+  const resolvedTarget = pMod.resolve(stripWindowsDevicePrefix(abs));
+  const realBase = stripWindowsDevicePrefix(await fsp.realpath(resolvedBase).catch(() => resolvedBase));
+  try {
+    const realTarget = stripWindowsDevicePrefix(await fsp.realpath(resolvedTarget));
+    if (!isWithinNormalized(realBase, realTarget, win32)) {
+      throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+    }
+    return;
+  } catch (err) {
+    if (err instanceof FsError) throw err;
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ELOOP') {
+      throw new FsError(400, 40001, '路径存在循环符号链接');
+    }
+    if (code && code !== 'ENOENT' && code !== 'ENOTDIR') {
+      throw new FsError(400, 40001, `路径校验失败: ${(err as Error).message}`);
+    }
+  }
+  let cursor = pMod.dirname(resolvedTarget);
+  while (cursor && cursor !== pMod.dirname(cursor)) {
+    if (!isWithinNormalized(resolvedBase, cursor, win32)) break;
+    try {
+      const realAncestor = stripWindowsDevicePrefix(await fsp.realpath(cursor));
+      if (!isWithinNormalized(realBase, realAncestor, win32)) {
+        throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+      }
+      return;
+    } catch (err) {
+      if (err instanceof FsError) throw err;
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ELOOP') {
+        throw new FsError(400, 40001, '路径存在循环符号链接');
+      }
+      cursor = pMod.dirname(cursor);
+    }
   }
 }
 
 /** 请求里的相对路径原样回给前端(前端按 cwd 相对路径展示);绝对路径转相对。 */
-function displayPath(cwd: string, abs: string): string {
-  const base = path.resolve(cwd);
-  if (abs === base) return '.';
-  const rel = path.relative(base, abs);
-  return rel === '' ? '.' : rel.split(path.sep).join('/');
+export function displayPath(cwd: string, abs: string): string {
+  const win32 = useWin32Paths(cwd, abs);
+  const pMod = win32 ? path.win32 : path;
+  const base = pMod.resolve(stripWindowsDevicePrefix(cwd));
+  const target = pMod.resolve(stripWindowsDevicePrefix(abs));
+  if (normalizeForCompare(target, win32) === normalizeForCompare(base, win32)) return '.';
+  const rel = pMod.relative(base, target);
+  return rel === '' ? '.' : rel.split(/[\\/]/).join('/');
 }
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', '__pycache__', '.venv', 'dist', '.next', 'target']);
@@ -92,9 +169,107 @@ function etagOf(size: number, mtimeMs: number): string {
   return `${Math.round(mtimeMs)}:${size}`;
 }
 
+export interface BoundFileHandle {
+  fh: fsp.FileHandle;
+  stat: Stats;
+  realPath: string;
+}
+
+const OPEN_BOUND_FLAGS =
+  fsConstants.O_RDONLY |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+/**
+ * TOCTOU-safe bounded file opener:
+ * uses O_RDONLY | O_NONBLOCK | O_NOFOLLOW (where available) plus post-open fstat
+ * verification of regular-file type and dev/ino identity against lstat/realpath.
+ */
+export async function openBound(abs: string, cwd?: string): Promise<BoundFileHandle> {
+  if (cwd !== undefined) {
+    await assertRealInCwd(cwd, abs);
+  }
+  const initialLst = await fsp.lstat(abs).catch((err: unknown) => {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new FsError(404, 40404, `文件不存在: ${abs}`);
+    }
+    throw new FsError(400, 40001, `无法访问文件: ${(err as Error).message}`);
+  });
+
+  let target = abs;
+  let expectedLst = initialLst;
+  if (initialLst.isSymbolicLink()) {
+    if (cwd === undefined) {
+      throw new FsError(400, 40001, '禁止打开符号链接');
+    }
+    const win32 = useWin32Paths(cwd, abs);
+    const pMod = win32 ? path.win32 : path;
+    const realBase = stripWindowsDevicePrefix(
+      await fsp.realpath(pMod.resolve(stripWindowsDevicePrefix(cwd))).catch(() => pMod.resolve(stripWindowsDevicePrefix(cwd))),
+    );
+    const resolved = await fsp.realpath(abs).catch((err: unknown) => {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new FsError(404, 40404, `文件不存在: ${abs}`);
+      }
+      throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+    });
+    const cleanedResolved = stripWindowsDevicePrefix(resolved);
+    if (!isWithinNormalized(realBase, cleanedResolved, win32)) {
+      throw new FsError(400, 40001, '路径经符号链接越出会话目录');
+    }
+    target = cleanedResolved;
+    expectedLst = await fsp.lstat(target).catch(() => {
+      throw new FsError(404, 40404, `文件不存在: ${abs}`);
+    });
+    if (expectedLst.isSymbolicLink()) {
+      throw new FsError(400, 40001, '禁止打开未解析符号链接');
+    }
+  }
+
+  if (!expectedLst.isFile()) {
+    throw new FsError(400, 40003, `不是文件: ${abs}`);
+  }
+
+  let fh: fsp.FileHandle;
+  try {
+    fh = await fsp.open(target, OPEN_BOUND_FLAGS);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      throw new FsError(404, 40404, `文件不存在: ${abs}`);
+    }
+    if (code === 'ELOOP' || code === 'ENXIO') {
+      throw new FsError(400, 40001, `拒绝打开非受信任文件(${code}): ${abs}`);
+    }
+    if (code === 'EISDIR') {
+      throw new FsError(400, 40003, `不是文件: ${abs}`);
+    }
+    throw new FsError(400, 40001, `打开文件失败: ${(err as Error).message}`);
+  }
+
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) {
+      throw new FsError(400, 40003, `不是常规文件: ${abs}`);
+    }
+    const devMismatch = st.dev !== expectedLst.dev;
+    const inoTestable = process.platform !== 'win32' || (st.ino !== 0 && expectedLst.ino !== 0);
+    const inoMismatch = inoTestable && st.ino !== expectedLst.ino;
+    if (devMismatch || inoMismatch) {
+      throw new FsError(400, 40001, '文件在打开期间发生替换');
+    }
+    return { fh, stat: st, realPath: target };
+  } catch (err) {
+    await fh.close().catch(() => undefined);
+    throw err;
+  }
+}
+
 /** 读前 8KB 判 NUL 字节,有则视为二进制。 */
 async function isBinaryFile(abs: string): Promise<boolean> {
-  const fh = await fsp.open(abs, 'r');
+  const { fh } = await openBound(abs);
   try {
     const buf = Buffer.alloc(8192);
     const { bytesRead } = await fh.read(buf, 0, 8192, 0);
@@ -292,20 +467,19 @@ export async function fsRead(
 }> {
   if (!input.path) throw new FsError(400, 40001, '缺少 path');
   const abs = resolveInCwd(cwd, input.path);
-  await assertRealInCwd(cwd, abs);
-  const st = await fsp.stat(abs).catch(() => null);
-  if (!st) throw new FsError(404, 40404, `文件不存在: ${input.path}`);
-  if (!st.isFile()) throw new FsError(400, 40003, `不是文件: ${input.path}`);
+  const { fh, stat: st } = await openBound(abs, cwd);
 
   const offset = Math.max(0, input.offset ?? 0);
   const length = Math.max(1, Math.min(READ_MAX_BYTES, input.length ?? READ_MAX_BYTES));
   const size = st.size;
-  const fh = await fsp.open(abs, 'r');
   let buf: Buffer;
   try {
     const readLen = Math.min(length, Math.max(0, size - offset));
     buf = Buffer.alloc(readLen);
-    await fh.read(buf, 0, readLen, offset);
+    if (readLen > 0) {
+      const { bytesRead } = await fh.read(buf, 0, readLen, offset);
+      buf = buf.subarray(0, bytesRead);
+    }
   } finally {
     await fh.close();
   }
@@ -541,19 +715,21 @@ export async function fsDiff(cwd: string, input: { path: string }): Promise<{ pa
     const diff = await runGit(cwd, ['diff', 'HEAD', '--', rel]);
     return { path: rel, diff };
   }
-  await assertRealInCwd(cwd, abs);
-  const st = await fsp.stat(abs).catch(() => null);
-  if (!st || !st.isFile()) throw new FsError(404, 40404, `文件不存在: ${input.path}`);
-  // 大文件上限:未跟踪文件要整读拼 diff,无 cap 会把 GB 级文件读进内存(审查发现)。
-  if (st.size > READ_MAX_BYTES) {
-    return { path: rel, diff: `# 文件过大(${(st.size / 1024 / 1024).toFixed(1)}MB),超过 ${READ_MAX_BYTES / 1024 / 1024}MB 上限,不生成 diff\n` };
+  const { fh, stat: st } = await openBound(abs, cwd);
+  try {
+    // 大文件上限:未跟踪文件要整读拼 diff,无 cap 会把 GB 级文件读进内存(审查发现)。
+    if (st.size > READ_MAX_BYTES) {
+      return { path: rel, diff: `# 文件过大(${(st.size / 1024 / 1024).toFixed(1)}MB),超过 ${READ_MAX_BYTES / 1024 / 1024}MB 上限,不生成 diff\n` };
+    }
+    const buf = await fh.readFile();
+    if (buf.includes(0)) return { path: rel, diff: `Binary file ${rel} (untracked)\n` };
+    const lines = buf.toString('utf8').split('\n');
+    const body = lines.map((l) => `+${l}`).join('\n');
+    return {
+      path: rel,
+      diff: `diff --git a/${rel} b/${rel}\nnew file mode 100644\n--- /dev/null\n+++ b/${rel}\n@@ -0,0 +1,${lines.length} @@\n${body}\n`,
+    };
+  } finally {
+    await fh.close();
   }
-  const buf = await fsp.readFile(abs);
-  if (buf.includes(0)) return { path: rel, diff: `Binary file ${rel} (untracked)\n` };
-  const lines = buf.toString('utf8').split('\n');
-  const body = lines.map((l) => `+${l}`).join('\n');
-  return {
-    path: rel,
-    diff: `diff --git a/${rel} b/${rel}\nnew file mode 100644\n--- /dev/null\n+++ b/${rel}\n@@ -0,0 +1,${lines.length} @@\n${body}\n`,
-  };
 }

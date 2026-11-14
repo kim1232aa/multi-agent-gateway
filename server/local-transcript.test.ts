@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LocalTranscriptHub, buildLocalTranscriptPage } from './local-transcript.js';
+import { LocalTranscriptHub, buildLocalTranscriptPage, contentFrames } from './local-transcript.js';
 import type { Message } from './types.js';
 
 const history: Message[] = [
@@ -179,4 +179,186 @@ test('unbased completed turns survive first observation via rebase, not eviction
   assert.equal(items[0].turnId, 't3');
   assert.equal(items[0].state, 'completed');
   assert.equal(items[0].prompt, 'done prompt');
+});
+
+test('projects image parts safely in contentFrames and page attachments without embedding raw base64', () => {
+  const hugeBase64 = 'A'.repeat(2048);
+  const messages: Message[] = [
+    {
+      id: 'u-img', session_id: 's1', role: 'user',
+      content: [
+        { type: 'image', mime_type: 'image/png', data: hugeBase64, name: 'inline.png' },
+        { type: 'image', mime_type: 'image/jpeg', url: '/api/v1/sessions/s1/images/ref-1', name: 'snap.jpg' },
+      ],
+      created_at: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'a-img', session_id: 's1', role: 'assistant',
+      content: [
+        { type: 'image', mimeType: 'image/webp', url: 'data:image/webp;base64,' + hugeBase64, ref: 'media-9' },
+      ],
+      created_at: '2026-01-01T00:00:01.000Z',
+    },
+  ];
+
+  const userFrames = contentFrames(messages[0]!);
+  assert.equal(userFrames.length, 2);
+  assert.equal(userFrames[0]?.kind, 'text');
+  assert.equal(userFrames[0]?.text, '[image: inline.png]');
+  assert.equal(userFrames[0]?.inlineOmitted, true);
+  assert.equal(userFrames[1]?.text, '[image: snap.jpg]');
+  assert.deepEqual(userFrames[1]?.attachmentIds, ['u-img.att.1']);
+
+  const assistantFrames = contentFrames(messages[1]!);
+  assert.equal(assistantFrames.length, 1);
+  assert.equal(assistantFrames[0]?.kind, 'text');
+  assert.equal(assistantFrames[0]?.inlineOmitted, true);
+  assert.equal(assistantFrames[0]?.url, undefined);
+  assert.equal(assistantFrames[0]?.ref, 'media-9');
+  assert.deepEqual(assistantFrames[0]?.attachmentIds, ['a-img.att.0']);
+
+  const page = buildLocalTranscriptPage(messages, { agentId: 'main' }, 'idle', 0);
+  assert.equal(page.items.length, 1);
+  assert.deepEqual(page.items[0]?.attachmentIds, ['u-img.att.1']);
+  assert.equal(page.attachments.length, 2);
+  assert.equal(JSON.stringify(page).includes(hugeBase64), false);
+});
+
+test('preserves non-string and structured tool_result outputs without empty-string masking', () => {
+  const messages: Message[] = [
+    {
+      id: 'a1', session_id: 's1', role: 'assistant',
+      content: [
+        { type: 'tool_result', tool_call_id: 'c1', output: '', content: 'from-content' },
+        { type: 'tool_result', tool_call_id: 'c2', output: '', structuredOutput: { files: ['a.ts'], count: 1 } },
+        { type: 'tool_result', tool_call_id: 'c3', content: [{ type: 'text', text: 'chunked failure' }], is_error: true },
+        { type: 'tool_result', tool_call_id: 'c4', output: 0, is_error: false },
+      ],
+      created_at: '2026-01-01T00:00:01.000Z',
+    },
+  ];
+  const frames = contentFrames(messages[0]!);
+  assert.equal(frames[0]?.output, 'from-content');
+  assert.deepEqual(frames[1]?.output, { files: ['a.ts'], count: 1 });
+  assert.deepEqual(frames[2]?.output, [{ type: 'text', text: 'chunked failure' }]);
+  assert.equal(frames[2]?.state, 'error');
+  assert.equal(typeof frames[2]?.error, 'string');
+  assert.equal(frames[2]?.error, 'chunked failure');
+  assert.equal(frames[3]?.output, 0);
+
+  const hub = new LocalTranscriptHub();
+  const turn = hub.beginTurn('s1', 'structured tool');
+  turn.toolStarted('c5', 'mcp_lookup', { q: 'x' }, { phase: 'commentary', agentId: 'sub-1' });
+  turn.toolResult('c5', '', true, { structuredOutput: { message: 'upstream denied' }, agentId: 'sub-1' });
+  turn.end('failed');
+  const active = hub.activeItems('s1');
+  const toolFrame = active[0]?.steps[0]?.frames[0];
+  assert.deepEqual(toolFrame?.output, { message: 'upstream denied' });
+  assert.equal(toolFrame?.error, 'upstream denied');
+  assert.deepEqual(toolFrame?.agentRefs, [{ agentId: 'sub-1', role: 'child' }]);
+});
+
+test('supports subagent, plan, notice, and phase metadata cleanly', () => {
+  const hub = new LocalTranscriptHub();
+  const turn = hub.beginTurn('s1', 'plan and run');
+  turn.setPhase('commentary');
+  turn.append('assistant', 'thinking aloud', { phase: 'commentary' });
+  turn.append('assistant', 'final answer', { phase: 'final_answer' });
+  turn.notice('Context compacted', { level: 'warning', source: 'compact', detail: { before: 100 } });
+  turn.toolStarted('sub-call', 'Agent', { task: 'audit' }, { parentToolUseId: 'root-tu', agentId: 'worker-2' });
+  turn.end('completed');
+  hub.upsertTask('s1', {
+    taskId: 'task-sub-1',
+    kind: 'subagent',
+    state: 'completed',
+    detached: true,
+    agentId: 'worker-2',
+    outputTail: 'done',
+  });
+  hub.setPlans('s1', [{ step: 'Inspect contracts', status: 'completed' }], { version: 1 });
+
+  const liveTurn = hub.activeItems('s1')[0]!;
+  const frames = liveTurn.steps[0]?.frames ?? [];
+  assert.equal(frames.filter((f) => f.kind === 'text').length, 2);
+  assert.equal(frames[0]?.phase, 'commentary');
+  assert.equal(frames[1]?.phase, 'final_answer');
+  assert.equal(frames[2]?.kind, 'notice');
+  assert.equal(frames[2]?.level, 'warning');
+  assert.equal(frames[3]?.parentToolUseId, 'root-tu');
+  assert.deepEqual(frames[3]?.agentRefs, [{ agentId: 'worker-2', role: 'child' }]);
+
+  const historyWithMeta: Message[] = [
+    {
+      id: 'sys-1', session_id: 's1', role: 'system',
+      content: [{ type: 'text', text: 'Plan updated' }],
+      created_at: '2026-01-01T00:00:00.000Z',
+      metadata: {
+        notice_level: 'info',
+        notice_source: 'plan',
+        phase: 'commentary',
+        agent_id: 'worker-1',
+        parent_tool_use_id: 'tu-parent',
+        plan: { explanation: 'step 1', steps: [{ step: 'Read', status: 'completed' }] },
+      },
+    },
+  ];
+  const page = buildLocalTranscriptPage(
+    historyWithMeta,
+    { agentId: 'main' },
+    'idle',
+    hub.currentSeq('s1'),
+    hub.activeItems('s1'),
+    [],
+    [],
+    { tasks: hub.currentTasks('s1'), meta: hub.currentMeta('s1'), plans: hub.currentPlans('s1') },
+  );
+  assert.equal(page.tasks.length, 1);
+  assert.equal(page.plans?.length, 2);
+  assert.deepEqual(page.meta.modes, { plan: { version: 1 } });
+  assert.ok(page.agents.some((a) => a.agentId === 'main' && a.type === 'main'));
+  assert.ok(page.agents.some((a) => a.agentId === 'worker-1' && a.type === 'subagent'));
+  assert.ok(page.agents.some((a) => a.agentId === 'worker-2' && a.type === 'subagent'));
+});
+
+test('coordinates transcript.reset notifications for active subscribers on invalidateHistory', () => {
+  const hub = new LocalTranscriptHub();
+  const seededEmissions: any[] = [];
+  const unseededEmissions: any[] = [];
+
+  const sub1 = hub.subscribe('s1', (emission) => seededEmissions.push(emission));
+  sub1.seed(history, 'idle');
+
+  const t1 = hub.beginTurn('s1', 'will be rolled back');
+  t1.append('assistant', 'stale');
+  t1.end('completed');
+  assert.ok(hub.currentSeq('s1') > 0);
+
+  // Unseeded subscriber joins before invalidation and buffers live ops.
+  const sub2 = hub.subscribe('s1', (emission) => unseededEmissions.push(emission));
+  const t2 = hub.beginTurn('s1', 'buffered stale');
+  t2.append('assistant', 'drop me');
+  t2.end('completed');
+
+  const genBefore = hub.currentGeneration('s1');
+  hub.invalidateHistory('s1', { messages: [], reason: 'undo', activity: 'idle' });
+  assert.equal(hub.currentGeneration('s1'), genBefore + 1);
+  assert.equal(hub.currentSeq('s1'), 0);
+  assert.equal(hub.hasObservedHistory('s1'), true);
+
+  const resets = seededEmissions.filter((e) => e.type === 'transcript.reset');
+  assert.equal(resets.length, 2);
+  assert.equal(resets[1]?.payload.seq, 0);
+  assert.equal(resets[1]?.payload.has_more_older, false);
+  assert.equal(resets[1]?.payload.reason, 'undo');
+
+  // Unseeded subscriber seeded after invalidation does not replay pre-undo buffered ops.
+  sub2.seed([], 'idle');
+  assert.equal(unseededEmissions.length, 1);
+  assert.equal(unseededEmissions[0]?.type, 'transcript.reset');
+  assert.equal(unseededEmissions[0]?.payload.seq, 0);
+
+  // Subsequent ops restart cleanly from seq 1.
+  hub.publish('s1', [{ op: 'meta.merge', meta: { activity: 'idle' } }]);
+  const postResetOps = seededEmissions.filter((e) => e.type === 'transcript.ops' && e.payload.seq === 1);
+  assert.ok(postResetOps.length >= 1);
 });

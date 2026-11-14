@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -89,6 +89,89 @@ test('copySession clones every scoped value onto the forked id', async () => {
     assert.equal(restarted.getBoolean('plan', 'new'), true);
     assert.equal(restarted.getString('model', 'other'), 'haiku');
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('close() flushes pending writes synchronously and is idempotent', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'settings-store-close-'));
+  const path = join(dir, 'nested', 'session-settings.pi.json');
+  try {
+    const store = new SettingsStore(path);
+    store.set('model', 's1', 'anthropic/claude-sonnet-4');
+    assert.equal(store.isDirty(), true);
+    store.close();
+    store.close();
+    assert.equal(store.isDirty(), false);
+    assert.equal(store.getLastError(), undefined);
+
+    const reloaded = new SettingsStore(path);
+    assert.equal(reloaded.getString('model', 's1'), 'anthropic/claude-sonnet-4');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('uses collision-free atomic temp names and preserves fresh foreign temp files', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'settings-store-tmp-'));
+  const path = join(dir, 'settings.json');
+  try {
+    const ownStaleTmp = `${path}.${process.pid}.999.deadbeef.tmp`;
+    const foreignActiveTmp = `${path}.${process.pid + 999999}.1.cafe.tmp`;
+    await writeFile(ownStaleTmp, 'stale');
+    await writeFile(foreignActiveTmp, 'active-other-process');
+
+    const a = new SettingsStore(path);
+    const b = new SettingsStore(path);
+    a.set('model', 'sa', 'm1');
+    b.set('model', 'sb', 'm2');
+    a.flushNow();
+    b.flushNow();
+
+    const entries = await readdir(dir);
+    assert.equal(entries.includes(`settings.json.${process.pid}.999.deadbeef.tmp`), false);
+    assert.equal(entries.includes(`settings.json.${process.pid + 999999}.1.cafe.tmp`), true);
+    assert.deepEqual(entries.filter((n) => n.startsWith(`settings.json.${process.pid}.`)), []);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).model.sb, 'm2');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('records flush failures, leaves no temp files, and retries until writable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'settings-store-retry-'));
+  const path = join(dir, 'blocked.json');
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    // Make target path an existing directory so renameSync fails reliably even as root.
+    await mkdir(path);
+    const errors: unknown[] = [];
+    const store = new SettingsStore(path, {
+      retryDelayMs: 15,
+      maxRetries: 10,
+      onError: (err) => errors.push(err),
+    });
+    store.set('permission', 's1', 'yolo');
+    store.flushNow();
+
+    assert.equal(store.isDirty(), true);
+    assert.ok(store.getLastError() instanceof Error);
+    assert.ok(errors.length >= 1);
+    const duringFailureEntries = await readdir(dir);
+    assert.deepEqual(duringFailureEntries.filter((n) => n.endsWith('.tmp')), []);
+
+    // Remove the blocking directory so the scheduled retry succeeds without another set().
+    await rm(path, { recursive: true, force: true });
+    for (let i = 0; i < 40 && store.isDirty(); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    assert.equal(store.isDirty(), false);
+    assert.equal(store.getLastError(), undefined);
+    assert.equal(new SettingsStore(path).getString('permission', 's1'), 'yolo');
+    store.close();
+  } finally {
+    console.warn = originalWarn;
     await rm(dir, { recursive: true, force: true });
   }
 });
