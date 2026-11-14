@@ -8,6 +8,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import http from 'node:http';
+import { existsSync } from 'node:fs';
 import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -24,13 +25,13 @@ export interface KimiChild {
 }
 
 export interface SpawnKimiOptions {
-  /** kimi 二进制路径,默认 ~/.kimi-code/bin/kimi,可用 KIMI_BIN 覆盖。 */
+  /** kimi 路径:优先于 KIMI_BIN,默认先找 ~/.kimi-code/bin/kimi,不存在时查 PATH。 */
   bin?: string;
   /** 显式端口只复用同端口实例;否则作为新进程起始端口。 */
   port?: number;
   /** false 时跳过 registry 复用,专门启动网关 standby Core。 */
   reuseRegistered?: boolean;
-  /** 额外环境变量(合入子进程 env)。 */
+  /** 额外环境变量;继承环境中的 GATEWAY_* 会先被移除。 */
   env?: Record<string, string>;
 }
 
@@ -60,7 +61,8 @@ export async function spawnKimiServer(options: SpawnKimiOptions = {}): Promise<K
     if (reusable) return reusable;
   }
 
-  const bin = options.bin ?? setting('KIMI_BIN') ?? `${homedir()}/.kimi-code/bin/kimi`;
+  const defaultBin = join(homedir(), '.kimi-code', 'bin', 'kimi');
+  const bin = options.bin ?? setting('KIMI_BIN') ?? (existsSync(defaultBin) ? defaultBin : 'kimi');
   const basePort = requestedPort ?? 58731;
   let lastError: unknown = null;
   for (let port = basePort; port < basePort + 10; port++) {
@@ -212,8 +214,9 @@ function isLoopback(host: string): boolean {
 
 function trySpawn(bin: string, port: number, extraEnv?: Record<string, string>): Promise<KimiChild> {
   return new Promise((resolve, reject) => {
+    const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GATEWAY_/i.test(key)));
     const child = spawn(bin, ['web', '--port', String(port), '--no-open'], {
-      env: { ...process.env, ...extraEnv },
+      env: { ...inheritedEnv, ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 

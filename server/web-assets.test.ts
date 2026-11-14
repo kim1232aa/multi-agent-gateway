@@ -10,13 +10,14 @@ import { loadWebShell } from './web-assets.js';
 const sha256 = (value: Buffer): string => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-const OFFICIAL_040_ROOT = join(repoRoot, 'web-dist');
-const OFFICIAL_040_EXTENSION = join(repoRoot, 'web-extension');
-const OFFICIAL_040_FILES: Record<string, string> = {
-  'index.html': 'sha256:128c3ffa5cc0f079755fefadafca154715833a83d44de9266f18e34add93ddba',
-  'boot.js': 'sha256:81976f84e9679f26658800df8a6fb074ee1cee42b7d05c961386c7dc1ac68129',
-  'assets/index--0t1wzw_.js': 'sha256:e754b3142f70ac7298b36294edaa0f5ed9df948a2454b4095c870c7e99171d2f',
-  'assets/index-DDrI0Pxr.css': 'sha256:61e701365b653726780d3acd7bc8dea66f200ce6759b0586fcbe055df5dbcbf5',
+const OFFICIAL_ROOT = join(repoRoot, 'web-dist');
+const OFFICIAL_EXTENSION = join(repoRoot, 'web-extension');
+const OFFICIAL_MANIFEST = join(repoRoot, 'web-origin-manifest.json');
+const OFFICIAL_FILES: Record<string, string> = {
+  'index.html': 'sha256:a6dcedb8d09f6c43989329ef8c7302dd4bf1a7bbf2639cb92f701db75822f95b',
+  'boot.js': 'sha256:0bce32ba35f72acf1130dd19eafa7db96967a1597618310e650b83c046f42931',
+  'assets/index-BNG6LZmM.js': 'sha256:d8b253fe10fe4335cae046cd9229e12dd33e5618b68897de0fb4c1fb22e135d1',
+  'assets/index-DTeGWdC0.css': 'sha256:0f838232de6a929888b17f1354a16d475f122979b648599677a73f68703adcfc',
 };
 
 async function fixture(): Promise<{ root: string; extension: string; manifest: string; index: Buffer }> {
@@ -26,10 +27,10 @@ async function fixture(): Promise<{ root: string; extension: string; manifest: s
   await mkdir(join(root, 'assets'), { recursive: true });
   await mkdir(extension, { recursive: true });
   const files: Record<string, Buffer> = {
-    'index.html': Buffer.from('<script src="/boot.js"></script><script type="module" src="/assets/index--0t1wzw_.js"></script>'),
+    'index.html': Buffer.from('<script src="/boot.js"></script><script type="module" src="/assets/index-BNG6LZmM.js"></script>'),
     'boot.js': Buffer.from('window.boot = true;'),
-    'assets/index--0t1wzw_.js': Buffer.from('console.log("official");'),
-    'assets/index-DDrI0Pxr.css': Buffer.from('body{}'),
+    'assets/index-BNG6LZmM.js': Buffer.from('console.log("official");'),
+    'assets/index-DTeGWdC0.css': Buffer.from('body{}'),
   };
   for (const [relative, content] of Object.entries(files)) {
     await writeFile(join(root, relative), content);
@@ -37,8 +38,8 @@ async function fixture(): Promise<{ root: string; extension: string; manifest: s
   await writeFile(join(extension, 'boot.js'), 'window.__multiAgent = true;');
   await writeFile(join(extension, 'style.css'), '.multi-agent-provider-pill{}');
   const manifest = {
-    version: '0.40.1',
-    tag: '@moonshot-ai/kimi-code@0.40.1',
+    version: '2.6.2',
+    tag: '@moonshot-ai/kimi-code@2.6.2',
     commit: 'test',
     files: Object.fromEntries(Object.entries(files).map(([relative, content]) => [relative, sha256(content)])),
   };
@@ -56,7 +57,7 @@ test('injects extension after the official boot script without changing official
     assert.equal((html.match(/\/__multi_agent\/boot\.js/g) ?? []).length, 1);
     assert.equal((html.match(/\/__multi_agent\/style\.css/g) ?? []).length, 1);
     assert.ok(html.indexOf('/boot.js') < html.indexOf('/__multi_agent/boot.js'));
-    assert.ok(html.indexOf('/__multi_agent/boot.js') < html.indexOf('/assets/index--0t1wzw_.js'));
+    assert.ok(html.indexOf('/__multi_agent/boot.js') < html.indexOf('/assets/index-BNG6LZmM.js'));
     assert.deepEqual(shell.originalIndexHtml, f.index);
     assert.deepEqual(shell.extensionAsset('/__multi_agent/boot.js')?.body, Buffer.from('window.__multiAgent = true;'));
     assert.equal(shell.extensionAsset('/__multi_agent/boot.js')?.contentType, 'text/javascript; charset=utf-8');
@@ -69,7 +70,7 @@ test('fails open to the exact official shell when a manifest hash mismatches', a
   const f = await fixture();
   try {
     const manifest = JSON.parse(await readFile(f.manifest, 'utf8')) as { files: Record<string, string> };
-    manifest.files['assets/index--0t1wzw_.js'] = 'sha256:broken';
+    manifest.files['assets/index-BNG6LZmM.js'] = 'sha256:broken';
     await writeFile(f.manifest, JSON.stringify(manifest));
     const shell = await loadWebShell({ root: f.root, extensionDir: f.extension, manifestPath: f.manifest });
     assert.equal(shell.injectionEnabled, false);
@@ -80,39 +81,40 @@ test('fails open to the exact official shell when a manifest hash mismatches', a
   }
 });
 
-test('enables injection against official 0.40.1 dist-web when the manifest hashes match', async () => {
-  const base = await mkdtemp(join(tmpdir(), 'multi-agent-web-assets-039-'));
-  try {
-    const manifestPath = join(base, 'web-origin-manifest.json');
-    await writeFile(manifestPath, JSON.stringify({
-      version: '0.40.1',
-      tag: '@moonshot-ai/kimi-code@0.40.1',
-      commit: '0.40.1',
-      files: OFFICIAL_040_FILES,
-    }));
-    const original = await readFile(join(OFFICIAL_040_ROOT, 'index.html'));
-    const originalHtml = original.toString('utf8');
-    const shell = await loadWebShell({
-      root: OFFICIAL_040_ROOT,
-      extensionDir: OFFICIAL_040_EXTENSION,
-      manifestPath,
-    });
-    const html = shell.indexHtml.toString('utf8');
-    const boot = await readFile(join(OFFICIAL_040_EXTENSION, 'boot.js'));
-    assert.equal(shell.injectionEnabled, true);
-    assert.match(shell.reason, /0\.40\.1/);
-    assert.deepEqual(shell.originalIndexHtml, original);
-    assert.match(originalHtml, /\/assets\/index--0t1wzw_\.js/);
-    assert.match(originalHtml, /\/assets\/index-DDrI0Pxr\.css/);
-    assert.doesNotMatch(originalHtml, /index-ClWTW3HX/);
-    assert.doesNotMatch(originalHtml, /index-BeWF_T60/);
-    assert.equal((html.match(/\/__multi_agent\/boot\.js/g) ?? []).length, 1);
-    assert.equal((html.match(/\/__multi_agent\/style\.css/g) ?? []).length, 1);
-    assert.ok(html.indexOf('/boot.js') < html.indexOf('/__multi_agent/boot.js'));
-    assert.ok(html.indexOf('/__multi_agent/boot.js') < html.indexOf('/assets/index--0t1wzw_.js'));
-    assert.deepEqual(shell.extensionAsset('/__multi_agent/boot.js')?.body, boot);
-    assert.equal(shell.extensionAsset('/__multi_agent/boot.js')?.contentType, 'text/javascript; charset=utf-8');
-  } finally {
-    await rm(base, { recursive: true, force: true });
+test('verifies the committed official 2.6.2 manifest and injects only the in-memory shell', async () => {
+  const manifest = JSON.parse(await readFile(OFFICIAL_MANIFEST, 'utf8'));
+  assert.deepEqual(manifest, {
+    version: '2.6.2',
+    tag: '@moonshot-ai/kimi-code@2.6.2',
+    commit: '6a8493df3e1d796a63f7c7ca0de76c1e690cd943',
+    files: OFFICIAL_FILES,
+  });
+  for (const [relative, expected] of Object.entries(OFFICIAL_FILES)) {
+    assert.equal(sha256(await readFile(join(OFFICIAL_ROOT, relative))), expected, relative);
+  }
+  const original = await readFile(join(OFFICIAL_ROOT, 'index.html'));
+  const originalHtml = original.toString('utf8');
+  const shell = await loadWebShell({
+    root: OFFICIAL_ROOT,
+    extensionDir: OFFICIAL_EXTENSION,
+    manifestPath: OFFICIAL_MANIFEST,
+  });
+  const html = shell.indexHtml.toString('utf8');
+  assert.equal(shell.injectionEnabled, true);
+  assert.equal(shell.reason, '2.6.2 (6a8493d)');
+  assert.deepEqual(shell.originalIndexHtml, original);
+  assert.match(originalHtml, /\/assets\/index-BNG6LZmM\.js/);
+  assert.match(originalHtml, /\/assets\/index-DTeGWdC0\.css/);
+  assert.doesNotMatch(originalHtml, /\/__multi_agent\//);
+  assert.equal((html.match(/\/__multi_agent\/boot\.js/g) ?? []).length, 1);
+  assert.equal((html.match(/\/__multi_agent\/style\.css/g) ?? []).length, 1);
+  assert.ok(html.indexOf('/boot.js') < html.indexOf('/__multi_agent/boot.js'));
+  assert.ok(html.indexOf('/__multi_agent/boot.js') < html.indexOf('/assets/index-BNG6LZmM.js'));
+  assert.deepEqual(shell.extensionAsset('/__multi_agent/boot.js')?.body, await readFile(join(OFFICIAL_EXTENSION, 'boot.js')));
+  assert.equal(shell.extensionAsset('/__multi_agent/boot.js')?.contentType, 'text/javascript; charset=utf-8');
+  assert.deepEqual(shell.extensionAsset('/__multi_agent/style.css')?.body, await readFile(join(OFFICIAL_EXTENSION, 'style.css')));
+  assert.equal(shell.extensionAsset('/__multi_agent/style.css')?.contentType, 'text/css; charset=utf-8');
+  for (const [relative, expected] of Object.entries(OFFICIAL_FILES)) {
+    assert.equal(sha256(await readFile(join(OFFICIAL_ROOT, relative))), expected, relative);
   }
 });

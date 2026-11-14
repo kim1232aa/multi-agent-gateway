@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -271,6 +271,122 @@ test('force-kills an owned Kimi child that ignores SIGTERM', async () => {
     }
     if (previousHome === undefined) delete process.env.KIMI_CODE_HOME;
     else process.env.KIMI_CODE_HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function fakeKimi(root: string, relative: string, token: string): Promise<string> {
+  const bin = join(root, relative);
+  await mkdir(join(bin, '..'), { recursive: true });
+  await writeFile(bin, `#!${process.execPath}
+import { writeFileSync } from 'node:fs';
+if (process.env.KIMI_TEST_CAPTURE) {
+  writeFileSync(process.env.KIMI_TEST_CAPTURE, JSON.stringify({
+    token: process.env.GATEWAY_TOKEN ?? null,
+    kimi: process.env.GATEWAY_KIMI ?? null,
+    flag: process.env.GATEWAY_TEST_FLAG ?? null,
+    ordinary: process.env.KIMI_TEST_ORDINARY,
+    args: process.argv.slice(2),
+  }));
+}
+console.log('Kimi server: http://127.0.0.1/#token=${token}');
+setInterval(() => {}, 1000);
+`);
+  await chmod(bin, 0o755);
+  return bin;
+}
+
+test('strips inherited gateway environment while allowing explicit child overrides', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'multi-agent-kimi-env-'));
+  const saved = Object.fromEntries(['GATEWAY_TOKEN', 'GATEWAY_KIMI', 'GATEWAY_TEST_FLAG'].map((key) => [key, process.env[key]]));
+  process.env.GATEWAY_TOKEN = 'parent-secret';
+  process.env.GATEWAY_KIMI = 'parent-mode';
+  process.env.GATEWAY_TEST_FLAG = 'parent-flag';
+  try {
+    const bin = await fakeKimi(root, 'kimi', 'env-token');
+    for (const explicit of [false, true]) {
+      await t.test(explicit ? 'preserves explicit gateway overrides' : 'removes inherited gateway settings', async () => {
+        const capture = join(root, 'capture.json');
+        const child = await spawnKimiServer({
+          bin,
+          port: 59933,
+          reuseRegistered: false,
+          env: {
+            KIMI_UPSTREAM_URL: '',
+            KIMI_TEST_CAPTURE: capture,
+            KIMI_TEST_ORDINARY: 'preserved',
+            ...(explicit ? { GATEWAY_TOKEN: 'child-secret', GATEWAY_KIMI: 'child-mode', GATEWAY_TEST_FLAG: 'child-flag' } : {}),
+          },
+        });
+        try {
+          assert.deepEqual(JSON.parse(await readFile(capture, 'utf8')), {
+            token: explicit ? 'child-secret' : null,
+            kimi: explicit ? 'child-mode' : null,
+            flag: explicit ? 'child-flag' : null,
+            ordinary: 'preserved',
+            args: ['web', '--port', '59933', '--no-open'],
+          });
+          assert.equal(process.env.GATEWAY_TOKEN, 'parent-secret');
+          assert.equal(process.env.GATEWAY_KIMI, 'parent-mode');
+          assert.equal(process.env.GATEWAY_TEST_FLAG, 'parent-flag');
+        } finally {
+          await child.close();
+        }
+      });
+    }
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('resolves Kimi by explicit configuration, installed home binary, then PATH', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'multi-agent-kimi-bin-'));
+  const saved = Object.fromEntries(['HOME', 'USERPROFILE', 'KIMI_BIN'].map((key) => [key, process.env[key]]));
+  process.env.HOME = root;
+  process.env.USERPROFILE = root;
+  delete process.env.KIMI_BIN;
+  try {
+    const installed = await fakeKimi(root, '.kimi-code/bin/kimi', 'home-token');
+    const pathBin = await fakeKimi(root, 'path/kimi', 'path-token');
+    const configured = await fakeKimi(root, 'configured-kimi', 'configured-token');
+    const explicit = await fakeKimi(root, 'explicit-kimi', 'explicit-token');
+    const env = { KIMI_CODE_HOME: root, KIMI_UPSTREAM_URL: '', PATH: join(pathBin, '..') };
+    const scenarios = [
+      { name: 'options.bin takes precedence over KIMI_BIN', bin: explicit, env: { ...env, KIMI_BIN: configured }, token: 'explicit-token' },
+      { name: 'options.env KIMI_BIN takes precedence over process KIMI_BIN', env: { ...env, KIMI_BIN: configured }, token: 'configured-token' },
+      { name: 'process KIMI_BIN takes precedence over home and PATH', env, token: 'explicit-token' },
+      { name: 'existing home installation takes precedence over PATH', env, token: 'home-token' },
+      { name: 'falls back to PATH when the home binary is absent', env, token: 'path-token' },
+    ];
+    for (let index = 0; index < scenarios.length; index += 1) {
+      const scenario = scenarios[index];
+      await t.test(scenario.name, async () => {
+        if (index < 3) process.env.KIMI_BIN = explicit;
+        else delete process.env.KIMI_BIN;
+        if (index === 4) await rm(installed);
+        const child = await spawnKimiServer({ bin: scenario.bin, env: scenario.env, port: 59934, reuseRegistered: false });
+        try {
+          assert.equal(child.token, scenario.token);
+        } finally {
+          await child.close();
+        }
+      });
+    }
+    await t.test('does not fall back when an explicitly configured binary is missing', async () => {
+      await assert.rejects(
+        spawnKimiServer({ bin: join(root, 'missing'), env, port: 59934, reuseRegistered: false }),
+        /ENOENT/,
+      );
+    });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

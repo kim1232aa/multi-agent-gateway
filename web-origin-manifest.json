@@ -1,11 +1,11 @@
 {
-  "version": "0.40.1",
-  "tag": "@moonshot-ai/kimi-code@0.40.1",
-  "commit": "0.40.1",
+  "version": "2.6.2",
+  "tag": "@moonshot-ai/kimi-code@2.6.2",
+  "commit": "6a8493df3e1d796a63f7c7ca0de76c1e690cd943",
   "files": {
-    "index.html": "sha256:128c3ffa5cc0f079755fefadafca154715833a83d44de9266f18e34add93ddba",
-    "boot.js": "sha256:81976f84e9679f26658800df8a6fb074ee1cee42b7d05c961386c7dc1ac68129",
-    "assets/index--0t1wzw_.js": "sha256:e754b3142f70ac7298b36294edaa0f5ed9df948a2454b4095c870c7e99171d2f",
-    "assets/index-DDrI0Pxr.css": "sha256:61e701365b653726780d3acd7bc8dea66f200ce6759b0586fcbe055df5dbcbf5"
+    "index.html": "sha256:a6dcedb8d09f6c43989329ef8c7302dd4bf1a7bbf2639cb92f701db75822f95b",
+    "boot.js": "sha256:0bce32ba35f72acf1130dd19eafa7db96967a1597618310e650b83c046f42931",
+    "assets/index-BNG6LZmM.js": "sha256:d8b253fe10fe4335cae046cd9229e12dd33e5618b68897de0fb4c1fb22e135d1",
+    "assets/index-DTeGWdC0.css": "sha256:0f838232de6a929888b17f1354a16d475f122979b648599677a73f68703adcfc"
   }
 }
