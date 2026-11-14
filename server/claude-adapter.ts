@@ -1,43 +1,57 @@
 /**
- * ClaudeAdapter — wraps the Claude Code CLI (tested with 2.1.220–2.1.258) as a
- * ProviderAdapter for the multi-agent gateway.
+ * ClaudeAdapter — wraps the Claude Code CLI (2.1.220–2.1.325, including 2.1.311 compat)
+ * as a backend adapter for the multi-agent gateway.
  *
  * Driving mechanism: each turn spawns
  *   claude -p --input-format stream-json --output-format stream-json \
- *          --include-partial-messages --verbose [--session-id <id> | --resume <id> [--fork-session]]
+ *          --include-partial-messages --verbose --permission-prompt-tool=stdio \
+ *          --forward-subagent-text [--session-id <id> | --resume <id> [--fork-session]]
  * The first user message (stream-json line) is written to stdin, which stays
- * open so mid-turn 插话 can write another user line (steer). stdin closes on
- * the terminal `result` event, interrupt, or process close/error — not right
- * after the first prompt. Multi-turn conversations are continued via
- * --resume. Session transcripts live in ~/.claude/projects/<cwd-slug>/<sessionId>.jsonl.
- *
- * Verified behaviors (2.1.220, against the configured Anthropic-compatible endpoint):
- *  - `system/subtype=init` carries session_id, cwd, tool list.
- *  - `stream_event` carries raw Anthropic SSE deltas (text_delta / thinking_delta).
- *  - `assistant` events carry complete message blocks incl. tool_use.
- *  - `user` events carry tool_result blocks.
- *  - `result` is the terminal event: { subtype: "success"|..., result, is_error,
- *    usage, permission_denials[], session_id }.
- *  - 2.1.239 实测(-p stream-json, permission-mode=manual 或缺省,stdin 开/关
- *    两种):Bash 等工具会直接执行,result.permission_denials 为空,stdout 也
- *    没有 can_use_tool control_request(工具直接执行)。因此缺省行为与从前
- *    一致,不强制 --permission-mode。若 CLI 发出 control_request,适配器
- *    park 并以 approval/question 事件上报,resolveApproval/resolveQuestion
- *    写回 control_response,不自动 deny。若 CLI 仍拒绝某次工具,会以
- *    permission_denied 事件上报。
+ * open so mid-turn 插话 (steer) and bidirectional control requests/responses
+ * can flow until the terminal `result` event, interrupt, or process close/error.
+ * Multi-turn conversations continue via `--resume`. Session transcripts live in
+ * `<CLAUDE_CONFIG_DIR || ~/.claude>/projects/<cwd-slug>/<sessionId>.jsonl`.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import { promises as fsp } from "node:fs";
+import { constants as fsConstants, promises as fsp } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import { FsError, openBound, type OpenBoundOptions } from "./fs-local.js";
+import { discoverClaudeDiskCommands } from "./native-commands.js";
 import { ProviderError } from "./types.js";
 
-/** 会话列表只解析文件头这么多字节(ai-title/cwd/首条用户消息都在前 ~20 行)。 */
+/** 会话列表扫描文件头/尾的窗口大小。 */
 const HEAD_BYTES = 256 * 1024;
+/** 历史读取与 continued-in 内容核验的最大尾部/扫描窗口 (16 MiB)。 */
+const MAX_HISTORY_TAIL_BYTES = 16 * 1024 * 1024;
+const READ_CHUNK_BYTES = 1024 * 1024;
+const MAX_SIDECAR_BYTES = 4096;
+const MAX_UNMATCHED_CONTROL_RESPONSES = 256;
+
+const BOUNDED_APPEND_FLAGS =
+  fsConstants.O_WRONLY |
+  fsConstants.O_APPEND |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const OPEN_DIR_FLAGS =
+  fsConstants.O_RDONLY |
+  (fsConstants.O_DIRECTORY ?? 0) |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const CREATE_BOUND_FLAGS =
+  fsConstants.O_WRONLY |
+  fsConstants.O_CREAT |
+  fsConstants.O_EXCL |
+  (fsConstants.O_NONBLOCK ?? 0) |
+  (fsConstants.O_NOFOLLOW ?? 0);
+
+const HAS_PROC_SELF_FD = process.platform === "linux" && fs.existsSync("/proc/self/fd");
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -45,22 +59,40 @@ const HEAD_BYTES = 256 * 1024;
 
 export interface ClaudeSessionSummary {
   sessionId: string;
-  /** AI-generated title / summary / first user prompt, best effort. */
+  /** Custom title / AI title / summary / first or last user prompt, best effort. */
   title: string;
+  /** Explicit user title from JSONL `custom-title` or `custom-title.json` sidecar. */
+  customTitle?: string;
+  /** First meaningful user prompt in the session. */
+  firstPrompt?: string;
+  /** Git branch recorded in the session transcript. */
+  gitBranch?: string;
   /** Working directory the session ran in (from transcript entries). */
   cwd: string;
   /** Project dir slug under ~/.claude/projects. */
   projectDir: string;
   /** ISO timestamp of last transcript entry (file mtime fallback). */
   updatedAt: string;
+  /** Creation ISO timestamp from earliest transcript entry, when present. */
+  createdAt?: string;
+  /** Transcript file size in bytes. */
+  fileSize?: number;
+  /** Native archive status synchronized with `<sessionId>/archived.json`. */
+  archived?: boolean;
+  /** Continuation target if the tail contains an un-superseded `continued-in` entry. */
+  continuedInSessionId?: string;
 }
 
-/** initialize 握手回包里的单条斜杠命令描述。 */
+/** initialize 握手回包或磁盘发现的单条斜杠命令描述。 */
 export interface ClaudeSlashCommand {
   name: string;
   description: string;
   argumentHint: string;
   aliases: string[];
+  builtin?: boolean;
+  source?: string;
+  path?: string;
+  scope?: string;
 }
 
 /** initialize 握手回包里的单条内置模型描述(CLI 权威目录,无需登录即可获取)。 */
@@ -71,6 +103,13 @@ export interface ClaudeBuiltinModel {
   description?: string;
   supportsEffort?: boolean;
   supportedEffortLevels?: string[];
+  supportsAdaptiveThinking?: boolean;
+  supportsThinkingOff?: boolean;
+  supportsFastMode?: boolean;
+  fastMode?: boolean;
+  supportsAutoMode?: boolean;
+  fastModeState?: "off" | "cooldown" | "on" | string;
+  fastModeDisabledReason?: string;
 }
 
 export interface ClaudeHistoryMessage {
@@ -87,31 +126,188 @@ export interface ClaudeHistoryMessage {
   timestamp?: string;
   model?: string;
   isError?: boolean;
+  isCompactSummary?: boolean;
+  uuid?: string;
+  parentUuid?: string | null;
+  agentId?: string;
+  parentToolUseId?: string | null;
 }
 
+export type ClaudeApprovalDecision =
+  | "allow"
+  | "deny"
+  | "approve"
+  | "approve_always"
+  | "reject";
+
+export interface ResolveClaudeApprovalOptions {
+  message?: string;
+  interrupt?: boolean;
+  updatedInput?: Record<string, unknown>;
+  updatedPermissions?: unknown[];
+  scope?: string;
+}
+
+export type ClaudeQuestionAnswerInput = string | Record<string, string[] | string>;
+
 export type ClaudeAdapterEvent =
-  | { type: "init"; sessionId: string; cwd: string; tools: string[] }
-  | { type: "text_delta"; text: string }
-  | { type: "thinking_delta"; text: string }
+  | {
+      type: "init";
+      sessionId: string;
+      cwd: string;
+      tools: string[];
+      uuid?: string;
+      model?: string;
+      permissionMode?: string;
+      slashCommands?: string[];
+      skills?: string[];
+      capabilities?: string[];
+      claudeCodeVersion?: string;
+      fastModeState?: string;
+      effort?: string | null;
+    }
+  | {
+      type: "text_delta";
+      text: string;
+      uuid?: string;
+      parentToolUseId?: string;
+      agentId?: string;
+      subagentType?: string;
+    }
+  | {
+      type: "thinking_delta";
+      text: string;
+      uuid?: string;
+      parentToolUseId?: string;
+      agentId?: string;
+      subagentType?: string;
+    }
   /**
    * 本地命令(/mcp、/usage、/compact 等)的输出:assistant 事件 model 为
-   * "<synthetic>",没有 stream_event delta,整段文本一次到达(2.1.226 实测)。
+   * "<synthetic>",没有 stream_event delta,整段文本一次到达。
    */
-  | { type: "synthetic_text"; text: string }
-  | { type: "tool_use"; toolUseId: string; name: string; input: unknown }
-  | { type: "tool_result"; toolUseId: string; content: string; isError: boolean }
+  | {
+      type: "synthetic_text";
+      text: string;
+      uuid?: string;
+      parentToolUseId?: string;
+      agentId?: string;
+    }
+  | {
+      type: "tool_use";
+      toolUseId: string;
+      name: string;
+      input: unknown;
+      uuid?: string;
+      parentToolUseId?: string;
+      agentId?: string;
+      subagentType?: string;
+    }
+  | {
+      type: "tool_result";
+      toolUseId: string;
+      content: string;
+      isError: boolean;
+      toolUseResult?: unknown;
+      uuid?: string;
+      parentToolUseId?: string;
+      agentId?: string;
+      subagentType?: string;
+    }
+  | {
+      type: "tool_progress";
+      toolUseId: string;
+      toolName: string;
+      elapsedTimeSeconds: number;
+      parentToolUseId?: string;
+      taskId?: string;
+      subagentType?: string;
+      uuid?: string;
+    }
+  | {
+      type: "tool_use_summary";
+      summary: string;
+      precedingToolUseIds: string[];
+      uuid?: string;
+    }
+  | {
+      type: "task_started";
+      sessionId: string;
+      taskId: string;
+      description: string;
+      toolUseId?: string;
+      subagentType?: string;
+      isBackgrounded?: boolean;
+      spawnDepth?: number;
+      parentTaskId?: string;
+      taskType?: string;
+      uuid?: string;
+    }
+  | {
+      type: "task_progress";
+      sessionId: string;
+      taskId: string;
+      description: string;
+      toolUseId?: string;
+      subagentType?: string;
+      usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+      lastToolName?: string;
+      summary?: string;
+      uuid?: string;
+    }
+  | {
+      type: "task_updated";
+      sessionId: string;
+      taskId: string;
+      patch: Record<string, unknown>;
+      uuid?: string;
+    }
+  | {
+      type: "task_notification";
+      sessionId: string;
+      taskId: string;
+      status: string;
+      summary: string;
+      toolUseId?: string;
+      outputFile?: string;
+      usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+      uuid?: string;
+    }
   | {
       type: "approval";
       approvalId: string;
       tool: string;
       input?: unknown;
       itemId?: string;
+      suggestions?: unknown[];
+      blockedPath?: string;
+      decisionReason?: string;
+      decisionReasonType?: string;
+      suppressAlwaysAllow?: boolean;
+      defaultToNo?: boolean;
+      requiresUserInteraction?: boolean;
+      title?: string;
+      displayName?: string;
+      description?: string;
+      agentId?: string;
+      parentToolUseId?: string;
+      matchedAskRule?: Record<string, unknown>;
+      classifierApprovable?: boolean;
+      mcpServer?: { name: string; source: string };
     }
   | {
       type: "question";
       questionId: string;
       prompt: string;
       rawQuestions?: unknown[];
+      itemId?: string;
+      agentId?: string;
+      parentToolUseId?: string;
+    }
+  | {
+      type: "control_cancelled";
+      requestId: string;
+      kind: "approval" | "question";
     }
   | {
       type: "permission_denied";
@@ -125,7 +321,12 @@ export type ClaudeAdapterEvent =
       subtype: string;
       stopReason: string | null;
       usage?: Record<string, unknown>;
+      totalCostUsd?: number;
+      modelUsage?: Record<string, unknown>;
+      numTurns?: number;
+      fastModeState?: string;
       durationMs?: number;
+      uuid?: string;
     }
   | { type: "interrupted"; sessionId: string }
   | { type: "error"; message: string };
@@ -135,6 +336,21 @@ interface PendingControl {
   sessionId: string;
   kind: "approval" | "question";
   request: Record<string, unknown>;
+}
+
+interface PendingOutboundControl {
+  resolve: (response: Record<string, unknown>) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+interface SessionControlState {
+  pendingOutbound: Map<string, PendingOutboundControl>;
+  unmatchedResponses: Map<string, Record<string, unknown>>;
+}
+
+interface StreamMapperState {
+  streamedParentKeys: Set<string>;
 }
 
 export interface StartTurnOptions {
@@ -153,27 +369,56 @@ export interface StartTurnOptions {
   fork?: boolean;
   /** 覆盖本 turn 的模型(透传 CLI 的 --model;缺省由 CLI 配置/环境决定)。 */
   model?: string;
-  /** 思考档位(透传 CLI 的 --effort,2.1.226 --help 取证:low/medium/high/xhigh/max)。 */
+  /** 思考档位(透传 CLI 的 --effort: low/medium/high/xhigh/max)。 */
   effort?: string;
   /**
-   * 权限模式(透传 CLI 的 --permission-mode,choices 实测:
-   * acceptEdits/auto/bypassPermissions/manual/dontAsk/plan)。
+   * 权限模式(透传 CLI 的 --permission-mode,choices:
+   * default/acceptEdits/auto/bypassPermissions/manual/dontAsk/plan)。
    */
   permissionMode?: string;
+  /** Optional max thinking tokens budget passed to CLI. */
+  maxThinkingTokens?: number;
+  /** Whether to forward subagent text & thinking (`--forward-subagent-text`, default true). */
+  forwardSubagentText?: boolean;
+  /** Whether to enable stdio permission prompt tool (`--permission-prompt-tool=stdio`, default true). */
+  permissionPromptTool?: boolean;
+  /** Optional settings JSON object passed via `--settings`. */
+  settings?: Record<string, unknown>;
   /**
    * 完整 user content 块(图片/PDF 附件时优先于 prompt 单文本块;
-   * 2.1.226 复核:stream-json 接受 image/document base64 block)。
+   * stream-json 接受 image/document base64 block)。
    */
   contentBlocks?: Array<Record<string, unknown>>;
   onEvent: (event: ClaudeAdapterEvent) => void;
+}
+
+export interface GetHistoryOptions {
+  /** Follow `continued-in` chain to the latest valid continuation transcript. */
+  followContinuedIn?: boolean;
+  /** Include subagent transcripts under `<sessionId>/subagents/agent-*.jsonl`. */
+  includeSubagents?: boolean;
+  /** Test/verification hook invoked inside `openBound` after preflight checks. */
+  beforeAnchoredOpen?: () => void | Promise<void>;
+}
+
+export interface AnchoredOpOptions {
+  /** Test/verification hook invoked after discovery and before anchored handle traversal. */
+  beforeAnchoredOp?: () => void | Promise<void>;
+}
+
+export interface ListSlashCommandsOptions {
+  /** Fall back to zero-spawn disk discovery if initialize fails (default true). */
+  diskFallback?: boolean;
+  /** Skip spawning the CLI entirely and use zero-spawn disk discovery. */
+  diskOnly?: boolean;
 }
 
 export class UnsupportedCapability extends Error {
   constructor(capability: string) {
     super(
       `claude-adapter: "${capability}" is not supported by the Claude CLI in ` +
-        `non-interactive stream-json mode (verified on 2.1.220: tools needing ` +
-        `permission are auto-denied and reported via result.permission_denials).`,
+        `non-interactive stream-json mode (tools needing permission require ` +
+        `--permission-prompt-tool=stdio).`,
     );
     this.name = "UnsupportedCapability";
   }
@@ -184,24 +429,117 @@ export interface ClaudeAdapterOptions {
   claudeBin?: string;
   /** Extra/override env for the claude subprocess (merged over the defaults). */
   env?: Record<string, string>;
-  /** Root of claude session transcripts. Default ~/.claude/projects */
+  /** Root of claude session transcripts. Default `<configDir>/projects`. */
   projectsDir?: string;
+  /** Root Claude config dir. Default `CLAUDE_CONFIG_DIR || ~/.claude`. */
+  configDir?: string;
 }
 
 // ---------------------------------------------------------------------------
-// Default environment for the claude CLI child process.
+// Default environment & path/executable resolution
 // ---------------------------------------------------------------------------
 
-// 只放无密默认值;上游地址/密钥/模型一律由部署方经进程环境变量注入
-// (网关启动命令 export ANTHROPIC_*),源码不内置任何凭据。
+// 只放无密默认值;上游地址/密钥/模型一律由部署方经进程环境变量注入。
 const DEFAULT_ENV: Record<string, string> = {
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
 };
 
-const DEFAULT_CLAUDE_BIN = path.join(os.homedir(), ".local", "bin", "claude");
-
 /** Claude transcript 会话 id 是 UUID;列表/路径拼接统一用它把关。 */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const CONTROL_PERMISSION_MODES = new Set([
+  "default",
+  "acceptEdits",
+  "plan",
+  "auto",
+  "dontAsk",
+  "bypassPermissions",
+]);
+
+function findExecutableOnPath(binName: string, pathEnv: string | undefined): string | null {
+  if (!pathEnv) return null;
+  const exts =
+    process.platform === "win32"
+      ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
+      : [""];
+  for (const dir of pathEnv.split(path.delimiter)) {
+    const trimmed = dir.trim();
+    if (!trimmed) continue;
+    for (const ext of exts) {
+      const candidateName =
+        ext && !binName.toLowerCase().endsWith(ext.toLowerCase()) ? `${binName}${ext}` : binName;
+      const candidate = path.join(trimmed, candidateName);
+      try {
+        const st = fs.statSync(candidate);
+        if (!st.isFile()) continue;
+        if (process.platform !== "win32") {
+          fs.accessSync(candidate, fsConstants.X_OK);
+        }
+        return candidate;
+      } catch {
+        // continue scanning PATH
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve the Claude CLI binary path with precedence:
+ * 1. `options.claudeBin`
+ * 2. `CLAUDE_BIN` (`options.env.CLAUDE_BIN` then `process.env.CLAUDE_BIN`)
+ * 3. `claude` executable on `PATH` (`options.env.PATH` then `process.env.PATH`)
+ * 4. `~/.local/bin/claude` fallback
+ */
+export function resolveClaudeBin(options: { claudeBin?: string; env?: Record<string, string> } = {}): string {
+  const explicit = options.claudeBin?.trim();
+  if (explicit) return explicit;
+
+  const rawEnvBin =
+    options.env && "CLAUDE_BIN" in options.env ? options.env.CLAUDE_BIN : process.env.CLAUDE_BIN;
+  const envBin = rawEnvBin?.trim();
+  if (envBin) return envBin;
+
+  const pathEnv = options.env && "PATH" in options.env ? options.env.PATH : process.env.PATH;
+  const onPath = findExecutableOnPath("claude", pathEnv);
+  if (onPath) return onPath;
+
+  const rawHome = options.env && "HOME" in options.env ? options.env.HOME : undefined;
+  const home = rawHome?.trim() || os.homedir();
+  const binaryName = process.platform === "win32" ? "claude.exe" : "claude";
+  return path.join(home, ".local", "bin", binaryName);
+}
+
+/**
+ * Build child environment stripping inherited `GATEWAY_*` variables while
+ * preserving explicit `envOverrides` and `DEFAULT_ENV`.
+ */
+export function buildClaudeChildEnv(
+  envOverrides?: Record<string, string>,
+  configDir?: string,
+): NodeJS.ProcessEnv {
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !/^GATEWAY_/i.test(key)),
+  );
+  return {
+    ...inherited,
+    ...DEFAULT_ENV,
+    ...(envOverrides ?? {}),
+    ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+  };
+}
+
+/**
+ * Map gateway / CLI permission mode strings to valid control-protocol
+ * `set_permission_mode` modes without ever sending CLI-only `manual` over control.
+ */
+export function mapControlPermissionMode(mode: string): string {
+  const trimmed = mode.trim();
+  if (trimmed === "manual") return "default";
+  if (trimmed === "yolo") return "bypassPermissions";
+  if (CONTROL_PERMISSION_MODES.has(trimmed)) return trimmed;
+  throw new ProviderError("invalid_request", `claude-adapter: unsupported permission mode: ${mode}`, 400);
+}
 
 // ---------------------------------------------------------------------------
 // Adapter
@@ -210,20 +548,44 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export class ClaudeAdapter {
   private readonly claudeBin: string;
   private readonly env: Record<string, string>;
+  private readonly homeDir: string;
+  private readonly configDir: string;
+  private readonly explicitConfigDir?: string;
   private readonly projectsDir: string;
   /** sessionId -> running turn process (at most one turn per session). */
   private readonly running = new Map<string, ChildProcess>();
+  /** sessionId -> outbound control_request correlation state. */
+  private readonly sessionControls = new Map<string, SessionControlState>();
   /** Parked control_request rows keyed by request_id (approval / question). */
   private readonly pendingControls = new Map<string, PendingControl>();
   /** Sessions whose current turn was interrupted via interrupt(). */
   private readonly interruptRequested = new Set<string>();
+  /** Active interrupt fallback timers per session, cleared on exit. */
+  private readonly interruptTimers = new Map<string, Set<NodeJS.Timeout>>();
+  /** Child processes that have already initiated interrupt escalation. */
+  private readonly interruptingChildren = new WeakSet<ChildProcess>();
   /** startTurn 的中断窗口等待者:旧进程退出时唤醒(见 startTurn/waitForExit)。 */
   private readonly exitWaiters = new Map<string, Array<() => void>>();
 
   constructor(options: ClaudeAdapterOptions = {}) {
-    this.claudeBin = options.claudeBin ?? DEFAULT_CLAUDE_BIN;
+    this.claudeBin = resolveClaudeBin(options);
+    const rawHome = options.env && "HOME" in options.env ? options.env.HOME : undefined;
+    this.homeDir = rawHome?.trim() || os.homedir();
+    const rawEnvConfigDir =
+      options.env && "CLAUDE_CONFIG_DIR" in options.env
+        ? options.env.CLAUDE_CONFIG_DIR
+        : process.env.CLAUDE_CONFIG_DIR;
+    this.explicitConfigDir =
+      options.configDir?.trim() ||
+      rawEnvConfigDir?.trim() ||
+      undefined;
+    this.configDir = this.explicitConfigDir ?? path.join(this.homeDir, ".claude");
     this.env = { ...DEFAULT_ENV, ...(options.env ?? {}) };
-    this.projectsDir = options.projectsDir ?? path.join(os.homedir(), ".claude", "projects");
+    this.projectsDir = options.projectsDir ?? path.join(this.configDir, "projects");
+  }
+
+  private childEnv(): NodeJS.ProcessEnv {
+    return buildClaudeChildEnv(this.env, this.explicitConfigDir);
   }
 
   /** 等某会话的 running 进程退出;超时返回(不抛错,调用方自行判活)。 */
@@ -256,6 +618,22 @@ export class ClaudeAdapter {
     for (const done of waiters) done();
   }
 
+  private trackInterruptTimer(sessionId: string, timer: NodeJS.Timeout): void {
+    let set = this.interruptTimers.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.interruptTimers.set(sessionId, set);
+    }
+    set.add(timer);
+  }
+
+  private clearInterruptTimers(sessionId: string): void {
+    const set = this.interruptTimers.get(sessionId);
+    if (!set) return;
+    for (const timer of set) clearTimeout(timer);
+    this.interruptTimers.delete(sessionId);
+  }
+
   // -- capability surface ---------------------------------------------------
 
   readonly provider = "claude" as const;
@@ -267,64 +645,146 @@ export class ClaudeAdapter {
     interrupt: true,
     resume: true,
     fork: true,
-    /** Best-effort: emit/resolve when CLI sends can_use_tool control_request. */
     approvals: true,
-    /** AskUserQuestion / questions control_request, when the shape is obvious. */
     questions: true,
+    subagents: true,
+    nativeArchive: true,
+    rename: true,
+    delete: true,
+    mcp: true,
   };
 
   // -- list -----------------------------------------------------------------
 
   /**
-   * Scan ~/.claude/projects/<slug>/<sessionId>.jsonl into session summaries.
-   * 只列顶层 .jsonl(主会话);子 agent transcript 位于 <id>/subagents/ 下,天然排除。
-   *
-   * 性能:本机 121 个文件共 343MB,全量解析会把事件循环卡死(实测 99% CPU
-   * 无法响应)。因此只读文件头 HEAD_BYTES(ai-title/cwd/首条用户消息都在前
-   * ~20 行),updatedAt 用 mtime,并按 (mtimeMs,size) 做缓存。
+   * Scan `<configDir>/projects/<slug>/<sessionId>.jsonl` into session summaries.
+   * Only lists top-level UUID `.jsonl` transcripts; skips symlinks/FIFOs via
+   * `openBound`, resolves `continued-in` chains, reads `custom-title` and
+   * `archived.json` native metadata.
    */
   async list(): Promise<ClaudeSessionSummary[]> {
-    const out: ClaudeSessionSummary[] = [];
+    const rawSummaries: ClaudeSessionSummary[] = [];
     let projectDirs: fs.Dirent[];
     try {
       projectDirs = fs.readdirSync(this.projectsDir, { withFileTypes: true });
     } catch {
-      return out;
+      return rawSummaries;
     }
+
+    let realRoot: string;
+    try {
+      realRoot = fs.realpathSync(this.projectsDir);
+    } catch {
+      realRoot = path.resolve(this.projectsDir);
+    }
+
     const tasks: (() => Promise<void>)[] = [];
     for (const dirEnt of projectDirs) {
-      if (!dirEnt.isDirectory()) continue;
+      if (dirEnt.isSymbolicLink() || !dirEnt.isDirectory()) continue;
       const dirPath = path.join(this.projectsDir, dirEnt.name);
-      let files: string[];
+      let realDir: string;
       try {
-        files = fs.readdirSync(dirPath);
+        realDir = fs.realpathSync(dirPath);
       } catch {
         continue;
       }
-      for (const file of files) {
-        if (!file.endsWith(".jsonl")) continue;
-        const sessionId = file.slice(0, -".jsonl".length);
-        // 只收 UUID 会话(对齐原生 claude resume):非 UUID 的 .jsonl(用户误放/
-        // 未来新命名)会进列表但 findSessionFile 打不开——点不开的条目不如不列。
+      if (!isWithinDir(realRoot, realDir)) continue;
+
+      let files: fs.Dirent[];
+      try {
+        files = fs.readdirSync(realDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const fileEnt of files) {
+        if (fileEnt.isSymbolicLink() || !fileEnt.isFile()) continue;
+        if (!fileEnt.name.endsWith(".jsonl")) continue;
+        const sessionId = fileEnt.name.slice(0, -".jsonl".length);
         if (!UUID_RE.test(sessionId)) continue;
-        const filePath = path.join(dirPath, file);
+        const filePath = path.join(realDir, fileEnt.name);
         tasks.push(async () => {
           try {
-            const s = await this.summarizeSessionFile(sessionId, dirEnt.name, filePath);
-            if (s) out.push(s);
+            const s = await this.summarizeSessionFile(sessionId, dirEnt.name, filePath, realRoot);
+            if (s) rawSummaries.push(s);
           } catch {
-            // unreadable / malformed transcript — skip
+            // unreadable / symlink / malformed transcript — skip
           }
         });
       }
     }
-    // 有限并发,避免一次性 121 个同步读阻塞事件循环。
+
     const CONCURRENCY = 8;
     for (let i = 0; i < tasks.length; i += CONCURRENCY) {
       await Promise.all(tasks.slice(i, i + CONCURRENCY).map((t) => t()));
     }
+
+    // Filter out sessions superseded by a valid non-empty `continued-in` chain.
+    const byId = new Map<string, ClaudeSessionSummary>();
+    for (const s of rawSummaries) byId.set(s.sessionId, s);
+
+    const out: ClaudeSessionSummary[] = [];
+    for (const s of rawSummaries) {
+      if (s.continuedInSessionId && (await this.hasValidContinuedTarget(s, byId, realRoot))) {
+        continue;
+      }
+      out.push(s);
+    }
+
     out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
     return out;
+  }
+
+  private async hasValidContinuedTarget(
+    source: ClaudeSessionSummary,
+    byId: Map<string, ClaudeSessionSummary>,
+    realRoot: string,
+  ): Promise<boolean> {
+    const visited = new Set<string>([source.sessionId]);
+    let currentId: string | undefined = source.continuedInSessionId;
+    while (currentId && UUID_RE.test(currentId) && !visited.has(currentId)) {
+      visited.add(currentId);
+      const candidateFile =
+        this.findSessionFileInProjectDir(path.join(this.projectsDir, source.projectDir), currentId, realRoot) ??
+        this.findSessionFile(currentId);
+      if (!candidateFile) return false;
+      const hasMessages = await this.transcriptHasConversation(candidateFile, realRoot);
+      if (hasMessages) return true;
+      const nextSummary = byId.get(currentId);
+      currentId = nextSummary?.continuedInSessionId;
+    }
+    return false;
+  }
+
+  private async transcriptHasConversation(filePath: string, realRoot: string): Promise<boolean> {
+    try {
+      const { fh, stat } = await this.openTranscriptBound(filePath, realRoot);
+      try {
+        if (stat.size === 0) return false;
+        const scanMax = Math.min(stat.size, MAX_HISTORY_TAIL_BYTES);
+        const buf = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, scanMax));
+        let offset = 0;
+        let carry = "";
+        while (offset < scanMax) {
+          const toRead = Math.min(buf.length, scanMax - offset);
+          const { bytesRead } = await fh.read(buf, 0, toRead, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+          const chunkStr = carry + buf.toString("utf8", 0, bytesRead);
+          if (chunkStr.includes('"parentUuid":')) return true;
+          const lines = chunkStr.split("\n");
+          carry = lines.pop() ?? "";
+          for (const line of lines) {
+            if (lineHasConversationEntry(line)) return true;
+          }
+        }
+        if (carry && lineHasConversationEntry(carry)) return true;
+        return stat.size > MAX_HISTORY_TAIL_BYTES;
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+    } catch {
+      return false;
+    }
   }
 
   // -- create ---------------------------------------------------------------
@@ -339,95 +799,454 @@ export class ClaudeAdapter {
 
   // -- getHistory -----------------------------------------------------------
 
-  /** Parse the session transcript into user/assistant text messages. */
-  private historyCache = new Map<string, { mtimeMs: number; size: number; messages: ClaudeHistoryMessage[] }>();
+  /** Parse the session transcript into user/assistant messages using 16 MiB tail + branch pruning. */
+  private historyCache = new Map<string, { key: string; messages: ClaudeHistoryMessage[] }>();
 
-  async getHistory(sessionId: string): Promise<ClaudeHistoryMessage[]> {
-    const filePath = this.findSessionFile(sessionId);
+  async getHistory(sessionId: string, options: GetHistoryOptions = {}): Promise<ClaudeHistoryMessage[]> {
+    const resolvedId = options.followContinuedIn
+      ? await this.resolveContinuedSessionId(sessionId)
+      : sessionId;
+    const filePath = this.findSessionFile(resolvedId);
     if (!filePath) throw new Error(`claude-adapter: session not found: ${sessionId}`);
-    let st: fs.Stats;
+
+    const realRoot = await this.realProjectsRoot();
+    let opened: { fh: fsp.FileHandle; stat: fs.Stats };
     try {
-      st = fs.statSync(filePath);
-    } catch {
-      throw new Error(`claude-adapter: session not found: ${sessionId}`);
+      opened = await this.openTranscriptBound(
+        filePath,
+        realRoot,
+        options.beforeAnchoredOpen ? { beforeAnchoredOpen: options.beforeAnchoredOpen } : undefined,
+      );
+    } catch (err) {
+      if (err instanceof FsError && err.code === "not_found") {
+        throw new Error(`claude-adapter: session not found: ${sessionId}`);
+      }
+      throw err;
     }
-    const hit = this.historyCache.get(sessionId);
-    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
-      return hit.messages;
+
+    const { fh, stat: st } = opened;
+    try {
+      const cacheKey = `${resolvedId}:${options.includeSubagents ? "sub" : "main"}`;
+      const hit = this.historyCache.get(cacheKey);
+      if (hit && hit.key === `${st.mtimeMs}:${st.size}`) {
+        return hit.messages;
+      }
+
+      const text = await readTailWindowUtf8(fh, st.size, MAX_HISTORY_TAIL_BYTES);
+      const messages = parseHistoryTranscript(text);
+
+      if (options.includeSubagents) {
+        const subIds = await this.listSubagents(resolvedId).catch(() => []);
+        for (const agentId of subIds) {
+          const subMsgs = await this.getSubagentMessages(resolvedId, agentId).catch(() => []);
+          messages.push(...subMsgs);
+        }
+      }
+
+      this.historyCache.set(cacheKey, { key: `${st.mtimeMs}:${st.size}`, messages });
+      return messages;
+    } finally {
+      await fh.close().catch(() => undefined);
     }
-    const messages: ClaudeHistoryMessage[] = [];
-    for (const line of fs.readFileSync(filePath, "utf8").split("\n")) {
-      if (!line) continue;
-      let entry: any;
+  }
+
+  /** Follow `continued-in` chain up to the latest valid continuation session ID (cycle-safe). */
+  async resolveContinuedSessionId(sessionId: string): Promise<string> {
+    if (!UUID_RE.test(sessionId)) return sessionId;
+    const realRoot = await this.realProjectsRoot();
+    const visited = new Set<string>();
+    let current = sessionId;
+
+    while (!visited.has(current)) {
+      visited.add(current);
+      const filePath = this.findSessionFile(current);
+      if (!filePath) break;
+      let tail = "";
       try {
-        entry = JSON.parse(line);
+        const { fh, stat } = await this.openTranscriptBound(filePath, realRoot);
+        try {
+          tail = await readTailWindowUtf8(fh, stat.size, HEAD_BYTES);
+        } finally {
+          await fh.close().catch(() => undefined);
+        }
+      } catch {
+        break;
+      }
+      const nextId = extractTrailingContinuedIn(tail);
+      if (!nextId || visited.has(nextId)) break;
+      const nextFile =
+        this.findSessionFileInProjectDir(path.dirname(filePath), nextId, realRoot) ??
+        this.findSessionFile(nextId);
+      if (!nextFile) break;
+      const hasContent = await this.transcriptHasConversation(nextFile, realRoot);
+      if (!hasContent) break;
+      current = nextId;
+    }
+    return current;
+  }
+
+  // -- subagents ------------------------------------------------------------
+
+  // List subagent IDs from `<projectDir>/<sessionId>/subagents/.../agent-*.jsonl`.
+  async listSubagents(sessionId: string): Promise<string[]> {
+    if (!UUID_RE.test(sessionId)) return [];
+    const filePath = this.findSessionFile(sessionId);
+    if (!filePath) return [];
+
+    const realRoot = await this.realProjectsRoot();
+    const sessionDir = path.join(path.dirname(filePath), sessionId);
+    const subagentsDir = path.join(sessionDir, "subagents");
+    if (!(await this.isSafeDirectoryWithinRoot(sessionDir, realRoot))) return [];
+    if (!(await this.isSafeDirectoryWithinRoot(subagentsDir, realRoot))) return [];
+
+    const found = await this.scanSubagentFiles(subagentsDir, realRoot);
+    return found.map((entry) => entry.agentId);
+  }
+
+  /** Read and branch-prune a subagent transcript `subagents/agent-<agentId>.jsonl`. */
+  async getSubagentMessages(sessionId: string, agentId: string): Promise<ClaudeHistoryMessage[]> {
+    if (!UUID_RE.test(sessionId)) return [];
+    if (!isSafeAgentId(agentId)) {
+      throw new ProviderError("invalid_request", `claude-adapter: invalid subagent id: ${agentId}`, 400);
+    }
+    const filePath = this.findSessionFile(sessionId);
+    if (!filePath) return [];
+
+    const realRoot = await this.realProjectsRoot();
+    const sessionDir = path.join(path.dirname(filePath), sessionId);
+    const subagentsDir = path.join(sessionDir, "subagents");
+    if (!(await this.isSafeDirectoryWithinRoot(sessionDir, realRoot))) return [];
+    if (!(await this.isSafeDirectoryWithinRoot(subagentsDir, realRoot))) return [];
+
+    const files = await this.scanSubagentFiles(subagentsDir, realRoot);
+    const match = files.find((f) => f.agentId === agentId);
+    if (!match) return [];
+
+    const { fh, stat } = await this.openTranscriptBound(match.filePath, realRoot);
+    let text: string;
+    try {
+      text = await readTailWindowUtf8(fh, stat.size, MAX_HISTORY_TAIL_BYTES);
+    } finally {
+      await fh.close().catch(() => undefined);
+    }
+
+    let parentToolUseId: string | null = null;
+    const metaPath = match.filePath.replace(/\.jsonl$/, ".meta.json");
+    const metaText = await this.readBoundedSidecarText(metaPath, realRoot, MAX_SIDECAR_BYTES);
+    if (metaText) {
+      try {
+        const meta = JSON.parse(metaText) as Record<string, unknown>;
+        if (typeof meta.toolUseId === "string" && meta.toolUseId) {
+          parentToolUseId = meta.toolUseId;
+        }
+      } catch {
+        // ignore malformed sidecar
+      }
+    }
+
+    const messages = parseHistoryTranscript(text, { allowSidechain: true });
+    return messages.map((m) => ({
+      ...m,
+      agentId,
+      ...(parentToolUseId ? { parentToolUseId } : {}),
+    }));
+  }
+
+  private async scanSubagentFiles(
+    subagentsDir: string,
+    realRoot: string,
+  ): Promise<Array<{ agentId: string; filePath: string }>> {
+    const out: Array<{ agentId: string; filePath: string }> = [];
+    const queue: string[] = [subagentsDir];
+    let visitedDirs = 0;
+
+    while (queue.length > 0 && visitedDirs < 128) {
+      const dir = queue.shift()!;
+      visitedDirs += 1;
+      if (!(await this.isSafeDirectoryWithinRoot(dir, realRoot))) continue;
+      let dirents: fs.Dirent[];
+      try {
+        dirents = await fsp.readdir(dir, { withFileTypes: true });
       } catch {
         continue;
       }
-      if (entry.isSidechain) continue;
-      const type = entry.type;
-      if (type !== "user" && type !== "assistant") continue;
-      const msg = entry.message;
-      if (!msg || msg.role !== type) continue;
-      // 先收结构化块,再决定是否丢弃——原先 `if (!text) continue` 会把
-      // tool_use / tool_result / 纯 thinking 整条蒸发(刷新后工具卡全没)。
-      const blocks: NonNullable<ClaudeHistoryMessage["blocks"]> = [];
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (!block || typeof block !== "object") continue;
-          const b = block as Record<string, unknown>;
-          if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
-            blocks.push({ type: "thinking", text: b.thinking });
-          } else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
-            blocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
-          } else if (b.type === "tool_result") {
-            const raw = b.content;
-            const out = typeof raw === "string"
-              ? raw
-              : Array.isArray(raw)
-                ? (raw as Array<Record<string, unknown>>).map((x) => (x.text as string) ?? "").join("")
-                : "";
-            blocks.push({
-              type: "tool_result",
-              tool_use_id: (b.tool_use_id as string) ?? "",
-              content: out,
-              ...(b.is_error === true ? { is_error: true } : {}),
-            });
+      dirents.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of dirents) {
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          queue.push(full);
+          continue;
+        }
+        if (entry.isFile() && entry.name.startsWith("agent-") && entry.name.endsWith(".jsonl")) {
+          const agentId = entry.name.slice("agent-".length, -".jsonl".length);
+          if (isSafeAgentId(agentId)) {
+            out.push({ agentId, filePath: full });
           }
         }
       }
-      const text = extractText(msg.content);
-      if (!text && blocks.length === 0) continue;
-      if (type === "user" && text && isLocalCommandText(text)) continue;
-      messages.push({
-        role: type,
-        text,
-        ...(blocks.length > 0 ? { blocks } : {}),
-        timestamp: entry.timestamp,
-        model: type === "assistant" ? msg.model : undefined,
-        isError: type === "assistant" && entry.isApiErrorMessage === true,
-      });
     }
-    this.historyCache.set(sessionId, { mtimeMs: st.mtimeMs, size: st.size, messages });
-    return messages;
+    return out;
+  }
+
+  // -- rename / archive / delete --------------------------------------------
+
+  /**
+   * Persist a custom session title by appending a `custom-title` entry to the
+   * session JSONL transcript via anchored directory handles (O_WRONLY | O_APPEND | O_NONBLOCK | O_NOFOLLOW).
+   */
+  async rename(sessionId: string, title: string, options?: AnchoredOpOptions): Promise<void> {
+    if (!UUID_RE.test(sessionId)) {
+      throw new ProviderError("invalid_request", `claude-adapter: invalid sessionId: ${sessionId}`, 400);
+    }
+    const trimmed = sanitizeTitle(title);
+    if (!trimmed) {
+      throw new ProviderError("invalid_request", "claude-adapter: title must be non-empty", 400);
+    }
+
+    const filePath = this.findSessionFile(sessionId);
+    if (!filePath) {
+      if (this.running.has(sessionId)) {
+        await this.sendControlRequest(sessionId, {
+          subtype: "rename_session",
+          title: trimmed,
+          source: "host",
+          session_id: sessionId,
+        });
+        return;
+      }
+      throw new ProviderError("not_found", `claude-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    const realRoot = await this.realProjectsRoot();
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const relSegments = splitSafeRelSegments(path.relative(realRoot, anchoredTarget));
+    if (relSegments.length < 2) {
+      throw new ProviderError("invalid_request", "claude-adapter: invalid transcript location", 400);
+    }
+    const leafName = relSegments[relSegments.length - 1]!;
+    const dirSegments = relSegments.slice(0, -1);
+
+    if (options?.beforeAnchoredOp) {
+      await options.beforeAnchoredOp();
+    }
+
+    const dirHandle = await openAnchoredDir(realRoot, dirSegments);
+    try {
+      const leafTarget = dirChildPath(dirHandle, leafName);
+      const expectedLst = await fsp.lstat(leafTarget).catch((err: unknown) => {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          throw new ProviderError("not_found", `claude-adapter: session not found: ${sessionId}`, 404);
+        }
+        throw err;
+      });
+      if (expectedLst.isSymbolicLink() || !expectedLst.isFile()) {
+        throw new ProviderError("invalid_request", "claude-adapter: refusing to append to non-regular file", 400);
+      }
+
+      let fh: fsp.FileHandle;
+      try {
+        fh = await fsp.open(leafTarget, BOUNDED_APPEND_FLAGS);
+      } catch (err) {
+        throw mapAppendOpenError(err, anchoredTarget);
+      }
+      try {
+        const st = await fh.stat();
+        if (
+          !st.isFile() ||
+          st.dev !== expectedLst.dev ||
+          (process.platform !== "win32" && st.ino !== expectedLst.ino)
+        ) {
+          throw new ProviderError("invalid_request", "claude-adapter: transcript changed during rename", 400);
+        }
+        const line =
+          JSON.stringify({
+            type: "custom-title",
+            customTitle: trimmed,
+            sessionId,
+            timestamp: new Date().toISOString(),
+          }) + "\n";
+        const buf = Buffer.from(line, "utf8");
+        let written = 0;
+        const position = process.platform === "win32" ? st.size : null;
+        while (written < buf.length) {
+          const { bytesWritten } = await fh.write(
+            buf,
+            written,
+            buf.length - written,
+            position === null ? null : position + written,
+          );
+          if (bytesWritten <= 0) {
+            throw new ProviderError("upstream_error", "claude-adapter: short write during rename", 500);
+          }
+          written += bytesWritten;
+        }
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+    } finally {
+      await dirHandle.dirFd.close().catch(() => undefined);
+    }
+
+    this.summarizeCache.delete(filePath);
+    this.invalidateHistoryCacheForSession(sessionId);
+
+    if (this.running.has(sessionId)) {
+      await this.sendControlRequest(sessionId, {
+        subtype: "rename_session",
+        title: trimmed,
+        source: "host",
+        session_id: sessionId,
+      }).catch(() => undefined);
+    }
   }
 
   /**
-   * Unlink the session transcript .jsonl. Missing file is a no-op (idempotent).
-   * Clears the history / summarize caches so a later list/getHistory cannot
-   * revive the deleted session.
+   * Synchronize native archive state to `<projectDir>/<sessionId>/archived.json`
+   * through anchored directory handles within the validated projects root.
    */
-  async delete(sessionId: string): Promise<void> {
+  async setArchived(sessionId: string, archived: boolean, options?: AnchoredOpOptions): Promise<void> {
+    if (!UUID_RE.test(sessionId)) {
+      throw new ProviderError("invalid_request", `claude-adapter: invalid sessionId: ${sessionId}`, 400);
+    }
+    const filePath = this.findSessionFile(sessionId);
+    if (!filePath) {
+      throw new ProviderError("not_found", `claude-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    const realRoot = await this.realProjectsRoot();
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const relSegments = splitSafeRelSegments(path.relative(realRoot, anchoredTarget));
+    if (relSegments.length < 2) {
+      throw new ProviderError("invalid_request", "claude-adapter: invalid transcript location", 400);
+    }
+    const dirSegments = relSegments.slice(0, -1);
+
+    if (options?.beforeAnchoredOp) {
+      await options.beforeAnchoredOp();
+    }
+
+    const projectHandle = await openAnchoredDir(realRoot, dirSegments);
+    try {
+      const sessionHandle = await ensureAnchoredDirChild(projectHandle, sessionId);
+      try {
+        const archiveTarget = dirChildPath(sessionHandle, "archived.json");
+        const lst = await fsp.lstat(archiveTarget).catch(() => null);
+        if (lst && lst.isSymbolicLink()) {
+          throw new ProviderError("invalid_request", "claude-adapter: archived.json must not be a symlink", 400);
+        }
+
+        const payload = JSON.stringify({
+          archived: Boolean(archived),
+          at: new Date().toISOString(),
+          by: "gateway",
+        });
+        const tmpName = `.archived.${randomUUID()}.tmp`;
+        const tmpTarget = dirChildPath(sessionHandle, tmpName);
+        const tmpFh = await fsp.open(tmpTarget, CREATE_BOUND_FLAGS, 0o600);
+        try {
+          await tmpFh.writeFile(payload, "utf8");
+        } finally {
+          await tmpFh.close().catch(() => undefined);
+        }
+        try {
+          await fsp.rename(tmpTarget, archiveTarget);
+        } catch (err) {
+          await fsp.unlink(tmpTarget).catch(() => undefined);
+          throw err;
+        }
+      } finally {
+        await sessionHandle.dirFd.close().catch(() => undefined);
+      }
+    } finally {
+      await projectHandle.dirFd.close().catch(() => undefined);
+    }
+
+    this.summarizeCache.delete(filePath);
+  }
+
+  /**
+   * Unlink the session transcript `.jsonl` and safely remove its validated
+   * `subagents` directory (and owned session artifact dir) through anchored
+   * `O_DIRECTORY | O_NOFOLLOW` handles within `projectsDir`. Missing file is a
+   * no-op (idempotent). Refuses symlink escapes outside root.
+   */
+  async delete(sessionId: string, options?: AnchoredOpOptions): Promise<void> {
     this.interrupt(sessionId);
-    this.historyCache.delete(sessionId);
+    this.invalidateHistoryCacheForSession(sessionId);
+    if (!UUID_RE.test(sessionId)) return;
+
     const filePath = this.findSessionFile(sessionId);
     if (!filePath) return;
+
     this.summarizeCache.delete(filePath);
+
+    const realRoot = await this.realProjectsRoot();
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const relSegments = splitSafeRelSegments(path.relative(realRoot, anchoredTarget));
+    if (relSegments.length < 2) {
+      throw new ProviderError("invalid_request", "claude-adapter: invalid transcript location", 400);
+    }
+    const leafName = relSegments[relSegments.length - 1]!;
+    const dirSegments = relSegments.slice(0, -1);
+
+    if (options?.beforeAnchoredOp) {
+      await options.beforeAnchoredOp();
+    }
+
+    const projectHandle = await openAnchoredDir(realRoot, dirSegments);
+    let sessionHandle: AnchoredDirHandle | null = null;
+    let subagentsHandle: AnchoredDirHandle | null = null;
     try {
-      fs.unlinkSync(filePath);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException)?.code;
-      if (code !== "ENOENT") throw err;
+      const leafTarget = dirChildPath(projectHandle, leafName);
+      const fileLst = await fsp.lstat(leafTarget).catch((err: unknown) => {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code === "ENOENT" || code === "ENOTDIR") return null;
+        throw err;
+      });
+      if (fileLst && (fileLst.isSymbolicLink() || !fileLst.isFile())) {
+        throw new ProviderError("invalid_request", "claude-adapter: refusing to delete symlinked or non-regular transcript", 400);
+      }
+
+      sessionHandle = await openAnchoredDirChildOptional(projectHandle, sessionId, "session directory");
+      if (sessionHandle) {
+        subagentsHandle = await openAnchoredDirChildOptional(sessionHandle, "subagents", "subagents directory");
+      }
+
+      if (fileLst) {
+        try {
+          await fsp.unlink(leafTarget);
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code !== "ENOENT") throw err;
+        }
+      }
+
+      if (sessionHandle) {
+        if (subagentsHandle) {
+          await purgeAnchoredDirContents(subagentsHandle);
+          await subagentsHandle.dirFd.close().catch(() => undefined);
+          subagentsHandle = null;
+          await fsp.rmdir(dirChildPath(sessionHandle, "subagents")).catch((err: unknown) => {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code;
+            if (code !== "ENOENT") throw err;
+          });
+        }
+        for (const sidecar of ["archived.json", "custom-title.json"]) {
+          await fsp.unlink(dirChildPath(sessionHandle, sidecar)).catch((err: unknown) => {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code;
+            if (code !== "ENOENT") throw err;
+          });
+        }
+        await sessionHandle.dirFd.close().catch(() => undefined);
+        sessionHandle = null;
+        await fsp.rmdir(dirChildPath(projectHandle, sessionId)).catch(() => undefined);
+      }
+    } finally {
+      if (subagentsHandle) await subagentsHandle.dirFd.close().catch(() => undefined);
+      if (sessionHandle) await sessionHandle.dirFd.close().catch(() => undefined);
+      await projectHandle.dirFd.close().catch(() => undefined);
     }
   }
 
@@ -440,8 +1259,6 @@ export class ClaudeAdapter {
   async startTurn(opts: StartTurnOptions): Promise<void> {
     const { sessionId, prompt, onEvent } = opts;
     if (this.running.has(sessionId)) {
-      // 中断后旧进程还没退出(SIGINT→SIGKILL 最长 5s)就接到新 turn:
-      // 等它退干净再起,而不是直接失败(审查实测:abort 后立刻重提 100% 撞此)。
       await this.waitForExit(sessionId, 8_000);
       if (this.running.has(sessionId)) {
         throw new Error(`claude-adapter: a turn is already running for session ${sessionId}`);
@@ -456,6 +1273,12 @@ export class ClaudeAdapter {
       "--include-partial-messages",
       "--verbose",
     ];
+    if (opts.permissionPromptTool !== false) {
+      args.push("--permission-prompt-tool=stdio");
+    }
+    if (opts.forwardSubagentText !== false) {
+      args.push("--forward-subagent-text");
+    }
     if (opts.isNew) {
       args.push("--session-id", sessionId);
     } else {
@@ -465,21 +1288,40 @@ export class ClaudeAdapter {
     if (opts.model) args.push("--model", opts.model);
     if (opts.effort) args.push("--effort", opts.effort);
     if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
+    if (opts.maxThinkingTokens !== undefined) {
+      args.push("--max-thinking-tokens", String(opts.maxThinkingTokens));
+    }
+    if (opts.settings) {
+      args.push("--settings", JSON.stringify(opts.settings));
+    }
 
     const child = spawn(this.claudeBin, args, {
       cwd,
-      env: { ...process.env, ...this.env },
+      env: this.childEnv(),
       stdio: ["pipe", "pipe", "pipe"],
-      // 独立进程组:SIGKILL 升级/close 时整组收割,CLI 跑工具spawn的孙进程
-      // 不成孤儿(此前只杀主 pid,孙子活下来继续写文件/占资源)。
       detached: true,
     });
     this.running.set(sessionId, child);
+    const controlState: SessionControlState = {
+      pendingOutbound: new Map(),
+      unmatchedResponses: new Map(),
+    };
+    this.sessionControls.set(sessionId, controlState);
+    const mapperState: StreamMapperState = { streamedParentKeys: new Set() };
 
     let stderrTail = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
     });
+
+    const cleanupTurnState = (err?: Error): void => {
+      this.clearInterruptTimers(sessionId);
+      this.running.delete(sessionId);
+      this.dropPendingForSession(sessionId);
+      this.rejectOutboundControls(sessionId, err ?? new ProviderError("not_found", "claude process closed", 404));
+      this.sessionControls.delete(sessionId);
+      this.resolveExitWaiters(sessionId);
+    };
 
     const done = new Promise<void>((resolve, reject) => {
       let sawResult = false;
@@ -493,16 +1335,52 @@ export class ClaudeAdapter {
         } catch {
           return; // non-JSON noise
         }
-        for (const mapped of mapStreamEvent(ev)) {
-          if (mapped.type === "approval") {
-            this.parkControlRequest(sessionId, ev, "approval");
-          } else if (mapped.type === "question") {
-            this.parkControlRequest(sessionId, ev, "question");
+
+        if (ev?.type === "control_response") {
+          this.handleOutboundControlResponse(sessionId, ev);
+          return;
+        }
+
+        if (ev?.type === "control_cancel_request") {
+          const cancelledId = typeof ev.request_id === "string" ? ev.request_id : "";
+          if (cancelledId) {
+            const pending = this.pendingControls.get(cancelledId);
+            if (pending && pending.sessionId === sessionId) {
+              this.pendingControls.delete(cancelledId);
+              onEvent({ type: "control_cancelled", requestId: cancelledId, kind: pending.kind });
+            }
           }
+          return;
+        }
+
+        if (ev?.type === "control_request") {
+          const requestId = String(ev.request_id ?? ev.request?.request_id ?? "");
+          if (!requestId) return;
+          if (this.pendingControls.has(requestId)) return; // ignore duplicate delivery
+          const req =
+            ev.request && typeof ev.request === "object" ? (ev.request as Record<string, unknown>) : {};
+          const kind = controlKind(req);
+          if (kind === null) {
+            const subtype = typeof req.subtype === "string" && req.subtype ? req.subtype : "unknown";
+            void this.writeControlResponse(sessionId, {
+              type: "control_response",
+              response: {
+                subtype: "error",
+                request_id: requestId,
+                error: `Unsupported control request subtype: ${subtype}`,
+                error_code: "unsupported_request",
+              },
+            }).catch(() => undefined);
+            return;
+          }
+          this.parkControlRequest(sessionId, ev, kind);
+        }
+
+        for (const mapped of mapStreamEvent(ev, mapperState)) {
           if (mapped.type === "done") {
             sawResult = true;
             // Turn naturally finished: close stdin so the CLI can exit.
-            // Must not close earlier — steer needs the pipe during the turn.
+            // Must not close earlier — steer/control needs the pipe during the turn.
             endStdin(child);
           }
           onEvent(mapped);
@@ -511,21 +1389,14 @@ export class ClaudeAdapter {
 
       child.on("error", (err) => {
         endStdin(child);
-        this.running.delete(sessionId);
-        this.dropPendingForSession(sessionId);
-        this.resolveExitWaiters(sessionId);
+        cleanupTurnState(err);
         onEvent({ type: "error", message: `spawn failed: ${err.message}` });
         reject(err);
       });
 
       child.on("close", (code, signal) => {
         endStdin(child);
-        this.running.delete(sessionId);
-        this.dropPendingForSession(sessionId);
-        this.resolveExitWaiters(sessionId);
-        // The CLI handles SIGINT gracefully and exits code=0/signal=null
-        // without a result event — so key off our own interrupt request flag,
-        // not the exit signal.
+        cleanupTurnState();
         const wasInterrupted =
           this.interruptRequested.delete(sessionId) ||
           signal === "SIGINT" ||
@@ -545,15 +1416,10 @@ export class ClaudeAdapter {
       });
     });
 
-    // Send the first user message for this turn. Keep stdin open so steer()
-    // can inject another stream-json user line mid-turn. stdin is closed on
-    // result / interrupt / process close — not here.
     const userLine = JSON.stringify({
       type: "user",
       message: { role: "user", content: opts.contentBlocks ?? [{ type: "text", text: prompt }] },
     });
-    // CLI 秒退时 stdin 写会异步 EPIPE,没有监听就是 uncaught;失败由 close
-    // 事件如实上报(见 child.on("close"))。
     child.stdin!.on("error", () => undefined);
     child.stdin!.write(userLine + "\n");
 
@@ -581,7 +1447,7 @@ export class ClaudeAdapter {
     ];
     const child = spawn(this.claudeBin, args, {
       cwd: cwd ?? os.homedir(),
-      env: { ...process.env, ...this.env },
+      env: this.childEnv(),
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
@@ -658,9 +1524,6 @@ export class ClaudeAdapter {
 
   /**
    * Inject another user stream-json line into the running turn (Kimi 插话).
-   * Requires a live child with writable stdin — never faked as interrupt+new turn.
-   * Resolves only after the write is flushed; EPIPE / write-after-end fail so
-   * the gateway can keep the prompt queued instead of marking it steered.
    */
   steer(sessionId: string, text: string): Promise<void> {
     const child = this.running.get(sessionId);
@@ -685,25 +1548,106 @@ export class ClaudeAdapter {
     });
   }
 
-  // -- interrupt ------------------------------------------------------------
+  // -- interrupt & bidirectional control requests ---------------------------
 
   /**
-   * Interrupt the running turn of a session: SIGINT, escalating to SIGKILL
-   * after 5s. Returns false if no turn is running for the session.
+   * Interrupt the running turn of a session: first sends an `interrupt`
+   * `control_request` over open stdin; if unacknowledged within 400ms (or if
+   * the process does not exit within 1s after ack), falls back to SIGINT and
+   * escalates to SIGKILL after 5s. Returns false if no turn is running.
    */
   interrupt(sessionId: string): boolean {
     const child = this.running.get(sessionId);
     if (!child) return false;
     this.interruptRequested.add(sessionId);
-    endStdin(child);
-    child.kill("SIGINT");
-    const ref = setTimeout(() => {
-      // child.killed 只表示信号已发出(调用即置 true),不代表进程已退出;
-      // 判活要用 exitCode/signalCode,否则 SIGKILL 升级永远不生效。
-      if (child.exitCode === null && child.signalCode === null) this.killGroup(child, "SIGKILL");
-    }, 5000);
-    ref.unref?.();
+    if (this.interruptingChildren.has(child)) return true;
+    this.interruptingChildren.add(child);
+
+    let escalated = false;
+    const escalateToSignals = (): void => {
+      if (escalated) return;
+      escalated = true;
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      endStdin(child);
+      try {
+        child.kill("SIGINT");
+      } catch {
+        // ignore if already dead
+      }
+      const killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          this.killGroup(child, "SIGKILL");
+        }
+      }, 5_000);
+      killTimer.unref?.();
+      this.trackInterruptTimer(sessionId, killTimer);
+    };
+
+    const stdin = child.stdin;
+    if (stdin && !stdin.destroyed && !stdin.writableEnded && stdin.writable) {
+      this.sendControlRequest(sessionId, { subtype: "interrupt", cancel_queued: true }, 400)
+        .then(() => {
+          endStdin(child);
+          const exitGrace = setTimeout(() => escalateToSignals(), 1_000);
+          exitGrace.unref?.();
+          this.trackInterruptTimer(sessionId, exitGrace);
+        })
+        .catch(() => {
+          escalateToSignals();
+        });
+    } else {
+      escalateToSignals();
+    }
+
     return true;
+  }
+
+  /** Switch model mid-session via `set_model` control_request. */
+  async setModel(sessionId: string, model: string | null): Promise<Record<string, unknown>> {
+    return this.sendControlRequest(sessionId, { subtype: "set_model", model });
+  }
+
+  /** Switch permission mode mid-session via `set_permission_mode` (mapping `manual` -> `default`). */
+  async setPermissionMode(sessionId: string, mode: string): Promise<Record<string, unknown>> {
+    const mapped = mapControlPermissionMode(mode);
+    return this.sendControlRequest(sessionId, { subtype: "set_permission_mode", mode: mapped });
+  }
+
+  /** Update thinking budget/display mid-session via `set_max_thinking_tokens`. */
+  async setMaxThinkingTokens(
+    sessionId: string,
+    maxThinkingTokens?: number | null,
+    thinkingDisplay?: "summarized" | "omitted" | "highlights" | null,
+  ): Promise<Record<string, unknown>> {
+    return this.sendControlRequest(sessionId, {
+      subtype: "set_max_thinking_tokens",
+      ...(maxThinkingTokens !== undefined ? { max_thinking_tokens: maxThinkingTokens } : {}),
+      ...(thinkingDisplay !== undefined ? { thinking_display: thinkingDisplay } : {}),
+    });
+  }
+
+  /** Merge flag-tier settings overlay mid-session via `apply_flag_settings` (e.g. `effortLevel`). */
+  async applyFlagSettings(sessionId: string, settings: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.sendControlRequest(sessionId, { subtype: "apply_flag_settings", settings });
+  }
+
+  /** Convenience helper for setting `effortLevel` via `apply_flag_settings`. */
+  async setEffortLevel(sessionId: string, effortLevel: string): Promise<Record<string, unknown>> {
+    return this.applyFlagSettings(sessionId, { effortLevel });
+  }
+
+  /**
+   * Query MCP server connection statuses via `mcp_status` control_request.
+   * Uses the live turn's control channel when running, or spawns a short-lived
+   * control probe when idle.
+   */
+  async mcpStatus(sessionId?: string, cwd?: string): Promise<Array<Record<string, unknown>>> {
+    if (sessionId && this.running.has(sessionId)) {
+      const resp = await this.sendControlRequest(sessionId, { subtype: "mcp_status" });
+      return Array.isArray(resp.mcpServers) ? (resp.mcpServers as Array<Record<string, unknown>>) : [];
+    }
+    const resp = await this.spawnControlProbe({ subtype: "mcp_status" }, cwd);
+    return Array.isArray(resp?.mcpServers) ? (resp.mcpServers as Array<Record<string, unknown>>) : [];
   }
 
   /** 整组收割(detached spawn 的组 id = 主 pid);组不在时兜底单发。 */
@@ -712,18 +1656,128 @@ export class ClaudeAdapter {
       if (child.pid !== undefined) process.kill(-child.pid, signal);
       else child.kill(signal);
     } catch {
-      child.kill(signal);
+      try {
+        child.kill(signal);
+      } catch {
+        // already exited
+      }
     }
+  }
+
+  private sendControlRequest(
+    sessionId: string,
+    request: Record<string, unknown>,
+    timeoutMs = 15_000,
+  ): Promise<Record<string, unknown>> {
+    const child = this.running.get(sessionId);
+    const stdin = child?.stdin;
+    const state = this.sessionControls.get(sessionId);
+    if (!child || !state || !stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) {
+      return Promise.reject(
+        new ProviderError("not_found", `claude-adapter: no running turn for session ${sessionId}`, 404),
+      );
+    }
+
+    const requestId = `ctrl_${randomUUID()}`;
+    const unmatched = state.unmatchedResponses.get(requestId);
+    if (unmatched) {
+      state.unmatchedResponses.delete(requestId);
+      return Promise.resolve(unmatched);
+    }
+
+    const payload = JSON.stringify({
+      type: "control_request",
+      request_id: requestId,
+      request,
+    }) + "\n";
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        state.pendingOutbound.delete(requestId);
+        reject(new ProviderError("upstream_error", `claude-adapter: control_request timed out: ${String(request.subtype ?? "")}`, 504));
+      }, timeoutMs);
+      timer.unref?.();
+
+      state.pendingOutbound.set(requestId, { resolve, reject, timer });
+
+      stdin.write(payload, (err) => {
+        if (err) {
+          const entry = state.pendingOutbound.get(requestId);
+          if (entry) {
+            clearTimeout(entry.timer);
+            state.pendingOutbound.delete(requestId);
+          }
+          reject(
+            new ProviderError(
+              "not_found",
+              `claude-adapter: control_request write failed: ${err.message}`,
+              404,
+              err,
+            ),
+          );
+        }
+      });
+    });
+  }
+
+  private handleOutboundControlResponse(sessionId: string, ev: any): void {
+    const state = this.sessionControls.get(sessionId);
+    const resp = ev?.response;
+    if (!state || !resp || typeof resp !== "object") return;
+    const requestId = typeof resp.request_id === "string" ? resp.request_id : "";
+    if (!requestId) return;
+
+    const pending = state.pendingOutbound.get(requestId);
+    const body =
+      resp.response && typeof resp.response === "object" && !Array.isArray(resp.response)
+        ? (resp.response as Record<string, unknown>)
+        : {};
+
+    if (!pending) {
+      if (state.unmatchedResponses.size >= MAX_UNMATCHED_CONTROL_RESPONSES) {
+        const oldest = state.unmatchedResponses.keys().next().value;
+        if (oldest !== undefined) state.unmatchedResponses.delete(oldest);
+      }
+      state.unmatchedResponses.set(requestId, body);
+      return;
+    }
+
+    clearTimeout(pending.timer);
+    state.pendingOutbound.delete(requestId);
+    if (resp.subtype === "success") {
+      pending.resolve(body);
+    } else {
+      const errMsg = typeof resp.error === "string" && resp.error ? resp.error : "control_request rejected";
+      pending.reject(new ProviderError("invalid_request", errMsg, 400));
+    }
+  }
+
+  private rejectOutboundControls(sessionId: string, err: Error): void {
+    const state = this.sessionControls.get(sessionId);
+    if (!state) return;
+    for (const pending of state.pendingOutbound.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(err);
+    }
+    state.pendingOutbound.clear();
+    state.unmatchedResponses.clear();
   }
 
   // -- approvals / questions (control_request on a live stdin) --------------
 
   /**
-   * Answer a parked can_use_tool control_request. approve/always → allow;
-   * reject → deny. Does not auto-deny: if the CLI never sent control_request
-   * this throws not_found (same as no running turn).
+   * Answer a parked `can_use_tool` control_request.
+   * - `allow` / `approve`: `{ behavior: "allow", updatedInput, toolUseID, decisionClassification: "user_temporary" }`
+   * - `approve_always`: includes `updatedPermissions` (from `options.updatedPermissions` or `permission_suggestions`)
+   *   when `suppress_always_allow_rule` and `requires_user_interaction` are not set; otherwise single-allow only.
+   * - `deny` / `reject`: `{ behavior: "deny", message, interrupt?, toolUseID, decisionClassification: "user_reject" }`.
    */
-  async resolveApproval(sessionId: string, approvalId: string, decision: "allow" | "deny"): Promise<void> {
+  async resolveApproval(
+    sessionId: string,
+    approvalId: string,
+    decision: ClaudeApprovalDecision,
+    options?: ResolveClaudeApprovalOptions,
+  ): Promise<void> {
     const pending = this.pendingControls.get(approvalId);
     if (!pending || pending.kind !== "approval" || pending.sessionId !== sessionId) {
       throw new ProviderError(
@@ -732,9 +1786,51 @@ export class ClaudeAdapter {
         404,
       );
     }
-    const input = pending.request.input;
-    const response: Record<string, unknown> = { behavior: decision };
-    if (decision === "allow" && input !== undefined) response.updatedInput = input;
+
+    const req = pending.request;
+    const isDeny = decision === "deny" || decision === "reject";
+    const isAlways = decision === "approve_always";
+    const toolUseId = typeof req.tool_use_id === "string" && req.tool_use_id ? req.tool_use_id : undefined;
+
+    let response: Record<string, unknown>;
+    if (isDeny) {
+      const denyMessage =
+        typeof options?.message === "string" && options.message.trim()
+          ? options.message.trim()
+          : "User denied tool use";
+      response = {
+        behavior: "deny",
+        message: denyMessage,
+        ...(options?.interrupt === true ? { interrupt: true } : {}),
+        ...(toolUseId ? { toolUseID: toolUseId } : {}),
+        decisionClassification: "user_reject",
+      };
+    } else {
+      const updatedInput = options?.updatedInput ?? req.input;
+      const alwaysAllowed =
+        req.suppress_always_allow_rule !== true && req.requires_user_interaction !== true;
+      const explicitPermissions =
+        Array.isArray(options?.updatedPermissions) && options.updatedPermissions.length > 0
+          ? options.updatedPermissions
+          : undefined;
+      const suggestedPermissions =
+        Array.isArray(req.permission_suggestions) && req.permission_suggestions.length > 0
+          ? req.permission_suggestions
+          : undefined;
+      const updatedPermissions =
+        alwaysAllowed && (isAlways || explicitPermissions !== undefined)
+          ? (explicitPermissions ?? (isAlways ? suggestedPermissions : undefined))
+          : undefined;
+
+      response = {
+        behavior: "allow",
+        ...(updatedInput !== undefined ? { updatedInput } : {}),
+        ...(updatedPermissions !== undefined ? { updatedPermissions } : {}),
+        ...(toolUseId ? { toolUseID: toolUseId } : {}),
+        decisionClassification: updatedPermissions !== undefined ? "user_permanent" : "user_temporary",
+      };
+    }
+
     await this.writeControlResponse(sessionId, {
       type: "control_response",
       response: {
@@ -747,14 +1843,14 @@ export class ClaudeAdapter {
   }
 
   /**
-   * Answer a parked AskUserQuestion / questions control_request. Best-effort
-   * control_response: can_use_tool AskUserQuestion is allow + answers in
-   * updatedInput; a dedicated AskUserQuestion subtype sends answers only.
+   * Answer a parked `AskUserQuestion` / questions control_request.
+   * Translates `q_N` keys to `Record<question.question, string>` (comma-joined
+   * for multi-select), validates index bounds, and preserves original `input`.
    */
   async resolveQuestion(
     sessionId: string,
     questionId: string,
-    answer: string | Record<string, string[]>,
+    answer: ClaudeQuestionAnswerInput,
   ): Promise<void> {
     const pending = this.pendingControls.get(questionId);
     if (!pending || pending.kind !== "question" || pending.sessionId !== sessionId) {
@@ -764,18 +1860,28 @@ export class ClaudeAdapter {
         404,
       );
     }
-    const answers = typeof answer === "string" ? { q_0: [answer] } : answer;
+
     const req = pending.request;
+    const questions = extractQuestions(req);
+    const encodedAnswers = encodeAskUserQuestionAnswers(questions, answer);
+    const rawInput =
+      req.input && typeof req.input === "object" && !Array.isArray(req.input)
+        ? (req.input as Record<string, unknown>)
+        : {};
+    const toolUseId = typeof req.tool_use_id === "string" && req.tool_use_id ? req.tool_use_id : undefined;
+
     const response: Record<string, unknown> =
       req.subtype === "can_use_tool"
         ? {
             behavior: "allow",
             updatedInput: {
-              ...(req.input && typeof req.input === "object" ? (req.input as Record<string, unknown>) : {}),
-              answers,
+              ...rawInput,
+              answers: encodedAnswers,
             },
+            ...(toolUseId ? { toolUseID: toolUseId } : {}),
           }
-        : { answers };
+        : { answers: encodedAnswers };
+
     await this.writeControlResponse(sessionId, {
       type: "control_response",
       response: {
@@ -828,29 +1934,42 @@ export class ClaudeAdapter {
     });
   }
 
-  // -- 原生斜杠命令目录(initialize 握手) ---------------------------------------
+  // -- 原生斜杠命令目录(initialize 握手 + 零子进程磁盘兜底) ----------------------
 
-  /**
-   * 权威的 claude 斜杠命令目录 = CLI initialize 握手回包的 commands 字段
-   * (2.1.226 实测 154 条:插件命令 + skills + 内置 compact/usage/mcp/doctor
-   * 等,带 description/argumentHint/aliases)。这些命令由 CLI 自己展开/执行
-   * (-p stream-json 输入 "/name args" 实测会触发,如 /compact 产生
-   * system status compacting 事件),网关只做目录展示,不做文本展开。
-   *
-   * 每次调用spawn一个短命进程只做握手(不跑模型),按 cwd 缓存 5 分钟
-   * (项目级命令随 cwd 不同)。
-   */
   private static readonly COMMANDS_TTL_MS = 5 * 60_000;
   /** initialize 握手整包缓存(按 cwd):commands/models 同一次 spawn 都能取到。 */
   private handshakeCache = new Map<string, { ts: number; response: any }>();
   private handshakeInflight = new Map<string, Promise<any | null>>();
 
-  async listSlashCommands(cwd?: string): Promise<ClaudeSlashCommand[]> {
+  /** Zero-spawn disk discovery for `.claude/commands` and `.claude/skills` / `.agents/skills`. */
+  async discoverDiskCommands(cwd?: string): Promise<ClaudeSlashCommand[]> {
+    const disk = await discoverClaudeDiskCommands(cwd, this.configDir, { homeDir: this.homeDir });
+    return disk.map((c) => ({
+      name: c.name,
+      description: c.description || c.name,
+      argumentHint: c.argumentHint ?? "",
+      aliases: Array.isArray(c.aliases) ? c.aliases : [],
+      ...(c.builtin !== undefined ? { builtin: c.builtin } : {}),
+      ...(c.source ? { source: c.source } : {}),
+      ...(c.path ? { path: c.path } : {}),
+      ...(c.scope ? { scope: c.scope } : {}),
+    }));
+  }
+
+  async listSlashCommands(
+    cwd?: string,
+    options: ListSlashCommandsOptions = {},
+  ): Promise<ClaudeSlashCommand[]> {
+    if (options.diskOnly) {
+      return this.discoverDiskCommands(cwd);
+    }
     const response = await this.getHandshakeResponse(cwd);
     const list = response?.commands;
     if (!Array.isArray(list)) {
-      // 与 listBuiltinModels 同一口径:握手失败如实抛错,不吞成空目录——
-      // 空目录会让前端把"CLI 坏了"显示成"没有命令"(错误就报错,不掩盖)。
+      if (options.diskFallback !== false) {
+        const disk = await this.discoverDiskCommands(cwd);
+        if (disk.length > 0) return disk;
+      }
       throw new Error("claude-adapter: initialize handshake returned no commands (CLI missing, broken, or too old)");
     }
     return list
@@ -860,38 +1979,57 @@ export class ClaudeAdapter {
         description: typeof c.description === "string" ? c.description : (c.name as string),
         argumentHint: typeof c.argumentHint === "string" ? c.argumentHint : "",
         aliases: Array.isArray(c.aliases) ? c.aliases.filter((a: any) => typeof a === "string") : [],
+        ...(typeof c.builtin === "boolean" ? { builtin: c.builtin } : {}),
+        ...(typeof c.source === "string" ? { source: c.source } : {}),
+        ...(typeof c.path === "string" ? { path: c.path } : {}),
+        ...(typeof c.scope === "string" ? { scope: c.scope } : {}),
       }));
   }
 
   // -- 内置模型目录(initialize 握手) ------------------------------------------
 
-  /**
-   * 权威的 claude 内置模型目录 = CLI initialize 握手回包的 models 字段
-   * (2.1.226 实测:default/opus[1m]/fable/sonnet/haiku,带 displayName、
-   * description、supportedEffortLevels;握手不需要登录态)。未配置自定义
-   * 端点时,Web 选择器必须展示这个目录,而不是拿环境变量拼占位模型。
-   *
-   * 与 listSlashCommands 共用握手整包缓存:切到 Claude 时 /models+/commands
-   * 只 spawn 一次,不再各起一个 ~1s 进程。
-   */
   async listBuiltinModels(): Promise<ClaudeBuiltinModel[]> {
     const response = await this.getHandshakeResponse(undefined);
     const list = response?.models;
     if (!Array.isArray(list) || list.length === 0) {
       throw new Error("claude-adapter: initialize handshake returned no models (CLI missing, broken, or too old)");
     }
+    const fastModeState = typeof response.fast_mode_state === "string" ? response.fast_mode_state : undefined;
+    const fastModeDisabledReason =
+      typeof response.fast_mode_disabled_reason === "string" ? response.fast_mode_disabled_reason : undefined;
+
     return list
-      .filter((m: any) => m && typeof m.value === "string")
-      .map((m: any) => ({
-        value: m.value as string,
-        resolvedModel: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
-        displayName: typeof m.displayName === "string" ? m.displayName : undefined,
-        description: typeof m.description === "string" ? m.description : undefined,
-        supportsEffort: m.supportsEffort === true,
-        supportedEffortLevels: Array.isArray(m.supportedEffortLevels)
-          ? m.supportedEffortLevels.filter((e: any) => typeof e === "string")
-          : undefined,
-      }));
+      .filter((m: any) => m && typeof m.value === "string" && !/qwen/i.test(m.value))
+      .map((m: any) => {
+        const supportsFastMode = typeof m.supportsFastMode === "boolean" ? m.supportsFastMode : undefined;
+        const fastMode =
+          typeof m.fastMode === "boolean"
+            ? m.fastMode
+            : supportsFastMode;
+        return {
+          value: m.value as string,
+          resolvedModel: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
+          displayName: typeof m.displayName === "string" ? m.displayName : undefined,
+          description: typeof m.description === "string" ? m.description : undefined,
+          supportsEffort: m.supportsEffort === true,
+          supportedEffortLevels: Array.isArray(m.supportedEffortLevels)
+            ? m.supportedEffortLevels.filter((e: any) => typeof e === "string")
+            : undefined,
+          ...(typeof m.supportsAdaptiveThinking === "boolean"
+            ? { supportsAdaptiveThinking: m.supportsAdaptiveThinking }
+            : {}),
+          ...(typeof m.supportsThinkingOff === "boolean"
+            ? { supportsThinkingOff: m.supportsThinkingOff }
+            : {}),
+          ...(supportsFastMode !== undefined ? { supportsFastMode } : {}),
+          ...(fastMode !== undefined ? { fastMode } : {}),
+          ...(typeof m.supportsAutoMode === "boolean"
+            ? { supportsAutoMode: m.supportsAutoMode }
+            : {}),
+          ...(fastModeState !== undefined ? { fastModeState } : {}),
+          ...(fastModeDisabledReason !== undefined ? { fastModeDisabledReason } : {}),
+        };
+      });
   }
 
   /** 取 initialize 整包(成功结果缓存 5 分钟;并发合并;失败不进缓存)。 */
@@ -912,27 +2050,38 @@ export class ClaudeAdapter {
     return pending;
   }
 
-  /** initialize 控制握手:起一个短命进程(不跑模型),回整包 response。 */
+  /** initialize 控制握手:起一个短命进程(不跑模型),回整包 response (按 request_id 精确关联)。 */
   private spawnHandshake(cwd: string | undefined): Promise<any | null> {
+    return this.spawnControlProbe({ subtype: "initialize" }, cwd);
+  }
+
+  private spawnControlProbe(
+    request: Record<string, unknown>,
+    cwd?: string,
+  ): Promise<Record<string, unknown> | null> {
     return new Promise((resolve) => {
+      const requestId = request.subtype === "initialize" ? "gw_init" : `probe_${randomUUID()}`;
       const child = spawn(
         this.claudeBin,
         ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
-        { cwd: cwd ?? os.homedir(), env: { ...process.env, ...this.env }, stdio: ["pipe", "pipe", "pipe"] },
+        { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"] },
       );
       let settled = false;
-      const finish = (value: any | null): void => {
+      const finish = (value: Record<string, unknown> | null): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        child.kill("SIGTERM");
+        endStdin(child);
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // already exited
+        }
         resolve(value);
       };
       const timer = setTimeout(() => finish(null), 20_000);
       timer.unref();
       child.on("error", () => finish(null));
-      // spawn 成功但 CLI 启动即退(二进制损坏/缺库)不会触发 error——
-      // 此前只能等满 20s 超时,且失败不进缓存,每次请求都重新卡 20s。
       child.on("exit", () => finish(null));
       const rl = readline.createInterface({ input: child.stdout! });
       rl.on("line", (line) => {
@@ -944,15 +2093,23 @@ export class ClaudeAdapter {
           return;
         }
         if (ev.type !== "control_response") return;
-        finish(ev.response?.response ?? null);
+        const resp = ev.response;
+        const respId = typeof resp?.request_id === "string" ? resp.request_id : "";
+        if (respId !== requestId) return;
+        if (resp.subtype !== "success") {
+          finish(null);
+          return;
+        }
+        const body =
+          resp.response && typeof resp.response === "object" && !Array.isArray(resp.response)
+            ? (resp.response as Record<string, unknown>)
+            : {};
+        finish(body);
       });
-      // CLI 秒退时 stdin 写会异步 EPIPE——没有监听就是 uncaught(网关直接崩)。
       child.stdin!.on("error", () => undefined);
-      // stderr 不排空会在 --verbose 输出超 ~64KB 时阻塞子进程写端,导致
-      // control_response 永不到达(与 startTurn 的 stderr 消费对齐)。
       child.stderr?.resume();
       child.stdin!.write(
-        JSON.stringify({ type: "control_request", request_id: "gw_init", request: { subtype: "initialize" } }) + "\n",
+        JSON.stringify({ type: "control_request", request_id: requestId, request }) + "\n",
       );
     });
   }
@@ -962,31 +2119,142 @@ export class ClaudeAdapter {
   /** Kill all running turn processes. */
   async close(): Promise<void> {
     for (const [sessionId, child] of this.running) {
+      this.clearInterruptTimers(sessionId);
       endStdin(child);
       this.killGroup(child, "SIGTERM");
       this.running.delete(sessionId);
       this.dropPendingForSession(sessionId);
+      this.rejectOutboundControls(sessionId, new ProviderError("not_found", "claude adapter closed", 404));
+      this.sessionControls.delete(sessionId);
       this.resolveExitWaiters(sessionId);
     }
   }
 
   // -- internals --------------------------------------------------------------
 
+  private async realProjectsRoot(): Promise<string> {
+    try {
+      return await fsp.realpath(this.projectsDir);
+    } catch {
+      return path.resolve(this.projectsDir);
+    }
+  }
+
+  private anchorTargetToRoot(targetPath: string, realRoot: string): string {
+    const resolvedRoot = path.resolve(realRoot);
+    const resolvedTarget = path.resolve(targetPath);
+    if (isWithinDir(resolvedRoot, resolvedTarget)) {
+      return resolvedTarget;
+    }
+    const resolvedProjects = path.resolve(this.projectsDir);
+    if (isWithinDir(resolvedProjects, resolvedTarget)) {
+      return path.join(resolvedRoot, path.relative(resolvedProjects, resolvedTarget));
+    }
+    throw new ProviderError("invalid_request", "claude-adapter: path escapes projectsDir", 400);
+  }
+
+  private async isSafeDirectoryWithinRoot(dirPath: string, realRoot: string): Promise<boolean> {
+    try {
+      const lst = await fsp.lstat(dirPath);
+      if (lst.isSymbolicLink() || !lst.isDirectory()) return false;
+      const realDir = await fsp.realpath(dirPath);
+      return isWithinDir(realRoot, realDir);
+    } catch {
+      return false;
+    }
+  }
+
+  private async openTranscriptBound(
+    filePath: string,
+    realRoot: string,
+    openOptions?: OpenBoundOptions,
+  ): Promise<{ fh: fsp.FileHandle; stat: fs.Stats }> {
+    const anchoredTarget = this.anchorTargetToRoot(filePath, realRoot);
+    const opened = await openBound(anchoredTarget, realRoot, openOptions);
+    if (path.resolve(opened.realPath) !== anchoredTarget) {
+      await opened.fh.close().catch(() => undefined);
+      throw new ProviderError("invalid_request", "claude-adapter: refusing symlinked transcript or ancestor", 400);
+    }
+    return { fh: opened.fh, stat: opened.stat };
+  }
+
+  private async readBoundedSidecarText(
+    sidecarPath: string,
+    realRoot: string,
+    maxBytes: number,
+  ): Promise<string | null> {
+    try {
+      const anchoredTarget = this.anchorTargetToRoot(sidecarPath, realRoot);
+      const opened = await openBound(anchoredTarget, realRoot);
+      if (path.resolve(opened.realPath) !== anchoredTarget) {
+        await opened.fh.close().catch(() => undefined);
+        return null;
+      }
+      const { fh, stat } = opened;
+      try {
+        if (stat.size <= 0 || stat.size > maxBytes) return null;
+        const buf = Buffer.allocUnsafe(stat.size);
+        let offset = 0;
+        while (offset < stat.size) {
+          const { bytesRead } = await fh.read(buf, offset, stat.size - offset, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+        }
+        return buf.toString("utf8", 0, offset);
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private invalidateHistoryCacheForSession(sessionId: string): void {
+    const prefix = `${sessionId}:`;
+    for (const key of this.historyCache.keys()) {
+      if (key === sessionId || key.startsWith(prefix)) {
+        this.historyCache.delete(key);
+      }
+    }
+  }
+
+  private findSessionFileInProjectDir(projectDir: string, sessionId: string, realRoot?: string): string | null {
+    if (!UUID_RE.test(sessionId)) return null;
+    try {
+      const dirLst = fs.lstatSync(projectDir);
+      if (dirLst.isSymbolicLink() || !dirLst.isDirectory()) return null;
+      const realDir = fs.realpathSync(projectDir);
+      const root = realRoot ?? fs.realpathSync(this.projectsDir);
+      if (!isWithinDir(root, realDir)) return null;
+      const candidate = path.join(realDir, `${sessionId}.jsonl`);
+      const fileLst = fs.lstatSync(candidate);
+      if (fileLst.isSymbolicLink() || !fileLst.isFile()) return null;
+      return candidate;
+    } catch {
+      return null;
+    }
+  }
+
   private findSessionFile(sessionId: string): string | null {
-    // Claude transcript ids are UUIDs; reject separators before constructing a path.
     if (!UUID_RE.test(sessionId)) {
       return null;
     }
     let projectDirs: fs.Dirent[];
+    let realRoot: string;
     try {
+      realRoot = fs.realpathSync(this.projectsDir);
       projectDirs = fs.readdirSync(this.projectsDir, { withFileTypes: true });
     } catch {
       return null;
     }
     for (const dirEnt of projectDirs) {
-      if (!dirEnt.isDirectory()) continue;
-      const candidate = path.join(this.projectsDir, dirEnt.name, `${sessionId}.jsonl`);
-      if (fs.existsSync(candidate)) return candidate;
+      if (dirEnt.isSymbolicLink() || !dirEnt.isDirectory()) continue;
+      const candidate = this.findSessionFileInProjectDir(
+        path.join(this.projectsDir, dirEnt.name),
+        sessionId,
+        realRoot,
+      );
+      if (candidate) return candidate;
     }
     return null;
   }
@@ -998,105 +2266,778 @@ export class ClaudeAdapter {
 
   private summarizeCache = new Map<string, { mtimeMs: number; size: number; summary: ClaudeSessionSummary }>();
 
-  /** 提取标题/cwd。标题逐条对齐原生 /resume(实测核验):
-   *  1) 文件中最后一个 ai-title/agent-name/summary(标题随会话演变,原生显示最新)
-   *  2) 无标题条目时取最后一条真实用户消息(不是第一条!原生对 "测试" 会话
-   *     显示的是最后的 prompt);caveat/stdout/interrupted/⎿ 错误回显跳过
-   *  3) 连真实消息都没有时用最后一条斜杠命令("/model" 会话实测)
-   *  4) 啥都没有 → "(session)"
-   *  头+尾各读 256KB(大文件最后的条目必在尾部),按 (mtime,size) 缓存;
-   *  原生连空会话也显示,这里不做内容过滤。 */
+  /**
+   * Extract session summary with O_RDONLY|O_NONBLOCK|O_NOFOLLOW `openBound`,
+   * reading head+tail 256 KiB windows, custom-title JSONL + sidecar,
+   * native archived.json (unarchived by newer human prompts), and continued-in chain.
+   */
   private async summarizeSessionFile(
     sessionId: string,
     projectDir: string,
     filePath: string,
+    realRoot: string,
   ): Promise<ClaudeSessionSummary | null> {
-    const stat = await fsp.stat(filePath);
-    const hit = this.summarizeCache.get(filePath);
-    if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.summary;
-
-    let headTitle = "";
-    let tailTitle = "";
-    let headUser = "";
-    let tailUser = "";
-    let headCmd = "";
-    let tailCmd = "";
-    let cwd = "";
-    const updatedAt = stat.mtime.toISOString();
-
-    const titleOf = (entry: any): string => {
-      if (entry.type === "ai-title" && typeof entry.aiTitle === "string") return entry.aiTitle;
-      if (entry.type === "agent-name" && typeof entry.agentName === "string") return entry.agentName;
-      if (entry.type === "summary" && entry.summary) {
-        const s = entry.summary;
-        return typeof s === "string" ? s : String(s.title ?? s.summary ?? "");
-      }
-      return "";
-    };
-    const scan = (
-      text: string,
-      setTitle: (t: string) => void,
-      setUser: (t: string) => void,
-      setCmd: (t: string) => void,
-    ): void => {
-      for (const line of text.split("\n")) {
-        if (!line) continue;
-        let entry: any;
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (!cwd && typeof entry.cwd === "string") cwd = entry.cwd;
-        const t = titleOf(entry);
-        if (t) setTitle(t);
-        if (entry.type === "user" && !entry.isSidechain) {
-          const c = userTextCandidate(entry.message?.content);
-          if (c?.kind === "text") setUser(c.text);
-          else if (c?.kind === "cmd") setCmd(c.text);
-        }
-      }
-    };
-
-    const fh = await fsp.open(filePath, "r");
+    const { fh, stat } = await this.openTranscriptBound(filePath, realRoot);
     try {
-      const headBuf = Buffer.alloc(HEAD_BYTES);
-      const { bytesRead: headN } = await fh.read(headBuf, 0, HEAD_BYTES, 0);
-      let head = headBuf.toString("utf8", 0, headN);
-      const headNl = head.lastIndexOf("\n");
-      if (headNl > 0) head = head.slice(0, headNl);
-      scan(head, (t) => { headTitle = t; }, (u) => { headUser = u; }, (c) => { headCmd = c; });
-      // 文件大于头部窗口时再读尾部:最后的标题/用户消息在尾部(实测 26MB 会话
-      // 的最新标题在倒数几行)。小文件头部已覆盖,跳过。
-      if (headN < stat.size) {
-        const tailStart = Math.max(0, stat.size - HEAD_BYTES);
-        const tailBuf = Buffer.alloc(HEAD_BYTES);
-        const { bytesRead: tailN } = await fh.read(tailBuf, 0, HEAD_BYTES, tailStart);
-        let tail = tailBuf.toString("utf8", 0, tailN);
-        // 丢掉第一行(可能半截),保留完整行。
-        const firstNl = tail.indexOf("\n");
-        if (firstNl >= 0) tail = tail.slice(firstNl + 1);
-        scan(tail, (t) => { tailTitle = t; }, (u) => { tailUser = u; }, (c) => { tailCmd = c; });
+      const hit = this.summarizeCache.get(filePath);
+      if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
+        return hit.summary;
       }
-    } finally {
-      await fh.close();
-    }
 
-    const summary: ClaudeSessionSummary = {
-      sessionId,
-      title: (tailTitle || headTitle || tailUser || headUser || tailCmd || headCmd || "(session)").slice(0, 120),
-      cwd,
-      projectDir,
-      updatedAt,
-    };
-    this.summarizeCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, summary });
-    return summary;
+      let headCustomTitle = "";
+      let tailCustomTitle = "";
+      let headTitle = "";
+      let tailTitle = "";
+      let headUser = "";
+      let tailUser = "";
+      let firstPrompt = "";
+      let headCmd = "";
+      let tailCmd = "";
+      let cwd = "";
+      let gitBranch = "";
+      let createdAt: string | undefined;
+      let latestUserPromptMs = Number.NEGATIVE_INFINITY;
+      let isSidechainHead = false;
+      const updatedAt = stat.mtime.toISOString();
+
+      const aiTitleOf = (entry: any): string => {
+        if (entry.type === "ai-title" && typeof entry.aiTitle === "string") return entry.aiTitle;
+        if (entry.type === "agent-name" && typeof entry.agentName === "string") return entry.agentName;
+        if (entry.type === "summary" && entry.summary) {
+          const s = entry.summary;
+          return typeof s === "string" ? s : String(s.title ?? s.summary ?? "");
+        }
+        return "";
+      };
+
+      const scan = (
+        text: string,
+        isHead: boolean,
+        setCustomTitle: (t: string) => void,
+        setTitle: (t: string) => void,
+        setUser: (t: string) => void,
+        setCmd: (t: string) => void,
+      ): void => {
+        let lineIdx = 0;
+        for (const line of text.split("\n")) {
+          if (!line) continue;
+          const idx = lineIdx++;
+          let entry: any;
+          try {
+            entry = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (isHead && idx === 0 && entry.isSidechain === true) {
+            isSidechainHead = true;
+            return;
+          }
+          if (!createdAt && typeof entry.timestamp === "string" && !Number.isNaN(Date.parse(entry.timestamp))) {
+            createdAt = entry.timestamp;
+          }
+          if (!cwd && typeof entry.cwd === "string") cwd = entry.cwd;
+          if (typeof entry.relocatedCwd === "string" && entry.type === "relocated") cwd = entry.relocatedCwd;
+          if (typeof entry.gitBranch === "string" && entry.gitBranch) gitBranch = entry.gitBranch;
+          if (entry.type === "custom-title" && typeof entry.customTitle === "string") {
+            const sanitized = sanitizeTitle(entry.customTitle);
+            if (sanitized) setCustomTitle(sanitized);
+          }
+          const t = aiTitleOf(entry);
+          if (t) setTitle(t);
+          if (
+            entry.type === "user" &&
+            !entry.isSidechain &&
+            entry.isMeta !== true &&
+            entry.isCompactSummary !== true &&
+            entry.isVisibleInTranscriptOnly !== true
+          ) {
+            const c = userTextCandidate(entry.message?.content);
+            if (c?.kind === "text") {
+              if (!firstPrompt) firstPrompt = c.text;
+              setUser(c.text);
+              const tsMs = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
+              if (!Number.isNaN(tsMs) && tsMs > latestUserPromptMs) {
+                latestUserPromptMs = tsMs;
+              }
+            } else if (c?.kind === "cmd") {
+              setCmd(c.text);
+            }
+          }
+          if (
+            entry.type === "attachment" &&
+            !entry.isSidechain &&
+            entry.attachment?.type === "queued_command" &&
+            entry.attachment?.isMeta !== true
+          ) {
+            const c = userTextCandidate(entry.attachment?.prompt);
+            if (c?.kind === "text") {
+              const tsMs = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
+              if (!Number.isNaN(tsMs) && tsMs > latestUserPromptMs) {
+                latestUserPromptMs = tsMs;
+              }
+            }
+          }
+        }
+      };
+
+      const headLen = Math.min(HEAD_BYTES, stat.size);
+      const headSlice = headLen > 0 ? await readRange(fh, 0, headLen) : Buffer.alloc(0);
+      let head = "";
+      if (headSlice.length > 0) {
+        let trimmedHead = headSlice;
+        if (headSlice.length < stat.size) {
+          const headNl = headSlice.lastIndexOf(0x0a);
+          if (headNl > 0) trimmedHead = headSlice.subarray(0, headNl);
+        }
+        head = trimmedHead.toString("utf8");
+      }
+      scan(
+        head,
+        true,
+        (t) => { headCustomTitle = t; },
+        (t) => { headTitle = t; },
+        (u) => { headUser = u; },
+        (c) => { headCmd = c; },
+      );
+      if (isSidechainHead) return null;
+
+      let tail = head;
+      if (headSlice.length < stat.size) {
+        const tailStart = Math.max(0, stat.size - HEAD_BYTES);
+        const tailLen = stat.size - tailStart;
+        let tailSlice = await readRange(fh, tailStart, tailLen);
+        if (tailStart > 0) {
+          const firstNl = tailSlice.indexOf(0x0a);
+          tailSlice = firstNl >= 0 ? tailSlice.subarray(firstNl + 1) : Buffer.alloc(0);
+        }
+        tail = tailSlice.toString("utf8");
+        scan(
+          tail,
+          false,
+          (t) => { tailCustomTitle = t; },
+          (t) => { tailTitle = t; },
+          (u) => { tailUser = u; },
+          (c) => { tailCmd = c; },
+        );
+      }
+
+      const sessionArtifactsDir = path.join(path.dirname(filePath), sessionId);
+      let sidecarCustomTitle = "";
+      if (!tailCustomTitle) {
+        const rawCt = await this.readBoundedSidecarText(
+          path.join(sessionArtifactsDir, "custom-title.json"),
+          realRoot,
+          MAX_SIDECAR_BYTES,
+        );
+        if (rawCt) {
+          try {
+            const parsed = JSON.parse(rawCt) as Record<string, unknown>;
+            if (typeof parsed.customTitle === "string") {
+              sidecarCustomTitle = sanitizeTitle(parsed.customTitle);
+            }
+          } catch {
+            // ignore invalid sidecar
+          }
+        }
+      }
+
+      let archived: boolean | undefined;
+      const rawArch = await this.readBoundedSidecarText(
+        path.join(sessionArtifactsDir, "archived.json"),
+        realRoot,
+        MAX_SIDECAR_BYTES,
+      );
+      if (rawArch) {
+        try {
+          const parsed = JSON.parse(rawArch) as Record<string, unknown>;
+          if (typeof parsed.archived === "boolean" && typeof parsed.at === "string") {
+            const archAtMs = Date.parse(parsed.at);
+            if (!Number.isNaN(archAtMs)) {
+              if (!parsed.archived) {
+                archived = false;
+              } else {
+                archived = !(latestUserPromptMs > archAtMs);
+              }
+            }
+          }
+        } catch {
+          // ignore invalid sidecar
+        }
+      }
+
+      const customTitle = tailCustomTitle || sidecarCustomTitle || headCustomTitle || undefined;
+      const continuedInSessionId = extractTrailingContinuedIn(tail);
+      const bestTitle =
+        customTitle ||
+        tailTitle ||
+        headTitle ||
+        tailUser ||
+        headUser ||
+        tailCmd ||
+        headCmd ||
+        "(session)";
+
+      const summary: ClaudeSessionSummary = {
+        sessionId,
+        title: bestTitle.slice(0, 120),
+        ...(customTitle ? { customTitle } : {}),
+        ...(firstPrompt ? { firstPrompt: firstPrompt.slice(0, 200) } : {}),
+        ...(gitBranch ? { gitBranch } : {}),
+        cwd,
+        projectDir,
+        updatedAt,
+        ...(createdAt ? { createdAt } : {}),
+        fileSize: stat.size,
+        ...(archived !== undefined ? { archived } : {}),
+        ...(continuedInSessionId ? { continuedInSessionId } : {}),
+      };
+      this.summarizeCache.set(filePath, { mtimeMs: stat.mtimeMs, size: stat.size, summary });
+      return summary;
+    } finally {
+      await fh.close().catch(() => undefined);
+    }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Pure protocol & transcript helpers
 // ---------------------------------------------------------------------------
+
+function isWithinDir(baseDir: string, targetPath: string): boolean {
+  const b = path.resolve(baseDir);
+  const t = path.resolve(targetPath);
+  if (t === b) return true;
+  const prefix = b.endsWith(path.sep) ? b : b + path.sep;
+  return t.startsWith(prefix);
+}
+
+interface AnchoredDirHandle {
+  dirFd: fsp.FileHandle;
+  fallbackDir: string;
+}
+
+function splitSafeRelSegments(rel: string): string[] {
+  if (!rel || rel === "." || path.isAbsolute(rel)) return [];
+  const parts = rel.split(path.sep).filter(Boolean);
+  for (const seg of parts) {
+    if (seg === "." || seg === ".." || seg.includes("/") || seg.includes("\\") || seg.includes("\0")) {
+      throw new ProviderError("invalid_request", `claude-adapter: invalid path segment: ${seg}`, 400);
+    }
+  }
+  return parts;
+}
+
+function dirChildPath(handle: AnchoredDirHandle, childName: string): string {
+  return HAS_PROC_SELF_FD
+    ? `/proc/self/fd/${handle.dirFd.fd}/${childName}`
+    : path.join(handle.fallbackDir, childName);
+}
+
+function mapDirOpenError(err: unknown, label: string): ProviderError {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT") {
+    return new ProviderError("not_found", `claude-adapter: directory missing: ${label}`, 404, err);
+  }
+  if (code === "ELOOP") {
+    return new ProviderError("invalid_request", `claude-adapter: refusing symlinked ${label}`, 400, err);
+  }
+  if (code === "ENOTDIR" || code === "ENXIO") {
+    return new ProviderError("invalid_request", `claude-adapter: invalid directory (${code}): ${label}`, 400, err);
+  }
+  return new ProviderError("invalid_request", `claude-adapter: directory open failed: ${(err as Error).message}`, 400, err);
+}
+
+function mapAppendOpenError(err: unknown, target: string): ProviderError {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "ENOENT" || code === "ENOTDIR") {
+    return new ProviderError("not_found", `claude-adapter: session file missing: ${target}`, 404, err);
+  }
+  if (code === "ELOOP" || code === "ENXIO" || code === "EISDIR") {
+    return new ProviderError("invalid_request", `claude-adapter: refusing non-regular or symlinked file (${code}): ${target}`, 400, err);
+  }
+  return new ProviderError("invalid_request", `claude-adapter: open failed (${code ?? "ERR"}): ${(err as Error).message}`, 400, err);
+}
+
+async function openAnchoredDirChildOptional(
+  parentHandle: AnchoredDirHandle,
+  childName: string,
+  label: string,
+): Promise<AnchoredDirHandle | null> {
+  if (!childName || childName === "." || childName === ".." || childName.includes("/") || childName.includes("\\") || childName.includes("\0")) {
+    throw new ProviderError("invalid_request", `claude-adapter: invalid directory name: ${childName}`, 400);
+  }
+  const childTarget = dirChildPath(parentHandle, childName);
+  const childFallback = path.join(parentHandle.fallbackDir, childName);
+
+  if (!HAS_PROC_SELF_FD) {
+    const lst = await fsp.lstat(childTarget).catch((err: unknown) => {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") return null;
+      throw mapDirOpenError(err, label);
+    });
+    if (!lst) return null;
+    if (lst.isSymbolicLink()) {
+      throw new ProviderError("invalid_request", `claude-adapter: refusing symlinked ${label}`, 400);
+    }
+    if (!lst.isDirectory()) {
+      throw new ProviderError("invalid_request", `claude-adapter: ${label} is not a directory`, 400);
+    }
+  }
+
+  let dirFd: fsp.FileHandle;
+  try {
+    dirFd = await fsp.open(childTarget, OPEN_DIR_FLAGS);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP" || code === "ENOTDIR") {
+      const lst = await fsp.lstat(childTarget).catch(() => null);
+      if (lst?.isSymbolicLink()) {
+        throw new ProviderError("invalid_request", `claude-adapter: refusing symlinked ${label}`, 400, err);
+      }
+    }
+    throw mapDirOpenError(err, label);
+  }
+
+  try {
+    const st = await dirFd.stat();
+    if (!st.isDirectory()) {
+      throw new ProviderError("invalid_request", `claude-adapter: ${label} is not a directory`, 400);
+    }
+    return { dirFd, fallbackDir: childFallback };
+  } catch (err) {
+    await dirFd.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+async function openAnchoredDir(realRoot: string, segments: string[]): Promise<AnchoredDirHandle> {
+  const actualRoot = await fsp.realpath(path.resolve(realRoot)).catch((err: unknown) => {
+    throw mapDirOpenError(err, "projectsDir");
+  });
+  const rootLst = await fsp.lstat(actualRoot).catch((err: unknown) => {
+    throw mapDirOpenError(err, "projectsDir");
+  });
+  if (rootLst.isSymbolicLink() || !rootLst.isDirectory()) {
+    throw new ProviderError("invalid_request", "claude-adapter: invalid projects root", 400);
+  }
+  const rootFd = await fsp.open(actualRoot, OPEN_DIR_FLAGS).catch((err: unknown) => {
+    throw mapDirOpenError(err, "projectsDir");
+  });
+
+  let current: AnchoredDirHandle = { dirFd: rootFd, fallbackDir: actualRoot };
+  try {
+    const rootSt = await rootFd.stat();
+    if (
+      !rootSt.isDirectory() ||
+      rootSt.dev !== rootLst.dev ||
+      (process.platform !== "win32" && rootSt.ino !== rootLst.ino)
+    ) {
+      throw new ProviderError("invalid_request", "claude-adapter: projects root changed during open", 400);
+    }
+
+    for (const seg of segments) {
+      const next = await openAnchoredDirChildOptional(current, seg, `directory ${seg}`);
+      if (!next) {
+        throw new ProviderError("not_found", `claude-adapter: directory missing: ${seg}`, 404);
+      }
+      await current.dirFd.close().catch(() => undefined);
+      current = next;
+    }
+    return current;
+  } catch (err) {
+    await current.dirFd.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+async function ensureAnchoredDirChild(
+  parentHandle: AnchoredDirHandle,
+  childName: string,
+): Promise<AnchoredDirHandle> {
+  const existing = await openAnchoredDirChildOptional(parentHandle, childName, "session directory");
+  if (existing) return existing;
+
+  const target = dirChildPath(parentHandle, childName);
+  try {
+    await fsp.mkdir(target, { mode: 0o700 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "EEXIST") throw err;
+  }
+  const created = await openAnchoredDirChildOptional(parentHandle, childName, "session directory");
+  if (!created) {
+    throw new ProviderError("not_found", `claude-adapter: failed to open session directory ${childName}`, 404);
+  }
+  return created;
+}
+
+async function purgeAnchoredDirContents(handle: AnchoredDirHandle): Promise<void> {
+  const dirRef = HAS_PROC_SELF_FD ? `/proc/self/fd/${handle.dirFd.fd}` : handle.fallbackDir;
+  let dirents: fs.Dirent[];
+  try {
+    dirents = await fsp.readdir(dirRef, { withFileTypes: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ENOENT") return;
+    throw err;
+  }
+
+  for (const entry of dirents) {
+    if (entry.name === "." || entry.name === "..") continue;
+    const childTarget = dirChildPath(handle, entry.name);
+    const lst = await fsp.lstat(childTarget).catch((err: unknown) => {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === "ENOENT") return null;
+      throw err;
+    });
+    if (!lst) continue;
+    if (lst.isDirectory()) {
+      const childHandle = await openAnchoredDirChildOptional(handle, entry.name, "subagents directory");
+      if (childHandle) {
+        try {
+          await purgeAnchoredDirContents(childHandle);
+        } finally {
+          await childHandle.dirFd.close().catch(() => undefined);
+        }
+        await fsp.rmdir(childTarget).catch((err: unknown) => {
+          const code = (err as NodeJS.ErrnoException | undefined)?.code;
+          if (code !== "ENOENT") throw err;
+        });
+      }
+    } else {
+      // Regular files, symlinks (unlinks link itself without traversing), FIFOs, etc.
+      await fsp.unlink(childTarget).catch((err: unknown) => {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "ENOENT") throw err;
+      });
+    }
+  }
+}
+
+function isSafeAgentId(agentId: string): boolean {
+  return (
+    typeof agentId === "string" &&
+    agentId.length > 0 &&
+    agentId.length <= 128 &&
+    /^[A-Za-z0-9._-]+$/.test(agentId) &&
+    agentId !== "." &&
+    agentId !== ".."
+  );
+}
+
+function sanitizeTitle(title: string): string {
+  return title.replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim().slice(0, 200);
+}
+
+async function readRange(fh: fsp.FileHandle, offset: number, length: number): Promise<Buffer> {
+  if (length <= 0) return Buffer.alloc(0);
+  const buf = Buffer.allocUnsafe(length);
+  let total = 0;
+  while (total < length) {
+    const { bytesRead } = await fh.read(buf, total, length - total, offset + total);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+  }
+  return total === length ? buf : buf.subarray(0, total);
+}
+
+async function readTailWindowUtf8(fh: fsp.FileHandle, size: number, maxBytes: number): Promise<string> {
+  if (size <= 0) return "";
+  const startOffset = size > maxBytes ? size - maxBytes : 0;
+  const targetBytes = size - startOffset;
+  const out = Buffer.allocUnsafe(targetBytes);
+  let totalRead = 0;
+  while (totalRead < targetBytes) {
+    const chunkSize = Math.min(READ_CHUNK_BYTES, targetBytes - totalRead);
+    const { bytesRead } = await fh.read(out, totalRead, chunkSize, startOffset + totalRead);
+    if (bytesRead === 0) break;
+    totalRead += bytesRead;
+  }
+  let slice = out.subarray(0, totalRead);
+  if (startOffset > 0) {
+    // Drop partial leading line before decoding UTF-8 so multi-byte characters never split.
+    const firstNl = slice.indexOf(0x0a);
+    if (firstNl < 0) return "";
+    slice = slice.subarray(firstNl + 1);
+  }
+  return slice.toString("utf8");
+}
+
+function lineHasConversationEntry(line: string): boolean {
+  if (!line) return false;
+  if (!line.includes('"type":"user"') && !line.includes('"type": "user"') &&
+      !line.includes('"type":"assistant"') && !line.includes('"type": "assistant"')) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    if (parsed.type === "user") {
+      return parsed.isMeta !== true && parsed.isCompactSummary !== true;
+    }
+    if (parsed.type === "assistant") {
+      const msg = parsed.message as Record<string, unknown> | undefined;
+      return parsed.isApiErrorMessage !== true && typeof msg?.stop_reason === "string";
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Scan backward from the end of transcript tail for an active `continued-in`
+ * marker, stopping if a real user or assistant turn occurred after it.
+ */
+function extractTrailingContinuedIn(tailText: string): string | undefined {
+  if (!tailText.includes('"continued-in"')) return undefined;
+  let end = tailText.length;
+  while (end > 0) {
+    const nl = tailText.lastIndexOf("\n", end - 1);
+    const line = tailText.slice(nl + 1, end).trim();
+    end = nl;
+    if (!line) {
+      if (nl < 0) break;
+      continue;
+    }
+    const isCont = line.includes('"continued-in"');
+    const isMsg = line.includes('"user"') || line.includes('"assistant"');
+    if (isCont || isMsg) {
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        if (entry.type === "continued-in" && typeof entry.continuedInSessionId === "string") {
+          return UUID_RE.test(entry.continuedInSessionId) ? entry.continuedInSessionId : undefined;
+        }
+        if (entry.type === "assistant") {
+          const msg = entry.message as Record<string, unknown> | undefined;
+          if (entry.isApiErrorMessage !== true && typeof msg?.stop_reason === "string") {
+            return undefined;
+          }
+        }
+        if (entry.type === "user") {
+          const candidate = userTextCandidate((entry.message as Record<string, unknown> | undefined)?.content);
+          if (candidate !== null && entry.isMeta !== true && entry.isCompactSummary !== true) {
+            return undefined;
+          }
+        }
+      } catch {
+        // ignore unparseable line
+      }
+    }
+    if (nl < 0) break;
+  }
+  return undefined;
+}
+
+/**
+ * Prune rewound/abandoned branches in Claude JSONL transcripts by walking the
+ * active chain from the latest main-thread leaf via `parentUuid` / `logicalParentUuid`.
+ * Legacy transcripts without `uuid` fields are returned verbatim in file order.
+ */
+export function followClaudeBranch<T extends Record<string, unknown>>(entries: T[]): T[] {
+  if (entries.length === 0) return [];
+
+  const withUuid = entries.filter((e) => typeof e.uuid === "string" && e.uuid.length > 0);
+  if (withUuid.length === 0) {
+    return entries;
+  }
+
+  const byUuid = new Map<string, T>();
+  const indexByUuid = new Map<string, number>();
+  for (let i = 0; i < withUuid.length; i += 1) {
+    const entry = withUuid[i]!;
+    const uuid = entry.uuid as string;
+    byUuid.set(uuid, entry);
+    indexByUuid.set(uuid, i);
+  }
+
+  // Relink compact_boundary preservedMessages / preservedSegment when present.
+  for (const entry of [...byUuid.values()]) {
+    if (entry.type !== "system" || entry.subtype !== "compact_boundary") continue;
+    const meta = entry.compactMetadata as Record<string, unknown> | undefined;
+    const preservedMessages = meta?.preservedMessages as { anchorUuid?: string; uuids?: string[] } | undefined;
+    const preservedSegment = meta?.preservedSegment as
+      | { anchorUuid?: string; headUuid?: string; tailUuid?: string }
+      | undefined;
+
+    if (
+      preservedMessages &&
+      Array.isArray(preservedMessages.uuids) &&
+      preservedMessages.uuids.length > 0 &&
+      typeof preservedMessages.anchorUuid === "string" &&
+      preservedMessages.uuids.every((u) => byUuid.has(u))
+    ) {
+      let anchor = preservedMessages.anchorUuid;
+      for (const u of preservedMessages.uuids) {
+        const target = byUuid.get(u)!;
+        byUuid.set(u, { ...target, parentUuid: anchor });
+        anchor = u;
+      }
+      const firstU = preservedMessages.uuids[0]!;
+      const lastU = preservedMessages.uuids[preservedMessages.uuids.length - 1]!;
+      for (const [u, cur] of byUuid) {
+        if (cur.parentUuid === preservedMessages.anchorUuid && u !== firstU) {
+          byUuid.set(u, { ...cur, parentUuid: lastU });
+        }
+      }
+    } else if (
+      preservedSegment &&
+      typeof preservedSegment.anchorUuid === "string" &&
+      typeof preservedSegment.headUuid === "string" &&
+      typeof preservedSegment.tailUuid === "string"
+    ) {
+      const headNode = byUuid.get(preservedSegment.headUuid);
+      if (headNode) {
+        byUuid.set(preservedSegment.headUuid, { ...headNode, parentUuid: preservedSegment.anchorUuid });
+      }
+      for (const [u, cur] of byUuid) {
+        if (cur.parentUuid === preservedSegment.anchorUuid && u !== preservedSegment.headUuid) {
+          byUuid.set(u, { ...cur, parentUuid: preservedSegment.tailUuid });
+        }
+      }
+    }
+  }
+
+  const parentOf = (entry: T): string | undefined => {
+    if (typeof entry.parentUuid === "string" && entry.parentUuid) return entry.parentUuid;
+    if (typeof entry.logicalParentUuid === "string" && entry.logicalParentUuid) return entry.logicalParentUuid;
+    return undefined;
+  };
+
+  const isMainTrack = (entry: T): boolean =>
+    entry.isSidechain !== true && !entry.teamName && entry.type !== "progress";
+
+  const referencedParents = new Set<string>();
+  for (const entry of byUuid.values()) {
+    if (!isMainTrack(entry)) continue;
+    const p = parentOf(entry);
+    if (p) referencedParents.add(p);
+  }
+
+  const tips = [...byUuid.values()]
+    .filter((entry) => isMainTrack(entry) && !referencedParents.has(entry.uuid as string))
+    .sort((a, b) => (indexByUuid.get(b.uuid as string) ?? -1) - (indexByUuid.get(a.uuid as string) ?? -1));
+
+  let leaf: T | undefined;
+  for (const tip of tips) {
+    const seen = new Set<string>();
+    let cursor: T | undefined = tip;
+    while (cursor && !seen.has(cursor.uuid as string)) {
+      seen.add(cursor.uuid as string);
+      if (cursor.type === "user" || cursor.type === "assistant") {
+        leaf = cursor;
+        break;
+      }
+      const p = parentOf(cursor);
+      cursor = p ? byUuid.get(p) : undefined;
+    }
+    if (leaf) break;
+  }
+
+  if (!leaf) {
+    const fallbacks = [...byUuid.values()].filter((e) => e.type === "user" || e.type === "assistant");
+    const nonMeta = fallbacks.filter((e) => isMainTrack(e) && e.isMeta !== true);
+    const pool = nonMeta.length > 0 ? nonMeta : fallbacks;
+    if (pool.length === 0) return [];
+    leaf = pool.reduce((best, cur) =>
+      (indexByUuid.get(cur.uuid as string) ?? -1) > (indexByUuid.get(best.uuid as string) ?? -1) ? cur : best,
+    );
+  }
+
+  const chain: T[] = [];
+  const visited = new Set<string>();
+  let cursor: T | undefined = leaf;
+  while (cursor) {
+    const uuid = cursor.uuid as string;
+    if (visited.has(uuid)) break;
+    visited.add(uuid);
+    chain.push(cursor);
+    const p = parentOf(cursor);
+    cursor = p ? byUuid.get(p) : undefined;
+  }
+  chain.reverse();
+  return chain;
+}
+
+function parseHistoryTranscript(
+  text: string,
+  options: { allowSidechain?: boolean } = {},
+): ClaudeHistoryMessage[] {
+  const rawEntries: Array<Record<string, unknown>> = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const rec = entry as Record<string, unknown>;
+    if (!options.allowSidechain && rec.isSidechain === true) continue;
+    if (rec.teamName) continue;
+    rawEntries.push(rec);
+  }
+
+  const branchEntries = followClaudeBranch(rawEntries);
+  const messages: ClaudeHistoryMessage[] = [];
+
+  for (const entry of branchEntries) {
+    const type = entry.type;
+    if (type !== "user" && type !== "assistant") continue;
+    if (entry.isMeta === true && entry.isCompactSummary !== true) continue;
+
+    const msg = entry.message as Record<string, unknown> | undefined;
+    if (!msg || msg.role !== type) continue;
+
+    const blocks: NonNullable<ClaudeHistoryMessage["blocks"]> = [];
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (!block || typeof block !== "object") continue;
+        const b = block as Record<string, unknown>;
+        if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
+          blocks.push({ type: "thinking", text: b.thinking });
+        } else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
+          blocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
+        } else if (b.type === "tool_result") {
+          const raw = b.content;
+          const out =
+            typeof raw === "string"
+              ? raw
+              : Array.isArray(raw)
+                ? (raw as Array<Record<string, unknown>>).map((x) => (x.text as string) ?? "").join("")
+                : "";
+          blocks.push({
+            type: "tool_result",
+            tool_use_id: (b.tool_use_id as string) ?? "",
+            content: out,
+            ...(b.is_error === true ? { is_error: true } : {}),
+          });
+        }
+      }
+    }
+
+    const rawText = extractText(msg.content);
+    const formattedText = type === "user" ? formatTranscriptUserText(rawText) : rawText;
+    if (formattedText === null && blocks.length === 0) continue;
+    const finalText = formattedText ?? "";
+    if (!finalText && blocks.length === 0) continue;
+
+    messages.push({
+      role: type,
+      text: finalText,
+      ...(blocks.length > 0 ? { blocks } : {}),
+      timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+      model: type === "assistant" && typeof msg.model === "string" ? msg.model : undefined,
+      isError: type === "assistant" && entry.isApiErrorMessage === true,
+      ...(entry.isCompactSummary === true ? { isCompactSummary: true } : {}),
+      ...(typeof entry.uuid === "string" ? { uuid: entry.uuid } : {}),
+      ...(entry.parentUuid !== undefined ? { parentUuid: entry.parentUuid as string | null } : {}),
+    });
+  }
+
+  return messages;
+}
 
 /** Close stdin if it is still open; safe on already-ended / destroyed pipes. */
 function endStdin(child: ChildProcess): void {
@@ -1109,17 +3050,53 @@ function endStdin(child: ChildProcess): void {
   }
 }
 
-/** Pull human-readable text out of a transcript message content field. */
+export function unwrapPastedContent(text: string): string {
+  if (!text.includes("<pasted_content")) return text;
+  let out = text.replace(
+    /<pasted_content(?:\s+id="([0-9a-f]{4})")?>\r?\n?([\s\S]*?)\r?\n?<\/pasted_content(?:\s+id="\1")?>/gi,
+    (_m, _id, body: string) => body,
+  );
+  out = out.replace(
+    /<pasted_content(?:\s+[^>]*)?>\r?\n?([\s\S]*?)\r?\n?<\/pasted_content(?:\s+[^>]*)?>/gi,
+    (_m, body: string) => body,
+  );
+  return out;
+}
+
+/** Pull human-readable text out of a transcript message content field, unwrapping `<pasted_content>`. */
 function extractText(content: unknown): string {
-  if (typeof content === "string") return content.trim();
+  if (typeof content === "string") return unwrapPastedContent(content).trim();
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const block of content) {
-    if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
-      parts.push(block.text);
+    if (block && typeof block === "object" && (block as any).type === "text" && typeof (block as any).text === "string") {
+      parts.push(unwrapPastedContent((block as any).text));
     }
   }
   return parts.join("").trim();
+}
+
+/** Format user text in transcript history (`<bash-input>`, `<bash-stdout>`, `<bash-stderr>`, skipping local noise). */
+function formatTranscriptUserText(text: string): string | null {
+  if (!text) return null;
+  if (isLocalCommandText(text)) return null;
+
+  const bashIn = /^\s*<bash-input>([\s\S]*?)<\/bash-input>\s*$/.exec(text);
+  if (bashIn) {
+    const cmd = bashIn[1]!.trim();
+    return cmd ? `! ${cmd}` : null;
+  }
+
+  if (text.includes("<bash-stdout>") || text.includes("<bash-stderr>")) {
+    const outMatch = /<bash-stdout>([\s\S]*?)<\/bash-stdout>/.exec(text);
+    const errMatch = /<bash-stderr>([\s\S]*?)<\/bash-stderr>/.exec(text);
+    const stdoutText = outMatch?.[1]?.trim() ?? "";
+    const stderrText = errMatch?.[1]?.trim() ?? "";
+    const combined = [stdoutText, stderrText].filter(Boolean).join("\n").trim();
+    return combined || null;
+  }
+
+  return text;
 }
 
 /** True for CLI-local noise (`<local-command-...>`, `<command-name>`, caveats). */
@@ -1127,23 +3104,156 @@ function isLocalCommandText(text: string): boolean {
   return text.startsWith("<local-command") || text.startsWith("<command-name") || text.startsWith("Caveat:");
 }
 
-/** 原生 /resume 标题兜底候选:真实消息 → {kind:'text'};斜杠命令(还原 "/x")
- *  → {kind:'cmd'}(弱于真实消息,实测 "/model" 会话只有命令时原生才用它);
- *  caveat/stdout/中断/⎿ 错误回显 → null。 */
+/** 原生 /resume 标题兜底候选:真实消息 → {kind:'text'};斜杠命令(还原 "/x") → {kind:'cmd'}。 */
 function userTextCandidate(content: unknown): { kind: "text" | "cmd"; text: string } | null {
   const text = extractText(content);
   if (!text) return null;
   const cmd = /^<command-name>([^<]+)<\/command-name>/.exec(text);
   if (cmd) return { kind: "cmd", text: cmd[1]!.trim() };
+  const bashIn = /<bash-input>([\s\S]*?)<\/bash-input>/.exec(text);
+  if (bashIn) {
+    const cmdText = bashIn[1]!.trim();
+    return cmdText ? { kind: "text", text: `! ${cmdText}` } : null;
+  }
+  if (text.startsWith("<bash-stdout") || text.startsWith("<bash-stderr")) return null;
   if (isLocalCommandText(text)) return null;
   if (text === "[Request interrupted by user]") return null;
   if (text.startsWith("⎿")) return null;
   return { kind: "text", text };
 }
 
+function formatMultiSelectAnswer(values: string[], multiSelect: boolean): string {
+  const cleaned = values.map((v) => String(v));
+  if (multiSelect || cleaned.length > 1) {
+    return cleaned
+      .map((v) => (v.includes(", ") || v.includes('"') ? JSON.stringify(v) : v))
+      .join(", ");
+  }
+  return cleaned[0] ?? "";
+}
+
+/**
+ * Translate gateway question answers (`string` or `Record<q_N | questionId | questionText, string[] | string>`)
+ * into Claude CLI's expected `Record<question.question, string>` map, validating `q_N` bounds.
+ */
+export function encodeAskUserQuestionAnswers(
+  questions: unknown[],
+  answer: ClaudeQuestionAnswerInput,
+): Record<string, string> {
+  const qRecords = questions.map((q) =>
+    q && typeof q === "object" && !Array.isArray(q) ? (q as Record<string, unknown>) : {},
+  );
+
+  if (typeof answer === "string") {
+    if (qRecords.length === 0) return { q_0: answer };
+    const first = qRecords[0]!;
+    const key =
+      (typeof first.question === "string" && first.question) ||
+      (typeof first.header === "string" && first.header) ||
+      "q_0";
+    return { [key]: answer };
+  }
+
+  if (!answer || typeof answer !== "object" || Array.isArray(answer)) {
+    throw new ProviderError("invalid_request", "claude-adapter: invalid question answer payload", 400);
+  }
+
+  const encoded: Record<string, string> = {};
+  for (const [rawKey, rawVal] of Object.entries(answer)) {
+    let targetKey = rawKey;
+    let isMulti = false;
+
+    const indexMatch = /^q_(-?\d+)$/.exec(rawKey);
+    if (indexMatch) {
+      const idx = Number(indexMatch[1]);
+      if (qRecords.length === 0) {
+        if (idx !== 0) {
+          throw new ProviderError(
+            "invalid_request",
+            `claude-adapter: question index ${rawKey} out of bounds (no questions)`,
+            400,
+          );
+        }
+      } else {
+        if (!Number.isInteger(idx) || idx < 0 || idx >= qRecords.length) {
+          throw new ProviderError(
+            "invalid_request",
+            `claude-adapter: question index ${rawKey} out of bounds (0..${qRecords.length - 1})`,
+            400,
+          );
+        }
+        const q = qRecords[idx]!;
+        const qText =
+          (typeof q.question === "string" && q.question) ||
+          (typeof q.header === "string" && q.header) ||
+          "";
+        if (!qText) {
+          throw new ProviderError(
+            "invalid_request",
+            `claude-adapter: question at index ${idx} is missing question text`,
+            400,
+          );
+        }
+        targetKey = qText;
+        isMulti = q.multiSelect === true || q.multi_select === true;
+      }
+    } else if (qRecords.length > 0) {
+      const byText = qRecords.find((q) => q.question === rawKey);
+      const byId = byText ?? qRecords.find((q) => q.id === rawKey);
+      if (!byId) {
+        throw new ProviderError(
+          "invalid_request",
+          `claude-adapter: unknown question key "${rawKey}"`,
+          400,
+        );
+      }
+      targetKey =
+        (typeof byId.question === "string" && byId.question) ||
+        (typeof byId.header === "string" && byId.header) ||
+        rawKey;
+      isMulti = byId.multiSelect === true || byId.multi_select === true;
+    }
+
+    if (Array.isArray(rawVal)) {
+      encoded[targetKey] = formatMultiSelectAnswer(
+        rawVal.map((item) => {
+          if (typeof item !== "string" && typeof item !== "number" && typeof item !== "boolean") {
+            throw new ProviderError(
+              "invalid_request",
+              `claude-adapter: invalid answer item for "${rawKey}"`,
+              400,
+            );
+          }
+          return String(item);
+        }),
+        isMulti,
+      );
+    } else if (typeof rawVal === "string") {
+      encoded[targetKey] = rawVal;
+    } else {
+      throw new ProviderError(
+        "invalid_request",
+        `claude-adapter: invalid answer value for "${rawKey}"`,
+        400,
+      );
+    }
+  }
+
+  return encoded;
+}
+
 /** Translate one CLI stream-json line into zero or more adapter events. */
-function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
+function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[] {
   const out: ClaudeAdapterEvent[] = [];
+  const uuid = typeof ev?.uuid === "string" && ev.uuid ? ev.uuid : undefined;
+  const parentToolUseId =
+    typeof ev?.parent_tool_use_id === "string" && ev.parent_tool_use_id
+      ? ev.parent_tool_use_id
+      : undefined;
+  const agentId = typeof ev?.agent_id === "string" && ev.agent_id ? ev.agent_id : undefined;
+  const subagentType =
+    typeof ev?.subagent_type === "string" && ev.subagent_type ? ev.subagent_type : undefined;
+
   switch (ev?.type) {
     case "system":
       if (ev.subtype === "init") {
@@ -1152,9 +3262,64 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
           sessionId: ev.session_id,
           cwd: ev.cwd,
           tools: Array.isArray(ev.tools) ? ev.tools : [],
+          ...(uuid ? { uuid } : {}),
+          ...(typeof ev.model === "string" ? { model: ev.model } : {}),
+          ...(typeof ev.permissionMode === "string" ? { permissionMode: ev.permissionMode } : {}),
+          ...(Array.isArray(ev.slash_commands) ? { slashCommands: ev.slash_commands } : {}),
+          ...(Array.isArray(ev.skills) ? { skills: ev.skills } : {}),
+          ...(Array.isArray(ev.capabilities) ? { capabilities: ev.capabilities } : {}),
+          ...(typeof ev.claude_code_version === "string" ? { claudeCodeVersion: ev.claude_code_version } : {}),
+          ...(typeof ev.fast_mode_state === "string" ? { fastModeState: ev.fast_mode_state } : {}),
+          ...(ev.effort !== undefined ? { effort: ev.effort as string | null } : {}),
+        });
+      } else if (ev.subtype === "task_started" && typeof ev.task_id === "string") {
+        out.push({
+          type: "task_started",
+          sessionId: String(ev.session_id ?? ""),
+          taskId: ev.task_id,
+          description: String(ev.description ?? ""),
+          ...(typeof ev.tool_use_id === "string" ? { toolUseId: ev.tool_use_id } : {}),
+          ...(typeof ev.subagent_type === "string" ? { subagentType: ev.subagent_type } : {}),
+          ...(typeof ev.is_backgrounded === "boolean" ? { isBackgrounded: ev.is_backgrounded } : {}),
+          ...(typeof ev.spawn_depth === "number" ? { spawnDepth: ev.spawn_depth } : {}),
+          ...(typeof ev.parent_task_id === "string" ? { parentTaskId: ev.parent_task_id } : {}),
+          ...(typeof ev.task_type === "string" ? { taskType: ev.task_type } : {}),
+          ...(uuid ? { uuid } : {}),
+        });
+      } else if (ev.subtype === "task_progress" && typeof ev.task_id === "string") {
+        out.push({
+          type: "task_progress",
+          sessionId: String(ev.session_id ?? ""),
+          taskId: ev.task_id,
+          description: String(ev.description ?? ""),
+          ...(typeof ev.tool_use_id === "string" ? { toolUseId: ev.tool_use_id } : {}),
+          ...(typeof ev.subagent_type === "string" ? { subagentType: ev.subagent_type } : {}),
+          ...(ev.usage && typeof ev.usage === "object" ? { usage: ev.usage } : {}),
+          ...(typeof ev.last_tool_name === "string" ? { lastToolName: ev.last_tool_name } : {}),
+          ...(typeof ev.summary === "string" ? { summary: ev.summary } : {}),
+          ...(uuid ? { uuid } : {}),
+        });
+      } else if (ev.subtype === "task_updated" && typeof ev.task_id === "string") {
+        out.push({
+          type: "task_updated",
+          sessionId: String(ev.session_id ?? ""),
+          taskId: ev.task_id,
+          patch: ev.patch && typeof ev.patch === "object" ? (ev.patch as Record<string, unknown>) : {},
+          ...(uuid ? { uuid } : {}),
+        });
+      } else if (ev.subtype === "task_notification" && typeof ev.task_id === "string") {
+        out.push({
+          type: "task_notification",
+          sessionId: String(ev.session_id ?? ""),
+          taskId: ev.task_id,
+          status: String(ev.status ?? ""),
+          summary: String(ev.summary ?? ""),
+          ...(typeof ev.tool_use_id === "string" ? { toolUseId: ev.tool_use_id } : {}),
+          ...(typeof ev.output_file === "string" ? { outputFile: ev.output_file } : {}),
+          ...(ev.usage && typeof ev.usage === "object" ? { usage: ev.usage } : {}),
+          ...(uuid ? { uuid } : {}),
         });
       }
-      // hook_started/hook_response/status/thinking_tokens: internal noise, skip.
       break;
 
     case "stream_event": {
@@ -1162,9 +3327,25 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
       if (e?.type === "content_block_delta") {
         const d = e.delta;
         if (d?.type === "text_delta" && typeof d.text === "string") {
-          out.push({ type: "text_delta", text: d.text });
+          state?.streamedParentKeys.add(parentToolUseId ?? "__main__");
+          out.push({
+            type: "text_delta",
+            text: d.text,
+            ...(uuid ? { uuid } : {}),
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+            ...(agentId ? { agentId } : {}),
+            ...(subagentType ? { subagentType } : {}),
+          });
         } else if (d?.type === "thinking_delta" && typeof d.thinking === "string") {
-          out.push({ type: "thinking_delta", text: d.thinking });
+          state?.streamedParentKeys.add(parentToolUseId ?? "__main__");
+          out.push({
+            type: "thinking_delta",
+            text: d.thinking,
+            ...(uuid ? { uuid } : {}),
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+            ...(agentId ? { agentId } : {}),
+            ...(subagentType ? { subagentType } : {}),
+          });
         }
       }
       break;
@@ -1173,12 +3354,49 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
     case "assistant": {
       const content = ev.message?.content;
       if (Array.isArray(content)) {
-        // 本地命令输出(/mcp 等):model 为 <synthetic>,无 delta 流,
-        // 整段文本直接上来(2.1.226 实测 /mcp、/compact)。
         if (ev.message?.model === "<synthetic>") {
           const text = extractText(content);
-          if (text) out.push({ type: "synthetic_text", text });
+          if (text) {
+            out.push({
+              type: "synthetic_text",
+              text,
+              ...(uuid ? { uuid } : {}),
+              ...(parentToolUseId ? { parentToolUseId } : {}),
+              ...(agentId ? { agentId } : {}),
+            });
+          }
+        } else if (parentToolUseId) {
+          // `--forward-subagent-text` forwards subagent text/thinking on `assistant` frames
+          // (without preceding `stream_event` deltas); emit deltas only if not already streamed.
+          const alreadyStreamed = state?.streamedParentKeys.has(parentToolUseId) ?? false;
+          state?.streamedParentKeys.delete(parentToolUseId);
+          if (!alreadyStreamed) {
+            for (const block of content) {
+              if (block?.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
+                out.push({
+                  type: "thinking_delta",
+                  text: block.thinking,
+                  ...(uuid ? { uuid } : {}),
+                  parentToolUseId,
+                  ...(agentId ? { agentId } : {}),
+                  ...(subagentType ? { subagentType } : {}),
+                });
+              } else if (block?.type === "text" && typeof block.text === "string" && block.text) {
+                out.push({
+                  type: "text_delta",
+                  text: block.text,
+                  ...(uuid ? { uuid } : {}),
+                  parentToolUseId,
+                  ...(agentId ? { agentId } : {}),
+                  ...(subagentType ? { subagentType } : {}),
+                });
+              }
+            }
+          }
+        } else {
+          state?.streamedParentKeys.delete("__main__");
         }
+
         for (const block of content) {
           if (block?.type === "tool_use") {
             out.push({
@@ -1186,11 +3404,14 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
               toolUseId: String(block.id ?? ""),
               name: String(block.name ?? ""),
               input: block.input,
+              ...(uuid ? { uuid } : {}),
+              ...(parentToolUseId ? { parentToolUseId } : {}),
+              ...(agentId ? { agentId } : {}),
+              ...(subagentType ? { subagentType } : {}),
             });
           }
         }
       }
-      // text blocks are already covered by text_delta streaming; skip here.
       break;
     }
 
@@ -1207,12 +3428,41 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
                   ? block.content
                   : JSON.stringify(block.content ?? ""),
               isError: block.is_error === true,
+              ...(ev.tool_use_result !== undefined ? { toolUseResult: ev.tool_use_result } : {}),
+              ...(uuid ? { uuid } : {}),
+              ...(parentToolUseId ? { parentToolUseId } : {}),
+              ...(agentId ? { agentId } : {}),
+              ...(subagentType ? { subagentType } : {}),
             });
           }
         }
       }
       break;
     }
+
+    case "tool_progress":
+      out.push({
+        type: "tool_progress",
+        toolUseId: String(ev.tool_use_id ?? ""),
+        toolName: String(ev.tool_name ?? ""),
+        elapsedTimeSeconds: typeof ev.elapsed_time_seconds === "number" ? ev.elapsed_time_seconds : 0,
+        ...(parentToolUseId ? { parentToolUseId } : {}),
+        ...(typeof ev.task_id === "string" ? { taskId: ev.task_id } : {}),
+        ...(subagentType ? { subagentType } : {}),
+        ...(uuid ? { uuid } : {}),
+      });
+      break;
+
+    case "tool_use_summary":
+      out.push({
+        type: "tool_use_summary",
+        summary: String(ev.summary ?? ""),
+        precedingToolUseIds: Array.isArray(ev.preceding_tool_use_ids)
+          ? ev.preceding_tool_use_ids.filter((id: unknown): id is string => typeof id === "string")
+          : [],
+        ...(uuid ? { uuid } : {}),
+      });
+      break;
 
     case "result": {
       const denials = Array.isArray(ev.permission_denials) ? ev.permission_denials : [];
@@ -1226,6 +3476,11 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
           })),
         });
       }
+      const totalCostUsd = typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : undefined;
+      const modelUsage =
+        ev.modelUsage && typeof ev.modelUsage === "object" && !Array.isArray(ev.modelUsage)
+          ? (ev.modelUsage as Record<string, unknown>)
+          : undefined;
       out.push({
         type: "done",
         sessionId: String(ev.session_id ?? ""),
@@ -1234,7 +3489,12 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
         subtype: String(ev.subtype ?? ""),
         stopReason: ev.stop_reason ?? null,
         usage: ev.usage,
+        ...(totalCostUsd !== undefined ? { totalCostUsd } : {}),
+        ...(modelUsage !== undefined ? { modelUsage } : {}),
+        ...(typeof ev.num_turns === "number" ? { numTurns: ev.num_turns } : {}),
+        ...(typeof ev.fast_mode_state === "string" ? { fastModeState: ev.fast_mode_state } : {}),
         durationMs: ev.duration_ms,
+        ...(uuid ? { uuid } : {}),
       });
       break;
     }
@@ -1245,11 +3505,20 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
         ev.request && typeof ev.request === "object" ? (ev.request as Record<string, unknown>) : {};
       if (!requestId) break;
       const kind = controlKind(req);
+      const reqParentToolUseId =
+        typeof req.parent_tool_use_id === "string" && req.parent_tool_use_id
+          ? req.parent_tool_use_id
+          : parentToolUseId;
+      const reqAgentId =
+        typeof req.agent_id === "string" && req.agent_id ? req.agent_id : agentId;
+      const itemId = typeof req.tool_use_id === "string" && req.tool_use_id ? req.tool_use_id : undefined;
+
       if (kind === "question") {
         const questions = extractQuestions(req);
-        const first = questions[0] && typeof questions[0] === "object"
-          ? (questions[0] as Record<string, unknown>)
-          : undefined;
+        const first =
+          questions[0] && typeof questions[0] === "object"
+            ? (questions[0] as Record<string, unknown>)
+            : undefined;
         const prompt =
           (typeof first?.question === "string" && first.question) ||
           (typeof first?.header === "string" && first.header) ||
@@ -1259,15 +3528,42 @@ function mapStreamEvent(ev: any): ClaudeAdapterEvent[] {
           questionId: requestId,
           prompt,
           ...(questions.length > 0 ? { rawQuestions: questions } : {}),
+          ...(itemId ? { itemId } : {}),
+          ...(reqAgentId ? { agentId: reqAgentId } : {}),
+          ...(reqParentToolUseId ? { parentToolUseId: reqParentToolUseId } : {}),
         });
       } else if (kind === "approval") {
-        const itemId = req.tool_use_id;
         out.push({
           type: "approval",
           approvalId: requestId,
           tool: String(req.tool_name ?? ""),
           input: req.input,
-          ...(typeof itemId === "string" && itemId ? { itemId } : {}),
+          ...(itemId ? { itemId } : {}),
+          ...(Array.isArray(req.permission_suggestions) ? { suggestions: req.permission_suggestions } : {}),
+          ...(typeof req.blocked_path === "string" ? { blockedPath: req.blocked_path } : {}),
+          ...(typeof req.decision_reason === "string" ? { decisionReason: req.decision_reason } : {}),
+          ...(typeof req.decision_reason_type === "string" ? { decisionReasonType: req.decision_reason_type } : {}),
+          ...(typeof req.suppress_always_allow_rule === "boolean"
+            ? { suppressAlwaysAllow: req.suppress_always_allow_rule }
+            : {}),
+          ...(typeof req.default_to_no === "boolean" ? { defaultToNo: req.default_to_no } : {}),
+          ...(typeof req.requires_user_interaction === "boolean"
+            ? { requiresUserInteraction: req.requires_user_interaction }
+            : {}),
+          ...(typeof req.title === "string" ? { title: req.title } : {}),
+          ...(typeof req.display_name === "string" ? { displayName: req.display_name } : {}),
+          ...(typeof req.description === "string" ? { description: req.description } : {}),
+          ...(reqAgentId ? { agentId: reqAgentId } : {}),
+          ...(reqParentToolUseId ? { parentToolUseId: reqParentToolUseId } : {}),
+          ...(req.matched_ask_rule && typeof req.matched_ask_rule === "object"
+            ? { matchedAskRule: req.matched_ask_rule as Record<string, unknown> }
+            : {}),
+          ...(typeof req.classifier_approvable === "boolean"
+            ? { classifierApprovable: req.classifier_approvable }
+            : {}),
+          ...(req.mcp_server && typeof req.mcp_server === "object"
+            ? { mcpServer: req.mcp_server as { name: string; source: string } }
+            : {}),
         });
       }
       break;
