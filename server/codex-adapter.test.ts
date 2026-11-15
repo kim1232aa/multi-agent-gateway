@@ -643,6 +643,22 @@ test('getHistory falls back to thread/read on legacy threads and returns [] for 
   };
   const emptyTurns = await adapter.getHistory('th-new');
   assert.deepEqual(emptyTurns, []);
+
+  // Codex 0.169.0 draft paginated thread: listTurns + thread/read(includeTurns=true) throw -32601,
+  // while thread/read(includeTurns=false) returns empty preview & turns.
+  (adapter as any).request = async (method: string, params: Record<string, unknown>) => {
+    if (method === 'thread/turns/list') {
+      throw new Error("codex 'thread/turns/list' failed (-32601): paginated_threads is not supported yet");
+    }
+    if (method === 'thread/read' && params.includeTurns === true) {
+      throw new Error("codex 'thread/read' failed (-32601): list_turns is not supported yet");
+    }
+    if (method === 'thread/read' && params.includeTurns === false) {
+      return { thread: { id: 'th-draft', preview: '', turns: [] } };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  assert.deepEqual(await adapter.getHistory('th-draft'), []);
 });
 
 test('handleServerRequest supports 0.169 granular commandExecution, fileChange, and serverRequest/resolved', async () => {
@@ -1126,10 +1142,16 @@ test('handleNotification maps plan, diff, goal/cleared, thread/reverted, summary
   for await (const _ of h.events) { /* drain */ }
 });
 
-test('live smoke test against extracted @openai/codex 0.169.0 binary when present', async (t) => {
-  const codex0169Bin = '/tmp/codex-survey.LoV5Nh/stable/package/vendor/x86_64-unknown-linux-musl/bin/codex';
-  if (!fs.existsSync(codex0169Bin)) {
-    t.skip(`0.169.0 binary not found at ${codex0169Bin}`);
+test('live smoke test against installed @openai/codex 0.169.0 binary when present', async (t) => {
+  const candidates = [
+    process.env.CODEX_LIVE_BIN,
+    '/tmp/codex-survey.LoV5Nh/stable/package/vendor/x86_64-unknown-linux-musl/bin/codex',
+    path.join(os.homedir(), '.local', 'bin', 'codex'),
+    ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, 'codex')),
+  ].filter((p): p is string => Boolean(p));
+  const codex0169Bin = candidates.find((p) => fs.existsSync(p));
+  if (!codex0169Bin) {
+    t.skip('0.169.0 codex binary not found');
     return;
   }
 
@@ -1146,9 +1168,11 @@ test('live smoke test against extracted @openai/codex 0.169.0 binary when presen
     assert.ok(thread.id.length > 0);
     assert.equal(thread.historyMode, 'paginated');
 
-    // Unmaterialized new 0.169 thread should cleanly return empty history
+    // Unmaterialized new 0.169 thread should cleanly return empty history even on repeated reads
     const history = await adapter.getHistory(thread.id);
     assert.deepEqual(history, []);
+    await new Promise((r) => setTimeout(r, 250));
+    assert.deepEqual(await adapter.getHistory(thread.id), []);
 
     // Skills list should succeed against 0.169 app-server
     const skills = await adapter.listSkills({ cwd: tmpCodexHome });
@@ -1305,4 +1329,25 @@ test('probeStalledTurn uses thread/turns/list without killing responsive child, 
     result: { contentItems: [{ type: 'inputText', text: 'ok' }], success: true },
   });
   off();
+});
+
+test('normalizeCodexThreadItem normalizes collabAgentToolCall and subAgentActivity', () => {
+  const collabItem = normalizeCodexThreadItem({
+    type: 'collabAgentToolCall',
+    id: 'call-collab-1',
+    tool: 'spawn_agent',
+    receiverThreadIds: ['thread-sub-1'],
+    senderThreadId: 'thread-main',
+  } as any);
+  assert.equal(collabItem?.type, 'collabAgentToolCall');
+  assert.equal(collabItem?.name, 'spawn_agent');
+  assert.deepEqual((collabItem as any)?.receiverThreadIds, ['thread-sub-1']);
+
+  const subActivityItem = normalizeCodexThreadItem({
+    type: 'subAgentActivity',
+    id: 'act-1',
+    agentThreadId: 'thread-sub-1',
+  } as any);
+  assert.equal(subActivityItem?.type, 'subAgentActivity');
+  assert.equal((subActivityItem as any)?.agentId, 'thread-sub-1');
 });

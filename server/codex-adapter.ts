@@ -970,6 +970,7 @@ export class CodexAdapter {
   private readyPromise: Promise<void> | null = null;
   private closed = false;
   private recycleTimer: ReturnType<typeof setTimeout> | null = null;
+  private recycleKillTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * thread/start 创建但未落盘的线程(codex 要等首个 turn 才写 rollout)及其
    * 创建时间。回收会杀掉 app-server,这类线程随之蒸发("no rollout found",
@@ -1038,6 +1039,10 @@ export class CodexAdapter {
     if (this.recycleTimer) {
       clearTimeout(this.recycleTimer);
       this.recycleTimer = null;
+    }
+    if (this.recycleKillTimer) {
+      clearTimeout(this.recycleKillTimer);
+      this.recycleKillTimer = null;
     }
     this.rl?.close();
     const child = this.child;
@@ -2378,9 +2383,18 @@ export class CodexAdapter {
     const child = this.child;
     if (!child || child.exitCode !== null) return;
     child.kill('SIGTERM');
-    setTimeout(() => {
+    if (this.recycleKillTimer) clearTimeout(this.recycleKillTimer);
+    this.recycleKillTimer = setTimeout(() => {
+      this.recycleKillTimer = null;
       if (child.exitCode === null) child.kill('SIGKILL');
-    }, 3_000).unref?.();
+    }, 3_000);
+    this.recycleKillTimer.unref?.();
+    child.once('exit', () => {
+      if (this.recycleKillTimer) {
+        clearTimeout(this.recycleKillTimer);
+        this.recycleKillTimer = null;
+      }
+    });
   }
 
   // -- public API: threads & turns -------------------------------------------------
@@ -2714,6 +2728,16 @@ export class CodexAdapter {
         const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
         if (/not materialized yet|no rollout found/i.test(msg) || /not materialized yet|no rollout found/i.test(fbMsg)) {
           return [];
+        }
+        if (/list_turns is not supported yet|paginated_threads is not supported yet/i.test(msg)
+          || /list_turns is not supported yet|paginated_threads is not supported yet/i.test(fbMsg)) {
+          // Codex 0.169.0 rejects includeTurns=true (-32601 list_turns is not supported yet)
+          // on empty draft paginated threads; confirm existence with includeTurns=false.
+          const metaRaw = await this.request('thread/read', { threadId, includeTurns: false });
+          const metaThread = ThreadReadResponseSchema.parse(metaRaw).thread;
+          if (!metaThread.preview) {
+            return this.normalizeTurnHistory(metaThread.turns ?? []);
+          }
         }
         throw fallbackErr;
       }
@@ -3250,6 +3274,44 @@ export class CodexAdapter {
           : [];
       },
     );
+  }
+
+  /** 清理后台终端(thread/backgroundTerminals/clean)。 */
+  async cleanBackgroundTerminals(threadId: string): Promise<void> {
+    await this.connect();
+    await this.withThreadRetry(threadId, () =>
+      this.request('thread/backgroundTerminals/clean', { threadId }),
+    );
+  }
+
+  /** 与远端追踪分支的 git diff(gitDiffToRemote)。 */
+  async gitDiffToRemote(cwd: string): Promise<{ sha: string; diff: string } | null> {
+    await this.connect();
+    const raw = (await this.request('gitDiffToRemote', { cwd }).catch(() => null)) as
+      | { sha?: unknown; diff?: unknown }
+      | null;
+    if (!raw || typeof raw.diff !== 'string') return null;
+    return {
+      sha: typeof raw.sha === 'string' ? raw.sha : '',
+      diff: raw.diff,
+    };
+  }
+
+  /** 读取账号速率限制快照(account/rateLimits/read)。 */
+  async accountRateLimits(): Promise<Record<string, unknown> | null> {
+    await this.connect();
+    const raw = await this.request('account/rateLimits/read', {}).catch(() => null);
+    return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+  }
+
+  /** 读取账号/线程 token 用量汇总(account/usage/read)。 */
+  async accountUsage(threadId?: string): Promise<Record<string, unknown> | null> {
+    await this.connect();
+    const raw = await this.request(
+      'account/usage/read',
+      threadId ? { threadId } : {},
+    ).catch(() => null);
+    return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
   }
 
   /** 线程有效模型:显式设置过的优先,否则读 config/read 的全局默认(缓存)。 */

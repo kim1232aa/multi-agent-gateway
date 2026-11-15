@@ -13,7 +13,7 @@ import { detectAvailableProviders, startGateway } from './gateway.js';
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
 
-function fakeAdapter(name: 'claude' | 'codex' | 'grok'): ProviderAdapter {
+function fakeAdapter(name: 'claude' | 'codex' | 'grok' | 'pi'): ProviderAdapter {
   const session: Session = {
     id: `${name}-native`, workspace_id: '', title: `${name} test`, created_at: new Date(0).toISOString(), updated_at: new Date().toISOString(), busy: false, metadata: { cwd: '/tmp' }, provider: name,
   };
@@ -23,8 +23,29 @@ function fakeAdapter(name: 'claude' | 'codex' | 'grok'): ProviderAdapter {
   const sessionThinking = new Map<string, string>();
   const sessionPermission = new Map<string, string>();
   const sessionPlan = new Map<string, boolean>();
+  const adapterCaps: ProviderCapabilities = name === 'pi'
+    ? {
+        ...capabilities,
+        questions: true,
+        compact: true,
+        fork: true,
+        clone: true,
+        rollback: false,
+        manualApproval: false,
+        planMode: false,
+        goals: false,
+      }
+    : name === 'claude' || name === 'codex'
+      ? {
+          ...capabilities,
+          approvals: true,
+          manualApproval: true,
+          planMode: true,
+          questions: true,
+        }
+      : capabilities;
   return {
-    name, capabilities: () => capabilities,
+    name, capabilities: () => adapterCaps,
     list: async (): Promise<SessionPage> => ({ items: [session] }),
     create: async (_input: CreateSessionInput): Promise<Session> => ({ ...session, id: `${name}-created` }),
     getHistory: async (_id: string, _query?: HistoryQuery): Promise<Message[]> => [
@@ -140,6 +161,7 @@ test('falls back to Kimi for native global routes and keeps non-Kimi config loca
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     availableProviders: ['kimi', 'claude', 'codex'],
+    pi: fakeAdapter('pi') as any,
   });
   const get = (path: string, init: RequestInit = {}) => fetch(`${gateway.url}/api/v1${path}`, { ...init, headers: { authorization: 'Bearer gateway-token', ...(init.headers ?? {}) } });
   try {
@@ -279,6 +301,8 @@ test('uses provider-native cursors for non-Kimi session pagination', async () =>
     kimi: 'off',
     codex: codex as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -323,6 +347,8 @@ test('builds local workspaces across all provider-native pages', async () => {
     kimi: 'off',
     codex: codex as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/workspaces?provider=codex`, {
@@ -362,6 +388,8 @@ test('finds an older local session through provider-native pages', async () => {
     kimi: 'off',
     codex: codex as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/codex_older`, {
@@ -399,6 +427,8 @@ test('forwards explicit Kimi session creation without follow-up mutation', async
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions?provider=kimi&token=internal`, {
@@ -442,6 +472,8 @@ test('forwards provider-less native Kimi routes to the official upstream', async
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -523,6 +555,8 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
       token: 'gateway-token',
       codex: fakeAdapter('codex') as any,
       claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+      pi: fakeAdapter('pi') as any,
+      availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
     });
     await waitForSource('fallback');
 
@@ -542,6 +576,8 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
       token: 'gateway-token',
       codex: fakeAdapter('codex') as any,
       claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+      pi: fakeAdapter('pi') as any,
+      availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
     });
     await waitForSource('official');
     await rm(registry);
@@ -607,6 +643,8 @@ server.listen(port, '127.0.0.1', () => console.log('Kimi server: http://127.0.0.
       token: 'gateway-token',
       codex: fakeAdapter('codex') as any,
       claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+      pi: fakeAdapter('pi') as any,
+      availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
     });
     await waitForSource('fallback');
 
@@ -649,6 +687,8 @@ test('snapshot returns only the latest message page and pages older via /message
     kimi: 'off',
     codex: codex as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -697,6 +737,8 @@ test('maps local history blocks to the Kimi Web message wire', async () => {
     kimi: 'off',
     codex: codex as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     for (const provider of ['claude', 'codex'] as const) {
@@ -776,6 +818,8 @@ test('tunnels Kimi WebSocket upgrade with upstream authorization and the browser
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Record<string, unknown>[] = [];
   try {
@@ -846,6 +890,8 @@ test('strips Origin on Kimi WebSocket tunnel so kap-server does not 403 the hand
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const gatewayUrl = new URL(gateway.url);
@@ -906,6 +952,8 @@ test('unsubscribes transcript v2 and resumes legacy content for local providers'
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -993,6 +1041,8 @@ test('streams local assistant deltas with official offsets reset for each step',
     kimi: 'off',
     codex: codex as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1070,36 +1120,43 @@ test('streams local turns through transcript v2 without duplicate legacy content
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
-  let resolveReset!: () => void;
-  let resolveCompleted!: () => void;
-  const resetSeen = new Promise<void>((resolve) => { resolveReset = resolve; });
-  const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-  try {
-    ws = new WebSocket(
-      `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`,
-      ['kimi-code.bearer.test-token'],
-    );
-    ws.onopen = () => {
-      ws?.send(JSON.stringify({
-        type: 'client_hello', id: 'hello-v2',
-        payload: { client_id: 'transcript-test', subscriptions: ['codex_codex-native'] },
-      }));
-      ws?.send(JSON.stringify({
-        type: 'subscribe_v2', id: 'subscribe-v2-stream',
-        payload: { session_id: 'codex_codex-native', transcript: { main: 'delta' } },
-      }));
-    };
-    ws.onmessage = (event) => {
-      const frame = JSON.parse(String(event.data)) as Record<string, any>;
-      frames.push(frame);
-      if (frame.type === 'transcript.reset') resolveReset();
-      if (frame.type === 'transcript.ops' && frame.payload.ops.some((op: any) => op.op === 'turn.upsert' && op.turn.state === 'completed')) {
-        resolveCompleted();
-      }
-    };
+    let resolveReset!: () => void;
+    let resolveCompleted!: () => void;
+    let sawTurnCompleted = false;
+    let sawPromptCompleted = false;
+    const resetSeen = new Promise<void>((resolve) => { resolveReset = resolve; });
+    const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+    try {
+      ws = new WebSocket(
+        `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`,
+        ['kimi-code.bearer.test-token'],
+      );
+      ws.onopen = () => {
+        ws?.send(JSON.stringify({
+          type: 'client_hello', id: 'hello-v2',
+          payload: { client_id: 'transcript-test', subscriptions: ['codex_codex-native'] },
+        }));
+        ws?.send(JSON.stringify({
+          type: 'subscribe_v2', id: 'subscribe-v2-stream',
+          payload: { session_id: 'codex_codex-native', transcript: { main: 'delta' } },
+        }));
+      };
+      ws.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data)) as Record<string, any>;
+        frames.push(frame);
+        if (frame.type === 'transcript.reset') resolveReset();
+        if (frame.type === 'transcript.ops') {
+          const ops = frame.payload.ops as Array<Record<string, any>>;
+          if (ops.some((op) => op.op === 'turn.upsert' && op.turn?.state === 'completed')) sawTurnCompleted = true;
+          if (ops.some((op) => op.op === 'prompt.upsert' && op.prompt?.status === 'completed')) sawPromptCompleted = true;
+          if (sawTurnCompleted && sawPromptCompleted) resolveCompleted();
+        }
+      };
     await Promise.race([
       resetSeen,
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('transcript reset timed out')), 1_000)),
@@ -1185,6 +1242,8 @@ test('filters transcript v2 operations independently for turn, block, and delta 
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const grades = ['turn', 'block', 'delta'] as const;
   const sockets: WebSocket[] = [];
@@ -1263,6 +1322,8 @@ test('replays covered transcript cursors and resets incomplete cursors', async (
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const sockets: WebSocket[] = [];
   try {
@@ -1366,6 +1427,8 @@ test('projects Codex local commands into transcript v2', async () => {
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: fakeAdapter('codex') as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1450,6 +1513,8 @@ test('projects a queued prompt into transcript v2 while another turn is running'
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1554,6 +1619,8 @@ test('settles steered queued prompts without ending the active prompt', async ()
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1631,6 +1698,8 @@ test('marks the active transcript step failed when a local turn fails', async ()
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1710,6 +1779,8 @@ test('streams a local turn without reloading transcript history after subscribe_
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1779,6 +1850,8 @@ test('settles an aborted active prompt in transcript v2', async () => {
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Array<Record<string, any>> = [];
   let ws: WebSocket | undefined;
@@ -1856,6 +1929,8 @@ test('fans session global events to every local connection without leaking turn 
   const gateway = await startGateway({
     host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
     codex: codex as any, claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const subscribedFrames: Array<Record<string, any>> = [];
   const observerFrames: Array<Record<string, any>> = [];
@@ -1930,6 +2005,8 @@ test('opens a local events socket when kimi is off so the official splash can fi
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const frames: Record<string, unknown>[] = [];
   const ws = new WebSocket(
@@ -1979,6 +2056,8 @@ test('does not fan other-provider session events onto the kimi=off splash socket
     codex: codex as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const splashFrames: Record<string, unknown>[] = [];
   const splash = new WebSocket(
@@ -2039,6 +2118,8 @@ test('returns 502 when kimi is on and the upstream WebSocket is unreachable', as
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const gatewayUrl = new URL(gateway.url);
   try {
@@ -2085,6 +2166,7 @@ test('does not preheat list/models/commands for providers that are not installed
   const claude = fakeAdapter('claude');
   const grok = fakeAdapter('grok');
   const codex = fakeAdapter('codex');
+  const pi = fakeAdapter('pi');
   const calls: string[] = [];
   claude.list = async () => { calls.push('claude.list'); return { items: [] }; };
   claude.listModels = async () => { calls.push('claude.models'); return []; };
@@ -2092,6 +2174,9 @@ test('does not preheat list/models/commands for providers that are not installed
   grok.list = async () => { calls.push('grok.list'); return { items: [] }; };
   grok.listModels = async () => { calls.push('grok.models'); return []; };
   grok.listCommands = async () => { calls.push('grok.cmds'); return []; };
+  pi.list = async () => { calls.push('pi.list'); return { items: [] }; };
+  pi.listModels = async () => { calls.push('pi.models'); return []; };
+  pi.listCommands = async () => { calls.push('pi.cmds'); return []; };
   let resolveCodex!: () => void;
   const codexWarmed = new Promise<void>((resolve) => { resolveCodex = resolve; });
   const originalList = codex.list.bind(codex);
@@ -2110,6 +2195,7 @@ test('does not preheat list/models/commands for providers that are not installed
     codex: codex as any,
     claude: claude as any,
     grok: grok as any,
+    pi: pi as any,
   });
   try {
     await Promise.race([
@@ -2118,7 +2204,7 @@ test('does not preheat list/models/commands for providers that are not installed
     ]);
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(calls.includes('codex.list'), true);
-    assert.equal(calls.some((name) => name.startsWith('claude.') || name.startsWith('grok.')), false);
+    assert.equal(calls.some((name) => name.startsWith('claude.') || name.startsWith('grok.') || name.startsWith('pi.')), false);
   } finally {
     await gateway.close();
   }
@@ -2143,6 +2229,8 @@ test('keeps grok WebSocket local instead of tunneling to Kimi', async () => {
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const ws = new WebSocket(
     `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=grok`,
@@ -2172,6 +2260,8 @@ test('acknowledges a local provider WebSocket close frame', async () => {
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const ws = new WebSocket(
     `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`,
@@ -2207,6 +2297,8 @@ test('closes the gateway while a WebSocket connection is still open', async () =
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const port = Number(new URL(gateway.url).port);
   const socket = createConnection(port, '127.0.0.1');
@@ -2250,6 +2342,8 @@ test('returns 404 for a missing local session instead of fabricating one', async
     kimi: 'off',
     codex: codex as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/codex_missing`, {
@@ -2274,6 +2368,8 @@ test('returns an empty message page before a Claude transcript is materialized',
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/claude_new/messages`, {
@@ -2294,6 +2390,7 @@ test('reports only installed providers in /meta', async () => {
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
     availableProviders: ['kimi', 'codex'],
+    pi: fakeAdapter('pi') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/meta`, {
@@ -2305,7 +2402,7 @@ test('reports only installed providers in /meta', async () => {
   }
 });
 
-test('detectAvailableProviders honors CLAUDE_BIN, GROK_BIN and CODEX_PATH presence', async () => {
+test('detectAvailableProviders honors CLAUDE_BIN, GROK_BIN, CODEX_PATH and PI_BIN presence', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-avail-'));
   try {
     const claudeBin = join(base, 'claude');
@@ -2314,13 +2411,23 @@ test('detectAvailableProviders honors CLAUDE_BIN, GROK_BIN and CODEX_PATH presen
     const grokBin = join(base, 'grok');
     await writeFile(grokBin, '#!/bin/sh\n');
 
-    const present = detectAvailableProviders({ CLAUDE_BIN: claudeBin, GROK_BIN: grokBin, CODEX_PATH: '/bin/true', PATH: '' });
-    assert.deepEqual(present, ['kimi', 'claude', 'grok', 'codex']);
+    const piBin = join(base, 'pi');
+    await writeFile(piBin, '#!/bin/sh\n');
+
+    const present = detectAvailableProviders({
+      CLAUDE_BIN: claudeBin,
+      GROK_BIN: grokBin,
+      CODEX_PATH: '/bin/true',
+      PI_BIN: piBin,
+      PATH: '',
+    });
+    assert.deepEqual(present, ['kimi', 'claude', 'grok', 'codex', 'pi']);
 
     const missing = detectAvailableProviders({
       CLAUDE_BIN: join(base, 'missing-claude'),
       GROK_BIN: join(base, 'missing-grok'),
       CODEX_PATH: join(base, 'missing-codex'),
+      PI_BIN: join(base, 'missing-pi'),
       PATH: '',
     });
     assert.deepEqual(missing, ['kimi']);
@@ -2338,12 +2445,16 @@ test('detectAvailableProviders includes claude when a fake claude is on PATH', a
     // CLAUDE_BIN 指向不存在的路径,迫使探测走 PATH,而不是 ~/.local/bin/claude。
     const found = detectAvailableProviders({
       CLAUDE_BIN: join(base, 'missing-claude'),
+      GROK_BIN: join(base, 'missing-grok'),
+      PI_BIN: join(base, 'missing-pi'),
       PATH: base,
     });
     assert.equal(found.includes('claude'), true);
 
     const missing = detectAvailableProviders({
       CLAUDE_BIN: join(base, 'missing-claude'),
+      GROK_BIN: join(base, 'missing-grok'),
+      PI_BIN: join(base, 'missing-pi'),
       PATH: '',
     });
     assert.equal(missing.includes('claude'), false);
@@ -2361,6 +2472,7 @@ test('startGateway({kimi:off}) GET /api/v1/auth is 200 ready true without kimi c
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
     availableProviders: ['claude', 'codex', 'grok'],
+    pi: fakeAdapter('pi') as any,
   });
   const get = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     headers: { authorization: 'Bearer gateway-token' },
@@ -2380,7 +2492,7 @@ test('startGateway({kimi:off}) GET /api/v1/auth is 200 ready true without kimi c
     assert.equal(meta.status, 200);
     const metaData = (await meta.json() as any).data;
     assert.deepEqual(metaData.providers, ['claude', 'codex', 'grok']);
-    assert.match(String(metaData.server_version), /Kimi 0\.40\.1 compatible/);
+    assert.match(String(metaData.server_version), /Kimi 2\.6\.2 compatible/);
 
     const models = await get('/models');
     assert.equal(models.status, 200);
@@ -2400,6 +2512,8 @@ test('rejects grok swarm and goal the same way as Claude', async () => {
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const post = (path: string, body: unknown) => fetch(`${gateway.url}/api/v1${path}`, {
     method: 'POST',
@@ -2438,6 +2552,8 @@ test('surfaces provider model catalog errors instead of faking an empty list', a
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/models?provider=claude`, {
@@ -2463,6 +2579,8 @@ test('GATEWAY_DEMO does not replace a failed Claude model catalog', async () => 
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/models?provider=claude`, {
@@ -2503,6 +2621,8 @@ test('keeps a running turn visible when the first history fetch fails but a late
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/prompts`, {
@@ -2540,6 +2660,8 @@ test('surfaces provider DTO catalog errors instead of faking an empty list', asy
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/providers?provider=claude`, {
@@ -2561,6 +2683,8 @@ test('rejects unsupported Claude goal routes and profile controls', async () => 
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const get = (path: string, init: RequestInit = {}) => fetch(`${gateway.url}/api/v1${path}`, {
     ...init,
@@ -2604,6 +2728,8 @@ test('rejects swarm mode requests for local Claude and Codex providers', async (
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     for (const provider of ['claude', 'codex'] as const) {
@@ -2645,6 +2771,8 @@ test('rejects Kimi swarm/goal fields on local prompt submit', async () => {
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const post = (path: string, body: Record<string, unknown>) => fetch(`${gateway.url}/api/v1${path}`, {
     method: 'POST',
@@ -2684,6 +2812,8 @@ test('lets unauthenticated CORS preflight through to the OPTIONS handler', async
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`, { method: 'OPTIONS' });
@@ -2703,6 +2833,8 @@ test('rejects oversized request bodies instead of buffering unbounded memory', a
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions?provider=claude`, {
@@ -2733,6 +2865,8 @@ test('disposes provider adapters on gateway close', async () => {
     codex: codex as any,
     claude: claude as any,
     grok: grok as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   await gateway.close();
   assert.deepEqual(disposed.sort(), ['claude', 'codex', 'grok']);
@@ -2746,6 +2880,8 @@ test('GET /models?provider=grok returns adapter items', async () => {
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/models?provider=grok`, {
@@ -2773,6 +2909,8 @@ test('session id grok_<id> is not proxied to kimi', async () => {
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/grok_grok-native`, {
@@ -2806,6 +2944,7 @@ test('meta providers includes grok when availableProviders includes it', async (
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
     availableProviders: ['kimi', 'claude', 'codex', 'grok'],
+    pi: fakeAdapter('pi') as any,
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/meta`, {
@@ -2832,6 +2971,8 @@ test('PATCH and DELETE local workspaces without wd_codex_/wd_claude_ prefixes st
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const auth = { authorization: 'Bearer gateway-token', 'content-type': 'application/json' };
   try {
@@ -2897,6 +3038,8 @@ test('GET grok session status fills max_context_tokens from grok window when usa
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const response = await fetch(`${gateway.url}/api/v1/sessions/grok_grok-native/status`, {
@@ -2965,6 +3108,8 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: grok as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   try {
     const grouped = await fetch(
@@ -2994,6 +3139,8 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
       codex: empty as any,
       claude: fakeAdapter('claude') as any,
       grok: fakeAdapter('grok') as any,
+      pi: fakeAdapter('pi') as any,
+      availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
     });
     try {
       const response = await fetch(
@@ -3039,6 +3186,8 @@ test('0.39 remote control, local title/generate and :cancel stay on the right si
     codex: fakeAdapter('codex') as any,
     claude: claude as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const auth = { authorization: 'Bearer gateway-token', 'content-type': 'application/json' };
   try {
@@ -3099,6 +3248,8 @@ test('0.39 task detach is proxied for Kimi and 400 for local providers', async (
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any,
     grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
   });
   const post = (path: string) => fetch(`${gateway.url}/api/v1${path}`, {
     method: 'POST',
@@ -3125,3 +3276,1124 @@ test('0.39 task detach is proxied for Kimi and 400 for local providers', async (
   }
 });
 
+
+test('Pi routing, wireModelDto, capability gating, and Pi slash commands work end-to-end', async () => {
+  const calls: string[] = [];
+  const pi = fakeAdapter('pi');
+  pi.listModels = async () => [{
+    provider: 'pi',
+    model: 'anthropic/claude-sonnet-4',
+    display_name: 'Claude Sonnet 4',
+    max_context_size: 200_000,
+    max_output_tokens: 16_384,
+    capabilities: ['thinking', 'vision'],
+    support_efforts: ['low', 'medium', 'high'],
+    supportsAdaptiveThinking: true,
+  }];
+  pi.clone = async (id: string) => ({
+    id: `${id}-clone`,
+    workspace_id: '',
+    title: 'Pi Clone',
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date().toISOString(),
+    busy: false,
+    metadata: { cwd: '/tmp' },
+    provider: 'pi',
+  });
+  pi.fork = async (id: string) => ({
+    id: `${id}-fork`,
+    workspace_id: '',
+    title: 'Pi Fork',
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date().toISOString(),
+    busy: false,
+    metadata: { cwd: '/tmp' },
+    provider: 'pi',
+  });
+  pi.compact = async (_id: string, instr?: string) => { calls.push(`compact:${instr ?? ''}`); };
+  pi.delete = async (id: string) => { calls.push(`delete:${id}`); };
+  pi.resolveQuestion = async (_id: string, qid: string) => { calls.push(`question:${qid}`); };
+
+  let upstreamHits = 0;
+  const upstream = await listen(createServer((_req, res) => {
+    upstreamHits += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(envelope({ upstream: true }));
+  }));
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: pi as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const reqJson = (path: string, method = 'GET', body?: unknown) => fetch(`${gateway.url}/api/v1${path}`, {
+    method,
+    headers: {
+      authorization: 'Bearer gateway-token',
+      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  try {
+    const modelsRes = await reqJson('/models?provider=pi');
+    assert.equal(modelsRes.status, 200);
+    const modelDto = (await modelsRes.json() as any).data.items[0];
+    assert.equal(modelDto.max_output_size, 16_384);
+    assert.equal(modelDto.adaptive_thinking, true);
+
+    assert.equal((await reqJson('/sessions/pi_pi-native:clone', 'POST', {})).status, 200);
+    assert.equal((await reqJson('/sessions/pi_pi-native:fork', 'POST', {})).status, 200);
+    assert.equal((await reqJson('/sessions/pi_pi-native:compact', 'POST', { instruction: 'trim' })).status, 200);
+
+    assert.equal((await reqJson('/sessions/pi_pi-native:undo', 'POST', {})).status, 400);
+    assert.equal((await reqJson('/sessions?provider=pi', 'POST', { cwd: '/tmp', agent_config: { permission_mode: 'manual' } })).status, 400);
+    assert.equal((await reqJson('/sessions?provider=pi', 'POST', { cwd: '/tmp', agent_config: { plan_mode: true } })).status, 400);
+    assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: 'hi' }], permission_mode: 'manual' })).status, 400);
+    assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: 'hi' }], plan_mode: true })).status, 400);
+    const approvalsRes = await reqJson('/sessions/pi_pi-native/approvals');
+    assert.equal(approvalsRes.status, 200);
+    assert.deepEqual((await approvalsRes.json() as any).data.items, []);
+    assert.equal((await reqJson('/sessions/pi_pi-native/approvals/ap-1', 'POST', { decision: 'approved' })).status, 400);
+    assert.equal((await reqJson('/sessions/pi_pi-native/interactions/ap-1', 'POST', { kind: 'approval', decision: 'approved' })).status, 400);
+
+    const qRes = await reqJson('/sessions/pi_pi-native/interactions/q-1', 'POST', {
+      kind: 'question',
+      answers: { pick: { kind: 'single', option_id: 'yes' } },
+    });
+    assert.equal(qRes.status, 200);
+    assert.equal((await qRes.json() as any).data.outcome, 'answered');
+
+    for (const cmd of ['/status', '/usage', '/clone', '/fork', '/compact keep']) {
+      const res = await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: cmd }] });
+      assert.equal(res.status, 200, `${cmd} should return 200`);
+    }
+    assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: '/undo' }] })).status, 400);
+    assert.equal((await reqJson('/sessions/pi_pi-native:delete', 'POST', {})).status, 200);
+    assert.equal(upstreamHits, 0);
+    assert.ok(calls.includes('compact:trim'));
+    assert.ok(calls.includes('compact:keep'));
+    assert.ok(calls.includes('delete:pi-native'));
+    assert.ok(calls.includes('question:q-1'));
+  } finally {
+    await gateway.close();
+    await upstream.close();
+  }
+});
+
+test('rejects tower mode for all local providers and allows Grok compact/goal when advertised', async () => {
+  const grok = fakeAdapter('grok');
+  let savedGoal: Record<string, unknown> | null = null;
+  (grok as any).capabilities = () => ({
+    streaming: true, thinking: true, tools: true, approvals: true, questions: true, interrupt: true, history: true,
+    compact: true, rollback: true, goals: true,
+  });
+  grok.compact = async () => {};
+  grok.setGoal = async (_id: string, objective: string) => {
+    savedGoal = { goalId: 'g1', objective, status: 'active', tokensUsed: 12, tokenBudget: 100 };
+    return savedGoal;
+  };
+  grok.getGoal = async () => savedGoal;
+
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: grok as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const reqJson = (path: string, method = 'POST', body?: unknown) => fetch(`${gateway.url}/api/v1${path}`, {
+    method,
+    headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  try {
+    for (const p of ['claude', 'codex', 'grok', 'pi'] as const) {
+      const sid = `${p}_${p}-native`;
+      assert.equal((await reqJson(`/sessions/${sid}:tower`, 'POST', {})).status, 400);
+      assert.equal((await reqJson(`/sessions/${sid}/profile`, 'POST', { agent_config: { tower_mode: true } })).status, 400);
+      assert.equal((await reqJson(`/sessions/${sid}/prompts`, 'POST', { content: [{ type: 'text', text: 'hi' }], tower_mode: true })).status, 400);
+    }
+
+    assert.equal((await reqJson('/sessions/grok_grok-native:compact', 'POST', {})).status, 200);
+    assert.equal((await reqJson('/sessions/grok_grok-native/profile', 'POST', { agent_config: { goal_objective: 'ship m15' } })).status, 200);
+    const goalGet = await reqJson('/sessions/grok_grok-native/goal', 'GET');
+    assert.equal(goalGet.status, 200);
+    const goalData = (await goalGet.json() as any).data;
+    assert.equal(goalData.objective, 'ship m15');
+    assert.equal(goalData.budget.remainingTokens, 88);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('by_workspace fetches all pages beyond 100 sessions and prompts:steer retains attachments', async () => {
+  const codex = fakeAdapter('codex');
+  const allItems: Session[] = Array.from({ length: 115 }, (_, idx) => ({
+    id: `c-${idx}`,
+    workspace_id: '',
+    title: `Session ${idx}`,
+    created_at: new Date(idx * 1000).toISOString(),
+    updated_at: new Date(1_700_000_000_000 + idx * 1000).toISOString(),
+    busy: false,
+    metadata: { cwd: idx % 2 === 0 ? '/tmp/ws-a' : '/tmp/ws-b' },
+    provider: 'codex',
+  }));
+  codex.list = async (query: ListSessionsQuery = {}): Promise<SessionPage> => {
+    const start = query.cursor ? Number(query.cursor) : 0;
+    const limit = query.limit ?? 100;
+    const slice = allItems.slice(start, start + limit);
+    return {
+      items: slice,
+      ...(start + slice.length < allItems.length ? { next_cursor: String(start + slice.length) } : {}),
+    };
+  };
+
+  let releaseTurn!: () => void;
+  const turnReleased = new Promise<void>((resolve) => { releaseTurn = resolve; });
+  const steers: Array<{ text: string; attachments?: unknown[] }> = [];
+  (codex as any).capabilities = () => ({ ...capabilities, steer: true, steerAttachments: false });
+  codex.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'live-turn',
+    events: (async function* () {
+      await turnReleased;
+      yield { sessionId: 'c-0', turnId: 'live-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+    })(),
+  });
+  codex.steer = async (_sid: string, _tid: string, text: string, attachments?: unknown[]) => {
+    steers.push({ text, attachments });
+  };
+
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-m15-steer-'));
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir,
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  try {
+    const groupsRes = await fetch(`${gateway.url}/api/v2/sessions?provider=codex&view=by_workspace&group.page_size=100`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(groupsRes.status, 200);
+    const groups = (await groupsRes.json() as any).data.groups as Array<{ sessions: unknown[]; total: number }>;
+    assert.equal(groups.reduce((acc, g) => acc + g.total, 0), 115);
+    assert.equal(groups.reduce((acc, g) => acc + g.sessions.length, 0), 115);
+
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+    const form = new FormData();
+    form.append('file', new Blob([pngBytes], { type: 'image/png' }), 'pic.png');
+    const upRes = await fetch(`${gateway.url}/api/v1/files`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token' },
+      body: form,
+    });
+    assert.equal(upRes.status, 200);
+    const fileId = (await upRes.json() as any).data.id as string;
+
+    await fetch(`${gateway.url}/api/v1/sessions/codex_c-0/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: 'first' }] }),
+    });
+    const queuedRes = await fetch(`${gateway.url}/api/v1/sessions/codex_c-0/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        content: [
+          { type: 'text', text: 'follow up' },
+          { type: 'image', source: { kind: 'file', file_id: fileId } },
+        ],
+      }),
+    });
+    const queuedPromptId = (await queuedRes.json() as any).data.prompt_id as string;
+    const steerRes = await fetch(`${gateway.url}/api/v1/sessions/codex_c-0/prompts:steer`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt_ids: [queuedPromptId] }),
+    });
+    assert.equal(steerRes.status, 200);
+    assert.equal(steers.length, 1);
+    assert.match(steers[0].text, /follow up/);
+    assert.match(steers[0].text, /\[attached image:/);
+  } finally {
+    releaseTurn();
+    await gateway.close();
+    await rm(settingsDir, { recursive: true, force: true });
+  }
+});
+
+test('uploadStore persists metadata sidecars across restarts, sniffs PNG magic bytes, and neuters active web MIMEs', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-m15-upload-'));
+  let gateway1 = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir,
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  let pngId = '';
+  let spoofId = '';
+  let svgId = '';
+  try {
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]);
+    const form1 = new FormData();
+    form1.append('file', new Blob([pngBytes], { type: 'image/jpeg' }), 'snap.png');
+    const r1 = await fetch(`${gateway1.url}/api/v1/files`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token' },
+      body: form1,
+    });
+    assert.equal(r1.status, 200);
+    const meta1 = (await r1.json() as any).data;
+    assert.equal(meta1.media_type, 'image/png');
+    pngId = meta1.id;
+
+    const formSpoof = new FormData();
+    formSpoof.append('file', new Blob(['<html><script>alert(1)</script></html>'], { type: 'image/png' }), 'fake.png');
+    const rSpoof = await fetch(`${gateway1.url}/api/v1/files`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token' },
+      body: formSpoof,
+    });
+    assert.equal(rSpoof.status, 200);
+    const metaSpoof = (await rSpoof.json() as any).data;
+    assert.equal(metaSpoof.media_type, 'application/octet-stream');
+    spoofId = metaSpoof.id;
+
+    const form2 = new FormData();
+    form2.append('file', new Blob(['<svg onload="alert(1)"/>'], { type: 'image/svg+xml' }), 'xss.svg');
+    const r2 = await fetch(`${gateway1.url}/api/v1/files`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token' },
+      body: form2,
+    });
+    assert.equal(r2.status, 200);
+    const meta2 = (await r2.json() as any).data;
+    assert.equal(meta2.media_type, 'application/octet-stream');
+    svgId = meta2.id;
+  } finally {
+    await gateway1.close();
+  }
+
+  const gateway2 = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir,
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  try {
+    const getPng = await fetch(`${gateway2.url}/api/v1/files/${pngId}`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(getPng.status, 200);
+    assert.equal(getPng.headers.get('content-type'), 'image/png');
+    assert.equal(getPng.headers.get('x-content-type-options'), 'nosniff');
+
+    const getSpoof = await fetch(`${gateway2.url}/api/v1/files/${spoofId}`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(getSpoof.status, 200);
+    assert.equal(getSpoof.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(getSpoof.headers.get('x-content-type-options'), 'nosniff');
+
+    const getSvg = await fetch(`${gateway2.url}/api/v1/files/${svgId}`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(getSvg.status, 200);
+    assert.equal(getSvg.headers.get('content-type'), 'application/octet-stream');
+    assert.equal(getSvg.headers.get('x-content-type-options'), 'nosniff');
+  } finally {
+    await gateway2.close();
+    await rm(settingsDir, { recursive: true, force: true });
+  }
+});
+
+test('subscribe_v2 rolls back on history error and 2.6.2 WS + secondary fallbacks work cleanly', async () => {
+  const wsDir = await mkdtemp(join(tmpdir(), 'multi-agent-m15-262-'));
+  const subDir = join(wsDir, 'sub');
+  const outsideDir = await mkdtemp(join(tmpdir(), 'multi-agent-m15-out-'));
+  await mkdir(subDir, { recursive: true });
+
+  const codex = fakeAdapter('codex');
+  let failHistory = true;
+  (codex as any).capabilities = () => ({ ...capabilities, rollback: true, compact: true, steer: true });
+  codex.getUsage = () => ({
+    input_tokens: 10,
+    output_tokens: 5,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+    context_tokens: 15,
+    context_limit: 200_000,
+    total_cost_usd: 0,
+    turn_count: 1,
+  });
+  codex.getHistory = async () => {
+    if (failHistory) throw new Error('boom history');
+    return [
+      { id: 'u1', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'turn one' }], created_at: '2026-01-01T00:00:01.000Z' },
+      { id: 'a1', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'answer one' }], created_at: '2026-01-01T00:00:02.000Z' },
+    ];
+  };
+  codex.list = async (): Promise<SessionPage> => ({
+    items: [{
+      id: 'codex-native', workspace_id: '', title: 'codex 262', created_at: new Date(0).toISOString(), updated_at: new Date().toISOString(), busy: false, metadata: { cwd: wsDir }, provider: 'codex',
+    }],
+  });
+  codex.rollback = async () => {};
+  codex.compact = async () => {};
+  codex.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'v262-turn',
+    events: (async function* () {
+      yield { sessionId: 'codex-native', turnId: 'v262-turn', kind: 'message', status: 'delta', timestamp: Date.now(), payload: { delta: 'hi 262' } } as any;
+      yield { sessionId: 'codex-native', turnId: 'v262-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+    })(),
+  });
+
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+
+  const reqJson = (path: string, method = 'GET', body?: unknown) => fetch(`${gateway.url}/api/v1${path}`, {
+    method,
+    headers: {
+      authorization: 'Bearer gateway-token',
+      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+
+  let wsV2: WebSocket | undefined;
+  let ws262: WebSocket | undefined;
+  try {
+    // 1. subscribe_v2 failure rollback
+    wsV2 = new WebSocket(`${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`, ['kimi-code.bearer.gateway-token']);
+    const ackErr = await new Promise<Record<string, any>>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('ack timeout')), 2_000);
+      wsV2!.onopen = () => wsV2!.send(JSON.stringify({
+        type: 'subscribe_v2',
+        id: 'sub-fail',
+        payload: { session_id: 'codex_codex-native', transcript: { main: 'delta' } },
+      }));
+      wsV2!.onmessage = (e) => {
+        const msg = JSON.parse(String(e.data)) as Record<string, any>;
+        if (msg.type === 'ack' && msg.id === 'sub-fail') {
+          clearTimeout(t);
+          resolve(msg);
+        }
+      };
+    });
+    assert.equal(ackErr.code, 1);
+    assert.deepEqual(ackErr.payload.resync_required, ['codex_codex-native']);
+
+    // 2. Enable history & verify 2.6.2 turns + WS subscribe + :undo/:reload/batch fallbacks
+    failHistory = false;
+    const turnsRes = await reqJson('/sessions/codex_codex-native/agents/main/turns');
+    assert.equal(turnsRes.status, 200);
+    assert.equal((await turnsRes.json() as any).data.turns.length, 1);
+
+    const v262Frames: Array<Record<string, any>> = [];
+    let resolveSub!: () => void;
+    let resolveTurnEnd!: () => void;
+    let resolveRemoved!: () => void;
+    const subDone = new Promise<void>((r) => { resolveSub = r; });
+    const turnDone = new Promise<void>((r) => { resolveTurnEnd = r; });
+    const removedDone = new Promise<void>((r) => { resolveRemoved = r; });
+
+    ws262 = new WebSocket(`${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`, ['kimi-code.bearer.gateway-token']);
+    ws262.onopen = () => ws262!.send(JSON.stringify({
+      type: 'subscribe',
+      request_id: 'req-262',
+      session_id: 'codex_codex-native',
+    }));
+    ws262.onmessage = (e) => {
+      const m = JSON.parse(String(e.data)) as Record<string, any>;
+      v262Frames.push(m);
+      if (
+        v262Frames.some((f) => f.type === 'turns' && f.session_id === 'codex_codex-native')
+        && v262Frames.some((f) => f.type === 'agent' && f.session_id === 'codex_codex-native')
+        && v262Frames.some((f) => f.type === 'usage' && f.session_id === 'codex_codex-native')
+      ) {
+        resolveSub();
+      }
+      if (m.type === 'turn.ended') resolveTurnEnd();
+      if (m.type === 'turns.removed') resolveRemoved();
+    };
+    await subDone;
+    assert.ok(v262Frames.some((m) => m.type === 'response' && m.request_id === 'req-262' && m.code === 0));
+    assert.ok(v262Frames.some((m) => m.type === 'agent'));
+    assert.ok(v262Frames.some((m) => m.type === 'usage'));
+
+    assert.equal((await reqJson('/sessions/codex_codex-native/prompts', 'POST', { content: [{ type: 'text', text: 'stream 262' }] })).status, 200);
+    await turnDone;
+    assert.ok(v262Frames.some((m) => m.type === 'turn.started'));
+    assert.ok(v262Frames.some((m) => m.type === 'item.delta' && m.delta === 'hi 262'));
+
+    const undoRes = await reqJson('/sessions/codex_codex-native:undo', 'POST', { count: 1 });
+    assert.equal(undoRes.status, 200);
+    assert.equal((await undoRes.json() as any).data.removed_turn_ids.length, 1);
+    await removedDone;
+
+    // 3. 2.6.2 secondary endpoints
+    assert.equal((await reqJson('/sessions/codex_codex-native:reload', 'POST', {})).status, 200);
+    assert.deepEqual((await (await reqJson('/sessions/codex_codex-native/file-history/changes')).json() as any).data, { recorded: false, changes: [] });
+    assert.deepEqual((await (await reqJson('/sessions/codex_codex-native/fs:pull_request:batch', 'POST', { roots: [wsDir] })).json() as any).data, { results: {}, errors: {} });
+
+    const gitBatchRes = await reqJson('/sessions/codex_codex-native/fs:git_status:batch', 'POST', { roots: [subDir, outsideDir] });
+    assert.equal(gitBatchRes.status, 200);
+    const gitBatch = (await gitBatchRes.json() as any).data;
+    assert.ok(gitBatch.results[subDir]);
+    assert.equal(gitBatch.errors[outsideDir]?.code, 40301);
+
+    assert.deepEqual((await (await reqJson('/workspaces/project-config-dirs')).json() as any).data, { additional_dirs: [] });
+    assert.deepEqual((await (await reqJson('/workspaces/wd_test/trust')).json() as any).data, { trusted: true });
+    assert.deepEqual((await (await reqJson('/workspaces/wd_test/trust', 'POST', {})).json() as any).data, { trusted: true });
+    assert.equal((await reqJson('/workspaces/wd_test/primary', 'POST', { path: wsDir })).status, 200);
+  } finally {
+    wsV2?.close();
+    ws262?.close();
+    await gateway.close();
+    await rm(wsDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('adapts Web UI slash menus, colon/attachment skill activation, extension notices, and per-provider commands', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'gw-web-cmds-'));
+  const calls: string[] = [];
+  let reviewCalls: any[] = [];
+  const codex = fakeAdapter('codex');
+  codex.getCwd = () => cwd;
+  codex.listSkills = async () => [
+    { name: 'proj-skill', description: 'Project skill', path: join(cwd, 'SKILL.md'), scope: 'project', enabled: true },
+    { name: 'status', description: 'Duplicate xM status', path: join(cwd, 'DUP.md'), scope: 'user', enabled: true },
+  ];
+  codex.listCommands = async () => [
+    { name: 'new', description: 'New', kind: 'client' },
+    { name: 'compact', description: 'Compact', kind: 'prompt', acceptsInput: false },
+    { name: 'review', description: 'Review code', kind: 'prompt', acceptsInput: true, argumentHint: '[instructions]' },
+    { name: 'goal', description: 'Goal', kind: 'prompt', acceptsInput: true, argumentHint: '<objective> | status' },
+    { name: 'diff', description: 'Git diff', kind: 'prompt', acceptsInput: false },
+    { name: 'help', description: 'Help', kind: 'prompt', acceptsInput: false },
+  ];
+  codex.review = async (_id: string, opts?: any) => {
+    reviewCalls.push(opts);
+    return {
+      turnId: 'rev-turn',
+      events: (async function* () {
+        yield { sessionId: 'codex-native', turnId: 'rev-turn', kind: 'message', status: 'delta', timestamp: Date.now(), payload: { delta: 'review-ok' } } as any;
+        yield { sessionId: 'codex-native', turnId: 'rev-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+  let savedGoal: Record<string, unknown> | null = null;
+  codex.setGoal = async (_id, obj) => { savedGoal = { goalId: 'g1', objective: obj, status: 'active' }; return savedGoal; };
+  codex.getGoal = async () => savedGoal;
+  codex.controlGoal = async (_id, ctrl) => { savedGoal = ctrl === 'cancel' ? null : { ...savedGoal, status: ctrl === 'pause' ? 'paused' : 'active' }; return savedGoal; };
+  codex.cleanTerminals = async () => { calls.push('codex.cleanTerminals'); };
+  codex.gitDiff = async () => ({ sha: 'abc123', diff: 'diff --git a/a.ts b/a.ts\n+hi\n' });
+
+  const claude = fakeAdapter('claude');
+  claude.getCwd = () => cwd;
+  claude.listCommands = async () => [
+    { name: 'compact', description: 'Compact', kind: 'prompt', builtin: true },
+    { name: 'color', description: 'Terminal color', kind: 'prompt', builtin: true, terminalOnly: true },
+    { name: 'sub:deploy', description: 'Sub command', kind: 'prompt', path: '/tmp/sub/deploy.md', scope: 'user' },
+    { name: 'status', description: 'Status', kind: 'prompt', builtin: true },
+    { name: 'help', description: 'Help', kind: 'prompt', builtin: true },
+  ];
+  const claudeStarted: StartTurnInput[] = [];
+  claude.startTurn = async (input: StartTurnInput) => {
+    claudeStarted.push(input);
+    return {
+      turnId: 'cl-turn',
+      events: (async function* () {
+        yield { sessionId: 'claude-native', turnId: 'cl-turn', kind: 'message', status: 'delta', timestamp: Date.now(), payload: { delta: 'claude-ok' } } as any;
+        yield { sessionId: 'claude-native', turnId: 'cl-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  const grok = fakeAdapter('grok');
+  grok.getCwd = () => cwd;
+  (grok as any).capabilities = () => ({ ...capabilities, compact: true, rollback: true, fork: true, goals: true });
+  const grokStarted: string[] = [];
+  grok.startTurn = async (input: StartTurnInput) => {
+    grokStarted.push(String(input.input));
+    return {
+      turnId: 'gr-turn',
+      events: (async function* () {
+        yield { sessionId: 'grok-native', turnId: 'gr-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  const pi = fakeAdapter('pi') as any;
+  pi.getCwd = () => cwd;
+  pi.setAutoCompaction = async (_id: string, enabled: boolean) => { calls.push(`pi.auto:${enabled}`); return enabled; };
+  pi.getAutoCompaction = async () => false;
+  pi.getLastAssistantText = async () => 'Last Pi reply body';
+  pi.getSessionTree = async () => ({ leafId: 'n2', tree: [{ entry: { id: 'n1', type: 'message', message: { role: 'user' } }, children: [{ entry: { id: 'n2', type: 'message', message: { role: 'assistant' } }, children: [] }] }] });
+  pi.getSessionStats = async () => ({ userMessages: 2, assistantMessages: 2, toolCalls: 1, tokens: { input: 100, output: 50, cacheRead: 20 }, cost: 0.01, contextUsage: { tokens: 150, contextWindow: 1000, percent: 15 } });
+  pi.rename = async (_id: string, title: string) => { calls.push(`pi.rename:${title}`); };
+  pi.startTurn = async (input: StartTurnInput) => {
+    calls.push(`pi.turn:${String(input.input)}`);
+    return {
+      turnId: 'pi-mcp-turn',
+      events: (async function* () {
+        yield { sessionId: 'pi-native', turnId: 'pi-mcp-turn', kind: 'notice', status: 'completed', timestamp: Date.now(), payload: { level: 'info', message: 'MCP server ready' } } as any;
+        yield { sessionId: 'pi-native', turnId: 'pi-mcp-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  const gateway = await startGateway({
+    port: 0, token: 'gw-tok', kimi: 'off',
+    codex: codex as any, claude: claude as any, grok: grok as any, pi,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const reqJson = (p: string, method = 'GET', body?: unknown) => fetch(`${gateway.url}/api/v1${p}`, {
+    method,
+    headers: { authorization: 'Bearer gw-tok', ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  try {
+    // 1. /skills strips Kimi xM duplicates, hides terminalOnly, avoids /skill: prefix for built-ins, sets workspace_dir for project skills
+    const codexSkills = (await (await reqJson('/sessions/codex_codex-native/skills')).json() as any).data.skills;
+    assert.equal(codexSkills.some((s: any) => s.name === 'compact' || s.name === 'goal' || s.name === 'status'), false);
+    const reviewSkill = codexSkills.find((s: any) => s.name === 'review');
+    assert.equal(reviewSkill?.source, 'builtin');
+    assert.equal(reviewSkill?.argument_hint, '[instructions]');
+    const projSkill = codexSkills.find((s: any) => s.name === 'proj-skill');
+    assert.equal(projSkill?.source, 'project');
+    assert.equal(projSkill?.workspace_dir, cwd);
+
+    const claudeSkills = (await (await reqJson('/sessions/claude_claude-native/skills')).json() as any).data.skills;
+    assert.equal(claudeSkills.some((s: any) => s.name === 'color'), false);
+    assert.equal(claudeSkills.find((s: any) => s.name === 'sub:deploy')?.source, 'user');
+
+    // 2. Colon command :activate + attachment forwarding
+    const actRes = await reqJson('/sessions/claude_claude-native/skills/sub%3Adeploy:activate', 'POST', {
+      args: 'prod',
+      attachments: [{ type: 'image', source: { kind: 'base64', media_type: 'image/png', data: 'AA==' } }],
+    });
+    assert.equal(actRes.status, 200);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(claudeStarted[0]?.input, '/sub:deploy prod');
+    assert.equal(claudeStarted[0]?.attachments?.[0]?.kind, 'imageDataUrl');
+
+    // 3. Codex /review args + /goal + /diff + /terminals-clean + /help
+    await reqJson('/sessions/codex_codex-native/skills/review:activate', 'POST', { args: 'check auth' });
+    await reqJson('/sessions/codex_codex-native/skills/review:activate', 'POST', { args: '--base main' });
+    await new Promise((r) => setTimeout(r, 40));
+    assert.deepEqual(reviewCalls, [{ instructions: 'check auth' }, { target: { type: 'baseBranch', branch: 'main' } }]);
+    for (const txt of ['/goal ship web ui', '/goal status', '/goal pause', '/diff', '/terminals-clean', '/help']) {
+      assert.equal((await reqJson('/sessions/codex_codex-native/prompts', 'POST', { content: [{ type: 'text', text: txt }] })).status, 200);
+    }
+    assert.ok(calls.includes('codex.cleanTerminals'));
+    const codexTr = (await (await reqJson('/sessions/codex_codex-native/transcript?agent_id=main&page_size=20')).json() as any).data.items;
+    assert.ok(codexTr.some((t: any) => t.prompt === '/diff' && t.steps[0]?.frames[0]?.text.includes('diff --git a/a.ts')));
+
+    // 4. Grok /status, /always-approve on, /feedback graceful interception (no LLM turn spawned!)
+    for (const txt of ['/status', '/info', '/always-approve on', '/feedback hello', '/help']) {
+      assert.equal((await reqJson('/sessions/grok_grok-native/prompts', 'POST', { content: [{ type: 'text', text: txt }] })).status, 200);
+    }
+    assert.equal(grokStarted.length, 0);
+    assert.equal(grok.getPermission?.('grok-native'), 'yolo');
+
+    // 5. Pi notice rendering (/mcp) + Pi RPC gateway commands (/auto-compact, /name, /thinking, /session, /copy, /tree, /settings)
+    assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: '/mcp' }] })).status, 200);
+    await new Promise((r) => setTimeout(r, 40));
+    for (const txt of ['/auto-compact on', '/name WebTitle', '/thinking high', '/session', '/copy', '/tree', '/settings', '/help']) {
+      assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: txt }] })).status, 200);
+    }
+    assert.ok(calls.includes('pi.auto:true'));
+    assert.ok(calls.includes('pi.rename:WebTitle'));
+    const piTr = (await (await reqJson('/sessions/pi_pi-native/transcript?agent_id=main&page_size=20')).json() as any).data.items;
+    assert.ok(piTr.some((t: any) => t.prompt === '/mcp' && t.steps[0]?.frames[0]?.text.includes('MCP server ready')));
+    assert.ok(piTr.some((t: any) => t.prompt === '/copy' && t.steps[0]?.frames[0]?.text.includes('Last Pi reply body')));
+    assert.ok(piTr.some((t: any) => t.prompt === '/tree' && t.steps[0]?.frames[0]?.text.includes('当前叶节点')));
+
+    // 6. Claude gateway-adapted commands + terminal-only fallback + /undo 400
+    for (const txt of ['/status', '/diff', '/skills', '/permissions auto', '/tasks', '/help', '/theme']) {
+      assert.equal((await reqJson('/sessions/claude_claude-native/prompts', 'POST', { content: [{ type: 'text', text: txt }] })).status, 200);
+    }
+    assert.equal(claude.getPermission?.('claude-native'), 'auto');
+    assert.equal((await reqJson('/sessions/claude_claude-native/prompts', 'POST', { content: [{ type: 'text', text: '/undo' }] })).status, 400);
+
+    // 7. runLocalGatewayCommand holds hub.busy so concurrent prompt queues and drains sequentially
+    let releaseTree!: () => void;
+    let treeEntered!: () => void;
+    const treeWait = new Promise<void>((r) => { treeEntered = r; });
+    pi.getSessionTree = async () => {
+      treeEntered();
+      await new Promise<void>((r) => { releaseTree = r; });
+      return { leafId: 'n2', tree: [] };
+    };
+    const treeReq = reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: '/tree' }] });
+    await treeWait;
+    const queuedRes = await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: 'follow up while busy' }] });
+    assert.equal(queuedRes.status, 200);
+    assert.equal(((await queuedRes.json()) as any).data.status, 'queued');
+    releaseTree();
+    assert.equal((await treeReq).status, 200);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(calls.includes('pi.turn:follow up while busy'));
+
+    // 8. /workspaces/:wid/skills passes workspace cwd so project skills include workspace_dir
+    const wsList = (await (await reqJson('/workspaces?provider=codex')).json() as any).data.items as Array<{ id: string; root: string }>;
+    assert.ok(wsList.length > 0);
+    const targetWs = wsList[0]!;
+    let capturedSkillCwd: string | undefined;
+    codex.listSkills = async (_sid?: string, cwdArg?: string) => {
+      capturedSkillCwd = cwdArg;
+      return [{ name: 'ws-only', description: 'Workspace skill', path: join(targetWs.root, 'SKILL.md'), scope: 'project', enabled: true }];
+    };
+    const wsSkills = (await (await reqJson(`/workspaces/${encodeURIComponent(targetWs.id)}/skills?provider=codex`)).json() as any).data.skills;
+    assert.equal(capturedSkillCwd, targetWs.root);
+    assert.equal(wsSkills.find((s: any) => s.name === 'ws-only')?.workspace_dir, targetWs.root);
+
+    // 9. /workspace/fs:list, /workspace/fs:suggest, and /fs:suggest work for local providers
+    await writeFile(join(targetWs.root, 'alpha.ts'), 'export const alpha = 1;\n');
+    const wsListFiles = await reqJson('/workspace/fs:list?provider=codex', 'POST', { workspace: targetWs.id, path: '.' });
+    assert.equal(wsListFiles.status, 200);
+    assert.ok(((await wsListFiles.json()) as any).data.items.some((e: any) => e.name === 'alpha.ts'));
+    const wsSuggest = await reqJson('/workspace/fs:suggest?provider=codex', 'POST', { workspace: targetWs.id, query: 'alpha' });
+    assert.equal(wsSuggest.status, 200);
+    assert.ok(((await wsSuggest.json()) as any).data.items.some((e: any) => e.name === 'alpha.ts'));
+    const rootSuggest = await reqJson('/fs:suggest?provider=codex', 'POST', { roots: [targetWs.root], query: 'alpha' });
+    assert.equal(rootSuggest.status, 200);
+    assert.ok(((await rootSuggest.json()) as any).data.items.some((e: any) => e.name === 'alpha.ts'));
+  } finally {
+    await gateway.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('local workspace creation returns full DTO, persists across restart, resolves workspace_id sessions, and config returns model map', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-ws-persist-'));
+  const projDir = await mkdtemp(join(tmpdir(), 'multi-agent-ws-proj-'));
+  const extraDir = await mkdtemp(join(tmpdir(), 'multi-agent-ws-extra-'));
+  const auth = { authorization: 'Bearer gateway-token', 'content-type': 'application/json' };
+  let capturedCreateCwd: string | undefined;
+  const makeGateway = () => {
+    const codex = fakeAdapter('codex');
+    const origCreate = codex.create.bind(codex);
+    codex.create = async (input) => {
+      capturedCreateCwd = input.cwd;
+      const s = await origCreate(input);
+      return { ...s, metadata: { ...s.metadata, cwd: input.cwd ?? s.metadata.cwd } };
+    };
+    return startGateway({
+      port: 0,
+      token: 'gateway-token',
+      kimi: 'off',
+      settingsDir,
+      codex: codex as any,
+      claude: fakeAdapter('claude') as any,
+      grok: fakeAdapter('grok') as any,
+      pi: fakeAdapter('pi') as any,
+      availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+    });
+  };
+  let gw = await makeGateway();
+  try {
+    // 1. POST /workspaces returns Kimi 2.6.2 fields (including additional_dirs array and managed kind)
+    const createRes = await fetch(`${gw.url}/api/v1/workspaces?provider=codex`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ root: projDir, name: 'GitHub', additional_dirs: [extraDir] }),
+    });
+    assert.equal(createRes.status, 200);
+    const created = ((await createRes.json()) as any).data;
+    assert.ok(created.id.startsWith('wd_'));
+    assert.equal(created.root, projDir);
+    assert.equal(created.name, 'GitHub');
+    assert.equal(created.kind, 'managed');
+    assert.deepEqual(created.additional_dirs, [extraDir]);
+    assert.equal(created.session_count, 0);
+    assert.equal(typeof created.last_opened_at, 'string');
+
+    // Empty root rejected with 400
+    const badCreate = await fetch(`${gw.url}/api/v1/workspaces?provider=codex`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ root: '   ' }),
+    });
+    assert.equal(badCreate.status, 400);
+
+    // 2. PATCH updates name and additional_dirs
+    const patchRes = await fetch(`${gw.url}/api/v1/workspaces/${encodeURIComponent(created.id)}?provider=codex`, {
+      method: 'PATCH',
+      headers: auth,
+      body: JSON.stringify({ name: 'GitHubRenamed', additional_dirs: [] }),
+    });
+    assert.equal(patchRes.status, 200);
+    const patched = ((await patchRes.json()) as any).data;
+    assert.equal(patched.name, 'GitHubRenamed');
+    assert.deepEqual(patched.additional_dirs, []);
+
+    // 3. /api/v1/config returns models as a keyed dictionary (matching Kimi schema)
+    const cfgRes = await fetch(`${gw.url}/api/v1/config?provider=codex`, { headers: auth });
+    assert.equal(cfgRes.status, 200);
+    const cfg = ((await cfgRes.json()) as any).data;
+    assert.equal(Array.isArray(cfg.models), false);
+    assert.equal(typeof cfg.models, 'object');
+
+    // 4. Restart gateway and verify managed workspace persists and resolves workspace_id -> cwd on session create
+    await gw.close();
+    gw = await makeGateway();
+    const listRes = await fetch(`${gw.url}/api/v1/workspaces?provider=codex`, { headers: auth });
+    assert.equal(listRes.status, 200);
+    const items = ((await listRes.json()) as any).data.items as Array<Record<string, unknown>>;
+    const persisted = items.find((w) => w.id === created.id);
+    assert.ok(persisted);
+    assert.equal(persisted.name, 'GitHubRenamed');
+    assert.equal(persisted.kind, 'managed');
+    assert.deepEqual(persisted.additional_dirs, []);
+
+    const sessRes = await fetch(`${gw.url}/api/v1/sessions?provider=codex`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ workspace_id: created.id }),
+    });
+    assert.equal(sessRes.status, 200);
+    const sess = ((await sessRes.json()) as any).data;
+    assert.equal(sess.metadata?.cwd, projDir);
+
+    // 5. DELETE removes persisted workspace
+    const delRes = await fetch(`${gw.url}/api/v1/workspaces/${encodeURIComponent(created.id)}?provider=codex`, {
+      method: 'DELETE',
+      headers: auth,
+    });
+    assert.equal(delRes.status, 200);
+    const afterDel = ((await (await fetch(`${gw.url}/api/v1/workspaces?provider=codex`, { headers: auth })).json()) as any).data.items;
+    assert.equal(afterDel.some((w: any) => w.id === created.id), false);
+  } finally {
+    await gw.close();
+    await rm(settingsDir, { recursive: true, force: true });
+    await rm(projDir, { recursive: true, force: true });
+    await rm(extraDir, { recursive: true, force: true });
+  }
+});
+
+test('2.6.2 skill chip stripping, thinking config/PATCH, wireModelDto off dedup, subagent drawer turns, and normalized Bash/Agent cards', async () => {
+  const startedInputs: Array<{ provider: string; input: string }> = [];
+  const defaultThinking = new Map<string, string>();
+  const makeTestAdapter = (name: 'codex' | 'claude' | 'grok' | 'pi') => {
+    const base = fakeAdapter(name);
+    const origSetThinking = base.setThinking!.bind(base);
+    const origGetThinking = base.getThinking!.bind(base);
+    base.setThinking = async (sid, level) => {
+      if (sid === '__default__') { defaultThinking.set(name, level); return; }
+      await origSetThinking(sid, level);
+    };
+    base.getThinking = (sid) => origGetThinking(sid) ?? defaultThinking.get(name);
+    const origStart = base.startTurn.bind(base);
+    base.startTurn = async (inp) => {
+      startedInputs.push({ provider: name, input: typeof inp.input === 'string' ? inp.input : '' });
+      return origStart(inp);
+    };
+    return base;
+  };
+
+  const codex = makeTestAdapter('codex');
+  const claude = makeTestAdapter('claude');
+  const grok = makeTestAdapter('grok');
+  const pi = makeTestAdapter('pi');
+
+  pi.listModels = async () => [
+    {
+      provider: 'pi',
+      model: 'ccwu/gemini-3.8-flash',
+      display_name: 'Gemini 3.8 Flash',
+      max_context_size: 1_000_000,
+      capabilities: ['vision', 'thinking'],
+      support_efforts: ['off', 'minimal', 'low', 'medium', 'high'],
+      supportsThinkingOff: true,
+    },
+    {
+      provider: 'pi',
+      model: 'kimi-coding/k3',
+      display_name: 'Kimi K3',
+      max_context_size: 1_000_000,
+      capabilities: ['vision', 'thinking'],
+      support_efforts: ['low', 'high', 'max'],
+      supportsThinkingOff: false,
+    },
+  ];
+
+  codex.getHistory = async () => [
+    {
+      id: 'm1',
+      session_id: 'codex-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'inspect repo' }],
+      created_at: '2026-11-15T08:00:00.000Z',
+    },
+    {
+      id: 'm2',
+      session_id: 'codex-native',
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', tool_call_id: 'call_bash_1', tool_name: 'commandExecution', input: { command: 'ls -la', cwd: '/tmp' } },
+        { type: 'tool_result', tool_call_id: 'call_bash_1', output: 'README.md', is_error: false },
+        { type: 'tool_use', tool_call_id: 'call_sub_1', tool_name: 'spawn_agent', input: { message: 'Analyze ovis', agent_type: 'explore' } },
+        { type: 'tool_result', tool_call_id: 'call_sub_1', output: 'agent_id: sub-thread-1\nDone', is_error: false },
+      ],
+      created_at: '2026-11-15T08:00:02.000Z',
+    },
+  ];
+  codex.listSubagents = async () => [{ agentId: 'sub-thread-1', parentToolUseId: 'call_sub_1', description: 'Analyze ovis', subagentType: 'explore' }];
+  codex.getSubagentMessages = async (_sid, agentId) => agentId === 'sub-thread-1'
+    ? [
+        {
+          id: 'sm1',
+          session_id: 'sub-thread-1',
+          role: 'user',
+          content: [{ type: 'text', text: 'Analyze ovis' }],
+          created_at: '2026-11-15T08:00:01.000Z',
+        },
+        {
+          id: 'sm2',
+          session_id: 'sub-thread-1',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Found HerdrSocket ping probe.' }],
+          created_at: '2026-11-15T08:00:02.000Z',
+        },
+      ]
+    : [];
+
+  let emitLiveEvents = false;
+  const origCodexStart = codex.startTurn.bind(codex);
+  codex.startTurn = async (inp) => {
+    if (!emitLiveEvents) return origCodexStart(inp);
+    return {
+      turnId: 'live-turn-1',
+      events: (async function* () {
+        yield {
+          kind: 'tool',
+          status: 'started',
+          sessionId: inp.sessionId,
+          turnId: 'live-turn-1',
+          timestamp: Date.now(),
+          payload: { toolCallId: 'live_bash_1', name: 'exec_command', input: { cmd: 'pwd' } },
+        };
+        yield {
+          kind: 'tool',
+          status: 'completed',
+          sessionId: inp.sessionId,
+          turnId: 'live-turn-1',
+          timestamp: Date.now(),
+          payload: { toolCallId: 'live_bash_1', name: 'exec_command', output: '/tmp', is_error: false },
+        };
+        yield {
+          kind: 'tool',
+          status: 'started',
+          sessionId: inp.sessionId,
+          turnId: 'live-turn-1',
+          timestamp: Date.now(),
+          payload: { toolCallId: 'live_sub_call', name: 'spawn_agent', input: { prompt: 'Check pi-web' } },
+        };
+        yield {
+          kind: 'subagent',
+          status: 'started',
+          sessionId: inp.sessionId,
+          turnId: 'live-turn-1',
+          timestamp: Date.now(),
+          agentId: 'sub-live-99',
+          parentToolUseId: 'live_sub_call',
+          payload: { agentId: 'sub-live-99', parentToolUseId: 'live_sub_call', summary: 'Check pi-web' },
+        };
+        yield {
+          kind: 'tool',
+          status: 'completed',
+          sessionId: inp.sessionId,
+          turnId: 'live-turn-1',
+          timestamp: Date.now(),
+          payload: { toolCallId: 'live_sub_call', name: 'spawn_agent', output: 'done', is_error: false },
+        };
+        yield { kind: 'turn', status: 'completed', sessionId: inp.sessionId, turnId: 'live-turn-1', timestamp: Date.now(), payload: { reason: 'completed' } };
+      })(),
+    };
+  };
+
+  const upstream = await listen(createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.url?.includes('/config')) {
+      return res.end(JSON.stringify({ thinking: { enabled: true, effort: 'xhigh' }, providers: {} }));
+    }
+    res.end(JSON.stringify({}));
+  }));
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: upstream.url, token: 'upstream-token' },
+    codex: codex as any,
+    claude: claude as any,
+    grok: grok as any,
+    pi: pi as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+
+  const reqJson = (path: string, method = 'GET', body?: unknown) => fetch(`${gw.url}/api/v1${path}`, {
+    method,
+    headers: {
+      authorization: 'Bearer gateway-token',
+      ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+
+  let ws: WebSocket | undefined;
+  try {
+    // 1. Skill mention chips stripped cleanly on :activate and /prompts
+    assert.equal((await reqJson('/sessions/grok_grok-native/skills/workflow:activate', 'POST', {
+      args: '[workflow](kimi-code://skill/workflow)',
+    })).status, 200);
+    assert.equal((await reqJson('/sessions/pi_pi-native/skills/thinking:activate', 'POST', {
+      args: '[thinking](kimi-code://skill/thinking?path=%2Ftmp) high',
+    })).status, 200);
+    assert.equal((await reqJson('/sessions/claude_claude-native/prompts', 'POST', {
+      content: [{ type: 'text', text: '/effort [effort](kimi-code://skill/effort) high' }],
+    })).status, 200);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(startedInputs.find((x) => x.provider === 'grok')?.input, '/workflow');
+    assert.equal(pi.getThinking?.('pi-native'), 'high');
+    assert.equal(startedInputs.find((x) => x.provider === 'claude')?.input, '/effort high');
+    assert.equal((await reqJson('/sessions/claude_claude-native/prompts', 'POST', {
+      content: [{ type: 'text', text: '先执行\n/effort [effort](kimi-code://skill/effort)' }],
+    })).status, 200);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(
+      startedInputs.filter((x) => x.provider === 'claude').at(-1)?.input,
+      '先执行\n/effort',
+    );
+
+    // 2. PATCH /sessions/:id + /config thinking object handling (never leaks Kimi's xhigh)
+    const cfgBefore = ((await (await reqJson('/config?provider=codex')).json()) as any).data;
+    assert.equal(cfgBefore.thinking, undefined);
+    const cfgSet = await reqJson('/config?provider=codex', 'POST', { thinking: { enabled: true, effort: 'low' } });
+    assert.equal(cfgSet.status, 200);
+    assert.deepEqual(((await cfgSet.json()) as any).data.thinking, { enabled: true, effort: 'low' });
+    assert.equal(codex.getThinking?.('codex-native'), 'low');
+
+    const patchSess = await reqJson('/sessions/codex_codex-native', 'PATCH', { thinking: 'high' });
+    assert.equal(patchSess.status, 200);
+    assert.equal(codex.getThinking?.('codex-native'), 'high');
+
+    // 3. Pi wireModelDto strips duplicate 'off' from support_efforts and adds always_thinking when supportsThinkingOff=false
+    const piModels = ((await (await reqJson('/models?provider=pi')).json()) as any).data.items as Array<Record<string, any>>;
+    const flash = piModels.find((m) => m.model === 'ccwu/gemini-3.8-flash');
+    const k3 = piModels.find((m) => m.model === 'kimi-coding/k3');
+    assert.deepEqual(flash?.support_efforts, ['minimal', 'low', 'medium', 'high']);
+    assert.equal(flash?.capabilities.includes('always_thinking'), false);
+    assert.equal(k3?.capabilities.includes('always_thinking'), true);
+
+    // 4. Normalized Bash/Agent items + subagent drawer /agents/:id/turns + /tasks + snapshot.subagents
+    const mainTurns = ((await (await reqJson('/sessions/codex_codex-native/agents/main/turns')).json()) as any).data.turns;
+    const tools = mainTurns[0].items.filter((it: any) => it.type === 'tool_call');
+    assert.equal(tools[0].name, 'Bash');
+    assert.equal(tools[0].input.command, 'ls -la');
+    assert.equal(tools[1].name, 'Agent');
+    assert.deepEqual(tools[1].agent_refs, [{ agent_id: 'sub-thread-1', role: 'child' }]);
+
+    const subTurnsRes = await reqJson('/sessions/codex_codex-native/agents/sub-thread-1/turns');
+    assert.equal(subTurnsRes.status, 200);
+    const subTurns = ((await subTurnsRes.json()) as any).data.turns;
+    assert.equal(subTurns.length, 1);
+    assert.equal(subTurns[0].items[0].text, 'Analyze ovis');
+    assert.equal(subTurns[0].items[1].text, 'Found HerdrSocket ping probe.');
+
+    const tasksList = ((await (await reqJson('/sessions/codex_codex-native/tasks')).json()) as any).data.items;
+    assert.equal(tasksList.length, 1);
+    assert.equal(tasksList[0].child_agent_id, 'sub-thread-1');
+
+    const snap = ((await (await reqJson('/sessions/codex_codex-native/snapshot')).json()) as any).data;
+    assert.equal(snap.subagents.length, 1);
+    assert.equal(snap.subagents[0].agent_id, 'sub-thread-1');
+
+    // 5. Gateway local command avoids duplicate t2 turn after history already observed
+    assert.equal((await reqJson('/sessions/codex_codex-native/prompts', 'POST', { content: [{ type: 'text', text: '/status' }] })).status, 200);
+    const trAfterCmd = ((await (await reqJson('/sessions/codex_codex-native/transcript?agent_id=main&page_size=20')).json()) as any).data;
+    assert.deepEqual(trAfterCmd.items.map((t: any) => t.turnId), ['t1', 't2']);
+
+    // 6. WS subscribe: agent omits unset thinking, sends task.list, handles ping->pong, and streams live Bash/Agent + item.updated(agent_refs)
+    const frames: Array<Record<string, any>> = [];
+    let gotSub!: () => void;
+    let gotPong!: () => void;
+    let gotTurnEnd!: () => void;
+    const subReady = new Promise<void>((r) => { gotSub = r; });
+    const pongReady = new Promise<void>((r) => { gotPong = r; });
+    const liveDone = new Promise<void>((r) => { gotTurnEnd = r; });
+
+    ws = new WebSocket(`${gw.url.replace(/^http/, 'ws')}/api/v1/ws?provider=claude`, ['kimi-code.bearer.gateway-token']);
+    ws.onopen = () => ws!.send(JSON.stringify({ type: 'subscribe', request_id: 's1', session_id: 'claude_claude-native' }));
+    ws.onmessage = (e) => {
+      const m = JSON.parse(String(e.data));
+      frames.push(m);
+      if (m.type === 'task.list') gotSub();
+      if (m.type === 'pong') gotPong();
+    };
+    await subReady;
+    const claudeAgentFrame = frames.find((f) => f.type === 'agent');
+    assert.equal(Object.prototype.hasOwnProperty.call(claudeAgentFrame, 'thinking'), false);
+
+    ws.send(JSON.stringify({ type: 'ping' }));
+    await pongReady;
+    ws.close();
+
+    emitLiveEvents = true;
+    const codexFrames: Array<Record<string, any>> = [];
+    let codexSub!: () => void;
+    const codexSubReady = new Promise<void>((r) => { codexSub = r; });
+    ws = new WebSocket(`${gw.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`, ['kimi-code.bearer.gateway-token']);
+    ws.onopen = () => ws!.send(JSON.stringify({ type: 'subscribe', request_id: 's2', session_id: 'codex_codex-native' }));
+    ws.onmessage = (e) => {
+      const m = JSON.parse(String(e.data));
+      codexFrames.push(m);
+      if (m.type === 'task.list') codexSub();
+      if (m.type === 'turn.ended') gotTurnEnd();
+    };
+    await codexSubReady;
+    assert.equal((await reqJson('/sessions/codex_codex-native/prompts', 'POST', { content: [{ type: 'text', text: 'run live' }] })).status, 200);
+    await liveDone;
+
+    assert.ok(codexFrames.some((f) => f.type === 'item.started' && f.item?.name === 'Bash' && f.item?.input?.command === 'pwd'));
+    assert.ok(codexFrames.some((f) => f.type === 'item.started' && f.item?.name === 'Agent' && f.item?.item_id === 'live_sub_call'));
+    assert.ok(codexFrames.some((f) => f.type === 'item.updated' && f.item_id === 'live_sub_call' && f.set?.agent_refs?.[0]?.agent_id === 'sub-live-99'));
+    assert.ok(codexFrames.some((f) => f.type === 'task' && f.child_agent_id === 'sub-live-99'));
+  } finally {
+    try { ws?.close(); } catch { /* ignore */ }
+    await gw.close();
+    await upstream.close();
+  }
+});

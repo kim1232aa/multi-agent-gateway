@@ -1,10 +1,19 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { CodexAdapter } from './codex-adapter.js';
-import { ClaudeProviderAdapter, CodexProviderAdapter } from './facade.js';
+import {
+  ClaudeProviderAdapter,
+  CodexProviderAdapter,
+  GrokProviderAdapter,
+  PiProviderAdapter,
+  workspaceIdFromCwd,
+} from './facade.js';
+import { fsRepoDiff } from './fs-local.js';
+import { discoverClaudeDiskCommands, expandCodexSkill, listClaudeCommands } from './native-commands.js';
 
 test('passes Codex source kinds to thread/list', async () => {
   const adapter = new CodexAdapter();
@@ -712,6 +721,28 @@ test('startTurn does not pass leftover qwen as --model', async () => {
   }
 });
 
+test('startTurn omits --model when stored model is default so ANTHROPIC_MODEL takes effect, while forwarding explicit aliases', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-default-alias-'));
+  try {
+    const settingsPath = join(base, 'session-settings.claude.json');
+    const sDefault = '123e4567-e89b-12d3-a456-426614174088';
+    const sSonnet = '123e4567-e89b-12d3-a456-426614174089';
+    await writeFile(settingsPath, JSON.stringify({ model: { [sDefault]: 'default', [sSonnet]: 'sonnet' } }));
+    const adapter = new ClaudeProviderAdapter({ settingsPath } as any);
+    const seen: Array<string | undefined> = [];
+    (adapter as any).inner.hasSessionFile = () => false;
+    (adapter as any).inner.startTurn = async (opts: any) => {
+      seen.push(opts.model);
+      opts.onEvent({ type: 'done', usage: null, isError: false, result: '' });
+    };
+    for await (const _ of (await adapter.startTurn({ sessionId: sDefault, input: 'hi' })).events) { /* drain */ }
+    for await (const _ of (await adapter.startTurn({ sessionId: sSonnet, input: 'hi' })).events) { /* drain */ }
+    assert.deepEqual(seen, [undefined, 'sonnet']);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test('decides Claude --session-id vs --resume from transcript file presence', async () => {
   // 回归:isNew 曾是一次性内存标记(created.delete)——首轮失败/网关重启后
   // 重试走 --resume 不存在的会话必败。现在只看 transcript 文件是否落盘。
@@ -848,11 +879,16 @@ test('ClaudeProviderAdapter.delete unlinks via inner and drops local state', asy
   assert.equal(adapter.getUsage('s1'), undefined);
 });
 
-test('ClaudeProviderAdapter maps approval events and resolveApproval writes allow/deny', async () => {
+test('ClaudeProviderAdapter maps approval events and resolveApproval writes allow/approve_always/deny with granular options', async () => {
   const adapter = new ClaudeProviderAdapter();
-  const resolved: Array<[string, string, string]> = [];
-  (adapter as any).inner.resolveApproval = async (sessionId: string, approvalId: string, decision: string) => {
-    resolved.push([sessionId, approvalId, decision]);
+  const resolved: Array<[string, string, string, unknown]> = [];
+  (adapter as any).inner.resolveApproval = async (
+    sessionId: string,
+    approvalId: string,
+    decision: string,
+    options?: unknown,
+  ) => {
+    resolved.push([sessionId, approvalId, decision, options]);
   };
   (adapter as any).inner.hasSessionFile = () => true;
   (adapter as any).inner.startTurn = async (opts: any) => {
@@ -862,6 +898,8 @@ test('ClaudeProviderAdapter maps approval events and resolveApproval writes allo
       tool: 'Bash',
       input: { command: 'ls' },
       itemId: 'toolu_1',
+      suggestions: [{ type: 'addRules', rules: [{ toolName: 'Bash' }] }],
+      decisionReason: 'Needs write',
     });
     opts.onEvent({ type: 'done', sessionId: 's', result: '', isError: false, subtype: 'success', stopReason: null });
   };
@@ -876,14 +914,18 @@ test('ClaudeProviderAdapter maps approval events and resolveApproval writes allo
   assert.equal(approval?.payload?.tool, 'Bash');
   assert.deepEqual(approval?.payload?.input, { command: 'ls' });
   assert.equal(approval?.payload?.itemId, 'toolu_1');
+  assert.equal(approval?.payload?.reason, 'Needs write');
+  assert.equal(Array.isArray(approval?.payload?.suggestions), true);
 
   await adapter.resolveApproval('s', 'req-1', 'approve');
-  await adapter.resolveApproval('s', 'req-1', 'approve_always');
-  await adapter.resolveApproval('s', 'req-1', 'reject');
+  await adapter.resolveApproval('s', 'req-1', 'approve_always', {
+    updatedPermissions: [{ type: 'addRules' }],
+  });
+  await adapter.resolveApproval('s', 'req-1', 'reject', { message: 'No thanks' });
   assert.deepEqual(resolved, [
-    ['s', 'req-1', 'allow'],
-    ['s', 'req-1', 'allow'],
-    ['s', 'req-1', 'deny'],
+    ['s', 'req-1', 'allow', undefined],
+    ['s', 'req-1', 'approve_always', { updatedPermissions: [{ type: 'addRules' }] }],
+    ['s', 'req-1', 'deny', { message: 'No thanks' }],
   ]);
 });
 
@@ -915,3 +957,580 @@ test('ClaudeProviderAdapter maps AskUserQuestion control events to question', as
   await adapter.resolveQuestion('s', 'q-1', { q_0: ['Pizza'] });
   assert.deepEqual(answered, [['s', 'q-1', { q_0: ['Pizza'] }]]);
 });
+
+test('workspaceIdFromCwd avoids prefix collisions and normalizes trailing slashes', () => {
+  const a = workspaceIdFromCwd('/tmp/very-long-shared-prefix-workspace-directory-name-alpha/', 'codex');
+  const b = workspaceIdFromCwd('/tmp/very-long-shared-prefix-workspace-directory-name-beta', 'codex');
+  const aNoSlash = workspaceIdFromCwd('/tmp/very-long-shared-prefix-workspace-directory-name-alpha', 'codex');
+  assert.equal(a, aNoSlash);
+  assert.notEqual(a, b);
+  assert.ok(a.length <= 60 && b.length <= 60);
+});
+
+test('CodexProviderAdapter handles 0.169 items, reverse requests, plans/diffs, usage, goalGet errors, and cwd-scoped skillsCache', async () => {
+  const adapter = new CodexProviderAdapter();
+  const caps = adapter.capabilities();
+  assert.equal(caps.elicitation, true);
+  assert.equal(caps.review, true);
+  assert.equal(caps.goals, true);
+  assert.equal(caps.subagents, true);
+
+  (adapter as any).inner.getHistory = async () => [{
+    startedAt: 1786289601,
+    items: [
+      { type: 'reasoning', id: 'r1', summary: ['step one', 'step two'] },
+      { type: 'commandExecution', id: 'c1', command: 'echo ok', result: '', output: 'output-not-masked', exitCode: 0 },
+      { type: 'collabAgentToolCall', id: 'ca1', tool: 'spawn_agent', agentsStates: { a1: 'done' }, status: 'completed' },
+      { type: 'plan', id: 'p1', text: '1. check' },
+    ],
+  }];
+  const history = await adapter.getHistory('th-1');
+  assert.deepEqual(history[0]?.content, [{ type: 'thinking', thinking: 'step one\nstep two' }]);
+  const toolRes = history.find((m) => m.id === 'c1_result');
+  assert.equal((toolRes?.content[0] as any)?.output, 'output-not-masked');
+  assert.ok(history.some((m) => m.id === 'ca1_call' && (m.content[0] as any)?.tool_name === 'spawn_agent'));
+  assert.ok(history.some((m) => m.metadata?.item_type === 'plan'));
+
+  // Event stream mapping for 0.169 events
+  async function* fakeEvents() {
+    yield { type: 'item-started', threadId: 'th-1', turnId: 't1', item: { id: 'ca2', type: 'collabAgentToolCall', tool: 'wait_agent' } };
+    yield { type: 'item-completed', threadId: 'th-1', turnId: 't1', item: { id: 'ca2', type: 'collabAgentToolCall', tool: 'wait_agent', result: '', output: 'collab-out', status: 'completed' } };
+    yield { type: 'approval-request', requestId: 'elic-1', kind: 'mcpElicitation', threadId: 'th-1', turnId: 't1', itemId: 'elic-1', availableDecisions: ['accept', 'decline', 'cancel'], elicitation: { serverName: 'srv', mode: 'form' }, params: {} };
+    yield { type: 'server-request', requestId: 'dyn-1', method: 'item/tool/call', threadId: 'th-1', turnId: 't1', params: { tool: 'custom' } };
+    yield { type: 'server-request-resolved', threadId: 'th-1', turnId: 't1', requestId: 'elic-1', interactionKind: 'elicitation' };
+    yield { type: 'plan-updated', threadId: 'th-1', turnId: 't1', explanation: 'Steps', plan: [{ step: 'do x', status: 'in_progress' }] };
+    yield { type: 'diff-updated', threadId: 'th-1', turnId: 't1', diff: '--- a\n+++ b' };
+    yield { type: 'token-usage', threadId: 'th-1', turnId: 't1', usage: { last: { totalTokens: 500 }, total: { inputTokens: 400, outputTokens: 100 }, modelContextWindow: 256000, reasoningOutputTokens: 33 } };
+    yield { type: 'turn-completed', threadId: 'th-1', turnId: 't1', turn: { id: 't1', status: 'failed' }, error: 'quota exceeded' };
+  }
+  (adapter as any).inner.startTurn = async () => ({ threadId: 'th-1', turnId: 't1', events: fakeEvents() });
+  const handle = await adapter.startTurn({ sessionId: 'th-1', input: 'hello' });
+  const evs: any[] = [];
+  for await (const e of handle.events) evs.push(e);
+  assert.equal(evs.find((e) => e.kind === 'tool' && e.status === 'completed')?.payload?.output, 'collab-out');
+  assert.equal(evs.find((e) => e.kind === 'approval')?.payload?.elicitation?.serverName, 'srv');
+  assert.equal(evs.find((e) => e.kind === 'passthrough')?.payload?.method, 'item/tool/call');
+  assert.equal(evs.find((e) => e.kind === 'interaction_resolved')?.payload?.interactionId, 'elic-1');
+  assert.equal(evs.find((e) => e.kind === 'plan')?.payload?.explanation, 'Steps');
+  assert.equal(evs.find((e) => e.kind === 'diff')?.payload?.diff, '--- a\n+++ b');
+  const term = evs.find((e) => e.kind === 'turn');
+  assert.equal(term?.status, 'failed');
+  assert.equal(term?.payload?.error, 'quota exceeded');
+  assert.equal(adapter.getUsage('th-1')?.reasoning_output_tokens, 33);
+  assert.equal(adapter.getUsage('th-1')?.authoritative, true);
+  assert.equal(adapter.getUsage('th-1')?.turn_count, 1);
+
+  // goalGet error propagation + goalSet origin: 'user'
+  let goalSetOpts: any;
+  (adapter as any).inner.goalSet = async (_id: string, _obj: string | null, _st: string | null, opts: any) => {
+    goalSetOpts = opts;
+    return { objective: 'ship', status: 'active' };
+  };
+  await adapter.setGoal('th-1', 'ship');
+  assert.equal(goalSetOpts?.origin, 'user');
+  (adapter as any).inner.goalGet = async () => { throw new Error('rpc connection lost'); };
+  await assert.rejects(adapter.getGoal('th-1'), /rpc connection lost/);
+
+  // skillsCache scoped by cwd and invalidated by skillsVersion
+  (adapter as any).threadCwd.set('s-a', '/repo/a');
+  (adapter as any).threadCwd.set('s-b', '/repo/b');
+  let skillsVersion = 1;
+  const skillCalls: unknown[] = [];
+  (adapter as any).inner.getSkillsVersion = () => skillsVersion;
+  (adapter as any).inner.listSkills = async (opts: any) => {
+    skillCalls.push(opts);
+    return [{ name: `sk-${opts?.cwd ?? 'none'}`, description: 'd', path: '/tmp/SKILL.md', scope: 'project', enabled: true }];
+  };
+  const cmdsA1 = await adapter.listCommands('s-a');
+  const cmdsA2 = await adapter.listCommands('s-a');
+  const cmdsB = await adapter.listCommands('s-b');
+  assert.ok(cmdsA1.some((c) => c.name === 'sk-/repo/a'));
+  assert.ok(cmdsA2.some((c) => c.name === 'sk-/repo/a'));
+  assert.ok(cmdsB.some((c) => c.name === 'sk-/repo/b'));
+  assert.equal(skillCalls.length, 2);
+  skillsVersion = 2;
+  await adapter.listCommands('s-a');
+  assert.equal(skillCalls.length, 3);
+
+  // listModels preserves rich metadata
+  (adapter as any).inner.listModels = async () => [{
+    model: 'gpt-6.1-sol',
+    displayName: 'GPT-6.1 Sol',
+    description: 'Frontier',
+    maxContextSize: 400_000,
+    maxOutputTokens: 32_768,
+    supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'ultra' }],
+    defaultReasoningEffort: 'high',
+    serviceTiers: ['standard', 'flex'],
+    defaultServiceTier: 'standard',
+    isDefault: true,
+  }];
+  const models = await adapter.listModels();
+  assert.equal(models[0]?.max_context_size, 400_000);
+  assert.equal(models[0]?.max_output_tokens, 32_768);
+  assert.deepEqual(models[0]?.serviceTiers, ['standard', 'flex']);
+  assert.equal(models[0]?.defaultServiceTier, 'standard');
+  assert.equal(models[0]?.isDefault, true);
+});
+
+test('ClaudeProviderAdapter forwards CLAUDE_BIN, preserves dynamic models & subagent/usage fields, and syncs native metadata', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-facade-claude-21325-'));
+  const savedBin = process.env.CLAUDE_BIN;
+  try {
+    process.env.CLAUDE_BIN = join(base, 'custom-claude');
+    const adapter = new ClaudeProviderAdapter({ projectsDir: join(base, 'projects') });
+    assert.equal((adapter as any).inner.claudeBin, join(base, 'custom-claude'));
+
+    const caps = adapter.capabilities();
+    assert.equal(caps.nativeArchive, true);
+    assert.equal(caps.subagents, true);
+    assert.equal(caps.planMode, true);
+
+    // Dynamic non-qwen model + capability preservation
+    (adapter as any).inner.listBuiltinModels = async () => [
+      { value: 'default', supportsEffort: true, supportsAdaptiveThinking: true, fastMode: true, supportedEffortLevels: ['low', 'high'] },
+      { value: 'claude-4-7-preview', displayName: 'Claude 4.7 Preview', description: 'Next gen', supportsEffort: true, supportsAdaptiveThinking: true, fastMode: true },
+      { value: 'qwen3.6-flash[1m]', displayName: 'qwen3.6-flash[1m]' },
+    ];
+    const models = await adapter.listModels();
+    assert.deepEqual(models.map((m) => m.model), ['default', 'claude-4-7-preview']);
+    assert.equal(models[1]?.supportsAdaptiveThinking, true);
+    assert.equal(models[1]?.fastMode, true);
+    assert.equal(models.some((m) => /qwen/i.test(JSON.stringify(m))), false);
+
+    // Usage from top-level totalCostUsd + modelUsage + subagent/task/cancel events
+    (adapter as any).inner.hasSessionFile = () => true;
+    (adapter as any).inner.startTurn = async (opts: any) => {
+      opts.onEvent({ type: 'tool_progress', toolUseId: 'tu-1', toolName: 'Bash', elapsedTimeSeconds: 2, parentToolUseId: 'pt-1' });
+      opts.onEvent({ type: 'task_started', sessionId: 's-1', taskId: 'tk-1', description: 'subtask', subagentType: 'explore', toolUseId: 'pt-1' });
+      opts.onEvent({ type: 'control_cancelled', requestId: 'req-c', kind: 'approval' });
+      opts.onEvent({
+        type: 'done',
+        sessionId: 's-1',
+        result: '',
+        isError: false,
+        subtype: 'success',
+        stopReason: 'end_turn',
+        totalCostUsd: 0.42,
+        modelUsage: {
+          'claude-sonnet-5': { inputTokens: 1000, outputTokens: 200, cacheReadInputTokens: 300, contextWindow: 500_000, costUSD: 0.42 },
+        },
+        usage: { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 300 },
+      });
+    };
+    const handle = await adapter.startTurn({ sessionId: 's-1', input: 'hi' });
+    const evs: any[] = [];
+    for await (const e of handle.events) evs.push(e);
+    assert.ok(evs.some((e) => e.kind === 'tool' && e.status === 'delta' && e.parentToolUseId === 'pt-1'));
+    assert.ok(evs.some((e) => e.kind === 'subagent' && e.status === 'started' && e.agentId === 'tk-1'));
+    assert.ok(evs.some((e) => e.kind === 'interaction_resolved' && e.status === 'cancelled'));
+    const usage = adapter.getUsage('s-1');
+    assert.equal(usage?.total_cost_usd, 0.42);
+    assert.equal(usage?.context_limit, 500_000);
+    assert.equal(usage?.authoritative, true);
+    assert.equal(usage?.model_usage?.['claude-sonnet-5']?.output_tokens, 200);
+  } finally {
+    if (savedBin === undefined) delete process.env.CLAUDE_BIN;
+    else process.env.CLAUDE_BIN = savedBin;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('GrokProviderAdapter and PiProviderAdapter satisfy facade contracts cleanly', () => {
+  const grok = new GrokProviderAdapter();
+  const pi = new PiProviderAdapter();
+  assert.equal(grok.name, 'grok');
+  assert.equal(pi.name, 'pi');
+  assert.equal(grok.capabilities().goals, true);
+  assert.equal(pi.capabilities().approvals, false);
+  assert.equal(pi.capabilities().clone, true);
+});
+
+test('supports positional skill argument substitution, Claude conversation_reset rotation, and Codex review options', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-facade-cmds-'));
+  try {
+    const skillPath = join(base, 'SKILL.md');
+    await writeFile(skillPath, '---\nname: deploy\n---\nTarget=$1 Env=$2 All=$ARGUMENTS Cost=$$1\n');
+    const expanded = expandCodexSkill('/deploy "api$&server" staging', [{ name: 'deploy', path: skillPath }]);
+    assert.equal(expanded, 'Target=api$&server Env=staging All="api$&server" staging Cost=$$1');
+
+    // Codex review forwards instructions/target, cleanTerminals, gitDiff, rateLimits
+    const codex = new CodexProviderAdapter();
+    let sentReviewOpts: any;
+    let cleanedThread = '';
+    (codex as any).inner.reviewTurn = async (_sid: string, opts: any) => {
+      sentReviewOpts = opts;
+      return {
+        turnId: 'r1',
+        events: (async function* () {
+          yield { type: 'turn-completed', threadId: _sid, turnId: 'r1', turn: { status: 'completed' } };
+        })(),
+      };
+    };
+    (codex as any).inner.cleanBackgroundTerminals = async (sid: string) => { cleanedThread = sid; };
+    (codex as any).inner.gitDiffToRemote = async () => ({ sha: 'deadbeef', diff: '+hello\n' });
+    (codex as any).inner.accountRateLimits = async () => ({ rateLimits: { primary: { usedPercent: 12 } } });
+    (codex as any).threadCwd.set('th-1', base);
+
+    const revHandle = await codex.review('th-1', { instructions: 'check auth' });
+    for await (const _ of revHandle.events) { /* drain */ }
+    assert.deepEqual(sentReviewOpts, { instructions: 'check auth' });
+    await codex.cleanTerminals('th-1');
+    assert.equal(cleanedThread, 'th-1');
+    assert.deepEqual(await codex.gitDiff('th-1'), { sha: 'deadbeef', diff: '+hello\n' });
+    assert.deepEqual(await codex.getRateLimits(), { rateLimits: { primary: { usedPercent: 12 } } });
+
+    // Claude conversation_reset rotates underlying CLI sessionId & emits confirmation
+    const claude = new ClaudeProviderAdapter({ projectsDir: join(base, 'projects') });
+    const startedIds: string[] = [];
+    (claude as any).inner.hasSessionFile = (id: string) => id === 'orig-id';
+    (claude as any).inner.startTurn = async (opts: any) => {
+      startedIds.push(opts.sessionId);
+      if (opts.sessionId === 'orig-id') {
+        opts.onEvent({ type: 'init', sessionId: 'orig-id', cwd: base, tools: [], terminalSlashCommands: ['doctor', 'color'] });
+        opts.onEvent({ type: 'conversation_reset', sessionId: 'orig-id', newConversationId: 'new-cli-id', trigger: 'clear' });
+        opts.onEvent({ type: 'done', sessionId: 'new-cli-id', result: '', isError: false, subtype: 'success', stopReason: null });
+      } else {
+        opts.onEvent({ type: 'text_delta', text: 'after clear' });
+        opts.onEvent({ type: 'done', sessionId: opts.sessionId, result: 'after clear', isError: false, subtype: 'success', stopReason: 'end_turn' });
+      }
+    };
+    const h1 = await claude.startTurn({ sessionId: 'orig-id', input: '/clear' });
+    const ev1: any[] = [];
+    for await (const e of h1.events) ev1.push(e);
+    assert.ok(ev1.some((e) => e.kind === 'message' && String(e.payload?.delta).includes('/clear')));
+    assert.deepEqual(await claude.getHistory('orig-id'), []);
+    const h2 = await claude.startTurn({ sessionId: 'orig-id', input: 'hello' });
+    for await (const _ of h2.events) { /* drain */ }
+    assert.deepEqual(startedIds, ['orig-id', 'new-cli-id']);
+
+    // listClaudeCommands keeps doctor/reload-plugins runnable while marking color terminalOnly & including Web UI commands
+    const catalog = listClaudeCommands([
+      { name: 'doctor', description: 'Doctor', builtin: true },
+      { name: 'color', description: 'Color', builtin: true },
+    ], ['doctor', 'color']);
+    assert.equal(catalog.find((c) => c.name === 'doctor')?.terminalOnly, undefined);
+    assert.equal(catalog.find((c) => c.name === 'color')?.terminalOnly, true);
+    assert.ok(catalog.some((c) => c.name === 'help'));
+    assert.ok(catalog.some((c) => c.name === 'diff'));
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('supports Claude SKILL.md $0/escaped $$, allowed-tools paren/space parsing, unborn git diff, and persistent /clear reset', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-review-fixes-'));
+  try {
+    // 1. $0/$ARGUMENTS[N] zero-indexed substitution + \$ escape + allowed-tools paren/space parsing
+    const claudeDir = join(base, 'repo', '.claude', 'skills', 'migrate');
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      join(claudeDir, 'SKILL.md'),
+      '---\nname: migrate\nallowed-tools: Read, Bash(git status, git diff), Grep\n---\nFrom=$0 To=$1 First=$ARGUMENTS[0] Cost=\\$1\n',
+    );
+    const spaceCmdDir = join(base, 'repo', '.claude', 'commands');
+    await mkdir(spaceCmdDir, { recursive: true });
+    await writeFile(
+      join(spaceCmdDir, 'lint.md'),
+      '---\nallowed-tools: Read Grep Bash(npm:*)\n---\nRun lint\n',
+    );
+    const cmds = await discoverClaudeDiskCommands(join(base, 'repo'), join(base, 'cfg'), { homeDir: base });
+    assert.deepEqual(cmds.find((c) => c.name === 'migrate')?.allowedTools, ['Read', 'Bash(git status, git diff)', 'Grep']);
+    assert.deepEqual(cmds.find((c) => c.name === 'lint')?.allowedTools, ['Read', 'Grep', 'Bash(npm:*)']);
+
+    const zeroExpanded = expandCodexSkill('/migrate Button React', [{ name: 'migrate', path: join(claudeDir, 'SKILL.md') }]);
+    assert.equal(zeroExpanded, 'From=Button To=React First=Button Cost=$1');
+
+    // 2. fsRepoDiff on non-git vs unborn git repo with staged file
+    const nonGit = await fsRepoDiff(base);
+    assert.equal(nonGit.isGitRepo, false);
+    const unbornRepo = join(base, 'unborn');
+    await mkdir(unbornRepo, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: unbornRepo });
+    await writeFile(join(unbornRepo, 'staged.txt'), 'hello staged\n');
+    execFileSync('git', ['add', 'staged.txt'], { cwd: unbornRepo });
+    const unbornDiff = await fsRepoDiff(unbornRepo);
+    assert.equal(unbornDiff.isGitRepo, true);
+    assert.ok(unbornDiff.diff.includes('+hello staged'), `expected staged diff on unborn HEAD, got: ${unbornDiff.diff}`);
+
+    // 3. Claude /clear commits resetSessionId on done (keeping in-turn interrupt targeting old id) & persists across restart
+    const settingsPath = join(base, 'settings.claude.json');
+    const c1 = new ClaudeProviderAdapter({ projectsDir: join(base, 'projects'), settingsPath });
+    const interruptedIds: string[] = [];
+    let releaseClearTurn!: () => void;
+    let sawResetCallback!: () => void;
+    const waitReset = new Promise<void>((r) => { sawResetCallback = r; });
+    (c1 as any).inner.hasSessionFile = (id: string) => id === 'orig-1';
+    (c1 as any).inner.interrupt = (id: string) => { interruptedIds.push(id); };
+    (c1 as any).inner.startTurn = async (opts: any) => {
+      opts.onEvent({ type: 'init', sessionId: opts.sessionId, cwd: base, tools: [] });
+      opts.onEvent({ type: 'conversation_reset', sessionId: opts.sessionId, newConversationId: 'reset-2', trigger: 'clear' });
+      sawResetCallback();
+      await new Promise<void>((r) => { releaseClearTurn = r; });
+      opts.onEvent({ type: 'done', sessionId: 'reset-2', result: '', isError: false, subtype: 'success', stopReason: null });
+    };
+    const turn = await c1.startTurn({ sessionId: 'orig-1', input: '/clear' });
+    await waitReset;
+    await c1.interrupt('orig-1');
+    assert.deepEqual(interruptedIds, ['orig-1']);
+    releaseClearTurn();
+    for await (const _ of turn.events) { /* drain */ }
+    await c1.dispose();
+
+    // New adapter instance reloads persisted resetSessionId; fork clears it on forked child
+    const c2 = new ClaudeProviderAdapter({ projectsDir: join(base, 'projects'), settingsPath });
+    const startedAfterRestart: string[] = [];
+    (c2 as any).inner.hasSessionFile = () => true;
+    (c2 as any).inner.startTurn = async (opts: any) => {
+      startedAfterRestart.push(opts.sessionId);
+      opts.onEvent({ type: 'done', sessionId: opts.sessionId, result: 'ok', isError: false, subtype: 'success', stopReason: 'end_turn' });
+    };
+    (c2 as any).inner.forkSession = async (eid: string) => {
+      assert.equal(eid, 'reset-2');
+      return { sessionId: 'forked-3' };
+    };
+    const postRestart = await c2.startTurn({ sessionId: 'orig-1', input: 'hi' });
+    for await (const _ of postRestart.events) { /* drain */ }
+    assert.deepEqual(startedAfterRestart, ['reset-2']);
+    const forked = await c2.fork('orig-1');
+    assert.equal(forked.id, 'forked-3');
+    const forkTurn = await c2.startTurn({ sessionId: 'forked-3', input: 'hi fork' });
+    for await (const _ of forkTurn.events) { /* drain */ }
+    assert.deepEqual(startedAfterRestart, ['reset-2', 'forked-3']);
+    await c2.dispose();
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeProviderAdapter and CodexProviderAdapter fall back to __default__ thinking setting', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-facade-thinking-'));
+  const settingsPath = join(base, 'settings.json');
+  try {
+    const claude = new ClaudeProviderAdapter({ settingsPath } as any);
+    const codex = new CodexProviderAdapter({ settingsPath } as any);
+
+    assert.equal(claude.getThinking('session-1'), undefined);
+    assert.equal(codex.getThinking('session-1'), undefined);
+
+    await claude.setThinking('__default__', 'high');
+    assert.equal(claude.getThinking('session-1'), 'high');
+
+    await codex.setThinking('__default__', 'medium');
+    assert.equal(codex.getThinking('session-1'), 'medium');
+
+    await claude.setThinking('session-1', 'low');
+    assert.equal(claude.getThinking('session-1'), 'low');
+
+    await codex.setThinking('session-1', 'high');
+    assert.equal(codex.getThinking('session-1'), 'high');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeProviderAdapter.getHistory merges adjacent <bash-input> and <bash-stdout> user messages into structured Bash tool_use and tool_result', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-bash-history-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const sessionId = '12345678-1234-4234-8234-123456789abc';
+  try {
+    await mkdir(projDir, { recursive: true });
+    await writeFile(
+      join(projDir, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', timestamp: '2026-08-11T10:00:00.000Z', message: { role: 'user', content: '<bash-input>pwd</bash-input>' } }),
+        JSON.stringify({ type: 'user', timestamp: '2026-08-11T10:00:01.000Z', message: { role: 'user', content: '<bash-stdout>/home/user/project</bash-stdout>' } }),
+        JSON.stringify({ type: 'assistant', timestamp: '2026-08-11T10:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'All done' }] } }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new ClaudeProviderAdapter({ projectsDir });
+    const history = await adapter.getHistory(sessionId);
+    assert.equal(history.length, 3);
+    assert.equal(history[0]?.role, 'assistant');
+    assert.deepEqual(history[0]?.content, [
+      { type: 'tool_use', tool_call_id: history[0]?.content[0]?.type === 'tool_use' ? history[0]?.content[0]?.tool_call_id : '', tool_name: 'Bash', input: { command: 'pwd' } },
+    ]);
+    assert.equal(history[1]?.role, 'tool');
+    assert.deepEqual(history[1]?.content, [
+      { type: 'tool_result', tool_call_id: history[1]?.content[0]?.type === 'tool_result' ? history[1]?.content[0]?.tool_call_id : '', output: '/home/user/project', is_error: false },
+    ]);
+    assert.equal(history[2]?.role, 'assistant');
+    assert.equal((history[2]?.content[0] as any)?.text, 'All done');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeProviderAdapter lists subagents and resolves toolUseId or taskId for getSubagentMessages', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-sub-facade-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const sessionId = '88888888-8888-4888-8888-888888888888';
+  try {
+    await mkdir(join(projDir, sessionId, 'subagents'), { recursive: true });
+    await writeFile(
+      join(projDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hello' } }) + '\n',
+    );
+    await writeFile(
+      join(projDir, sessionId, 'subagents', 'agent-worker1.jsonl'),
+      [
+        JSON.stringify({ type: 'user', isSidechain: true, message: { role: 'user', content: 'investigate bug' } }),
+        JSON.stringify({ type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: 'found bug' }] } }),
+      ].join('\n') + '\n',
+    );
+    await writeFile(
+      join(projDir, sessionId, 'subagents', 'agent-worker1.meta.json'),
+      JSON.stringify({
+        toolUseId: 'toolu_call_sub_1',
+        agentType: 'Investigator',
+        taskId: 'task_sub_1',
+        description: 'Subagent investigating bug',
+      }),
+    );
+
+    const adapter = new ClaudeProviderAdapter({ projectsDir });
+    const subagents = await adapter.listSubagents(sessionId);
+    assert.equal(subagents.length, 1);
+    assert.equal(subagents[0]?.agentId, 'worker1');
+    assert.equal(subagents[0]?.parentToolUseId, 'toolu_call_sub_1');
+    assert.equal(subagents[0]?.subagentType, 'Investigator');
+
+    // Resolves when passing toolUseId
+    const msgsByToolUse = await adapter.getSubagentMessages(sessionId, 'toolu_call_sub_1');
+    assert.equal(msgsByToolUse.length, 2);
+    assert.equal(msgsByToolUse[0]?.metadata?.agent_id, 'worker1');
+    assert.equal((msgsByToolUse[1]?.content[0] as any)?.text, 'found bug');
+
+    // Resolves when passing taskId
+    const msgsByTask = await adapter.getSubagentMessages(sessionId, 'task_sub_1');
+    assert.equal(msgsByTask.length, 2);
+    assert.equal(msgsByTask[0]?.metadata?.agent_id, 'worker1');
+
+    // Resolves when passing direct agentId
+    const msgsByDirect = await adapter.getSubagentMessages(sessionId, 'worker1');
+    assert.equal(msgsByDirect.length, 2);
+    assert.equal(msgsByDirect[0]?.metadata?.agent_id, 'worker1');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('CodexProviderAdapter parses rollout file directly with tail window, memory citation stripping, deduplication, and collabAgent metadata', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-codex-rollout-facade-'));
+  const codexHome = join(base, '.codex');
+  const sessionId = 'rollout-test-session-1';
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '15');
+  const rolloutFile = join(sessionDir, `rollout-2026-11-15T10-00-00-${sessionId}.jsonl`);
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      rolloutFile,
+      [
+        // System-injected tags stripped in user message
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            id: 'u-1',
+            message: '<INSTRUCTIONS>system prompt</INSTRUCTIONS><environment_context>cwd: /tmp</environment_context>Hello agent',
+          },
+        }),
+        // Reasoning with <oai-mem-citation>
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'reasoning',
+            id: 'r-1',
+            summary: ['Thinking about task <oai-mem-citation id="mem-1"/> carefully'],
+          },
+        }),
+        // Duplicate commentary in event_msg vs response_item
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'agent_message',
+            id: 'a-1',
+            text: 'I will launch subagents to help',
+            phase: 'commentary',
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'a-1',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'I will launch subagents to help' }],
+          },
+        }),
+        // collabAgentToolCall preserving receiverThreadIds and agent_id
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'collabAgentToolCall',
+            id: 'collab-1',
+            tool: 'collabAgentToolCall',
+            receiverThreadIds: ['child-thread-999'],
+            input: { prompt: 'Subtask for child' },
+            aggregatedOutput: 'child agent completed',
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new CodexProviderAdapter();
+    const history = await adapter.getHistory(sessionId);
+
+    // User message stripped instructions
+    assert.equal(history[0]?.role, 'user');
+    assert.equal((history[0]?.content[0] as any)?.text, 'Hello agent');
+
+    // Reasoning stripped citations
+    assert.equal(history[1]?.role, 'assistant');
+    assert.equal((history[1]?.content[0] as any)?.type, 'thinking');
+    assert.equal((history[1]?.content[0] as any)?.thinking, 'Thinking about task carefully');
+
+    // Deduplicated agent_message with commentary phase preserved
+    assert.equal(history[2]?.role, 'assistant');
+    assert.equal((history[2]?.content[0] as any)?.text, 'I will launch subagents to help');
+    assert.equal(history[2]?.metadata?.phase, 'commentary');
+
+    // collabAgentToolCall tool_use with receiverThreadIds and agent_id
+    assert.equal(history[3]?.role, 'assistant');
+    assert.equal((history[3]?.content[0] as any)?.type, 'tool_use');
+    assert.equal((history[3]?.content[0] as any)?.tool_name, 'collabAgentToolCall');
+    assert.equal(history[3]?.metadata?.agent_id, 'child-thread-999');
+    assert.deepEqual(history[3]?.metadata?.receiverThreadIds, ['child-thread-999']);
+
+    // collabAgentToolCall tool_result with agent_id: <id>
+    assert.equal(history[4]?.role, 'assistant');
+    assert.equal((history[4]?.content[0] as any)?.type, 'tool_result');
+    assert.equal((history[4]?.content[0] as any)?.output, 'agent_id: child-thread-999\nchild agent completed');
+    assert.equal(history[4]?.metadata?.agent_id, 'child-thread-999');
+
+    // listSubagents discovers child-thread-999
+    const subagents = await adapter.listSubagents(sessionId);
+    assert.equal(subagents.length, 1);
+    assert.equal(subagents[0]?.agentId, 'child-thread-999');
+
+    // Unrelated session rollout must never be exposed via getSubagentMessages
+    const otherId = 'other-unrelated-session-1';
+    await writeFile(
+      join(sessionDir, `rollout-2026-11-15T10-05-00-${otherId}.jsonl`),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', id: 'u2', message: 'secret other prompt' } }) + '\n',
+    );
+    assert.deepEqual(await adapter.getSubagentMessages(sessionId, otherId), []);
+    assert.deepEqual(await adapter.getSubagentMessages(sessionId, '1'), []);
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+

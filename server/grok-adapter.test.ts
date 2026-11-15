@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { GrokAdapter, GrokProviderAdapter, grokContextWindow, grokEffort, resolveGrokBin } from './grok-adapter.js';
+import { GrokAdapter, GrokProviderAdapter, grokContextWindow, grokEffort, resolveGrokBin, GROK_EFFORTS, acpPrompt, materializePromptFile } from './grok-adapter.js';
 import { ProviderError } from './types.js';
 
 async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: string; stdinLog: string }> {
@@ -70,7 +70,7 @@ if args[:2] == ["agent", "stdio"]:
         if method == "initialize":
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "_meta": {
                 "modelState": {"currentModelId": "grok-4.6", "availableModels": [{"modelId": "grok-4.6"}]},
-                "availableCommands": [{"name": n} for n in ["compact", "always-approve", "context", "session-info", "feedback", "deep-research", "workflow", "goal", "loop"]],
+                "availableCommands": [{"name": n} for n in ["compact", "always-approve", "context", "session-info", "deep-research", "workflow", "goal", "doctor", "docs", "dashboard"]],
             }}}), flush=True)
         elif method == "session/new":
             print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": params.get("sessionId") or "acp-assigned"}}), flush=True)
@@ -149,7 +149,7 @@ test('listModels max_context_size is 500000 not 0/200000', async () => {
     assert.equal(grokContextWindow('grok'), 500_000);
     assert.equal(grokContextWindow('unknown-family-model'), 500_000);
     assert.equal(grokContextWindow(), 500_000);
-    assert.deepEqual(models[0]?.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+    assert.deepEqual(models[0]?.support_efforts, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
     assert.equal(models[0]?.default_effort, 'high');
     assert.ok(models.every((m) => m.capabilities?.includes('thinking')));
   } finally {
@@ -447,7 +447,9 @@ test('maps kimi permission and plan_mode onto grok --permission-mode flags', asy
 
 test('maps kimi thinking chips onto grok --effort', async () => {
   assert.equal(grokEffort(undefined), undefined);
-  assert.equal(grokEffort('off'), undefined);
+  assert.equal(grokEffort('off'), 'none');
+  assert.equal(grokEffort('none'), 'none');
+  assert.equal(grokEffort('minimal'), 'minimal');
   assert.equal(grokEffort('on'), 'high');
   assert.equal(grokEffort('low'), 'low');
   assert.equal(grokEffort('medium'), 'medium');
@@ -478,9 +480,13 @@ test('maps kimi thinking chips onto grok --effort', async () => {
     argv = await run();
     assert.equal(argv[argv.indexOf('--effort') + 1], 'max', JSON.stringify(argv));
 
+    await adapter.setThinking(session.id, 'minimal');
+    argv = await run();
+    assert.equal(argv[argv.indexOf('--effort') + 1], 'minimal', JSON.stringify(argv));
+
     await adapter.setThinking(session.id, 'off');
     argv = await run();
-    assert.equal(argv.includes('--effort'), false, JSON.stringify(argv));
+    assert.equal(argv[argv.indexOf('--effort') + 1], 'none', JSON.stringify(argv));
   } finally {
     await rm(base, { recursive: true, force: true });
   }
@@ -929,10 +935,13 @@ test('listCommands merges ACP native commands with disk skills', async () => {
     const session = await adapter.create({ provider: 'grok', cwd: base });
     await drain(await adapter.startTurn({ sessionId: session.id, input: 'hi' }));
     const commands = await adapter.listCommands(session.id);
-    for (const name of ['compact', 'always-approve', 'context', 'session-info', 'feedback', 'deep-research', 'workflow', 'goal', 'loop']) {
+    for (const name of ['compact', 'always-approve', 'context', 'session-info', 'deep-research', 'workflow', 'goal']) {
       assert.ok(commands.some((c) => c.name === name), `missing native command ${name}`);
     }
+    assert.equal(commands.some((c) => c.name === 'feedback' || c.name === 'loop'), false);
     assert.ok(commands.some((c) => c.name === 'ship-it'), 'disk skill missing');
+    const discovered = await adapter.listCommands();
+    assert.ok(discovered.some((c) => c.name === 'doctor'), 'ACP command catalog not discovered without a session');
     const skills = await adapter.listSkills(session.id);
     assert.ok(skills.some((s) => s.name === 'ship-it' && s.enabled === true && s.scope === 'project'));
   } finally {
@@ -970,7 +979,10 @@ test('live ACP sync sends set_mode, set_model and set_config_option', async () =
   }
 });
 
-const LIVE_GROK_BIN = process.env.GROK_LIVE_BIN ?? '/tmp/grok-survey-80NQ6R/bin-1.0.77/grok';
+const LIVE_GROK_BIN = process.env.GROK_LIVE_BIN
+  ?? (existsSync('/tmp/grok-survey-80NQ6R/bin-1.0.77/grok')
+    ? '/tmp/grok-survey-80NQ6R/bin-1.0.77/grok'
+    : resolveGrokBin());
 
 test('live 1.0.77 binary speaks the ACP surface this adapter targets', { skip: !existsSync(LIVE_GROK_BIN) }, async () => {
   const home = await mkdtemp(join(tmpdir(), 'multi-agent-grok-live-'));
@@ -1205,5 +1217,165 @@ test('list skips symlinked summary.json and creates collision-resistant workspac
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('GROK_EFFORTS includes minimal', () => {
+  assert.deepEqual(GROK_EFFORTS, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+});
+
+test('getThinking falls back to __default__ and setThinking persists __default__ without throwing', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-default-thinking-'));
+  try {
+    const settingsPath = join(base, 'settings.json');
+    const adapter = new GrokProviderAdapter({ settingsPath });
+    const s1 = await adapter.create({ provider: 'grok', cwd: base });
+    assert.equal(adapter.getThinking(s1.id), undefined);
+
+    await adapter.setThinking('__default__', 'minimal');
+    assert.equal(adapter.getThinking('__default__'), 'minimal');
+    assert.equal(adapter.getThinking(s1.id), 'minimal');
+
+    await adapter.setThinking(s1.id, 'max');
+    assert.equal(adapter.getThinking(s1.id), 'max');
+    assert.equal(adapter.getThinking('__default__'), 'minimal');
+
+    const s2 = await adapter.create({ provider: 'grok', cwd: base });
+    assert.equal(adapter.getThinking(s2.id), 'minimal');
+    await adapter.dispose();
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('live ACP sync sends reasoning_effort for minimal and none (off)', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-effort-sync-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const rpcLog = join(base, 'rpc.log');
+    adapter = new GrokProviderAdapter({ grokBin: bin, env: { GROK_FAKE_ACP: '1', GROK_RPC_LOG: rpcLog } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'init' }));
+
+    await adapter.setThinking(session.id, 'minimal');
+    await adapter.setThinking(session.id, 'off');
+    await adapter.setThinking(session.id, 'none');
+
+    const methods = (await readFile(rpcLog, 'utf8')).trim().split('\n')
+      .map((l) => JSON.parse(l) as { method: string; params: Record<string, unknown> });
+    const configCalls = methods.filter((m) => m.method === 'session/set_config_option' && m.params.configId === 'reasoning_effort');
+    assert.ok(configCalls.length >= 3);
+    assert.equal(configCalls.at(-3)?.params.value, 'minimal');
+    assert.equal(configCalls.at(-2)?.params.value, 'none');
+    assert.equal(configCalls.at(-1)?.params.value, 'none');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('listModels ACP branch omits efforts and default_effort when supportsReasoningEffort is false', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-no-effort-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const bin = join(base, 'grok');
+    await writeFile(bin, `#!/usr/bin/env python3
+import json, sys
+sys.stdout.reconfigure(line_buffering=True)
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line: continue
+    msg = json.loads(line)
+    method, mid = msg.get("method"), msg.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "_meta": {
+            "modelState": {"currentModelId": "grok-no-reason", "availableModels": [
+                {"modelId": "grok-no-reason", "name": "No Reasoning", "supportsReasoningEffort": False},
+                {"modelId": "grok-with-reason", "name": "With Reasoning", "supportsReasoningEffort": True}
+            ]},
+        }}}), flush=True)
+    elif method == "session/new":
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s1"}}), flush=True)
+    elif mid is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}), flush=True)
+`);
+    await chmod(bin, 0o755);
+    adapter = new GrokProviderAdapter({ grokBin: bin, env: { GROK_FAKE_ACP: '1' } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'prime' }));
+    (adapter as any).inner.listModels = async () => { throw new Error('force-acp'); };
+    const models = await adapter.listModels();
+    const noReason = models.find((m) => m.model === 'grok-no-reason');
+    assert.ok(noReason);
+    assert.deepEqual(noReason.capabilities, []);
+    assert.equal(noReason.support_efforts, undefined);
+    assert.equal(noReason.default_effort, undefined);
+
+    const withReason = models.find((m) => m.model === 'grok-with-reason');
+    assert.ok(withReason);
+    assert.deepEqual(withReason.capabilities, ['thinking']);
+    assert.deepEqual(withReason.support_efforts, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    assert.equal(withReason.default_effort, 'high');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('acpPrompt validates non-empty prompt or throws clean ProviderError', () => {
+  assert.throws(() => acpPrompt(''), (err: unknown) => {
+    assert.ok(err instanceof ProviderError);
+    assert.equal(err.code, 'invalid_request');
+    assert.equal(err.httpStatus, 400);
+    assert.equal(err.message, 'empty prompt');
+    return true;
+  });
+  assert.throws(() => acpPrompt('   ', []), (err: unknown) => {
+    assert.ok(err instanceof ProviderError);
+    assert.equal(err.code, 'invalid_request');
+    assert.equal(err.httpStatus, 400);
+    return true;
+  });
+  assert.throws(() => acpPrompt('', [{ type: 'text', text: '   ' }]), (err: unknown) => {
+    assert.ok(err instanceof ProviderError);
+    assert.equal(err.code, 'invalid_request');
+    assert.equal(err.httpStatus, 400);
+    return true;
+  });
+
+  const textRes = acpPrompt('hello world');
+  assert.deepEqual(textRes, [{ type: 'text', text: 'hello world' }]);
+
+  const blockRes = acpPrompt('', [{ type: 'text', text: 'block text' }]);
+  assert.deepEqual(blockRes, [{ type: 'text', text: 'block text' }]);
+});
+
+test('materializePromptFile decodes base64 images into temp files and writes plain text prompt', async () => {
+  const base64Png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex').toString('base64');
+  const bigBase64 = base64Png + 'A'.repeat(35 * 1024);
+  const contentBlocks = [
+    { type: 'text', text: 'Please review this architecture diagram' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: bigBase64 } },
+  ];
+
+  const promptFile = materializePromptFile('prompt header', contentBlocks);
+  assert.ok(promptFile);
+  assert.ok(promptFile.path.endsWith('.txt'));
+
+  const fileContent = await readFile(promptFile.path, 'utf8');
+  assert.ok(!fileContent.startsWith('[{"type"'));
+  assert.ok(fileContent.includes('prompt header'));
+  assert.ok(fileContent.includes('Please review this architecture diagram'));
+  assert.ok(fileContent.includes('Attached image: '));
+
+  const match = /Attached image: (\S+)/.exec(fileContent);
+  assert.ok(match && match[1]);
+  const imgPath = match[1];
+  assert.ok(existsSync(imgPath));
+
+  promptFile.cleanup();
+  assert.equal(existsSync(promptFile.path), false);
+  assert.equal(existsSync(imgPath), false);
+});
+
 
 

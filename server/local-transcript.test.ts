@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LocalTranscriptHub, buildLocalTranscriptPage, contentFrames } from './local-transcript.js';
+import {
+  LocalTranscriptHub,
+  buildLocalTranscriptPage,
+  contentFrames,
+  normalizeKimiWebTool,
+  extractSubagentIdFromOutput,
+} from './local-transcript.js';
 import type { Message } from './types.js';
 
 const history: Message[] = [
@@ -523,4 +529,281 @@ test('rejects pre-invalidation cursors as incomplete across disconnect, pre-seed
   assert.equal(reconnectFreshEmissions.some((e) => e.type === 'transcript.reset'), false);
   assert.equal(reconnectFreshEmissions.length, 1);
   assert.equal(reconnectFreshEmissions[0]?.type, 'transcript.ops');
+});
+
+test('normalizeKimiWebTool maps shell tool names and normalizes inputs to Bash', () => {
+  const shellNames = [
+    'commandExecution',
+    'exec_command',
+    'shell_command',
+    'local_shell_call',
+    'run_terminal_command',
+    'run_command',
+    'execute_command',
+    'powershell',
+    'bash',
+    'shell',
+    'Bash',
+  ];
+
+  for (const name of shellNames) {
+    const resString = normalizeKimiWebTool(name, 'ls -la');
+    assert.equal(resString.name, 'Bash');
+    assert.deepEqual(resString.input, { command: 'ls -la' });
+
+    const resObj = normalizeKimiWebTool(name, { cmd: 'pwd', workdir: '/var' });
+    assert.equal(resObj.name, 'Bash');
+    assert.equal((resObj.input as Record<string, unknown>).command, 'pwd');
+    assert.equal((resObj.input as Record<string, unknown>).cwd, '/var');
+
+    const resScript = normalizeKimiWebTool(name, { script: 'echo test' });
+    assert.equal(resScript.name, 'Bash');
+    assert.equal((resScript.input as Record<string, unknown>).command, 'echo test');
+  }
+
+  // JSON string input parsing
+  const resJson = normalizeKimiWebTool('exec_command', '{"cmd": "git status", "cwd": "/app"}');
+  assert.equal(resJson.name, 'Bash');
+  assert.equal((resJson.input as Record<string, unknown>).command, 'git status');
+  assert.equal((resJson.input as Record<string, unknown>).cwd, '/app');
+});
+
+test('normalizeKimiWebTool maps subagent tools and normalizes inputs to Agent', () => {
+  const subagentNames = [
+    'spawn_agent',
+    'spawn_subagent',
+    'collabAgentToolCall',
+    'collab_tool_call',
+    'agent',
+    'task',
+    'subagent',
+    'Agent',
+  ];
+
+  for (const name of subagentNames) {
+    const resString = normalizeKimiWebTool(name, 'perform audit');
+    assert.equal(resString.name, 'Agent');
+    assert.deepEqual(resString.input, { description: 'perform audit', prompt: 'perform audit' });
+
+    const resObj = normalizeKimiWebTool(name, {
+      task: 'review PR',
+      agent: 'reviewer',
+      message: 'check changes',
+      run_in_background: true,
+      extra_flag: 42,
+    });
+    assert.equal(resObj.name, 'Agent');
+    const input = resObj.input as Record<string, unknown>;
+    assert.equal(input.description, 'review PR');
+    assert.equal(input.subagent_type, 'reviewer');
+    assert.equal(input.prompt, 'check changes');
+    assert.equal(input.run_in_background, true);
+    assert.equal(input.extra_flag, 42);
+
+    const resAlt = normalizeKimiWebTool(name, {
+      task_name: 'generate code',
+      agent_type: 'coder',
+      prompt: 'write function',
+    });
+    assert.equal(resAlt.name, 'Agent');
+    const inputAlt = resAlt.input as Record<string, unknown>;
+    assert.equal(inputAlt.description, 'generate code');
+    assert.equal(inputAlt.subagent_type, 'coder');
+    assert.equal(inputAlt.prompt, 'write function');
+
+    const resTitle = normalizeKimiWebTool(name, { title: 'plan task' });
+    assert.equal((resTitle.input as Record<string, unknown>).description, 'plan task');
+  }
+});
+
+test('normalizeKimiWebTool maps file and search aliases for rich cards', () => {
+  assert.deepEqual(normalizeKimiWebTool('read_file', { file_path: 'src/main.ts' }), {
+    name: 'Read',
+    input: { file_path: 'src/main.ts', path: 'src/main.ts' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('view_file', 'README.md'), {
+    name: 'Read',
+    input: { path: 'README.md' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('write_file', { file_path: 'dist/out.js', content: '1' }), {
+    name: 'Write',
+    input: { file_path: 'dist/out.js', path: 'dist/out.js', content: '1' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('create_file', { path: 'test.txt' }), {
+    name: 'Write',
+    input: { path: 'test.txt' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('apply_patch', { file_path: 'a.ts' }), {
+    name: 'Edit',
+    input: { file_path: 'a.ts', path: 'a.ts' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('fileChange', { path: 'b.ts' }), {
+    name: 'Edit',
+    input: { path: 'b.ts' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('str_replace', { path: 'c.ts' }), {
+    name: 'Edit',
+    input: { path: 'c.ts' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('replace_file', { path: 'd.ts' }), {
+    name: 'Edit',
+    input: { path: 'd.ts' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('grep_search', { query: 'export' }), {
+    name: 'Grep',
+    input: { query: 'export', pattern: 'export' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('search_grep', 'my_func'), {
+    name: 'Grep',
+    input: { pattern: 'my_func' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('find_by_name', { name: '*.ts' }), {
+    name: 'Glob',
+    input: { name: '*.ts', pattern: '*.ts' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('find_files', '*.json'), {
+    name: 'Glob',
+    input: { pattern: '*.json' },
+  });
+  assert.deepEqual(normalizeKimiWebTool('list_dir', '/var/log'), {
+    name: 'ListDir',
+    input: { path: '/var/log' },
+  });
+  // Unrelated tools are preserved
+  assert.deepEqual(normalizeKimiWebTool('custom_eval', { x: 1 }), {
+    name: 'custom_eval',
+    input: { x: 1 },
+  });
+});
+
+test('extractSubagentIdFromOutput extracts IDs from structured and text outputs', () => {
+  // Objects
+  assert.equal(extractSubagentIdFromOutput({ agent_id: 'agent-1' }), 'agent-1');
+  assert.equal(extractSubagentIdFromOutput({ subagent_id: 'sub-2' }), 'sub-2');
+  assert.equal(extractSubagentIdFromOutput({ agentId: 'agent-3' }), 'agent-3');
+  assert.equal(extractSubagentIdFromOutput({ subagentId: 'sub-4' }), 'sub-4');
+  assert.equal(extractSubagentIdFromOutput({ data: { subagent_id: 'nested-sub' } }), 'nested-sub');
+
+  // JSON strings
+  assert.equal(extractSubagentIdFromOutput('{"agent_id": "worker-1"}'), 'worker-1');
+  assert.equal(extractSubagentIdFromOutput('{"subagent_id": "worker-2"}'), 'worker-2');
+
+  // Text with colon / equals / punctuation
+  assert.equal(extractSubagentIdFromOutput('Task spawned agent_id: child-123'), 'child-123');
+  assert.equal(extractSubagentIdFromOutput('Created subagent_id: child-456.'), 'child-456');
+  assert.equal(extractSubagentIdFromOutput('subagent_id="child-789";'), 'child-789');
+  assert.equal(extractSubagentIdFromOutput('agent_id: <child-abc>'), 'child-abc');
+
+  // Array shapes
+  assert.equal(extractSubagentIdFromOutput([{ text: 'subagent_id: arr-1' }]), 'arr-1');
+
+  // Negative cases
+  assert.equal(extractSubagentIdFromOutput(null), undefined);
+  assert.equal(extractSubagentIdFromOutput(undefined), undefined);
+  assert.equal(extractSubagentIdFromOutput('regular command output'), undefined);
+});
+
+test('linkSubagentToToolCall and subagent agentRefs linkage in LocalTranscriptHub', () => {
+  const hub = new LocalTranscriptHub();
+  const turn = hub.beginTurn('s1', 'spawn subagent turn');
+
+  // Start tool using alias spawn_agent
+  turn.toolStarted('call-tu-1', 'spawn_agent', { task: 'run audit' });
+
+  // Frame is normalized to Agent
+  const activeMid = hub.activeItems('s1');
+  const frameRunning = activeMid[0]?.steps[0]?.frames[0];
+  assert.equal(frameRunning?.name, 'Agent');
+  assert.equal((frameRunning?.input as Record<string, unknown>).description, 'run audit');
+
+  // Link subagent to tool call
+  hub.linkSubagentToToolCall('s1', 'call-tu-1', 'worker-sub-99');
+
+  const activeAfterLink = hub.activeItems('s1');
+  const frameLinked = activeAfterLink[0]?.steps[0]?.frames[0];
+  assert.deepEqual(frameLinked?.agentRefs, [{ agentId: 'worker-sub-99', role: 'child' }]);
+
+  // Complete tool with subagent_id in output
+  turn.toolResult('call-tu-1', 'subagent_id: worker-sub-99', false);
+  turn.end('completed');
+
+  const activeFinal = hub.activeItems('s1');
+  const frameDone = activeFinal[0]?.steps[0]?.frames[0];
+  assert.deepEqual(frameDone?.agentRefs, [{ agentId: 'worker-sub-99', role: 'child' }]);
+});
+
+test('evicts matching completed unbased turns in observeHistory without duplicate rebase', () => {
+  const hub = new LocalTranscriptHub();
+  // Turn started before history observation with prompt matching the trailing persisted turn
+  const turn = hub.beginTurn('s1', '  old two  ');
+  turn.append('assistant', 'already completed answer');
+  turn.end('completed');
+
+  // At this point, the turn is in recentTurns and unbasedTurns
+  assert.equal(hub.activeItems('s1').length, 1);
+
+  // History is now observed, containing 'old two' in trailing persisted turns
+  hub.observeHistory('s1', persistedHistory);
+
+  // The unbased completed turn matching 'old two' must be evicted, NOT rebased into a duplicate t3
+  const active = hub.activeItems('s1');
+  assert.equal(active.length, 0);
+
+  // The generated page from history contains only t1 and t2 (no duplicate t3)
+  const page = buildLocalTranscriptPage(persistedHistory, { agentId: 'main' }, 'idle', 0, active);
+  assert.deepEqual(
+    page.items.map((item) => [item.turnId, item.prompt]),
+    [['t1', 'old one'], ['t2', 'old two']],
+  );
+});
+
+test('merges Claude and Pi bash execution messages in historyTurns ONLY when metadata.bash_card is present', () => {
+  const messagesWithBashCard: Message[] = [
+    {
+      id: 'u1', session_id: 's1', role: 'user',
+      content: [{ type: 'text', text: 'check directory' }],
+      created_at: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'u-bash', session_id: 's1', role: 'user',
+      content: [{ type: 'text', text: '$ pwd\n/home/user' }],
+      metadata: { bash_card: true },
+      created_at: '2026-01-01T00:00:01.000Z',
+    },
+    {
+      id: 'a1', session_id: 's1', role: 'assistant',
+      content: [{ type: 'text', text: 'You are in /home/user' }],
+      created_at: '2026-01-01T00:00:02.000Z',
+    },
+  ];
+
+  // With bash_card, u-bash is merged into turn 1 instead of starting a new turn
+  const pageCard = buildLocalTranscriptPage(messagesWithBashCard, { agentId: 'main' }, 'idle', 0);
+  assert.equal(pageCard.items.length, 1);
+  assert.equal(pageCard.items[0]?.prompt, 'check directory');
+  const allFrames = pageCard.items[0]?.steps.flatMap((step) => step.frames) ?? [];
+  const bashFrame = allFrames.find((f) => f.name === 'Bash');
+  assert.ok(bashFrame);
+  assert.equal(bashFrame.kind, 'tool');
+  assert.deepEqual(bashFrame.input, { command: 'pwd' });
+  assert.equal(bashFrame.output, '/home/user');
+  assert.equal(bashFrame.state, 'done');
+
+  // Without bash_card, plain text user message starts a separate turn
+  const messagesWithoutBashCard: Message[] = [
+    {
+      id: 'u1', session_id: 's1', role: 'user',
+      content: [{ type: 'text', text: 'check directory' }],
+      created_at: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'u2', session_id: 's1', role: 'user',
+      content: [{ type: 'text', text: '$ pwd\n/home/user' }],
+      created_at: '2026-01-01T00:00:01.000Z',
+    },
+  ];
+  const pagePlain = buildLocalTranscriptPage(messagesWithoutBashCard, { agentId: 'main' }, 'idle', 0);
+  assert.equal(pagePlain.items.length, 2);
+  assert.equal(pagePlain.items[0]?.prompt, 'check directory');
+  assert.equal(pagePlain.items[1]?.prompt, '$ pwd\n/home/user');
 });

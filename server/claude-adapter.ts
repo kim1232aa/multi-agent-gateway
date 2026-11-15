@@ -81,6 +81,8 @@ export interface ClaudeSessionSummary {
   archived?: boolean;
   /** Continuation target if the tail contains an un-superseded `continued-in` entry. */
   continuedInSessionId?: string;
+  /** Session creation entrypoint (e.g. 'cli', 'sdk-cli'), when known. */
+  entrypoint?: string;
 }
 
 /** initialize 握手回包或磁盘发现的单条斜杠命令描述。 */
@@ -93,6 +95,9 @@ export interface ClaudeSlashCommand {
   source?: string;
   path?: string;
   scope?: string;
+  terminalOnly?: boolean;
+  allowedTools?: string[];
+  model?: string;
 }
 
 /** initialize 握手回包里的单条内置模型描述(CLI 权威目录,无需登录即可获取)。 */
@@ -127,6 +132,7 @@ export interface ClaudeHistoryMessage {
   model?: string;
   isError?: boolean;
   isCompactSummary?: boolean;
+  isLocalBashOutput?: boolean;
   uuid?: string;
   parentUuid?: string | null;
   agentId?: string;
@@ -160,11 +166,19 @@ export type ClaudeAdapterEvent =
       model?: string;
       permissionMode?: string;
       slashCommands?: string[];
+      terminalSlashCommands?: string[];
       skills?: string[];
       capabilities?: string[];
       claudeCodeVersion?: string;
       fastModeState?: string;
       effort?: string | null;
+    }
+  | {
+      type: "conversation_reset";
+      sessionId: string;
+      newConversationId?: string;
+      trigger?: string;
+      uuid?: string;
     }
   | {
       type: "text_delta";
@@ -566,6 +580,9 @@ export class ClaudeAdapter {
   private readonly interruptingChildren = new WeakSet<ChildProcess>();
   /** startTurn 的中断窗口等待者:旧进程退出时唤醒(见 startTurn/waitForExit)。 */
   private readonly exitWaiters = new Map<string, Array<() => void>>();
+  /** Ephemeral fork/control-probe children tracked so close() terminates them immediately. */
+  private readonly activeProbes = new Set<ChildProcess>();
+  private closed = false;
 
   constructor(options: ClaudeAdapterOptions = {}) {
     this.claudeBin = resolveClaudeBin(options);
@@ -732,6 +749,11 @@ export class ClaudeAdapter {
 
     out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
     return out;
+  }
+
+  /** Alias for list() matching ProviderAdapter / store discovery conventions. */
+  async listSessions(): Promise<ClaudeSessionSummary[]> {
+    return this.list();
   }
 
   private async hasValidContinuedTarget(
@@ -901,6 +923,67 @@ export class ClaudeAdapter {
 
     const found = await this.scanSubagentFiles(subagentsDir, realRoot);
     return found.map((entry) => entry.agentId);
+  }
+
+  /** List subagent details including metadata mapped from `<session>/subagents/agent-*.meta.json`. */
+  async listSubagentDetails(sessionId: string): Promise<Array<{
+    agentId: string;
+    parentToolUseId?: string;
+    description?: string;
+    subagentType?: string;
+    taskId?: string;
+  }>> {
+    if (!UUID_RE.test(sessionId)) return [];
+    const filePath = this.findSessionFile(sessionId);
+    if (!filePath) return [];
+
+    const realRoot = await this.realProjectsRoot();
+    const sessionDir = path.join(path.dirname(filePath), sessionId);
+    const subagentsDir = path.join(sessionDir, "subagents");
+    if (!(await this.isSafeDirectoryWithinRoot(sessionDir, realRoot))) return [];
+    if (!(await this.isSafeDirectoryWithinRoot(subagentsDir, realRoot))) return [];
+
+    const files = await this.scanSubagentFiles(subagentsDir, realRoot);
+    const results: Array<{
+      agentId: string;
+      parentToolUseId?: string;
+      description?: string;
+      subagentType?: string;
+      taskId?: string;
+    }> = [];
+
+    for (const f of files) {
+      let parentToolUseId: string | undefined;
+      let description: string | undefined;
+      let subagentType: string | undefined;
+      let taskId: string | undefined;
+
+      const metaPath = f.filePath.replace(/\.jsonl$/, ".meta.json");
+      const metaText = await this.readBoundedSidecarText(metaPath, realRoot, MAX_SIDECAR_BYTES);
+      if (metaText) {
+        try {
+          const meta = JSON.parse(metaText) as Record<string, unknown>;
+          if (typeof meta.toolUseId === "string" && meta.toolUseId) parentToolUseId = meta.toolUseId;
+          else if (typeof meta.parentToolUseId === "string" && meta.parentToolUseId) parentToolUseId = meta.parentToolUseId;
+          if (typeof meta.description === "string" && meta.description) description = meta.description;
+          if (typeof meta.agentType === "string" && meta.agentType) subagentType = meta.agentType;
+          else if (typeof meta.subagentType === "string" && meta.subagentType) subagentType = meta.subagentType;
+          if (typeof meta.taskId === "string" && meta.taskId) taskId = meta.taskId;
+        } catch {
+          // ignore malformed sidecar
+        }
+      }
+
+      results.push({
+        agentId: f.agentId,
+        ...(parentToolUseId ? { parentToolUseId } : {}),
+        ...(description ? { description } : {}),
+        ...(subagentType ? { subagentType } : {}),
+        ...(taskId ? { taskId } : {}),
+      });
+    }
+
+    return results;
   }
 
   /** Read and branch-prune a subagent transcript `subagents/agent-<agentId>.jsonl`. */
@@ -1445,12 +1528,16 @@ export class ClaudeAdapter {
       "--resume", sessionId,
       "--fork-session",
     ];
+    if (this.closed) {
+      throw new ProviderError("not_found", "claude adapter closed", 404);
+    }
     const child = spawn(this.claudeBin, args, {
       cwd: cwd ?? os.homedir(),
       env: this.childEnv(),
       stdio: ["pipe", "pipe", "pipe"],
       detached: true,
     });
+    this.activeProbes.add(child);
     child.stdin?.on("error", () => undefined);
     child.stderr?.resume();
 
@@ -1462,10 +1549,12 @@ export class ClaudeAdapter {
     try {
       await new Promise<void>((resolve, reject) => {
         let settled = false;
+        const rl = readline.createInterface({ input: child.stdout! });
         const finish = (err?: Error): void => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          rl.close();
           if (err) reject(err);
           else resolve();
         };
@@ -1475,7 +1564,6 @@ export class ClaudeAdapter {
           finish(new Error(`claude-adapter: --fork-session timed out waiting for system/init for ${sessionId}`));
         }, 20_000);
         timer.unref();
-        const rl = readline.createInterface({ input: child.stdout! });
         rl.on("line", (line) => {
           if (!line.trim()) return;
           let ev: any;
@@ -1510,6 +1598,8 @@ export class ClaudeAdapter {
             400,
           );
       }
+    } finally {
+      this.activeProbes.delete(child);
     }
 
     if (!newSessionId) {
@@ -2059,6 +2149,7 @@ export class ClaudeAdapter {
     request: Record<string, unknown>,
     cwd?: string,
   ): Promise<Record<string, unknown> | null> {
+    if (this.closed) return Promise.resolve(null);
     return new Promise((resolve) => {
       const requestId = request.subtype === "initialize" ? "gw_init" : `probe_${randomUUID()}`;
       const child = spawn(
@@ -2066,11 +2157,15 @@ export class ClaudeAdapter {
         ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
         { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"] },
       );
+      this.activeProbes.add(child);
       let settled = false;
+      const rl = readline.createInterface({ input: child.stdout! });
       const finish = (value: Record<string, unknown> | null): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        rl.close();
+        this.activeProbes.delete(child);
         endStdin(child);
         try {
           child.kill("SIGTERM");
@@ -2083,7 +2178,6 @@ export class ClaudeAdapter {
       timer.unref();
       child.on("error", () => finish(null));
       child.on("exit", () => finish(null));
-      const rl = readline.createInterface({ input: child.stdout! });
       rl.on("line", (line) => {
         if (!line.trim()) return;
         let ev: any;
@@ -2118,6 +2212,8 @@ export class ClaudeAdapter {
 
   /** Kill all running turn processes. */
   async close(): Promise<void> {
+    this.closed = true;
+    this.handshakeInflight.clear();
     for (const [sessionId, child] of this.running) {
       this.clearInterruptTimers(sessionId);
       endStdin(child);
@@ -2127,6 +2223,11 @@ export class ClaudeAdapter {
       this.rejectOutboundControls(sessionId, new ProviderError("not_found", "claude adapter closed", 404));
       this.sessionControls.delete(sessionId);
       this.resolveExitWaiters(sessionId);
+    }
+    for (const probe of this.activeProbes) {
+      endStdin(probe);
+      this.killGroup(probe, "SIGTERM");
+      this.activeProbes.delete(probe);
     }
   }
 
@@ -2298,6 +2399,8 @@ export class ClaudeAdapter {
       let createdAt: string | undefined;
       let latestUserPromptMs = Number.NEGATIVE_INFINITY;
       let isSidechainHead = false;
+      let isSdkEntrypoint = false;
+      let sessionEntrypoint: string | undefined;
       const updatedAt = stat.mtime.toISOString();
 
       const aiTitleOf = (entry: any): string => {
@@ -2331,6 +2434,19 @@ export class ClaudeAdapter {
           if (isHead && idx === 0 && entry.isSidechain === true) {
             isSidechainHead = true;
             return;
+          }
+          const ep =
+            typeof entry.entrypoint === "string"
+              ? entry.entrypoint
+              : typeof entry.metadata?.entrypoint === "string"
+                ? entry.metadata.entrypoint
+                : undefined;
+          if (ep) {
+            if (!sessionEntrypoint) sessionEntrypoint = ep;
+            if (ep.startsWith("sdk-")) {
+              isSdkEntrypoint = true;
+              return;
+            }
           }
           if (!createdAt && typeof entry.timestamp === "string" && !Number.isNaN(Date.parse(entry.timestamp))) {
             createdAt = entry.timestamp;
@@ -2399,7 +2515,7 @@ export class ClaudeAdapter {
         (u) => { headUser = u; },
         (c) => { headCmd = c; },
       );
-      if (isSidechainHead) return null;
+      if (isSidechainHead || isSdkEntrypoint) return null;
 
       let tail = head;
       if (headSlice.length < stat.size) {
@@ -2419,6 +2535,7 @@ export class ClaudeAdapter {
           (u) => { tailUser = u; },
           (c) => { tailCmd = c; },
         );
+        if (isSdkEntrypoint) return null;
       }
 
       const sessionArtifactsDir = path.join(path.dirname(filePath), sessionId);
@@ -2488,6 +2605,7 @@ export class ClaudeAdapter {
         updatedAt,
         ...(createdAt ? { createdAt } : {}),
         fileSize: stat.size,
+        ...(sessionEntrypoint ? { entrypoint: sessionEntrypoint } : {}),
         ...(archived !== undefined ? { archived } : {}),
         ...(continuedInSessionId ? { continuedInSessionId } : {}),
       };
@@ -2924,7 +3042,11 @@ export function followClaudeBranch<T extends Record<string, unknown>>(entries: T
     let cursor: T | undefined = tip;
     while (cursor && !seen.has(cursor.uuid as string)) {
       seen.add(cursor.uuid as string);
-      if (cursor.type === "user" || cursor.type === "assistant") {
+      if (
+        cursor.type === "user" ||
+        cursor.type === "assistant" ||
+        (cursor.type === "system" && cursor.subtype === "local_command")
+      ) {
         leaf = cursor;
         break;
       }
@@ -2935,7 +3057,12 @@ export function followClaudeBranch<T extends Record<string, unknown>>(entries: T
   }
 
   if (!leaf) {
-    const fallbacks = [...byUuid.values()].filter((e) => e.type === "user" || e.type === "assistant");
+    const fallbacks = [...byUuid.values()].filter(
+      (e) =>
+        e.type === "user" ||
+        e.type === "assistant" ||
+        (e.type === "system" && e.subtype === "local_command"),
+    );
     const nonMeta = fallbacks.filter((e) => isMainTrack(e) && e.isMeta !== true);
     const pool = nonMeta.length > 0 ? nonMeta : fallbacks;
     if (pool.length === 0) return [];
@@ -2984,6 +3111,20 @@ function parseHistoryTranscript(
 
   for (const entry of branchEntries) {
     const type = entry.type;
+    if (type === "system" && entry.subtype === "local_command") {
+      const localOutput = extractLocalCommandOutput(typeof entry.content === "string" ? entry.content : extractText(entry.content));
+      if (localOutput) {
+        messages.push({
+          role: "assistant",
+          text: localOutput,
+          timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+          model: "<synthetic>",
+          ...(typeof entry.uuid === "string" ? { uuid: entry.uuid } : {}),
+          ...(entry.parentUuid !== undefined ? { parentUuid: entry.parentUuid as string | null } : {}),
+        });
+      }
+      continue;
+    }
     if (type !== "user" && type !== "assistant") continue;
     if (entry.isMeta === true && entry.isCompactSummary !== true) continue;
 
@@ -3018,6 +3159,23 @@ function parseHistoryTranscript(
     }
 
     const rawText = extractText(msg.content);
+    if (type === "user" && blocks.length === 0) {
+      const legacyOutput = extractLocalCommandOutput(rawText);
+      if (legacyOutput !== null) {
+        if (legacyOutput) {
+          messages.push({
+            role: "assistant",
+            text: legacyOutput,
+            timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
+            model: "<synthetic>",
+            ...(typeof entry.uuid === "string" ? { uuid: entry.uuid } : {}),
+            ...(entry.parentUuid !== undefined ? { parentUuid: entry.parentUuid as string | null } : {}),
+          });
+        }
+        continue;
+      }
+    }
+    const isBashOut = type === "user" && (rawText.includes("<bash-stdout>") || rawText.includes("<bash-stderr>"));
     const formattedText = type === "user" ? formatTranscriptUserText(rawText) : rawText;
     if (formattedText === null && blocks.length === 0) continue;
     const finalText = formattedText ?? "";
@@ -3031,6 +3189,7 @@ function parseHistoryTranscript(
       model: type === "assistant" && typeof msg.model === "string" ? msg.model : undefined,
       isError: type === "assistant" && entry.isApiErrorMessage === true,
       ...(entry.isCompactSummary === true ? { isCompactSummary: true } : {}),
+      ...(isBashOut ? { isLocalBashOutput: true } : {}),
       ...(typeof entry.uuid === "string" ? { uuid: entry.uuid } : {}),
       ...(entry.parentUuid !== undefined ? { parentUuid: entry.parentUuid as string | null } : {}),
     });
@@ -3076,9 +3235,40 @@ function extractText(content: unknown): string {
   return parts.join("").trim();
 }
 
-/** Format user text in transcript history (`<bash-input>`, `<bash-stdout>`, `<bash-stderr>`, skipping local noise). */
+/** Extract clean body from `<local-command-stdout>` / `<local-command-stderr>`; returns null if unrelated. */
+function extractLocalCommandOutput(text: string): string | null {
+  if (!text) return null;
+  if (!text.includes("<local-command-stdout") && !text.includes("<local-command-stderr")) return null;
+  const outMatch = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(text);
+  const errMatch = /<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/.exec(text);
+  const stdoutText = outMatch?.[1]?.trim() ?? "";
+  const stderrText = errMatch?.[1]?.trim() ?? "";
+  const combined = [stdoutText, stderrText ? `Error: ${stderrText}` : ""].filter(Boolean).join("\n").trim();
+  return combined;
+}
+
+/** Format user text in transcript history (`<command-name>`, `<bash-input>`, `<bash-stdout>`, `<bash-stderr>`, skipping caveats). */
 function formatTranscriptUserText(text: string): string | null {
   if (!text) return null;
+  if (text.startsWith("<local-command-caveat") || text.startsWith("Caveat:")) return null;
+
+  const cmdMatch = /<command-name>\s*([^<]+?)\s*<\/command-name>/.exec(text);
+  if (cmdMatch) {
+    const rawCmd = cmdMatch[1]!.trim();
+    const cmd = rawCmd.startsWith("/") ? rawCmd : `/${rawCmd}`;
+    const argsMatch = /<command-args>([\s\S]*?)<\/command-args>/.exec(text);
+    const argsText = argsMatch?.[1]?.trim() ?? "";
+    const stripped = text
+      .replace(/<command-name>[\s\S]*?<\/command-name>/g, "")
+      .replace(/<command-message>[\s\S]*?<\/command-message>/g, "")
+      .replace(/<command-args>[\s\S]*?<\/command-args>/g, "")
+      .trim();
+    if (!stripped) {
+      return argsText ? `${cmd} ${argsText}` : cmd;
+    }
+    return stripped;
+  }
+
   if (isLocalCommandText(text)) return null;
 
   const bashIn = /^\s*<bash-input>([\s\S]*?)<\/bash-input>\s*$/.exec(text);
@@ -3266,11 +3456,26 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           ...(typeof ev.model === "string" ? { model: ev.model } : {}),
           ...(typeof ev.permissionMode === "string" ? { permissionMode: ev.permissionMode } : {}),
           ...(Array.isArray(ev.slash_commands) ? { slashCommands: ev.slash_commands } : {}),
+          ...(Array.isArray(ev.terminal_slash_commands)
+            ? {
+                terminalSlashCommands: ev.terminal_slash_commands.filter(
+                  (c: unknown): c is string => typeof c === "string",
+                ),
+              }
+            : {}),
           ...(Array.isArray(ev.skills) ? { skills: ev.skills } : {}),
           ...(Array.isArray(ev.capabilities) ? { capabilities: ev.capabilities } : {}),
           ...(typeof ev.claude_code_version === "string" ? { claudeCodeVersion: ev.claude_code_version } : {}),
           ...(typeof ev.fast_mode_state === "string" ? { fastModeState: ev.fast_mode_state } : {}),
           ...(ev.effort !== undefined ? { effort: ev.effort as string | null } : {}),
+        });
+      } else if (ev.subtype === "conversation_reset") {
+        out.push({
+          type: "conversation_reset",
+          sessionId: String(ev.session_id ?? ""),
+          ...(typeof ev.new_conversation_id === "string" ? { newConversationId: ev.new_conversation_id } : {}),
+          ...(typeof ev.trigger === "string" ? { trigger: ev.trigger } : {}),
+          ...(uuid ? { uuid } : {}),
         });
       } else if (ev.subtype === "task_started" && typeof ev.task_id === "string") {
         out.push({
@@ -3320,6 +3525,16 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           ...(uuid ? { uuid } : {}),
         });
       }
+      break;
+
+    case "conversation_reset":
+      out.push({
+        type: "conversation_reset",
+        sessionId: String(ev.session_id ?? ""),
+        ...(typeof ev.new_conversation_id === "string" ? { newConversationId: ev.new_conversation_id } : {}),
+        ...(typeof ev.trigger === "string" ? { trigger: ev.trigger } : {}),
+        ...(uuid ? { uuid } : {}),
+      });
       break;
 
     case "stream_event": {

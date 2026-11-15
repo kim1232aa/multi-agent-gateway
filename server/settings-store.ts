@@ -88,6 +88,16 @@ export class SettingsStore {
     return typeof value === 'string' ? value : undefined;
   }
 
+  listStrings(scope: string): Record<string, string> {
+    const bucket = this.data[scope];
+    if (!bucket) return {};
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(bucket)) {
+      if (typeof value === 'string') out[key] = value;
+    }
+    return out;
+  }
+
   getBoolean(scope: string, sessionId: string): boolean | undefined {
     const value = this.data[scope]?.[sessionId];
     return typeof value === 'boolean' ? value : undefined;

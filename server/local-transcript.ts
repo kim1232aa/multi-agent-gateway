@@ -150,6 +150,7 @@ interface TranscriptSessionState {
   tasks: Map<string, TranscriptTask>;
   meta: Record<string, unknown>;
   plans: unknown[];
+  toolSubagentLinks: Map<string, Set<string>>;
 }
 
 interface TranscriptSubscriber {
@@ -169,9 +170,244 @@ export interface LocalTranscriptSubscription {
   close(): void;
 }
 
+const SHELL_TOOL_NAMES = new Set([
+  'commandexecution',
+  'exec_command',
+  'shell_command',
+  'local_shell_call',
+  'run_terminal_command',
+  'run_command',
+  'execute_command',
+  'powershell',
+  'bash',
+  'shell',
+]);
+
+const SUBAGENT_TOOL_NAMES = new Set([
+  'spawn_agent',
+  'spawn_subagent',
+  'spawnagent',
+  'spawnsubagent',
+  'collabagenttoolcall',
+  'collab_agent_tool_call',
+  'collab_tool_call',
+  'agent',
+  'task',
+  'subagent',
+]);
+
+const FILE_SEARCH_ALIASES: Record<string, string> = {
+  read: 'Read',
+  read_file: 'Read',
+  view_file: 'Read',
+  write: 'Write',
+  write_file: 'Write',
+  create_file: 'Write',
+  edit: 'Edit',
+  apply_patch: 'Edit',
+  filechange: 'Edit',
+  str_replace: 'Edit',
+  replace_file: 'Edit',
+  grep: 'Grep',
+  grep_search: 'Grep',
+  search_grep: 'Grep',
+  find: 'Glob',
+  find_by_name: 'Glob',
+  find_files: 'Glob',
+  list_dir: 'ListDir',
+  listdir: 'ListDir',
+};
+
+/** Normalize tool name and input for Kimi Web 2.6.2 tool presentation. */
+export function normalizeKimiWebTool(name: string, input: unknown): { name: string; input: unknown } {
+  let parsedInput: unknown = input;
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        parsedInput = JSON.parse(trimmed);
+      } catch {
+        // keep original string
+      }
+    }
+  }
+
+  const rawLower = (name ?? '').toLowerCase().replace(/[\s-]+/g, '_');
+
+  // 1. Shell tool names -> 'Bash'
+  if (name === 'Bash' || SHELL_TOOL_NAMES.has(rawLower) || SHELL_TOOL_NAMES.has(name)) {
+    let normInput: Record<string, unknown>;
+    if (typeof parsedInput === 'string') {
+      normInput = { command: parsedInput };
+    } else if (typeof parsedInput === 'object' && parsedInput !== null && !Array.isArray(parsedInput)) {
+      const raw = parsedInput as Record<string, unknown>;
+      const command = typeof raw.command === 'string'
+        ? raw.command
+        : typeof raw.cmd === 'string'
+          ? raw.cmd
+          : typeof raw.script === 'string'
+            ? raw.script
+            : raw.command !== undefined && raw.command !== null
+              ? String(raw.command)
+              : '';
+      const cwd = raw.cwd ?? raw.workdir;
+      normInput = {
+        ...raw,
+        command,
+        ...(cwd !== undefined ? { cwd } : {}),
+      };
+    } else {
+      normInput = { command: parsedInput !== undefined && parsedInput !== null ? String(parsedInput) : '' };
+    }
+    return { name: 'Bash', input: normInput };
+  }
+
+  // 2. Subagent tool names -> 'Agent'
+  if (name === 'Agent' || SUBAGENT_TOOL_NAMES.has(rawLower) || SUBAGENT_TOOL_NAMES.has(name)) {
+    let normInput: Record<string, unknown>;
+    if (typeof parsedInput === 'string') {
+      normInput = {
+        description: parsedInput.split(/\r?\n/)[0]?.slice(0, 80) || parsedInput,
+        prompt: parsedInput,
+      };
+    } else if (typeof parsedInput === 'object' && parsedInput !== null && !Array.isArray(parsedInput)) {
+      const raw = parsedInput as Record<string, unknown>;
+      const prompt = raw.prompt ?? raw.message;
+      const fallbackDesc = typeof prompt === 'string' && prompt.trim()
+        ? prompt.trim().split(/\r?\n/)[0]?.slice(0, 80)
+        : undefined;
+      const description = raw.description ?? raw.task_name ?? raw.task ?? raw.title ?? fallbackDesc;
+      const subagentType = raw.subagent_type ?? raw.agent_type ?? raw.agent;
+      normInput = {
+        ...raw,
+        ...(description !== undefined ? { description } : {}),
+        ...(subagentType !== undefined ? { subagent_type: subagentType } : {}),
+        ...(prompt !== undefined ? { prompt } : {}),
+        ...(raw.run_in_background !== undefined ? { run_in_background: raw.run_in_background } : {}),
+      };
+    } else {
+      normInput = {};
+    }
+    return { name: 'Agent', input: normInput };
+  }
+
+  // 3. File / search aliases
+  const mappedName = FILE_SEARCH_ALIASES[rawLower] ?? FILE_SEARCH_ALIASES[name];
+  const targetName = mappedName ?? name;
+
+  if (targetName === 'Read' || targetName === 'Write' || targetName === 'Edit') {
+    let normInput: unknown = parsedInput;
+    if (typeof parsedInput === 'string') {
+      normInput = { path: parsedInput };
+    } else if (typeof parsedInput === 'object' && parsedInput !== null && !Array.isArray(parsedInput)) {
+      const raw = parsedInput as Record<string, unknown>;
+      const pathVal = raw.path ?? raw.file_path;
+      normInput = {
+        ...raw,
+        ...(pathVal !== undefined ? { path: pathVal } : {}),
+      };
+    }
+    return { name: targetName, input: normInput };
+  }
+
+  if (targetName === 'Grep' || targetName === 'Glob') {
+    let normInput: unknown = parsedInput;
+    if (typeof parsedInput === 'string') {
+      normInput = { pattern: parsedInput };
+    } else if (typeof parsedInput === 'object' && parsedInput !== null && !Array.isArray(parsedInput)) {
+      const raw = parsedInput as Record<string, unknown>;
+      const pattern = raw.pattern ?? raw.query ?? raw.regex ?? raw.glob ?? raw.name;
+      const pathVal = raw.path ?? raw.dir ?? raw.directory;
+      normInput = {
+        ...raw,
+        ...(pattern !== undefined ? { pattern } : {}),
+        ...(pathVal !== undefined ? { path: pathVal } : {}),
+      };
+    }
+    return { name: targetName, input: normInput };
+  }
+
+  if (targetName === 'ListDir') {
+    let normInput: unknown = parsedInput;
+    if (typeof parsedInput === 'string') {
+      normInput = { path: parsedInput };
+    } else if (typeof parsedInput === 'object' && parsedInput !== null && !Array.isArray(parsedInput)) {
+      const raw = parsedInput as Record<string, unknown>;
+      const pathVal = raw.path ?? raw.dir ?? raw.directory;
+      normInput = {
+        ...raw,
+        ...(pathVal !== undefined ? { path: pathVal } : {}),
+      };
+    }
+    return { name: 'ListDir', input: normInput };
+  }
+
+  return { name: targetName, input: parsedInput };
+}
+
+/** Extract subagent ID from tool output (supports agent_id, subagent_id, JSON, and text). */
+export function extractSubagentIdFromOutput(output: unknown): string | undefined {
+  if (output === null || output === undefined) return undefined;
+
+  if (typeof output === 'object') {
+    if (Array.isArray(output)) {
+      for (const item of output) {
+        const found = extractSubagentIdFromOutput(item);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    const rec = output as Record<string, unknown>;
+    const direct = rec.subagent_id
+      ?? rec.agent_id
+      ?? rec.subagentId
+      ?? rec.agentId
+      ?? rec.agent_thread_id
+      ?? rec.agentThreadId
+      ?? (Array.isArray(rec.receiverThreadIds) ? rec.receiverThreadIds[0] : undefined)
+      ?? (Array.isArray(rec.receiver_thread_ids) ? rec.receiver_thread_ids[0] : undefined);
+    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+    if (typeof rec.data === 'object' && rec.data !== null) {
+      const found = extractSubagentIdFromOutput(rec.data);
+      if (found) return found;
+    }
+    if (typeof rec.result === 'object' && rec.result !== null) {
+      const found = extractSubagentIdFromOutput(rec.result);
+      if (found) return found;
+    }
+    if (typeof rec.text === 'string') {
+      const found = extractSubagentIdFromOutput(rec.text);
+      if (found) return found;
+    }
+  }
+
+  const text = typeof output === 'string' ? output : '';
+  if (!text) return undefined;
+
+  const trimmed = text.trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const found = extractSubagentIdFromOutput(parsed);
+      if (found) return found;
+    } catch {
+      // fallback to regex
+    }
+  }
+
+  const match = /(?:subagent_id|agent_id|subagentId|agentId)["']?\s*[:=]\s*["'<]?([a-zA-Z0-9_\-\.]+)/i.exec(text);
+  if (match?.[1]) {
+    const id = match[1].replace(/^[<"']+|[>"',;\.]+$/g, '').trim();
+    if (id) return id;
+  }
+
+  return undefined;
+}
+
 /** In-memory transcript-v2 journal for local Claude/Codex/Grok/Pi sessions. */
 export class LocalTranscriptHub {
   private readonly sessions = new Map<string, TranscriptSessionState>();
+  private readonly activeLocalTurns = new Map<string, LocalTranscriptTurn>();
   private static readonly JOURNAL_CAP = 200;
 
   currentSeq(sessionId: string): number {
@@ -191,12 +427,105 @@ export class LocalTranscriptHub {
     state.historyObserved = true;
     const persistedTurns = historyTurns(messages).turns;
     state.nextOrdinal = Math.max(state.nextOrdinal, persistedTurns.length + 1);
-    for (const [turnId, turn] of state.recentTurns) {
+
+    const trailingCount = Math.max(5, state.unbasedTurns.size * 2);
+    const trailingPersisted = persistedTurns.slice(-trailingCount);
+
+    for (const [turnId, turn] of [...state.recentTurns.entries()]) {
+      // 当 unbasedTurns 中的已完成 turn 与新观察到的末尾持久化 turn prompt 匹配时,
+      // 驱逐它而不是重编号为重复的 turn。
+      if (state.unbasedTurns.has(turnId) && turn.state !== 'running') {
+        const turnPrompt = turn.prompt?.trim();
+        if (turnPrompt && trailingPersisted.some((pt) => pt.prompt?.trim() === turnPrompt)) {
+          state.recentTurns.delete(turnId);
+          state.unbasedTurns.delete(turnId);
+          continue;
+        }
+      }
       // 未基准的 turn 不能按 ordinal 驱逐——它的 ordinal 是在历史未知时分配的,
       // 撞号不代表是同一个 turn;重编号后自然落到 persisted 之后。
-      if (turn.ordinal <= persistedTurns.length && !state.unbasedTurns.has(turnId)) state.recentTurns.delete(turnId);
+      if (turn.ordinal <= persistedTurns.length && !state.unbasedTurns.has(turnId)) {
+        state.recentTurns.delete(turnId);
+      }
     }
     if (state.unbasedTurns.size > 0) this.rebaseUnbasedTurns(state);
+  }
+
+  linkSubagentToToolCall(sessionId: string, parentToolUseId: string, agentId: string): void {
+    if (!parentToolUseId || !agentId) return;
+    const state = this.state(sessionId);
+
+    let set = state.toolSubagentLinks.get(parentToolUseId);
+    if (!set) {
+      set = new Set<string>();
+      state.toolSubagentLinks.set(parentToolUseId, set);
+    }
+    set.add(agentId);
+
+    for (const turn of [...state.activeTurns.values(), ...state.recentTurns.values()]) {
+      for (const step of turn.steps) {
+        for (const frame of step.frames) {
+          if (frame.kind === 'tool' && frame.toolCallId === parentToolUseId) {
+            const refs = Array.isArray(frame.agentRefs)
+              ? (frame.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>)
+              : [];
+            if (!refs.some((r) => r.agentId === agentId)) {
+              frame.agentRefs = [...refs, { agentId, role: 'child' }];
+              this.publish(sessionId, [{
+                op: 'frame.upsert',
+                turnId: turn.turnId,
+                stepId: step.stepId,
+                frame: { ...frame },
+              }]);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  getLinkedSubagents(sessionId: string, toolCallId: string): string[] {
+    const state = this.sessions.get(sessionId);
+    if (!state) return [];
+    const set = state.toolSubagentLinks.get(toolCallId);
+    return set ? [...set] : [];
+  }
+
+  toolStarted(sessionId: string, toolCallId: string, name: string, input: unknown, meta?: FrameMeta): void {
+    const active = this.activeLocalTurns.get(sessionId);
+    if (active) {
+      active.toolStarted(toolCallId, name, input, meta);
+      return;
+    }
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    const runningTurn = [...state.activeTurns.values()].reverse().find((t) => t.state === 'running');
+    if (runningTurn) {
+      const localTurn = new LocalTranscriptTurn(this, sessionId, runningTurn);
+      localTurn.toolStarted(toolCallId, name, input, meta);
+    }
+  }
+
+  toolResult(
+    sessionId: string,
+    toolCallId: string,
+    output: unknown,
+    isError: boolean,
+    extra?: { structuredOutput?: unknown } & FrameMeta,
+  ): void {
+    const active = this.activeLocalTurns.get(sessionId);
+    if (active) {
+      active.toolResult(toolCallId, output, isError, extra);
+      return;
+    }
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    const runningTurn = [...state.activeTurns.values()].reverse().find((t) => t.state === 'running')
+      ?? [...state.recentTurns.values()].reverse().find((t) => t.steps.some((s) => s.frames.some((f) => f.toolCallId === toolCallId)));
+    if (runningTurn) {
+      const localTurn = new LocalTranscriptTurn(this, sessionId, runningTurn);
+      localTurn.toolResult(toolCallId, output, isError, extra);
+    }
   }
 
   activeItems(sessionId: string): TranscriptTurn[] {
@@ -553,7 +882,9 @@ export class LocalTranscriptHub {
     state.activeTurns.set(turn.turnId, turn);
     this.mergeMeta(sessionId, { activity: 'turn' });
     this.publish(sessionId, [{ op: 'turn.upsert', turn: turnHeader(turn) }]);
-    return new LocalTranscriptTurn(this, sessionId, turn);
+    const localTurn = new LocalTranscriptTurn(this, sessionId, turn);
+    this.activeLocalTurns.set(sessionId, localTurn);
+    return localTurn;
   }
 
   publish(sessionId: string, ops: TranscriptOperation[]): void {
@@ -579,6 +910,9 @@ export class LocalTranscriptHub {
       const oldest = state.recentTurns.keys().next().value as string | undefined;
       if (oldest) state.recentTurns.delete(oldest);
     }
+    if (this.activeLocalTurns.get(sessionId)?.turnId === turn.turnId) {
+      this.activeLocalTurns.delete(sessionId);
+    }
   }
 
   drop(sessionId: string): void {
@@ -586,6 +920,7 @@ export class LocalTranscriptHub {
     if (!state) return;
     for (const subscriber of state.subscribers) subscriber.closed = true;
     this.sessions.delete(sessionId);
+    this.activeLocalTurns.delete(sessionId);
   }
 
   /**
@@ -673,6 +1008,7 @@ export class LocalTranscriptHub {
         tasks: new Map(),
         meta: {},
         plans: [],
+        toolSubagentLinks: new Map(),
       };
       this.sessions.set(sessionId, state);
     }
@@ -706,6 +1042,14 @@ export class LocalTranscriptTurn {
     private readonly sessionId: string,
     private readonly turn: TranscriptTurn,
   ) {}
+
+  get ordinal(): number {
+    return this.turn.ordinal;
+  }
+
+  get turnId(): string {
+    return this.turn.turnId;
+  }
 
   append(kind: 'assistant' | 'thinking', text: string, meta?: FrameMeta): void {
     if (!text || this.ended) return;
@@ -763,18 +1107,40 @@ export class LocalTranscriptTurn {
 
   toolStarted(toolCallId: string, name: string, input: unknown, meta?: FrameMeta): void {
     if (this.ended) return;
+    const normalized = normalizeKimiWebTool(name, input);
     const step = this.ensureStep(meta);
     const agentRefs = meta?.agentRefs
-      ?? (meta?.agentId && meta.agentId !== 'main' ? [{ agentId: meta.agentId, role: 'child' as const }] : undefined);
+      ? [...meta.agentRefs]
+      : (meta?.agentId && meta.agentId !== 'main' ? [{ agentId: meta.agentId, role: 'child' as const }] : []);
+
+    const linkedAgents = this.hub.getLinkedSubagents(this.sessionId, toolCallId);
+    for (const linkedId of linkedAgents) {
+      if (!agentRefs.some((r) => r.agentId === linkedId)) {
+        agentRefs.push({ agentId: linkedId, role: 'child' });
+      }
+    }
+
+    if (normalized.name === 'Agent') {
+      const inputSubagentId = extractSubagentIdFromOutput(normalized.input);
+      if (inputSubagentId && !agentRefs.some((r) => r.agentId === inputSubagentId)) {
+        agentRefs.push({ agentId: inputSubagentId, role: 'child' });
+        this.hub.linkSubagentToToolCall(this.sessionId, toolCallId, inputSubagentId);
+      }
+    }
+
+    if (meta?.parentToolUseId && meta?.agentId && meta.agentId !== 'main') {
+      this.hub.linkSubagentToToolCall(this.sessionId, meta.parentToolUseId, meta.agentId);
+    }
+
     const frame: TranscriptFrame = {
       kind: 'tool',
       frameId: `${step.stepId}.${toolCallId}`,
       toolCallId,
-      name,
+      name: normalized.name,
       state: 'running',
-      input,
+      input: normalized.input,
       ...compactFrameMeta(meta),
-      ...(agentRefs && agentRefs.length > 0 ? { agentRefs } : {}),
+      ...(agentRefs.length > 0 ? { agentRefs } : {}),
     };
     this.tools.set(toolCallId, frame);
     step.frames.push(frame);
@@ -794,7 +1160,35 @@ export class LocalTranscriptTurn {
       ? extra.structuredOutput
       : output;
     const agentRefs = extra?.agentRefs
-      ?? (extra?.agentId && extra.agentId !== 'main' ? [{ agentId: extra.agentId, role: 'child' as const }] : undefined);
+      ? [...extra.agentRefs]
+      : (extra?.agentId && extra.agentId !== 'main' ? [{ agentId: extra.agentId, role: 'child' as const }] : []);
+
+    if (existing?.agentRefs && Array.isArray(existing.agentRefs)) {
+      for (const ref of existing.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>) {
+        if (!agentRefs.some((r) => r.agentId === ref.agentId)) {
+          agentRefs.push(ref);
+        }
+      }
+    }
+
+    const linkedAgents = this.hub.getLinkedSubagents(this.sessionId, toolCallId);
+    for (const linkedId of linkedAgents) {
+      if (!agentRefs.some((r) => r.agentId === linkedId)) {
+        agentRefs.push({ agentId: linkedId, role: 'child' });
+      }
+    }
+
+    const extractedId = extractSubagentIdFromOutput(resolvedOutput)
+      ?? extractSubagentIdFromOutput(extra?.structuredOutput);
+    if (extractedId && !agentRefs.some((r) => r.agentId === extractedId)) {
+      agentRefs.push({ agentId: extractedId, role: 'child' });
+      this.hub.linkSubagentToToolCall(this.sessionId, toolCallId, extractedId);
+    }
+
+    if (extra?.parentToolUseId && extra?.agentId && extra.agentId !== 'main') {
+      this.hub.linkSubagentToToolCall(this.sessionId, extra.parentToolUseId, extra.agentId);
+    }
+
     const frame: TranscriptFrame = {
       ...(existing ?? {
         kind: 'tool',
@@ -809,7 +1203,7 @@ export class LocalTranscriptTurn {
         : {}),
       ...(isError ? { error: toolErrorText(resolvedOutput) } : {}),
       ...compactFrameMeta(extra),
-      ...(agentRefs && agentRefs.length > 0 ? { agentRefs } : {}),
+      ...(agentRefs.length > 0 ? { agentRefs } : {}),
     };
     this.tools.set(toolCallId, frame);
     const frameIndex = step.frames.findIndex((item) => item.frameId === frame.frameId);
@@ -999,12 +1393,13 @@ function historyTurns(messages: readonly Message[]): {
     if (meta.agentId && meta.agentId !== 'main') subagentIds.add(meta.agentId);
     if (message.metadata?.plan !== undefined) plans.push(message.metadata.plan);
 
+    const isBashCard = Boolean(message.metadata?.bash_card);
     const prompt = messageText(message.content);
     const hasMedia = message.content.some((part) =>
       part.type === 'image' || part.type === 'file' || part.type === 'document' || part.type === 'audio');
     const isToolOnlyUser = message.role === 'user' && !prompt && !hasMedia && message.content.some((part) =>
       part.type === 'tool_result' || part.type === 'tool_use' || part.type === 'tool_call');
-    if (message.role === 'user' && !isToolOnlyUser) {
+    if (message.role === 'user' && !isToolOnlyUser && !isBashCard) {
       const attachmentIds = collectAttachments(message);
       current = newTurn(turns.length + 1, 'user', message.created_at, prompt, attachmentIds, meta);
       turns.push(current);
@@ -1020,6 +1415,42 @@ function historyTurns(messages: readonly Message[]): {
     for (const frame of frames) {
       if (typeof frame.agentId === 'string' && frame.agentId && frame.agentId !== 'main') {
         subagentIds.add(frame.agentId);
+      }
+      if (Array.isArray(frame.agentRefs)) {
+        for (const ref of frame.agentRefs as Array<{ agentId: string }>) {
+          if (ref?.agentId && ref.agentId !== 'main') {
+            subagentIds.add(ref.agentId);
+          }
+        }
+      }
+      if (frame.kind === 'tool' && frame.toolCallId && Array.isArray(frame.agentRefs) && frame.agentRefs.length > 0) {
+        for (const step of current.steps) {
+          for (const priorFrame of step.frames) {
+            if (priorFrame.kind === 'tool' && priorFrame.toolCallId === frame.toolCallId) {
+              const priorRefs = (priorFrame.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>) ?? [];
+              for (const ref of frame.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>) {
+                if (!priorRefs.some((r) => r.agentId === ref.agentId)) {
+                  priorRefs.push(ref);
+                }
+              }
+              if (priorRefs.length > 0) priorFrame.agentRefs = priorRefs;
+            }
+          }
+        }
+      }
+    }
+    if (meta.parentToolUseId && meta.agentId && meta.agentId !== 'main') {
+      for (const turn of turns) {
+        for (const step of turn.steps) {
+          for (const f of step.frames) {
+            if (f.kind === 'tool' && f.toolCallId === meta.parentToolUseId) {
+              const refs = (f.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>) ?? [];
+              if (!refs.some((r) => r.agentId === meta.agentId)) {
+                f.agentRefs = [...refs, { agentId: meta.agentId, role: 'child' }];
+              }
+            }
+          }
+        }
       }
     }
     const isError = message.metadata?.is_error === true;
@@ -1081,6 +1512,85 @@ function newTurn(
 export function contentFrames(message: Message): TranscriptFrame[] {
   const frames: TranscriptFrame[] = [];
   const msgMeta = messageMeta(message);
+
+  if (message.metadata?.bash_card) {
+    const card = typeof message.metadata.bash_card === 'object' && message.metadata.bash_card !== null
+      ? (message.metadata.bash_card as Record<string, unknown>)
+      : {};
+    const rawText = messageText(message.content);
+    let command = typeof card.command === 'string'
+      ? card.command
+      : typeof card.cmd === 'string'
+        ? card.cmd
+        : '';
+    let output = card.output ?? card.stdout;
+    let isError = card.is_error === true
+      || card.isError === true
+      || (typeof card.exit_code === 'number' && card.exit_code !== 0)
+      || (typeof card.exitCode === 'number' && card.exitCode !== 0)
+      || message.metadata?.is_error === true;
+
+    if (!command) {
+      const bashIn = /<bash-input>([\s\S]*?)<\/bash-input>/.exec(rawText);
+      const bashOut = /<bash-stdout>([\s\S]*?)<\/bash-stdout>/.exec(rawText);
+      const bashErr = /<bash-stderr>([\s\S]*?)<\/bash-stderr>/.exec(rawText);
+      if (bashIn) {
+        command = bashIn[1].trim();
+        const stdoutText = bashOut?.[1]?.trim() ?? '';
+        const stderrText = bashErr?.[1]?.trim() ?? '';
+        const combined = [stdoutText, stderrText].filter(Boolean).join('\n');
+        if (output === undefined) output = combined;
+        if (!isError && stderrText && !card.exit_code && !card.exitCode) {
+          isError = true;
+        }
+      } else if (rawText.startsWith('$ ')) {
+        const firstNl = rawText.indexOf('\n');
+        if (firstNl !== -1) {
+          command = rawText.slice(2, firstNl).trim();
+          if (output === undefined) output = rawText.slice(firstNl + 1);
+        } else {
+          command = rawText.slice(2).trim();
+          if (output === undefined) output = '';
+        }
+      } else if (rawText.startsWith('! ')) {
+        command = rawText.slice(2).trim();
+        if (output === undefined) output = '';
+      } else {
+        command = rawText.trim();
+        if (output === undefined) output = '';
+      }
+    }
+    if (output === undefined) output = '';
+
+    const toolCallId = (typeof card.tool_call_id === 'string' && card.tool_call_id)
+      || (typeof card.toolCallId === 'string' && card.toolCallId)
+      || (typeof card.id === 'string' && card.id)
+      || `${message.id}.bash`;
+
+    const normalized = normalizeKimiWebTool('Bash', {
+      command,
+      ...(card.cwd ? { cwd: card.cwd } : {}),
+      ...(card.workdir ? { workdir: card.workdir } : {}),
+    });
+
+    const agentRefs = msgMeta.agentRefs
+      ?? (msgMeta.agentId && msgMeta.agentId !== 'main' ? [{ agentId: msgMeta.agentId, role: 'child' as const }] : undefined);
+
+    frames.push({
+      kind: 'tool',
+      frameId: `${message.id}.bash.0`,
+      toolCallId,
+      name: normalized.name,
+      state: isError ? 'error' : 'done',
+      input: normalized.input,
+      output,
+      ...(isError ? { error: toolErrorText(output) } : {}),
+      ...compactFrameMeta(msgMeta),
+      ...(agentRefs && agentRefs.length > 0 ? { agentRefs } : {}),
+    });
+    return frames;
+  }
+
   const isNoticeMsg = message.role === 'system'
     || message.metadata?.notice === true
     || typeof message.metadata?.notice_level === 'string';
@@ -1125,26 +1635,34 @@ export function contentFrames(message: Message): TranscriptFrame[] {
       });
     } else if (part.type === 'tool_call' || part.type === 'tool_use') {
       const toolCallId = part.type === 'tool_use' ? part.tool_call_id : part.id;
-      const name = part.type === 'tool_use' ? part.tool_name : part.name;
-      const agentRefs = partMeta.agentId && partMeta.agentId !== 'main'
-        ? [{ agentId: partMeta.agentId, role: 'child' as const }]
-        : undefined;
+      const rawName = part.type === 'tool_use' ? part.tool_name : part.name;
+      const normalized = normalizeKimiWebTool(rawName ?? 'tool', part.input);
+      let agentRefs = partMeta.agentRefs ? [...partMeta.agentRefs] : [];
+      if (normalized.name === 'Agent') {
+        const inputSubagentId = extractSubagentIdFromOutput(normalized.input);
+        if (inputSubagentId && !agentRefs.some((r) => r.agentId === inputSubagentId)) {
+          agentRefs.push({ agentId: inputSubagentId, role: 'child' });
+        }
+      }
       frames.push({
         kind: 'tool',
         frameId,
         toolCallId,
-        name,
+        name: normalized.name,
         state: 'running',
-        input: part.input,
+        input: normalized.input,
         ...compactFrameMeta(partMeta),
-        ...(agentRefs ? { agentRefs } : {}),
+        ...(agentRefs.length > 0 ? { agentRefs } : {}),
       });
     } else if (part.type === 'tool_result') {
       const output = resolveToolResultOutput(part);
       const structured = part.structured_output ?? part.structuredOutput;
-      const agentRefs = partMeta.agentId && partMeta.agentId !== 'main'
-        ? [{ agentId: partMeta.agentId, role: 'child' as const }]
-        : undefined;
+      let agentRefs = partMeta.agentRefs ? [...partMeta.agentRefs] : [];
+      const extractedId = extractSubagentIdFromOutput(output)
+        ?? extractSubagentIdFromOutput(structured);
+      if (extractedId && !agentRefs.some((r) => r.agentId === extractedId)) {
+        agentRefs.push({ agentId: extractedId, role: 'child' });
+      }
       frames.push({
         kind: 'tool',
         frameId,
@@ -1155,7 +1673,7 @@ export function contentFrames(message: Message): TranscriptFrame[] {
         ...(structured !== undefined && structured !== output ? { structuredOutput: structured } : {}),
         ...(part.is_error ? { error: toolErrorText(output) } : {}),
         ...compactFrameMeta(partMeta),
-        ...(agentRefs ? { agentRefs } : {}),
+        ...(agentRefs.length > 0 ? { agentRefs } : {}),
       });
     } else if (part.type === 'image' || part.type === 'file' || part.type === 'document' || part.type === 'audio') {
       const info = safeMediaInfo(message.id, index, part);
@@ -1369,13 +1887,22 @@ function messageMeta(message: Message): FrameMeta {
       ? m.agentId
       : typeof m.subagent_id === 'string' && m.subagent_id
         ? m.subagent_id
-        : undefined;
+        : typeof m.subagentId === 'string' && m.subagentId
+          ? m.subagentId
+          : undefined;
   const taskId = typeof m.task_id === 'string' && m.task_id
     ? m.task_id
     : typeof m.taskId === 'string' && m.taskId
       ? m.taskId
       : undefined;
-  return { phase, parentToolUseId, agentId, taskId };
+  const agentRefs = Array.isArray(m.agentRefs)
+    ? (m.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>)
+    : Array.isArray(m.agent_refs)
+      ? (m.agent_refs as Array<{ agentId: string; role?: 'child' | 'member' }>)
+      : agentId && agentId !== 'main'
+        ? [{ agentId, role: 'child' as const }]
+        : undefined;
+  return { phase, parentToolUseId, agentId, taskId, agentRefs };
 }
 
 function mergeFrameMeta(base: FrameMeta, part: MessageContentPart): FrameMeta {
@@ -1390,13 +1917,24 @@ function mergeFrameMeta(base: FrameMeta, part: MessageContentPart): FrameMeta {
     ? rec.agent_id
     : typeof rec.agentId === 'string' && rec.agentId
       ? rec.agentId
-      : base.agentId;
+      : typeof rec.subagent_id === 'string' && rec.subagent_id
+        ? rec.subagent_id
+        : typeof rec.subagentId === 'string' && rec.subagentId
+          ? rec.subagentId
+          : base.agentId;
   const taskId = typeof rec.task_id === 'string' && rec.task_id
     ? rec.task_id
     : typeof rec.taskId === 'string' && rec.taskId
       ? rec.taskId
       : base.taskId;
-  return { phase, parentToolUseId, agentId, taskId };
+  const agentRefs = Array.isArray(rec.agentRefs)
+    ? (rec.agentRefs as Array<{ agentId: string; role?: 'child' | 'member' }>)
+    : Array.isArray(rec.agent_refs)
+      ? (rec.agent_refs as Array<{ agentId: string; role?: 'child' | 'member' }>)
+      : rec.agent_id || rec.subagent_id
+        ? [{ agentId: (rec.agent_id ?? rec.subagent_id) as string, role: 'child' as const }]
+        : base.agentRefs;
+  return { phase, parentToolUseId, agentId, taskId, agentRefs };
 }
 
 function compactFrameMeta(meta?: FrameMeta): Record<string, unknown> {
@@ -1406,6 +1944,7 @@ function compactFrameMeta(meta?: FrameMeta): Record<string, unknown> {
     ...(meta.parentToolUseId ? { parentToolUseId: meta.parentToolUseId } : {}),
     ...(meta.agentId ? { agentId: meta.agentId } : {}),
     ...(meta.taskId ? { taskId: meta.taskId } : {}),
+    ...(meta.agentRefs && meta.agentRefs.length > 0 ? { agentRefs: meta.agentRefs } : {}),
   };
 }
 
@@ -1523,7 +2062,12 @@ function opsEmission(batch: TranscriptBatch): TranscriptEmission {
  * 及 archived_sessions/(归档会话会被移过去)。找不到返回 null(未落盘的新线程)。
  */
 export async function findCodexRollout(threadId: string, codexHome?: string): Promise<string | null> {
+  if (!threadId || !/^[a-zA-Z0-9._-]+$/.test(threadId) || threadId === '.' || threadId === '..') {
+    return null;
+  }
   const home = codexHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+  const suffix = `-${threadId}.jsonl`;
+  const exact = `${threadId}.jsonl`;
   const matchIn = async (dir: string, depth: number): Promise<string | null> => {
     let entries;
     try {
@@ -1536,7 +2080,7 @@ export async function findCodexRollout(threadId: string, codexHome?: string): Pr
       if (e.isDirectory() && depth > 0) {
         const hit = await matchIn(full, depth - 1);
         if (hit) return hit;
-      } else if (e.isFile() && e.name.endsWith('.jsonl') && e.name.includes(threadId)) {
+      } else if (e.isFile() && (e.name === exact || e.name.endsWith(suffix))) {
         return full;
       }
     }

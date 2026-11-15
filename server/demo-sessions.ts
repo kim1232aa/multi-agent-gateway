@@ -92,6 +92,7 @@ const CODEX_C = '9b3c1e40-3333-4ccc-addd-000000000023';
 const GROK_A = 'ac4d2f51-4444-4ddd-beee-000000000031';
 const GROK_B = 'ac4d2f51-4444-4ddd-beee-000000000032';
 const GROK_C = 'ac4d2f51-4444-4ddd-beee-000000000033';
+const PI_A = 'bd5e3062-5555-4eee-9fff-000000000041';
 
 add(
   'kimi',
@@ -422,7 +423,40 @@ add(
   ],
 );
 
+add(
+  'pi',
+  PI_A,
+  'Pi · RPC 模式接入',
+  'Pi 是怎么接入协议网关的？',
+  'anthropic/claude-sonnet-4-5',
+  3,
+  0.05,
+  [
+    msg('pi-a-u1', PI_A, 'user', iso(3), [
+      { type: 'text', text: 'Pi 是怎么接入协议网关的？' },
+    ]),
+    msg('pi-a-a1', PI_A, 'assistant', iso(0.05), [
+      {
+        type: 'text',
+        text: '网关通过 `pi --mode rpc` 严格 LF JSONL 通信，支持流式输出、steer 插话、clone/fork、compact 与扩展 UI 提问。',
+      },
+    ]),
+  ],
+);
+
 export function listDemoModels(provider: ProviderName): NativeModel[] {
+  if (provider === 'pi') {
+    return [
+      {
+        provider: 'pi',
+        model: 'anthropic/claude-sonnet-4-5',
+        display_name: 'Claude Sonnet 4.5 (anthropic)',
+        max_context_size: 200_000,
+        capabilities: ['thinking'],
+        support_efforts: ['off', 'minimal', 'low', 'medium', 'high'],
+      },
+    ];
+  }
   if (provider === 'claude') {
     return [
       {
@@ -549,5 +583,6 @@ function label(provider: ProviderName): string {
   if (provider === 'claude') return 'Claude';
   if (provider === 'codex') return 'Codex';
   if (provider === 'grok') return 'Grok';
+  if (provider === 'pi') return 'Pi';
   return 'Kimi';
 }

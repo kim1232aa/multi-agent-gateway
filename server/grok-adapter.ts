@@ -239,6 +239,8 @@ export class GrokAdapter {
   private readonly env: Record<string, string>;
   private readonly sessionsDir: string;
   private readonly running = new Map<string, ChildProcess>();
+  private readonly ephemeralChildren = new Set<ChildProcess>();
+  private closed = false;
   private readonly interruptRequested = new Set<string>();
   private readonly exitWaiters = new Map<string, Array<() => void>>();
   private readonly sessionCwd = new Map<string, string>();
@@ -489,37 +491,57 @@ export class GrokAdapter {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     for (const [sessionId, child] of this.running) {
       this.killGroup(child, 'SIGTERM');
       this.running.delete(sessionId);
       this.resolveExitWaiters(sessionId);
     }
+    for (const child of this.ephemeralChildren) {
+      this.killGroup(child, 'SIGTERM');
+      this.ephemeralChildren.delete(child);
+    }
   }
 
   private spawnText(args: string[]): Promise<string> {
+    if (this.closed) return Promise.reject(new Error('grok adapter closed'));
     return new Promise((resolve, reject) => {
-      const child = spawn(this.grokBin, args, {
-        cwd: os.homedir(),
-        env: this.childEnv(),
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      let child: ChildProcess;
+      try {
+        child = spawn(this.grokBin, args, {
+          cwd: os.homedir(),
+          env: this.childEnv(),
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      this.ephemeralChildren.add(child);
       let stdout = '';
       let stderr = '';
+      let settled = false;
+      const done = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.ephemeralChildren.delete(child);
+        fn();
+      };
       child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8'); });
       child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
-      child.on('error', reject);
+      child.on('error', (err) => done(() => reject(err)));
       const timer = setTimeout(() => {
-        child.kill('SIGTERM');
-        reject(new Error(`grok ${args.join(' ')} timed out`));
+        try { child.kill('SIGTERM'); } catch { /* ignore */ }
+        done(() => reject(new Error(`grok ${args.join(' ')} timed out`)));
       }, 20_000);
       timer.unref();
       child.on('close', (code) => {
-        clearTimeout(timer);
         if (code !== 0 && !stdout.trim()) {
-          reject(new Error(`grok ${args.join(' ')} failed (code=${code}): ${stderr.trim()}`));
+          done(() => reject(new Error(`grok ${args.join(' ')} failed (code=${code}): ${stderr.trim()}`)));
           return;
         }
-        resolve(stdout);
+        done(() => resolve(stdout));
       });
     });
   }
@@ -577,6 +599,7 @@ export class GrokAdapter {
   }
 
   private forkViaCli(sessionId: string, newId: string, cwd: string): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false);
     return new Promise((resolve) => {
       let child: ChildProcess;
       try {
@@ -596,6 +619,7 @@ export class GrokAdapter {
         resolve(false);
         return;
       }
+      this.ephemeralChildren.add(child);
       let stdout = '';
       child.stdout?.on('data', (chunk: Buffer) => { stdout = (stdout + chunk.toString('utf8')).slice(-16_000); });
       let settled = false;
@@ -603,6 +627,7 @@ export class GrokAdapter {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        this.ephemeralChildren.delete(child);
         resolve(ok);
       };
       const timer = setTimeout(() => {
@@ -796,6 +821,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly sessionGoals = new Map<string, Record<string, unknown>>();
   private readonly skillCache = new Map<string, { ts: number; skills: SkillCommandInput[] }>();
   private defaultModel: string | undefined;
+  private disposed = false;
   private static readonly SKILL_CACHE_TTL_MS = 30_000;
 
   constructor(options?: GrokAdapterOptions & { settingsPath?: string }) {
@@ -804,6 +830,15 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.settings = new SettingsStore(settingsPath);
     this.grokBin = this.inner.binPath;
     this.grokEnv = innerOptions.env ?? {};
+    this.restoreAcpSessionIds();
+  }
+
+  private restoreAcpSessionIds(): void {
+    for (const [gatewayId, acpId] of Object.entries(this.settings.listStrings('acpId'))) {
+      if (!gatewayId || !acpId || gatewayId === acpId) continue;
+      this.acpSessionIds.set(gatewayId, acpId);
+      this.gatewaySessionIds.set(acpId, gatewayId);
+    }
   }
 
   capabilities(): ProviderCapabilities {
@@ -935,7 +970,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const isNew = !this.inner.hasSessionFile(storageId);
     const cwd = this.getCwd(sessionId);
     const model = this.settings.getString('model', sessionId);
-    const thinking = this.settings.getString('thinking', sessionId);
+    const thinking = this.getThinking(sessionId);
     const effort = grokEffort(thinking);
     const permissionMode = this.settings.getBoolean('plan', sessionId)
       ? 'plan'
@@ -1128,12 +1163,14 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   private async ensureAcp(alwaysApprove: boolean): Promise<GrokAcpClient | null> {
+    if (this.disposed) return null;
     const existing = this.acpClients.get(alwaysApprove);
     if (existing?.ready) return existing;
     const inflight = this.acpConnecting.get(alwaysApprove);
     if (inflight) return inflight;
 
     const pending = (async (): Promise<GrokAcpClient | null> => {
+      if (this.disposed) return null;
       if (existing) {
         this.acpClients.delete(alwaysApprove);
         await existing.close().catch(() => undefined);
@@ -1142,12 +1179,16 @@ export class GrokProviderAdapter implements ProviderAdapter {
         grokBin: this.grokBin,
         env: this.grokEnv,
         alwaysApprove,
-        requestTimeoutMs: 6_000,
+        requestTimeoutMs: 20_000,
         // Turns can legitimately run for minutes; the old 20s cap killed live turns.
         promptTimeoutMs: 0,
       });
       try {
         await client.connect();
+        if (this.disposed) {
+          await client.close().catch(() => undefined);
+          return null;
+        }
         this.acpClients.set(alwaysApprove, client);
         client.onEvent((ev) => this.onAcpProcessEvent(client, alwaysApprove, ev));
         return client;
@@ -1494,12 +1535,25 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true;
+    const connecting = [...this.acpConnecting.values()];
     const clients = [...this.acpClients.values()];
     this.acpClients.clear();
     this.acpConnecting.clear();
     this.sessionClient.clear();
     this.acpSessionIds.clear();
     this.gatewaySessionIds.clear();
+    this.settings.close();
+    const resolvedConnecting = await Promise.allSettled(connecting);
+    for (const r of resolvedConnecting) {
+      if (r.status === 'fulfilled' && r.value && !clients.includes(r.value)) {
+        clients.push(r.value);
+      }
+    }
+    for (const leftover of this.acpClients.values()) {
+      if (!clients.includes(leftover)) clients.push(leftover);
+    }
+    this.acpClients.clear();
     await Promise.allSettled(clients.map((client) => client.close()));
     await this.inner.close();
   }
@@ -1523,6 +1577,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
     this.settings.set('thinking', sessionId, thinking);
+    if (sessionId === '__default__') return;
     const effort = grokEffort(thinking);
     const client = this.clientForSession(sessionId);
     const acpId = this.acpSessionIds.get(sessionId);
@@ -1532,7 +1587,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   getThinking(sessionId: string): string | undefined {
-    return this.settings.getString('thinking', sessionId);
+    return this.settings.getString('thinking', sessionId)
+      ?? this.settings.getString('thinking', '__default__');
   }
 
   async setPermission(sessionId: string, mode: string): Promise<void> {
@@ -1584,29 +1640,35 @@ export class GrokProviderAdapter implements ProviderAdapter {
         const state = client.modelState;
         if (client.ready && state && state.availableModels.length > 0) {
           if (state.currentModelId) this.defaultModel = state.currentModelId;
-          return state.availableModels.map((m) => ({
-            provider: 'grok',
-            model: m.modelId,
-            display_name: m.name ?? m.modelId,
-            ...(m.description ? { description: m.description } : {}),
-            max_context_size: m.totalContextTokens ?? grokContextWindow(m.modelId),
-            capabilities: m.supportsReasoningEffort === false ? [] : ['thinking'],
-            support_efforts: m.reasoningEfforts?.length
-              ? m.reasoningEfforts.map((e) => e.value)
-              : [...GROK_EFFORTS],
-            default_effort: m.reasoningEffort ?? 'high',
-            isDefault: state.currentModelId === m.modelId,
-            raw: m,
-          }));
+          return state.availableModels.map((m) => {
+            const supportsEffort = m.supportsReasoningEffort !== false;
+            return {
+              provider: 'grok',
+              model: m.modelId,
+              display_name: m.name ?? m.modelId,
+              ...(m.description ? { description: m.description } : {}),
+              max_context_size: m.totalContextTokens ?? grokContextWindow(m.modelId),
+              capabilities: supportsEffort ? ['thinking'] : [],
+              support_efforts: supportsEffort
+                ? (m.reasoningEfforts?.length
+                    ? m.reasoningEfforts.map((e) => e.value)
+                    : [...GROK_EFFORTS])
+                : undefined,
+              default_effort: supportsEffort ? (m.reasoningEffort ?? 'high') : undefined,
+              isDefault: state.currentModelId === m.modelId,
+              raw: m,
+            };
+          });
         }
       }
       throw err;
     }
   }
 
-  async listCommands(sessionId?: string): Promise<NativeCommand[]> {
-    const cwd = sessionId ? this.getCwd(sessionId) : undefined;
+  async listCommands(sessionId?: string, cwdOverride?: string): Promise<NativeCommand[]> {
+    const cwd = cwdOverride ?? (sessionId ? this.getCwd(sessionId) : undefined);
     const skills = await this.discoverSkills(cwd);
+    if (!this.clientForSession(sessionId ?? '')) await this.ensureAcp(false);
     const targetClient = sessionId ? this.clientForSession(sessionId) : this.clientForSession('');
     let native = targetClient?.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined) ?? [];
     if (native.length === 0) {
@@ -1618,8 +1680,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return listGrokCommands(skills, native);
   }
 
-  async listSkills(sessionId?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>> {
-    const cwd = sessionId ? this.getCwd(sessionId) : undefined;
+  async listSkills(
+    sessionId?: string,
+    cwdOverride?: string,
+  ): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>> {
+    const cwd = cwdOverride ?? (sessionId ? this.getCwd(sessionId) : undefined);
     return (await this.discoverSkills(cwd)).map((skill) => ({
       name: skill.name,
       description: skill.description,
@@ -1846,19 +1911,20 @@ export function grokPermissionMode(mode: string | undefined): string | undefined
   }
 }
 
-const GROK_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export const GROK_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 /** Map Kimi thinking chips onto grok --effort. UI 'on' is not a CLI value. */
 export function grokEffort(thinking: string | undefined): string | undefined {
-  if (!thinking || thinking === 'off') return undefined;
-  if ((GROK_EFFORTS as readonly string[]).includes(thinking)) return thinking;
+  if (!thinking) return undefined;
+  if (thinking === 'off') return 'none';
   if (thinking === 'on') return 'high';
+  if ((['none', ...GROK_EFFORTS] as readonly string[]).includes(thinking)) return thinking;
   return undefined;
 }
 
-function acpPrompt(prompt: string, contentBlocks?: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+export function acpPrompt(prompt: string, contentBlocks?: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
   if (contentBlocks && contentBlocks.length > 0) {
-    return contentBlocks.map((block) => {
+    const blocks = contentBlocks.map((block) => {
       if (block.type === 'text') return { type: 'text', text: String(block.text ?? '') };
       if (block.type === 'image' && isRecord(block.source)) {
         return {
@@ -1869,8 +1935,16 @@ function acpPrompt(prompt: string, contentBlocks?: Array<Record<string, unknown>
       }
       return block;
     });
+    const hasContent = blocks.some((b) => {
+      if (b.type === 'text') return String(b.text ?? '').trim().length > 0;
+      if (b.type === 'image') return Boolean(b.data);
+      return true;
+    });
+    if (hasContent) return blocks;
   }
-  return prompt.trim() ? [{ type: 'text', text: prompt }] : [];
+  const trimmed = prompt.trim();
+  if (trimmed) return [{ type: 'text', text: trimmed }];
+  throw new ProviderError('invalid_request', 'empty prompt', 400);
 }
 
 function usageFromAcp(raw: Record<string, unknown>, prev?: SessionUsage): SessionUsage {
@@ -2090,35 +2164,103 @@ interface PromptFile {
   cleanup: () => void;
 }
 
+function imageExtension(mediaType?: string): string {
+  switch (mediaType?.toLowerCase()) {
+    case 'image/png': return '.png';
+    case 'image/jpeg':
+    case 'image/jpg': return '.jpg';
+    case 'image/webp': return '.webp';
+    case 'image/gif': return '.gif';
+    case 'image/svg+xml': return '.svg';
+    default: return '.png';
+  }
+}
+
 /**
  * Payloads that would blow the argv limit (large text or base64 images) are
  * handed to the CLI as a 0600 temp file via --prompt-file.
+ *
+ * Grok CLI --prompt-file reads plain UTF-8 text, NOT JSON contentBlocks.
+ * Base64 images are cleanly materialized into 0600 temporary files and referenced
+ * by path in the plain text prompt, cleaned up after turn completion.
  */
-function materializePromptFile(
+export function materializePromptFile(
   prompt: string,
   contentBlocks?: Array<Record<string, unknown>>,
 ): PromptFile | null {
-  const json = contentBlocks && contentBlocks.length > 0 ? JSON.stringify(contentBlocks) : '';
+  const hasBlocks = contentBlocks && contentBlocks.length > 0;
+  const json = hasBlocks ? JSON.stringify(contentBlocks) : '';
   const oversized = Buffer.byteLength(json || prompt, 'utf8') > MAX_INLINE_PROMPT_BYTES;
   if (!oversized) return null;
-  const ext = json ? '.json' : '.txt';
-  const filePath = path.join(os.tmpdir(), `grok-prompt-${randomUUID()}${ext}`);
-  fs.writeFileSync(filePath, json || prompt, { mode: 0o600 });
+
+  const cleanupFiles: string[] = [];
+  const textParts: string[] = [];
+  const promptTrimmed = prompt.trim();
+  if (promptTrimmed) {
+    textParts.push(promptTrimmed);
+  }
+
+  if (hasBlocks) {
+    for (const block of contentBlocks) {
+      if (block.type === 'text') {
+        const t = String(block.text ?? '').trim();
+        if (t && !textParts.includes(t)) {
+          textParts.push(t);
+        }
+      } else if (block.type === 'image') {
+        let base64Data: string | undefined;
+        let mediaType: string | undefined;
+        if (isRecord(block.source) && block.source.type === 'base64') {
+          base64Data = typeof block.source.data === 'string' ? block.source.data : undefined;
+          mediaType = typeof block.source.media_type === 'string' ? block.source.media_type : undefined;
+        } else if (typeof block.data === 'string') {
+          base64Data = block.data;
+          mediaType = typeof block.mimeType === 'string' ? block.mimeType : undefined;
+        }
+
+        if (base64Data) {
+          const imgPath = path.join(os.tmpdir(), `grok-img-${randomUUID()}${imageExtension(mediaType)}`);
+          try {
+            fs.writeFileSync(imgPath, Buffer.from(base64Data, 'base64'), { mode: 0o600 });
+            try {
+              fs.chmodSync(imgPath, 0o600);
+            } catch {
+              // mode on writeFile is enough on POSIX
+            }
+            cleanupFiles.push(imgPath);
+            textParts.push(`Attached image: ${imgPath}`);
+          } catch {
+            // failed to write temp image file
+          }
+        } else if (typeof block.path === 'string') {
+          textParts.push(`Attached image: ${block.path}`);
+        }
+      }
+    }
+  }
+
+  const fileText = textParts.filter(Boolean).join('\n\n') || prompt;
+  const filePath = path.join(os.tmpdir(), `grok-prompt-${randomUUID()}.txt`);
+  fs.writeFileSync(filePath, fileText, { mode: 0o600 });
   try {
     fs.chmodSync(filePath, 0o600);
   } catch {
     // mode on writeFile is enough on POSIX
   }
+  cleanupFiles.push(filePath);
+
   let cleaned = false;
   return {
     path: filePath,
     cleanup: () => {
       if (cleaned) return;
       cleaned = true;
-      try {
-        fs.rmSync(filePath, { force: true });
-      } catch {
-        // already gone
+      for (const file of cleanupFiles) {
+        try {
+          fs.rmSync(file, { force: true });
+        } catch {
+          // already gone
+        }
       }
     },
   };

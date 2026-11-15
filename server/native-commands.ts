@@ -62,14 +62,26 @@ const CODEX_GATEWAY_COMMANDS: CodexGatewayCommand[] = [
   { name: 'undo', description: 'Roll back the last turn', kind: 'prompt', takesArgs: false },
   {
     name: 'review',
-    description: 'Review uncommitted changes or custom instructions',
+    description: 'Review uncommitted changes, a branch/commit, or custom instructions',
     kind: 'prompt',
     takesArgs: true,
-    argumentHint: '[instructions]',
+    argumentHint: '[instructions | --base <branch> | --commit <sha>]',
   },
-  { name: 'status', description: 'Show session model, effort and context usage', kind: 'prompt', takesArgs: false },
-  { name: 'usage', description: 'Show token usage for this session', kind: 'prompt', takesArgs: false },
+  {
+    name: 'goal',
+    description: 'Set, check, pause, resume, or clear a session goal',
+    kind: 'prompt',
+    takesArgs: true,
+    argumentHint: '<objective> | status | pause | resume | clear',
+  },
+  { name: 'diff', description: 'Show git diff against remote tracking branch or working tree', kind: 'prompt', takesArgs: false },
+  { name: 'status', description: 'Show session model, effort, rate limits and context usage', kind: 'prompt', takesArgs: false },
+  { name: 'usage', description: 'Show token usage and quota summary for this session', kind: 'prompt', takesArgs: false },
   { name: 'mcp', description: 'List MCP servers and their status', kind: 'prompt', takesArgs: false },
+  { name: 'terminals', description: 'List active background terminals in this thread', kind: 'prompt', takesArgs: false },
+  { name: 'terminals-clean', description: 'Clean up background terminals in this thread', kind: 'prompt', takesArgs: false },
+  { name: 'skills', description: 'List available skills for this workspace', kind: 'prompt', takesArgs: false },
+  { name: 'help', description: 'Show available Web UI commands for Codex', kind: 'prompt', takesArgs: false },
 ];
 
 /** codex 网关代执行命令的名字集合(gateway 拦截用)。 */
@@ -106,10 +118,25 @@ export function listCodexCommands(
   return out;
 }
 
+function tokenizeSkillArgs(argText: string): string[] {
+  const tokens: string[] = [];
+  const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\S+)/g;
+  for (;;) {
+    const match = re.exec(argText);
+    if (!match) break;
+    if (match[1] !== undefined) tokens.push(match[1].replace(/\\(["\\])/g, '$1'));
+    else if (match[2] !== undefined) tokens.push(match[2].replace(/\\(['\\])/g, '$1'));
+    else if (match[3] !== undefined) tokens.push(match[3]);
+  }
+  return tokens;
+}
+
 /**
- * skill 展开:"/name args" 命中 skills 时读 SKILL.md 正文(去
- * frontmatter),$ARGUMENTS 替换为参数文本;没有 $ARGUMENTS 时参数追加到
- * 末尾(与 claude 命令展开语义一致)。未命中返回 null(原样发送)。
+ * skill 展开:"/name args" 命中 skills 时读 SKILL.md 正文(去 frontmatter),
+ * 单趟函数替换 $ARGUMENTS(保留换行与全文)、$ARGUMENTS[N] 与位置参数 $0/$1..$N(按 shell 引号分词):
+ * - 若正文显式使用 $0 或 $ARGUMENTS[N],按 Claude SKILL.md 零基索引;
+ * - 否则 $1..$N 按一基索引(兼容 .claude/commands 与 Pi Prompt Template);
+ * - 支持 \$ 反转义保留字面量 $;两者都没有时把参数追加到末尾。未命中返回 null。
  */
 function expandSkillMarkdown(
   text: string,
@@ -130,8 +157,30 @@ function expandSkillMarkdown(
   if (fm) body = body.slice(fm[0].length);
   body = body.trim();
   const argText = args.trim();
-  if (body.includes('$ARGUMENTS')) return body.replaceAll('$ARGUMENTS', argText);
-  return argText ? `${body}\n\n${argText}` : body;
+  const tokenRe = /(?<!\$)(\\)?(?:\$ARGUMENTS\[(\d+)\]|\$ARGUMENTS|\$(\d+)\b)/g;
+  const zeroIndexed = /(?<!\$)(?<!\\)(?:\$0\b|\$ARGUMENTS\[\d+\])/.test(body);
+  let hasUnescapedPlaceholder = false;
+  for (const match of body.matchAll(tokenRe)) {
+    if (!match[1]) {
+      hasUnescapedPlaceholder = true;
+      break;
+    }
+  }
+  const tokens = hasUnescapedPlaceholder && argText ? tokenizeSkillArgs(argText) : [];
+  const replaced = body.replace(tokenRe, (full, bs?: string, bracketIdx?: string, numIdx?: string) => {
+    if (bs) return full.slice(1);
+    if (bracketIdx !== undefined) {
+      const idx = Number(bracketIdx);
+      return idx >= 0 && idx < tokens.length ? tokens[idx]! : full;
+    }
+    if (numIdx === undefined) return argText;
+    const rawNum = Number(numIdx);
+    const idx = zeroIndexed ? rawNum : rawNum - 1;
+    if (!zeroIndexed && rawNum === 0) return full;
+    return idx >= 0 && idx < tokens.length ? tokens[idx]! : full;
+  });
+  if (hasUnescapedPlaceholder) return replaced;
+  return argText ? `${replaced}\n\n${argText}` : replaced;
 }
 
 /**
@@ -159,6 +208,9 @@ const GROK_GATEWAY_COMMANDS: GrokGatewayCommand[] = [
   { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false },
   { name: 'undo', description: 'Roll back the last turn', kind: 'prompt', takesArgs: false, aliases: ['rewind'] },
   { name: 'usage', description: 'Show token usage for this session', kind: 'prompt', takesArgs: false },
+  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false },
+  { name: 'skills', description: 'List available Grok skills in this workspace', kind: 'prompt', takesArgs: false },
+  { name: 'help', description: 'Show available Web UI commands for Grok', kind: 'prompt', takesArgs: false },
 ];
 
 const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
@@ -167,7 +219,7 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     description: 'Toggle always-approve mode (skip all permission prompts)',
     kind: 'prompt',
     takesArgs: true,
-    argumentHint: 'on|off',
+    argumentHint: '[on|off]',
   },
   {
     name: 'context',
@@ -181,13 +233,6 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: false,
     aliases: ['status', 'info'],
-  },
-  {
-    name: 'feedback',
-    description: 'Report an issue or send feedback',
-    kind: 'prompt',
-    takesArgs: true,
-    argumentHint: '[message]',
   },
   {
     name: 'deep-research',
@@ -210,18 +255,26 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     takesArgs: true,
     argumentHint: '<objective> [--budget <tokens>] | status | pause | resume | clear',
   },
-  {
-    name: 'loop',
-    description: 'Run a prompt on a recurring interval',
-    kind: 'prompt',
-    takesArgs: true,
-    argumentHint: '[interval] <prompt>',
-  },
 ];
 
-/** grok 网关代执行命令的名字集合(gateway 拦截用)。 */
+const GROK_TUI_ONLY_UNSUPPORTED = new Set(['feedback', 'loop']);
+
+/** grok 网关代执行/别名拦截命令的名字集合(gateway submitPrompt 拦截用)。 */
 export function grokGatewayCommandNames(): Set<string> {
-  return new Set(GROK_GATEWAY_COMMANDS.map((c) => c.name));
+  return new Set([
+    ...GROK_GATEWAY_COMMANDS.map((c) => c.name),
+    'session-info',
+    'status',
+    'info',
+    'always-approve',
+    'thinking',
+    'effort',
+  ]);
+}
+
+/** Grok 1.0.77 仅在交互 TUI Shell 中存在、ACP 不支持的命令。 */
+export function grokUnsupportedTuiCommandNames(): Set<string> {
+  return new Set(GROK_TUI_ONLY_UNSUPPORTED);
 }
 
 /** Grok 1.0.77 原生可用命令名集合(含 compact 与 ACP 原生指令)。 */
@@ -320,13 +373,40 @@ const PI_GATEWAY_COMMANDS: PiGatewayCommand[] = [
     takesArgs: true,
     argumentHint: '[instructions]',
   },
+  {
+    name: 'auto-compact',
+    description: 'Toggle or set automatic compaction (on|off)',
+    kind: 'prompt',
+    takesArgs: true,
+    argumentHint: '[on|off]',
+  },
   { name: 'clone', description: 'Clone this session into a new session', kind: 'prompt', takesArgs: false },
   { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false },
+  {
+    name: 'name',
+    description: 'Rename the current session',
+    kind: 'prompt',
+    takesArgs: true,
+    argumentHint: '<title>',
+  },
+  {
+    name: 'thinking',
+    description: 'Show or set thinking level (off|minimal|low|medium|high|xhigh)',
+    kind: 'prompt',
+    takesArgs: true,
+    argumentHint: '[level]',
+  },
   { name: 'status', description: 'Show current session information and state', kind: 'prompt', takesArgs: false },
+  { name: 'session', description: 'Show detailed session stats and context state', kind: 'prompt', takesArgs: false },
   { name: 'usage', description: 'Show token usage and cost for this session', kind: 'prompt', takesArgs: false },
+  { name: 'copy', description: 'Show the last assistant reply for easy copying', kind: 'prompt', takesArgs: false },
+  { name: 'tree', description: 'Show session message branch tree summary', kind: 'prompt', takesArgs: false },
+  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false },
+  { name: 'skills', description: 'List available Pi skills and extension commands', kind: 'prompt', takesArgs: false },
+  { name: 'help', description: 'Show available Web UI commands for Pi', kind: 'prompt', takesArgs: false },
 ];
 
-/** Pi 仅在交互 TUI 中生效的内置命令 + 不支持的 /undo,RPC 路径禁止暴露/派发。 */
+/** Pi 仅在交互 TUI 中生效的内置命令 + 不支持的 /undo,RPC 路径禁止暴露/透传 LLM。 */
 const PI_TUI_ONLY_OR_UNSUPPORTED = new Set([
   'undo',
   'settings',
@@ -334,10 +414,7 @@ const PI_TUI_ONLY_OR_UNSUPPORTED = new Set([
   'scoped-models',
   'login',
   'logout',
-  'llama',
   'resume',
-  'tree',
-  'copy',
   'export',
   'share',
   'bug',
@@ -345,11 +422,8 @@ const PI_TUI_ONLY_OR_UNSUPPORTED = new Set([
   'reload',
   'changelog',
   'quit',
+  'exit',
   'import',
-  'session',
-  'mcp',
-  'thinking',
-  'name',
 ]);
 
 export interface PiNativeCommandInput {
@@ -369,9 +443,14 @@ export interface PiNativeCommandInput {
   scope?: string;
 }
 
-/** pi 网关代执行命令的名字集合(不含 /undo 与 TUI 独占命令)。 */
+/** pi 网关代执行命令的名字集合(含 alias rename 与 Web UI 拦截名)。 */
 export function piGatewayCommandNames(): Set<string> {
-  return new Set(PI_GATEWAY_COMMANDS.map((c) => c.name));
+  return new Set([...PI_GATEWAY_COMMANDS.map((c) => c.name), 'rename', 'settings']);
+}
+
+/** Pi RPC 模式下禁止暴露/透传给 LLM 的纯 TUI 或不支持命令。 */
+export function piUnsupportedTuiCommandNames(): Set<string> {
+  return new Set(PI_TUI_ONLY_OR_UNSUPPORTED);
 }
 
 /** pi 完整命令目录:client + 网关代执行 + `get_commands` 原生扩展/模板/skill 命令。 */
@@ -420,23 +499,103 @@ export interface ClaudeCatalogCommand {
   source?: string;
   path?: string;
   scope?: string;
+  terminalOnly?: boolean;
+  allowedTools?: string[];
+  model?: string;
+}
+
+/** Claude Code 仅在本地终端界面生效的命令（Web UI 不可交互执行，会在菜单中过滤并在网关友好提示）。 */
+const CLAUDE_TUI_ONLY_COMMANDS = new Set([
+  'login',
+  'logout',
+  'resume',
+  'rewind',
+  'voice',
+  'terminal-setup',
+  'exit',
+  'quit',
+  'btw',
+  'theme',
+  'color',
+  'focus',
+  'keybindings',
+  'stickers',
+  'ide',
+  'mobile',
+  'scroll-speed',
+  'privacy-settings',
+  'rate-limit-options',
+  'remote-control',
+  'remote-env',
+  'teleport',
+  'upgrade',
+  'usage-credits',
+  'web-setup',
+  'install-github-app',
+  'install-slack-app',
+  'design-login',
+  'desktop',
+  'chrome',
+  'feedback',
+  'bug',
+  'passes',
+  'powerup',
+  'artifacts',
+]);
+
+/** 网关为 Claude Web UI 补齐/适配的命令（原本 CLI 在 -p 模式提示不可用）。 */
+const CLAUDE_GATEWAY_COMMANDS: Array<{
+  name: string;
+  description: string;
+  takesArgs: boolean;
+  argumentHint?: string;
+}> = [
+  { name: 'status', description: 'Show Claude session model, effort, permission and usage', takesArgs: false },
+  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', takesArgs: false },
+  { name: 'skills', description: 'List available Claude commands and skills in this workspace', takesArgs: false },
+  {
+    name: 'permissions',
+    description: 'Show or set permission mode (manual | auto | yolo)',
+    takesArgs: true,
+    argumentHint: '[manual|auto|yolo]',
+  },
+  { name: 'tasks', description: 'Show background tasks status for this session', takesArgs: false },
+  { name: 'help', description: 'Show available Web UI commands for Claude', takesArgs: false },
+];
+
+/** Claude 在网关层拦截代执行的 Web UI 适配命令集合。 */
+export function claudeGatewayCommandNames(): Set<string> {
+  return new Set(CLAUDE_GATEWAY_COMMANDS.map((c) => c.name));
+}
+
+/** Claude 在无头模式下无法交互执行、需在网关拦截提示的终端独占命令。 */
+export function claudeUnsupportedTuiCommandNames(): Set<string> {
+  return new Set(CLAUDE_TUI_ONLY_COMMANDS);
 }
 
 /**
- * claude 完整命令目录:client 命令 + CLI initialize 目录(或磁盘回退目录)。
- * 保留 aliases / argumentHint 等元信息;剔除 client 独占的 model/new/clear。
+ * claude 完整命令目录:client 命令 + CLI initialize 目录(或磁盘回退目录) + Web UI 网关适配命令。
+ * 保留 aliases / argumentHint / terminalOnly 等元信息;剔除 client 独占的 model/new/clear。
  */
 export function listClaudeCommands(
   cliCatalog: ClaudeCatalogCommand[],
+  terminalSlashCommands: string[] = [],
 ): NativeCommand[] {
   const skip = new Set(['model', 'new', 'clear']);
+  const terminalCosmetics = new Set<string>(
+    terminalSlashCommands.filter((name) => name === 'color' || name === 'focus'),
+  );
   const prompts: NativeCommand[] = cliCatalog
     .filter((c) => !skip.has(c.name))
     .map((c) => {
-      const hint = typeof c.argumentHint === 'string' ? c.argumentHint.trim() : '';
+      let hint = typeof c.argumentHint === 'string' ? c.argumentHint.trim() : '';
+      if (!hint && c.name === 'fast') hint = 'on|off';
       const aliases = Array.isArray(c.aliases)
         ? c.aliases.filter((a): a is string => typeof a === 'string' && a.length > 0)
         : undefined;
+      const terminalOnly = c.terminalOnly === true
+        || CLAUDE_TUI_ONLY_COMMANDS.has(c.name)
+        || terminalCosmetics.has(c.name);
       return {
         name: c.name,
         description: c.description,
@@ -448,8 +607,24 @@ export function listClaudeCommands(
         ...(c.source ? { source: c.source } : {}),
         ...(c.path ? { path: c.path } : {}),
         ...(c.scope ? { scope: c.scope } : {}),
+        ...(terminalOnly ? { terminalOnly: true } : {}),
+        ...(c.allowedTools && c.allowedTools.length > 0 ? { allowedTools: [...c.allowedTools] } : {}),
+        ...(c.model ? { model: c.model } : {}),
       };
     });
+  const seen = new Set([...skip, ...prompts.map((c) => c.name)]);
+  for (const gw of CLAUDE_GATEWAY_COMMANDS) {
+    if (seen.has(gw.name)) continue;
+    seen.add(gw.name);
+    prompts.push({
+      name: gw.name,
+      description: gw.description,
+      kind: 'prompt',
+      acceptsInput: gw.takesArgs,
+      builtin: true,
+      ...(gw.argumentHint ? { argumentHint: gw.argumentHint } : {}),
+    });
+  }
   return [...clientCommands(), ...prompts];
 }
 
@@ -562,6 +737,8 @@ export async function discoverClaudeDiskCommands(
             description: parsed.description || name,
             argumentHint: parsed.argumentHint,
             ...(parsed.aliases.length > 0 ? { aliases: parsed.aliases } : {}),
+            ...(parsed.allowedTools.length > 0 ? { allowedTools: parsed.allowedTools } : {}),
+            ...(parsed.model ? { model: parsed.model } : {}),
             source: 'command',
             path: full,
             scope,
@@ -581,6 +758,8 @@ export async function discoverClaudeDiskCommands(
             description: parsed.description || name,
             argumentHint: parsed.argumentHint,
             ...(parsed.aliases.length > 0 ? { aliases: parsed.aliases } : {}),
+            ...(parsed.allowedTools.length > 0 ? { allowedTools: parsed.allowedTools } : {}),
+            ...(parsed.model ? { model: parsed.model } : {}),
             source: 'skill',
             path: full,
             scope,
@@ -625,17 +804,66 @@ function parseAliasesValue(raw: string): string[] {
     .filter(Boolean);
 }
 
+function splitTopLevel(raw: string, delimiter: 'comma' | 'space'): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let depth = 0;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]!;
+    if (quote) {
+      cur += ch;
+      if (ch === quote && raw[i - 1] !== '\\') quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === '(') depth += 1;
+    else if (ch === ')' && depth > 0) depth -= 1;
+    const isDelim = depth === 0 && (delimiter === 'comma' ? ch === ',' : /\s/.test(ch));
+    if (isDelim) {
+      if (cur.trim()) out.push(cur.trim());
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+function parseAllowedToolsValue(raw: string): string[] {
+  const trimmed = raw.trim();
+  const bracketed = trimmed.startsWith('[') && trimmed.endsWith(']');
+  const inner = bracketed ? trimmed.slice(1, -1).trim() : trimmed;
+  if (!inner) return [];
+  const commaParts = splitTopLevel(inner, 'comma');
+  const rawParts = !bracketed && commaParts.length <= 1
+    ? splitTopLevel(inner, 'space')
+    : commaParts;
+  return rawParts
+    .map((part) => stripYamlQuotes(part).trim())
+    .filter(Boolean);
+}
+
 function parseCommandMarkdown(raw: string): {
   name?: string;
   description: string;
   argumentHint: string;
   aliases: string[];
+  allowedTools: string[];
+  model?: string;
   userInvocable?: boolean;
 } {
   let name: string | undefined;
   let description = '';
   let argumentHint = '';
   const aliases: string[] = [];
+  const allowedTools: string[] = [];
+  let model: string | undefined;
   let userInvocable: boolean | undefined;
   let body = raw;
 
@@ -643,16 +871,21 @@ function parseCommandMarkdown(raw: string): {
   if (fm) {
     body = raw.slice(fm[0].length);
     const lines = fm[1].split(/\r?\n/);
-    let inAliasesList = false;
+    let listKey: 'aliases' | 'allowedTools' | null = null;
     for (const line of lines) {
-      if (inAliasesList) {
+      if (listKey) {
         const item = /^\s*-\s+(.+)$/.exec(line);
         if (item) {
-          const val = stripYamlQuotes(item[1]).replace(/^\//, '').trim();
-          if (val) aliases.push(val);
+          const val = stripYamlQuotes(item[1]);
+          if (listKey === 'aliases') {
+            const cleaned = val.replace(/^\//, '').trim();
+            if (cleaned) aliases.push(cleaned);
+          } else if (val) {
+            allowedTools.push(val);
+          }
           continue;
         }
-        if (line.trim() !== '') inAliasesList = false;
+        if (line.trim() !== '') listKey = null;
       }
       const kv = /^([A-Za-z0-9_-]+)\s*:\s*(.*)$/.exec(line);
       if (!kv) continue;
@@ -661,13 +894,17 @@ function parseCommandMarkdown(raw: string): {
       if (key === 'name' && val) name = stripYamlQuotes(val).replace(/^\//, '');
       else if (key === 'description' && val) description = stripYamlQuotes(val);
       else if ((key === 'argument-hint' || key === 'argumenthint') && val) argumentHint = stripYamlQuotes(val);
+      else if (key === 'model' && val) model = stripYamlQuotes(val);
       else if (key === 'aliases') {
-        if (!val) inAliasesList = true;
+        if (!val) listKey = 'aliases';
         else aliases.push(...parseAliasesValue(val));
+      } else if (key === 'allowed-tools' || key === 'allowedtools') {
+        if (!val) listKey = 'allowedTools';
+        else allowedTools.push(...parseAllowedToolsValue(val));
       } else if (key === 'user-invocable' || key === 'userinvocable') {
         const lower = stripYamlQuotes(val).toLowerCase();
-        if (lower === 'false') userInvocable = false;
-        else if (lower === 'true') userInvocable = true;
+        if (lower === 'false' || lower === 'no' || lower === 'off' || lower === '0') userInvocable = false;
+        else if (lower === 'true' || lower === 'yes' || lower === 'on' || lower === '1') userInvocable = true;
       }
     }
   }
@@ -681,5 +918,5 @@ function parseCommandMarkdown(raw: string): {
     }
   }
 
-  return { name, description, argumentHint, aliases, userInvocable };
+  return { name, description, argumentHint, aliases, allowedTools, model, userInvocable };
 }

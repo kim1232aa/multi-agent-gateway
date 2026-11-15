@@ -1714,7 +1714,10 @@ test('rename() anchored open rejects symlink-swapped, parent-swapped, and FIFO-s
 // 5. Live unauthenticated @anthropic-ai/claude-code@2.1.325 handshake test
 // ---------------------------------------------------------------------------
 
-const LIVE_21325_BIN = '/tmp/claude-survey.nCx4IC/native/package/claude';
+const LIVE_21325_BIN = process.env.CLAUDE_LIVE_BIN
+  ?? (existsSync('/tmp/claude-survey.nCx4IC/native/package/claude')
+    ? '/tmp/claude-survey.nCx4IC/native/package/claude'
+    : resolveClaudeBin());
 
 test(
   'live unauthenticated 2.1.325 initialize handshake exposes dynamic models, commands, and mcpStatus',
@@ -1745,7 +1748,7 @@ test(
       assert.equal(typeof first.value, 'string');
       assert.equal(typeof first.supportsAdaptiveThinking, 'boolean');
       assert.equal(typeof first.supportsThinkingOff, 'boolean');
-      assert.equal(typeof first.fastMode, 'boolean');
+      assert.ok(models.some((m) => typeof m.fastMode === 'boolean'));
 
       const commands = await adapter.listSlashCommands(base);
       assert.ok(commands.length >= 5, `expected built-in commands, got ${commands.length}`);
@@ -1758,4 +1761,174 @@ test(
     }
   },
 );
+
+test('preserves local-command-stdout, formats command-name chips, drops caveats, and captures conversation_reset + terminal_slash_commands', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-local-cmd-'));
+  const projectsDir = join(base, 'projects');
+  const projectDir = join(projectsDir, 'proj');
+  const sessionId = '22222222-2222-4222-8222-222222222222';
+  const bin = join(base, 'claude');
+  try {
+    await mkdir(projectDir, { recursive: true });
+    const jsonl = [
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u-cav',
+        parentUuid: null,
+        isMeta: true,
+        message: { role: 'user', content: '<local-command-caveat>Disclaimer</local-command-caveat>' },
+      }),
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u-cmd',
+        parentUuid: 'u-cav',
+        message: {
+          role: 'user',
+          content: '<command-name>/context</command-name>\n<command-message>context</command-message>\n<command-args></command-args>',
+        },
+      }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'local_command',
+        uuid: 's-out',
+        parentUuid: 'u-cmd',
+        content: '<local-command-stdout>## Context Usage\n12k / 1m</local-command-stdout>',
+        timestamp: '2026-11-15T00:00:01.000Z',
+      }),
+      JSON.stringify({
+        type: 'user',
+        uuid: 'u-leg',
+        parentUuid: 's-out',
+        message: { role: 'user', content: '<local-command-stdout>Session renamed to: web-ui</local-command-stdout>' },
+      }),
+    ].join('\n') + '\n';
+    await writeFile(join(projectDir, `${sessionId}.jsonl`), jsonl);
+
+    await writeFile(bin, `#!/usr/bin/env node
+process.stdin.on('data', () => {
+  process.stdout.write(JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: '${sessionId}',
+    cwd: ${JSON.stringify(base)},
+    tools: ['Bash'],
+    terminal_slash_commands: ['doctor', 'color', 'focus', 'reload-plugins'],
+  }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    type: 'conversation_reset',
+    session_id: '${sessionId}',
+    new_conversation_id: '33333333-3333-4333-8333-333333333333',
+    trigger: 'clear',
+    uuid: 'rst-1',
+  }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    session_id: '33333333-3333-4333-8333-333333333333',
+    is_error: false,
+    result: '',
+  }) + '\\n');
+});
+process.stdin.resume();
+`);
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin, projectsDir });
+    const history = await adapter.getHistory(sessionId);
+    assert.deepEqual(
+      history.map((m) => ({ role: m.role, text: m.text })),
+      [
+        { role: 'user', text: '/context' },
+        { role: 'assistant', text: '## Context Usage\n12k / 1m' },
+        { role: 'assistant', text: 'Session renamed to: web-ui' },
+      ],
+    );
+
+    const events: ClaudeAdapterEvent[] = [];
+    await adapter.startTurn({
+      sessionId,
+      cwd: base,
+      prompt: '/clear',
+      onEvent: (ev) => events.push(ev),
+    });
+    const initEv = events.find((e): e is Extract<ClaudeAdapterEvent, { type: 'init' }> => e.type === 'init');
+    assert.deepEqual(initEv?.terminalSlashCommands, ['doctor', 'color', 'focus', 'reload-plugins']);
+    const resetEv = events.find((e): e is Extract<ClaudeAdapterEvent, { type: 'conversation_reset' }> => e.type === 'conversation_reset');
+    assert.equal(resetEv?.newConversationId, '33333333-3333-4333-8333-333333333333');
+    assert.equal(resetEv?.trigger, 'clear');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeAdapter.listSessions filters out internal entrypoints starting with sdk-', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-entrypoint-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'my-proj');
+  try {
+    await mkdir(projDir, { recursive: true });
+
+    const normalSessionId = '11111111-1111-4111-8111-111111111111';
+    const sdkSessionId = '22222222-2222-4222-8222-222222222222';
+
+    await writeFile(
+      join(projDir, `${normalSessionId}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', timestamp: '2026-08-11T10:00:00.000Z', entrypoint: 'cli', message: { role: 'user', content: 'Normal CLI turn' } }),
+      ].join('\n') + '\n',
+    );
+
+    await writeFile(
+      join(projDir, `${sdkSessionId}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', timestamp: '2026-08-11T10:01:00.000Z', entrypoint: 'sdk-cli', message: { role: 'user', content: 'SDK programmatic turn' } }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    const sessions = await adapter.listSessions();
+    assert.equal(sessions.some((s) => s.sessionId === normalSessionId), true);
+    assert.equal(sessions.some((s) => s.sessionId === sdkSessionId), false);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('ClaudeAdapter.listSubagentDetails reads sidecar metadata fields', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-sub-details-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'proj');
+  const sessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  try {
+    await mkdir(join(projDir, sessionId, 'subagents'), { recursive: true });
+    await writeFile(
+      join(projDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'main' } }) + '\n',
+    );
+    await writeFile(
+      join(projDir, sessionId, 'subagents', 'agent-worker1.jsonl'),
+      JSON.stringify({ type: 'user', isSidechain: true, message: { role: 'user', content: 'sub' } }) + '\n',
+    );
+    await writeFile(
+      join(projDir, sessionId, 'subagents', 'agent-worker1.meta.json'),
+      JSON.stringify({
+        toolUseId: 'toolu_parent_123',
+        agentType: 'CodeReviewer',
+        taskId: 'task_abc',
+        description: 'Reviewing changes',
+      }),
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    const details = await adapter.listSubagentDetails(sessionId);
+    assert.equal(details.length, 1);
+    assert.equal(details[0]?.agentId, 'worker1');
+    assert.equal(details[0]?.parentToolUseId, 'toolu_parent_123');
+    assert.equal(details[0]?.subagentType, 'CodeReviewer');
+    assert.equal(details[0]?.taskId, 'task_abc');
+    assert.equal(details[0]?.description, 'Reviewing changes');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
 

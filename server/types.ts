@@ -566,6 +566,12 @@ export interface NativeCommand {
   builtin?: boolean;
   path?: string;
   scope?: string;
+  /** 仅交互 TUI / 终端风格命令（如 Claude `terminal_slash_commands`），Web 菜单隐藏。 */
+  terminalOnly?: boolean;
+  /** Markdown frontmatter 解析出的允许工具列表。 */
+  allowedTools?: string[];
+  /** Markdown frontmatter 指定的模型覆盖。 */
+  model?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -649,11 +655,11 @@ export interface ProviderAdapter {
   /** 原生模型目录(可选)。kimi 由上游代理,不实现此方法。 */
   listModels?(): Promise<NativeModel[]>;
 
-  /** 原生斜杠命令目录(可选)。sessionId 可用于项目级命令发现。 */
-  listCommands?(sessionId?: string): Promise<NativeCommand[]>;
+  /** 原生斜杠命令目录(可选)。sessionId 或 cwd 可用于项目级命令发现。 */
+  listCommands?(sessionId?: string, cwd?: string): Promise<NativeCommand[]>;
 
   /** 原生 skills 目录(可选;codex skills/list)。claude 的 skill 即斜杠命令,不实现。 */
-  listSkills?(sessionId?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>>;
+  listSkills?(sessionId?: string, cwd?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>>;
 
   /** 记录会话级模型选择(内存态;影响后续 startTurn)。 */
   setModel?(sessionId: string, model: string): Promise<void>;
@@ -696,7 +702,7 @@ export interface ProviderAdapter {
   ): Promise<void>;
 
   /** 压缩会话上下文。 */
-  compact?(sessionId: string): Promise<void>;
+  compact?(sessionId: string, customInstructions?: string): Promise<void>;
 
   /** 归档/取消归档。 */
   setArchived?(sessionId: string, archived: boolean): Promise<void>;
@@ -734,12 +740,54 @@ export interface ProviderAdapter {
   /** 后台终端列表(codex thread/backgroundTerminals)。 */
   listTerminals?(sessionId: string): Promise<Array<Record<string, unknown>>>;
 
+  /** 清理已完成/残留的后台终端(codex thread/backgroundTerminals/clean)。 */
+  cleanTerminals?(sessionId: string): Promise<void>;
+
+  /** Git diff 摘要(codex gitDiffToRemote)。 */
+  gitDiff?(sessionId: string): Promise<{ sha?: string; diff: string } | null>;
+
+  /** 读取账号速率限制快照(account/rateLimits/read)。 */
+  getRateLimits?(): Promise<Record<string, unknown> | null>;
+
+  /** 触发 Codex 账号/会话用量读取(account/usage/read)。 */
+  getAccountUsage?(sessionId?: string): Promise<Record<string, unknown> | null>;
+
+  /** 切换自动压缩(pi set_auto_compaction)。 */
+  setAutoCompaction?(sessionId: string, enabled: boolean): Promise<boolean>;
+
+  /** 查询自动压缩开关状态(pi get_state.autoCompactionEnabled)。 */
+  getAutoCompaction?(sessionId: string): Promise<boolean | undefined>;
+
+  /** 取最后一条 assistant 回复文本(pi get_last_assistant_text)。 */
+  getLastAssistantText?(sessionId: string): Promise<string | null>;
+
+  /** 取会话树摘要(pi get_tree)。 */
+  getSessionTree?(sessionId: string): Promise<Record<string, unknown> | null>;
+
   /**
    * 发起一次 inline review(codex review/start)。返回的 TurnHandle 事件流
    * 与 startTurn 同形(review 实际以一个新 turn 运行,通知经 app-server
    * 推送),网关复用正常 turn 的消费路径广播。
    */
-  review?(sessionId: string): Promise<TurnHandle>;
+  review?(
+    sessionId: string,
+    options?: {
+      instructions?: string;
+      target?:
+        | { type: 'uncommittedChanges' }
+        | { type: 'baseBranch'; branch: string }
+        | { type: 'commit'; sha: string; title?: string | null }
+        | { type: 'custom'; instructions: string };
+    },
+  ): Promise<TurnHandle>;
+
+  /** 列出该会话的子代理列表(可选)。 */
+  listSubagents?(
+    sessionId: string,
+  ): Promise<Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>>;
+
+  /** 获取子代理的历史消息(可选)。 */
+  getSubagentMessages?(sessionId: string, agentId: string): Promise<Message[]>;
 }
 
 export interface ModelUsageEntry {

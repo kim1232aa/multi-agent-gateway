@@ -975,3 +975,100 @@ export async function fsDiff(cwd: string, input: { path: string }): Promise<{ pa
     await fh.close();
   }
 }
+
+const REPO_DIFF_MAX_BYTES = 48 * 1024;
+
+function runGitBounded(
+  cwd: string,
+  args: string[],
+  maxBytes: number,
+  timeoutMs = 10000,
+): Promise<{ stdout: string; truncated: boolean }> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn('git', ['-C', cwd, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const chunks: Buffer[] = [];
+    const errs: Buffer[] = [];
+    let totalBytes = 0;
+    let truncated = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill('SIGKILL');
+      rejectPromise(new FsError(500, 50001, 'git 命令超时'));
+    }, timeoutMs);
+    const finish = (out: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise({ stdout: out, truncated });
+    };
+    child.stdout.on('data', (d: Buffer) => {
+      if (truncated || settled) return;
+      const remaining = maxBytes + 1 - totalBytes;
+      if (d.length >= remaining) {
+        chunks.push(d.subarray(0, remaining));
+        totalBytes += remaining;
+        truncated = true;
+        child.stdout.destroy();
+        try { child.kill('SIGTERM'); } catch { /* ignore */ }
+        finish(Buffer.concat(chunks, maxBytes).toString('utf8'));
+        return;
+      }
+      chunks.push(d);
+      totalBytes += d.length;
+    });
+    child.stderr.on('data', (d: Buffer) => {
+      if (errs.length < 8) errs.push(d);
+    });
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rejectPromise(new FsError(500, 50001, `git 启动失败: ${err.message}`));
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      if (truncated) {
+        finish(Buffer.concat(chunks, Math.min(totalBytes, maxBytes)).toString('utf8'));
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolvePromise({ stdout: Buffer.concat(chunks).toString('utf8'), truncated: false });
+        return;
+      }
+      rejectPromise(new FsError(400, 40002, `git ${args[0] ?? ''} 失败(${code}): ${Buffer.concat(errs).toString('utf8').slice(0, 200)}`));
+    });
+  });
+}
+
+/** 汇总工作区未提交 git 改动（状态列表 + git diff HEAD/cached），供 Web UI `/diff` 命令安全展示。 */
+export async function fsRepoDiff(
+  cwd: string,
+): Promise<{ isGitRepo: boolean; branch: string; entries: Record<string, string>; diff: string; truncated: boolean }> {
+  const isGitRepo = await runGit(cwd, ['rev-parse', '--is-inside-work-tree'])
+    .then((out) => out.trim() === 'true', () => false);
+  if (!isGitRepo) {
+    return { isGitRepo: false, branch: '', entries: {}, diff: '', truncated: false };
+  }
+  const [status, hasHead] = await Promise.all([
+    fsGitStatus(cwd),
+    runGit(cwd, ['rev-parse', '--verify', 'HEAD']).then(() => true, () => false),
+  ]);
+  const diffArgs = hasHead ? ['diff', 'HEAD'] : ['diff', '--cached'];
+  const bounded = await runGitBounded(cwd, diffArgs, REPO_DIFF_MAX_BYTES).catch(() => ({ stdout: '', truncated: false }));
+  let diff = bounded.stdout;
+  if (bounded.truncated) {
+    const lastNl = diff.lastIndexOf('\n');
+    if (lastNl > 0) diff = diff.slice(0, lastNl);
+  }
+  return {
+    isGitRepo: true,
+    branch: status.branch,
+    entries: status.entries,
+    diff,
+    truncated: bounded.truncated,
+  };
+}

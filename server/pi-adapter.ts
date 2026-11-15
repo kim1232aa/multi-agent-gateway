@@ -17,7 +17,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
@@ -681,13 +681,16 @@ export class PiRpcClient {
 
   private waitForExit(ms: number): Promise<void> {
     if (this.exited || !this.exitPromise) return Promise.resolve();
+    let timer: ReturnType<typeof setTimeout> | null = null;
     return Promise.race([
       this.exitPromise,
       new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, ms);
-        t.unref?.();
+        timer = setTimeout(resolve, ms);
+        timer.unref?.();
       }),
-    ]);
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
   }
 
   private handleLine(line: string): void {
@@ -812,6 +815,8 @@ export class PiAdapter {
   private readonly resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
 
   private readonly processes = new Map<string, PiRpcClient>();
+  private readonly ephemeralClients = new Set<PiRpcClient>();
+  private disposed = false;
   private readonly clientToSession = new WeakMap<PiRpcClient, string>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly parkedQuestions = new Map<string, ParkedQuestion>();
@@ -1016,7 +1021,8 @@ export class PiAdapter {
   async getAvailableThinkingLevels(sessionId: string): Promise<string[]> {
     const client = await this.ensureSessionProcess(sessionId);
     const data = await client.request<{ levels?: string[] }>({ type: 'get_available_thinking_levels' });
-    return Array.isArray(data?.levels) ? data.levels.filter((l): l is string => typeof l === 'string') : [];
+    const raw = Array.isArray(data?.levels) ? data.levels.filter((l): l is string => typeof l === 'string') : [];
+    return Array.from(new Set(raw));
   }
 
   async setModel(sessionId: string, encodedModel: string): Promise<PiModelInfo> {
@@ -1054,7 +1060,7 @@ export class PiAdapter {
     this.recordState(sessionId, state);
     const effective = state.thinkingLevel ?? normalized;
     const prevApplied = this.appliedPreferences.get(sessionId);
-    this.appliedPreferences.set(sessionId, { ...prevApplied, thinking: normalized });
+    this.appliedPreferences.set(sessionId, { ...prevApplied, thinking: effective });
     return effective;
   }
 
@@ -1069,6 +1075,35 @@ export class PiAdapter {
   async refreshUsage(sessionId: string): Promise<SessionUsage> {
     const stats = await this.getSessionStats(sessionId);
     return mapPiStatsToUsage(stats, this.sessionModels.get(sessionId), this.modelsCache?.models);
+  }
+
+  async setAutoCompaction(sessionId: string, enabled: boolean): Promise<boolean> {
+    const client = await this.ensureSessionProcess(sessionId);
+    await client.request({ type: 'set_auto_compaction', enabled });
+    const state = await client.request<PiSessionState>({ type: 'get_state' }).catch(() => null);
+    if (state) this.recordState(sessionId, state);
+    return state?.autoCompactionEnabled ?? enabled;
+  }
+
+  async getAutoCompaction(sessionId: string): Promise<boolean | undefined> {
+    const state = await this.getState(sessionId);
+    return state.autoCompactionEnabled;
+  }
+
+  async getLastAssistantText(sessionId: string): Promise<string | null> {
+    const client = await this.ensureSessionProcess(sessionId);
+    const data = await client.request<{ text?: string | null }>({ type: 'get_last_assistant_text' });
+    return typeof data?.text === 'string' ? data.text : null;
+  }
+
+  async getSessionTree(sessionId: string): Promise<Record<string, unknown> | null> {
+    const client = await this.ensureSessionProcess(sessionId);
+    const data = await client.request<Record<string, unknown>>({ type: 'get_tree' });
+    return data && typeof data === 'object' ? data : null;
+  }
+
+  clearCommandsCache(): void {
+    this.commandsCache.clear();
   }
 
   async compact(sessionId: string, customInstructions?: string): Promise<void> {
@@ -1180,9 +1215,14 @@ export class PiAdapter {
       ? ['--session', resolvedSourceFile]
       : ['--session-id', sourceSessionId];
 
+    if (this.disposed) {
+      throw new ProviderError('not_found', 'pi adapter disposed', 404);
+    }
+
     // Spawn an isolated RPC process for the cloned/forked session so the source
     // session's running process is never switched or mutated.
     const newClient = this.createClient(sourceCwd, launchArgs);
+    this.ephemeralClients.add(newClient);
     try {
       newClient.start();
       const preState = await newClient.request<PiSessionState>({ type: 'get_state' });
@@ -1249,6 +1289,15 @@ export class PiAdapter {
         newState = await newClient.request<PiSessionState>({ type: 'get_state' });
       }
 
+      if (this.disposed) {
+        throw new ProviderError('not_found', 'pi adapter disposed', 404);
+      }
+      this.ephemeralClients.delete(newClient);
+      const displaced = this.processes.get(newSessionId);
+      if (displaced && displaced !== newClient) {
+        this.clientToSession.delete(displaced);
+        await displaced.close().catch(() => undefined);
+      }
       this.clientToSession.set(newClient, newSessionId);
       this.processes.set(newSessionId, newClient);
       this.sessionCwd.set(newSessionId, sourceCwd);
@@ -1260,10 +1309,11 @@ export class PiAdapter {
         this.draftSessions.add(newSessionId);
       }
       this.recordState(newSessionId, newState);
-      if (sourceModel || sourceThinking) {
+      const effectiveThinking = newState.thinkingLevel ?? sourceThinking;
+      if (sourceModel || effectiveThinking) {
         this.appliedPreferences.set(newSessionId, {
           ...(sourceModel ? { model: sourceModel } : {}),
-          ...(sourceThinking ? { thinking: sourceThinking } : {}),
+          ...(effectiveThinking ? { thinking: effectiveThinking } : {}),
         });
       }
 
@@ -1283,6 +1333,7 @@ export class PiAdapter {
         parentSession: resolvedSourceFile,
       };
     } catch (err) {
+      this.ephemeralClients.delete(newClient);
       await newClient.close().catch(() => undefined);
       throw err;
     }
@@ -1513,8 +1564,16 @@ export class PiAdapter {
   }
 
   async dispose(): Promise<void> {
+    this.disposed = true;
+    this.modelsInflight = null;
+    this.commandsInflight.clear();
     const sessionIds = new Set([...this.processes.keys(), ...this.activeTurns.keys()]);
-    await Promise.allSettled([...sessionIds].map((id) => this.close(id)));
+    const ephemeral = [...this.ephemeralClients];
+    this.ephemeralClients.clear();
+    await Promise.allSettled([
+      ...[...sessionIds].map((id) => this.close(id)),
+      ...ephemeral.map((client) => client.close()),
+    ]);
     this.processes.clear();
     this.activeTurns.clear();
     for (const [, q] of this.parkedQuestions) {
@@ -1663,11 +1722,16 @@ export class PiAdapter {
     cwd?: string,
     args: string[] = ['--no-session'],
   ): Promise<T> {
+    if (this.disposed) {
+      throw new ProviderError('not_found', 'pi adapter disposed', 404);
+    }
     const client = this.createClient(cwd ?? process.cwd(), args);
+    this.ephemeralClients.add(client);
     client.start();
     try {
       return await fn(client);
     } finally {
+      this.ephemeralClients.delete(client);
       await client.close().catch(() => undefined);
     }
   }
@@ -2412,11 +2476,13 @@ export class PiProviderAdapter implements ProviderAdapter {
   readonly name = 'pi' as ProviderName;
   private readonly inner: PiAdapter;
   private readonly settings: SettingsStore;
+  private readonly agentDir: string;
   private readonly renames = new Map<string, string>();
   private readonly sessionCwd = new Map<string, string>();
 
   constructor(options?: PiAdapterOptions) {
     this.settings = new SettingsStore(options?.settingsPath);
+    this.agentDir = resolvePiAgentDirForSettings(options?.env ?? {}, options?.sessionsDir);
     this.inner = new PiAdapter({
       ...options,
       resolveSessionPreferences: (sessionId) => ({
@@ -2424,6 +2490,21 @@ export class PiProviderAdapter implements ProviderAdapter {
         thinking: this.settings.getString('thinking', sessionId) ?? this.settings.getString('thinking', '__default__'),
       }),
     });
+  }
+
+  private readConfiguredDefaultModel(): string | undefined {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(this.agentDir, 'settings.json'), 'utf8')) as {
+        defaultProvider?: unknown;
+        defaultModel?: unknown;
+      };
+      const provider = typeof raw.defaultProvider === 'string' ? raw.defaultProvider.trim() : '';
+      const model = typeof raw.defaultModel === 'string' ? raw.defaultModel.trim() : '';
+      if (!model) return undefined;
+      return provider ? encodePiModelId(provider, model) : model;
+    } catch {
+      return undefined;
+    }
   }
 
   capabilities(): ProviderCapabilities {
@@ -2544,12 +2625,15 @@ export class PiProviderAdapter implements ProviderAdapter {
 
   async listModels(): Promise<NativeModel[]> {
     const models = await this.inner.getAvailableModels();
-    return models.map((m) => {
+    const configuredDefault = this.readConfiguredDefaultModel();
+    const out: NativeModel[] = models.map((m) => {
       const encoded = encodePiModelId(m.provider, m.id);
       const levels = piModelSupportedThinkingLevels(m);
       const caps: string[] = [];
       if (Array.isArray(m.input) && m.input.includes('image')) caps.push('vision');
       if (m.reasoning) caps.push('thinking');
+      if (m.reasoning && !levels.includes('off')) caps.push('always_thinking');
+      const isDefault = configuredDefault !== undefined && (encoded === configuredDefault || m.id === configuredDefault);
       return {
         provider: 'pi',
         model: encoded,
@@ -2560,9 +2644,16 @@ export class PiProviderAdapter implements ProviderAdapter {
         support_efforts: levels,
         supportsThinkingOff: levels.includes('off'),
         ...(levels.length > 0 ? { default_effort: levels.includes('medium') ? 'medium' : levels[0] } : {}),
+        ...(isDefault ? { isDefault: true } : {}),
         raw: m,
       };
     });
+    const defIdx = out.findIndex((entry) => entry.isDefault === true);
+    if (defIdx > 0) {
+      const [defEntry] = out.splice(defIdx, 1);
+      if (defEntry) out.unshift(defEntry);
+    }
+    return out;
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
@@ -2579,7 +2670,8 @@ export class PiProviderAdapter implements ProviderAdapter {
     return (
       this.inner.getCachedModel(sessionId) ??
       this.settings.getString('model', sessionId) ??
-      this.settings.getString('model', '__default__')
+      this.settings.getString('model', '__default__') ??
+      this.readConfiguredDefaultModel()
     );
   }
 
@@ -2635,6 +2727,34 @@ export class PiProviderAdapter implements ProviderAdapter {
 
   async compact(sessionId: string, customInstructions?: string): Promise<void> {
     await this.inner.compact(sessionId, customInstructions);
+  }
+
+  async setAutoCompaction(sessionId: string, enabled: boolean): Promise<boolean> {
+    return this.inner.setAutoCompaction(sessionId, enabled);
+  }
+
+  async getAutoCompaction(sessionId: string): Promise<boolean | undefined> {
+    return this.inner.getAutoCompaction(sessionId);
+  }
+
+  async getLastAssistantText(sessionId: string): Promise<string | null> {
+    return this.inner.getLastAssistantText(sessionId);
+  }
+
+  async getSessionTree(sessionId: string): Promise<Record<string, unknown> | null> {
+    return this.inner.getSessionTree(sessionId);
+  }
+
+  async getSessionState(sessionId: string): Promise<PiSessionState> {
+    return this.inner.getState(sessionId);
+  }
+
+  async getSessionStats(sessionId: string): Promise<PiSessionStats> {
+    return this.inner.getSessionStats(sessionId);
+  }
+
+  clearCommandsCache(): void {
+    this.inner.clearCommandsCache();
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
@@ -2917,7 +3037,11 @@ export async function readPiActiveBranchHistory(
     if (edit && edit.replacement === null) continue;
 
     const mapped = mapPiHistoryEntry(entry, options.sessionId, edit);
-    if (mapped) messages.push(mapped);
+    if (Array.isArray(mapped)) {
+      messages.push(...mapped);
+    } else if (mapped) {
+      messages.push(mapped);
+    }
   }
   return messages;
 }
@@ -2950,7 +3074,14 @@ export function buildPiChildEnv(extraEnv?: Record<string, string>): NodeJS.Proce
   const clean: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(merged)) {
     if (value === undefined) continue;
-    if (key.startsWith('GATEWAY_')) continue;
+    if (
+      key.startsWith('GATEWAY_') ||
+      key === 'PORT' ||
+      key === 'NODE_ENV' ||
+      key === 'PI_WEB_PASSWORD'
+    ) {
+      continue;
+    }
     clean[key] = value;
   }
   const hasProxy = Boolean(
@@ -2969,7 +3100,7 @@ export function buildPiChildEnv(extraEnv?: Record<string, string>): NodeJS.Proce
   return clean;
 }
 
-function resolveDefaultPiSessionsDir(env: Record<string, string | undefined>): string {
+function resolveDefaultPiAgentDir(env: Record<string, string | undefined>): string {
   const agentDirEnv = (env.PI_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR)?.trim();
   const homeDir = env.HOME ?? process.env.HOME ?? os.homedir();
   if (agentDirEnv) {
@@ -2978,9 +3109,22 @@ function resolveDefaultPiSessionsDir(env: Record<string, string | undefined>): s
       : agentDirEnv.startsWith('~/')
         ? path.join(homeDir, agentDirEnv.slice(2))
         : agentDirEnv;
-    return path.join(path.resolve(expanded), 'sessions');
+    return path.resolve(expanded);
   }
-  return path.join(homeDir, '.pi', 'agent', 'sessions');
+  return path.join(homeDir, '.pi', 'agent');
+}
+
+function resolvePiAgentDirForSettings(
+  env: Record<string, string | undefined>,
+  explicitSessionsDir?: string,
+): string {
+  if (env.PI_CODING_AGENT_DIR?.trim()) return resolveDefaultPiAgentDir(env);
+  if (explicitSessionsDir) return path.dirname(explicitSessionsDir);
+  return resolveDefaultPiAgentDir(env);
+}
+
+function resolveDefaultPiSessionsDir(env: Record<string, string | undefined>): string {
+  return path.join(resolveDefaultPiAgentDir(env), 'sessions');
 }
 
 function assertSafeSessionId(sessionId: string): void {
@@ -3431,11 +3575,11 @@ async function safeUnlinkWithinRoot(realRoot: string, targetPath: string): Promi
   }
 }
 
-function mapPiHistoryEntry(
+export function mapPiHistoryEntry(
   entry: Record<string, unknown>,
   sessionId: string,
   edit?: Record<string, unknown>,
-): Message | null {
+): Message | Message[] | null {
   const entryId = String(entry.id ?? randomUUID());
   const createdAt = typeof entry.timestamp === 'string' && entry.timestamp ? entry.timestamp : nowIso();
   const type = typeof entry.type === 'string' ? entry.type : '';
@@ -3510,16 +3654,49 @@ function mapPiHistoryEntry(
     }
 
     if (role === 'bashExecution') {
+      const toolCallId = String(
+        typeof msg.toolCallId === 'string' && msg.toolCallId
+          ? msg.toolCallId
+          : typeof msg.id === 'string' && msg.id
+            ? `call_${msg.id}`
+            : `call_${entryId}`,
+      );
       const cmd = typeof msg.command === 'string' ? msg.command : '';
-      const out = typeof msg.output === 'string' ? msg.output : '';
-      const text = out ? `$ ${cmd}\n${out}` : `$ ${cmd}`;
-      return {
-        id: entryId,
-        session_id: sessionId,
-        role: 'user',
-        content: [{ type: 'text', text }],
-        created_at: msgCreatedAt,
-      };
+      const out = typeof msg.output === 'string' ? msg.output : extractToolContentText(msg);
+      const isError =
+        msg.isError === true ||
+        msg.is_error === true ||
+        (typeof msg.exitCode === 'number' && msg.exitCode !== 0);
+      return [
+        {
+          id: `${entryId}_call`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              tool_call_id: toolCallId,
+              tool_name: 'bash',
+              input: { command: cmd },
+            },
+          ],
+          created_at: msgCreatedAt,
+        },
+        {
+          id: `${entryId}_result`,
+          session_id: sessionId,
+          role: 'tool',
+          content: [
+            {
+              type: 'tool_result',
+              tool_call_id: toolCallId,
+              output: out,
+              is_error: isError,
+            },
+          ],
+          created_at: msgCreatedAt,
+        },
+      ];
     }
 
     if (role === 'custom' || role === 'hookMessage') {
@@ -3577,6 +3754,8 @@ function mapPiHistoryEntry(
 
   return null;
 }
+
+export const parsePiSessionEntry = mapPiHistoryEntry;
 
 function mapPiContentToGateway(raw: unknown, allowAssistantBlocks: boolean): MessageContentPart[] {
   if (typeof raw === 'string') {
@@ -3958,8 +4137,14 @@ function emptyAssistantMessage(sessionId: string): Message {
 }
 
 function workspaceIdFromCwd(cwd: string, provider: string): string {
-  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
-  return `wd_${provider}_${slug}`.slice(0, 60);
+  const resolved = path.resolve(cwd);
+  const normalized = (process.platform === 'win32' ? resolved.toLowerCase() : resolved)
+    .replace(/[\\/]+$/, '') || '/';
+  const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
+  const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  const prefix = `wd_${provider}_`;
+  const maxSlug = Math.max(1, 60 - prefix.length - 1 - hash.length);
+  return `${prefix}${slug.slice(0, maxSlug)}_${hash}`;
 }
 
 function nowIso(): string {

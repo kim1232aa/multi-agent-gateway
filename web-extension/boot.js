@@ -1,10 +1,13 @@
 (function () {
   'use strict';
 
-  var PROVIDERS = ['kimi', 'claude', 'codex', 'grok'];
-  var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok' };
+  var PROVIDERS = ['kimi', 'claude', 'codex', 'grok', 'pi'];
+  var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok', pi: 'Pi' };
   var STORAGE_KEY = 'multi-agent-gateway.provider.v1';
   var EXPLICIT_KEY = 'multi-agent-gateway.explicitProvider.v1';
+  var WS_STALE_WAKE_MS = 45000;
+  var WS_WAKE_PROBE_AFTER_MS = 10000;
+  var WS_WAKE_PONG_TIMEOUT_MS = 3000;
   var originalFetch = window.fetch || fetch;
   var OriginalWebSocket = window.WebSocket;
   var providerSockets = new Set();
@@ -22,6 +25,15 @@
     }
   }
 
+  function providerFromSessionId(id) {
+    if (typeof id !== 'string' || !id) return 'kimi';
+    if (id.indexOf('codex_') === 0) return 'codex';
+    if (id.indexOf('claude_') === 0) return 'claude';
+    if (id.indexOf('grok_') === 0) return 'grok';
+    if (id.indexOf('pi_') === 0) return 'pi';
+    return 'kimi';
+  }
+
   function providerFromPath(pathname) {
     var match = /^\/sessions\/([^/]+)/.exec(pathname || '');
     if (!match) return null;
@@ -31,10 +43,7 @@
     } catch (_) {
       id = match[1];
     }
-    if (id.indexOf('codex_') === 0) return 'codex';
-    if (id.indexOf('claude_') === 0) return 'claude';
-    if (id.indexOf('grok_') === 0) return 'grok';
-    return 'kimi';
+    return providerFromSessionId(id);
   }
 
   // 首页默认 kimi,不读 localStorage(否则上次的 codex 会藏掉 Swarm)。
@@ -74,15 +83,100 @@
   }
 
   function needsProvider(pathname) {
-    // /api/v1/auth 永不带 provider:登录是 Kimi 的全局状态,切 Agent 只切
-    // 会话/模型/命令来源,不切登录体系(否则 Claude/Codex 会被误显示成未登录)。
-    if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta') return true;
-    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/workspace/fs:search' || /^\/api\/v1\/files\//.test(pathname)) return true;
-    // 0.39 新增的 /v1/remote/devices、/capabilities、/plugins 是 Kimi 全局能力,不跟 Agent 走。
-    // /workspace/fs:suggest 与 /fs:content 仍不打标:网关没有对应本地实现,打上 provider 会 404。
-    // /providers 和 /catalog/providers 是 Kimi 的供应商目录(设置页),不跟 Agent 切换走。
-    if (/^\/api\/v1\/workspaces\/[^/]+$/.test(pathname)) return true;
-    return /^\/api\/v1\/workspaces\/[^/]+\/skills$/.test(pathname);
+    // /api/v1/auth 与 /api/v2/mcp/* 永不带 provider:登录和官方 MCP 认证是 Kimi 全局状态。
+    if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta' || pathname === '/api/v1/providers') return true;
+    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/fs:suggest' || pathname === '/api/v1/workspace/fs:list' || pathname === '/api/v1/workspace/fs:search' || pathname === '/api/v1/workspace/fs:suggest' || /^\/api\/v1\/files\//.test(pathname)) return true;
+    // 2.6.2 / 0.39 全局能力不跟 Agent 切换走:
+    // /v1/remote*、/capabilities、/plugins、/remote-control*、/api/v2/mcp/*、/providers、/catalog/providers、/fs:content。
+    // /workspaces/* (project-config-dirs、/:id、/:id/trust、/:id/primary、/:id/skills) 必须带 provider,
+    // 否则本地 Agent 的 wd_ 工作区 id 会被透传给 Kimi 上游而报 "workspace does not exist / 无法确认项目信任状态"。
+    return /^\/api\/v1\/workspaces\/.+/.test(pathname);
+  }
+
+  var SKILL_CHIP_RE = /\[([^\]]+)\]\((?:kimi-code:\/\/skill\/|kimi-code-composer:\/\/skills\/)([^)\s?]+)(?:[?#][^)]*)?\)/g;
+
+  function stripSkillChips(text) {
+    if (typeof text !== 'string' || !text) return text;
+    if (text.indexOf('kimi-code://skill/') === -1 && text.indexOf('kimi-code-composer://skills/') === -1) return text;
+    var out = text.replace(
+      /^(\s*\/([^\s]+))(?:\s+\[([^\]]+)\]\((?:kimi-code:\/\/skill\/|kimi-code-composer:\/\/skills\/)([^)\s?]+)(?:[?#][^)]*)?\))+/,
+      function (full, cmdPart, cmdName, label, encodedSlug) {
+        var slug = encodedSlug;
+        try { slug = decodeURIComponent(encodedSlug); } catch (_) {}
+        if (String(slug).toLowerCase() === String(cmdName).toLowerCase() || String(label).trim().toLowerCase() === String(cmdName).toLowerCase()) {
+          return cmdPart;
+        }
+        return full;
+      },
+    );
+    out = out.replace(SKILL_CHIP_RE, function (_full, label, encodedSlug) {
+      var slug = encodedSlug;
+      try { slug = decodeURIComponent(encodedSlug); } catch (_) {}
+      return slug ? '/' + slug : label;
+    });
+    return out.replace(/[ \t]+\n/g, '\n').replace(/[ \t]{2,}/g, ' ').trim();
+  }
+
+  function sanitizePromptBody(bodyText) {
+    if (typeof bodyText !== 'string' || !bodyText) return bodyText;
+    if (bodyText.indexOf('kimi-code://skill/') === -1 && bodyText.indexOf('kimi-code-composer://skills/') === -1) return bodyText;
+    try {
+      var body = JSON.parse(bodyText);
+      var changed = false;
+      if (body && typeof body.args === 'string') {
+        var nextArgs = stripSkillChips(body.args);
+        if (/^\/[^\s]+$/.test(nextArgs)) nextArgs = '';
+        if (nextArgs !== body.args) {
+          body.args = nextArgs;
+          changed = true;
+        }
+      }
+      var composer = body && body.metadata && body.metadata.kimi_code_composer;
+      if (composer && composer.doc && Array.isArray(composer.doc.content)) {
+        for (var p = 0; p < composer.doc.content.length; p += 1) {
+          var block = composer.doc.content[p];
+          var pieces = block && Array.isArray(block.content) ? block.content : [];
+          for (var q = 0; q < pieces.length; q += 1) {
+            if (pieces[q] && typeof pieces[q].text === 'string') {
+              var cleanPiece = stripSkillChips(pieces[q].text);
+              if (cleanPiece !== pieces[q].text) {
+                pieces[q].text = cleanPiece;
+                changed = true;
+              }
+            }
+          }
+        }
+      }
+      if (body && body.metadata && typeof body.metadata.display_text === 'string') {
+        var cleanDisplay = stripSkillChips(body.metadata.display_text);
+        if (cleanDisplay !== body.metadata.display_text) {
+          body.metadata.display_text = cleanDisplay;
+          changed = true;
+        }
+      }
+      var content = body && body.content;
+      if (Array.isArray(content)) {
+        for (var i = 0; i < content.length; i += 1) {
+          var part = content[i];
+          if (part && part.type === 'text' && typeof part.text === 'string') {
+            var nextText = stripSkillChips(part.text);
+            if (nextText !== part.text) {
+              part.text = nextText;
+              changed = true;
+            }
+          }
+        }
+      } else if (body && typeof body.text === 'string') {
+        var next = stripSkillChips(body.text);
+        if (next !== body.text) {
+          body.text = next;
+          changed = true;
+        }
+      }
+      return changed ? JSON.stringify(body) : bodyText;
+    } catch (_) {
+      return stripSkillChips(bodyText);
+    }
   }
 
   function rewriteApiUrl(input) {
@@ -96,21 +190,157 @@
     return url;
   }
 
+  var skillHintsByProvider = Object.create(null);
+
+  function rememberSkillHints(provider, skills) {
+    if (!isProvider(provider) || !Array.isArray(skills)) return;
+    var bucket = skillHintsByProvider[provider] || (skillHintsByProvider[provider] = Object.create(null));
+    for (var i = 0; i < skills.length; i += 1) {
+      var item = skills[i];
+      if (!item || typeof item.name !== 'string' || !item.name) continue;
+      var hint = typeof item.argument_hint === 'string'
+        ? item.argument_hint.trim()
+        : typeof item.argumentHint === 'string'
+          ? item.argumentHint.trim()
+          : '';
+      if (hint) bucket[item.name] = hint;
+      else delete bucket[item.name];
+    }
+  }
+
+  function isSkillsCatalogPath(pathname) {
+    return /^\/api\/v1\/(sessions|workspaces)\/[^/]+\/skills$/.test(pathname);
+  }
+
+  var capturedAuthHeader = null;
+
+  function captureAuthHeader(input, init) {
+    try {
+      var auth = null;
+      if (init && init.headers) {
+        if (typeof Headers === 'function' && init.headers instanceof Headers) {
+          auth = init.headers.get('authorization') || init.headers.get('Authorization');
+        } else if (Array.isArray(init.headers)) {
+          for (var i = 0; i < init.headers.length; i += 1) {
+            var pair = init.headers[i];
+            if (pair && String(pair[0]).toLowerCase() === 'authorization') {
+              auth = pair[1];
+              break;
+            }
+          }
+        } else if (typeof init.headers === 'object') {
+          auth = init.headers.authorization || init.headers.Authorization || null;
+        }
+      }
+      if (!auth && typeof Request === 'function' && input instanceof Request && input.headers) {
+        auth = input.headers.get('authorization') || input.headers.get('Authorization');
+      }
+      if (typeof auth === 'string' && auth.trim()) {
+        capturedAuthHeader = auth.trim();
+      }
+    } catch (_) {}
+  }
+
   window.fetch = function (input, init) {
     var url = rewriteApiUrl(input);
-    if (input instanceof Request) {
-      return originalFetch.call(window, new Request(url.href, input), init);
+    if (url.origin === window.location.origin && (url.pathname.indexOf('/api/v1/') === 0 || url.pathname.indexOf('/api/v2/') === 0)) {
+      captureAuthHeader(input, init);
     }
-    return originalFetch.call(window, url.href, init);
+    var method = ((init && init.method) || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
+    var isPromptWrite = method !== 'GET' && method !== 'HEAD' && (
+      /\/prompts$/.test(url.pathname)
+      || /\/skills\/[^/]+:activate$/.test(url.pathname)
+      || /\/steer$/.test(url.pathname)
+    );
+    if (isPromptWrite && selectedProvider() !== 'kimi') {
+      var effortMatch = url.pathname.match(/\/skills\/(effort|thinking):activate$/i);
+      var sessionMatch = url.pathname.match(/\/sessions\/([^/]+)\//);
+      if (effortMatch && sessionMatch && init && typeof init.body === 'string') {
+        try {
+          var effortBody = JSON.parse(init.body);
+          var effortText = [
+            effortBody && effortBody.args,
+            effortBody && effortBody.metadata && effortBody.metadata.display_text,
+          ].filter(function (value) { return typeof value === 'string'; }).join(' ');
+          var effortToken = String(effortText).toLowerCase().match(/\b(off|minimal|low|medium|high|xhigh|max|auto)\b/);
+          if (effortToken) {
+            var piniaForEffort = findPinia();
+            var modeForEffort = getPiniaStore(piniaForEffort, 'kimi.mode');
+            var sid = decodeURIComponent(sessionMatch[1]);
+            if (modeForEffort) {
+              modeForEffort.thinking = effortToken[1];
+              modeForEffort.thinkingBySession = Object.assign({}, modeForEffort.thinkingBySession, { [sid]: effortToken[1] });
+            }
+          }
+        } catch (_) {}
+      }
+    }
+    if (isPromptWrite) {
+      if (init && typeof init.body === 'string') {
+        init = Object.assign({}, init, { body: sanitizePromptBody(init.body) });
+      } else if (!init && input instanceof Request && typeof input.clone === 'function') {
+        var sourceRequest = input;
+        input = sourceRequest.clone();
+        var rewritten = input.text().then(function (bodyText) {
+          return new Request(url.href, {
+            method: sourceRequest.method,
+            headers: sourceRequest.headers,
+            body: sanitizePromptBody(bodyText),
+            credentials: sourceRequest.credentials,
+            cache: sourceRequest.cache,
+            redirect: sourceRequest.redirect,
+            referrer: sourceRequest.referrer,
+            integrity: sourceRequest.integrity,
+          });
+        });
+        return rewritten.then(function (request) {
+          return originalFetch.call(window, request);
+        });
+      }
+    }
+    var reqPromise = input instanceof Request
+      ? originalFetch.call(window, new Request(url.href, input), init)
+      : originalFetch.call(window, url.href, init);
+    if (isSkillsCatalogPath(url.pathname) && reqPromise && typeof reqPromise.then === 'function') {
+      var reqProvider = url.searchParams.get('provider') || providerFromPath(url.pathname.replace(/^\/api\/v1/, '')) || selectedProvider();
+      reqPromise.then(function (res) {
+        if (!res || !res.ok || typeof res.clone !== 'function') return;
+        res.clone().json().then(function (body) {
+          var list = body && body.data && body.data.skills;
+          if (!Array.isArray(list) && body && Array.isArray(body.skills)) list = body.skills;
+          if (Array.isArray(list)) {
+            rememberSkillHints(reqProvider, list);
+            scheduleSyncUi();
+          }
+        }).catch(function () {});
+      }).catch(function () {});
+    }
+    return reqPromise;
   };
 
   if (typeof OriginalWebSocket === 'function') {
+    function emitSyntheticWsMessage(ws, payload) {
+      var raw = JSON.stringify(payload);
+      setTimeout(function () {
+        if (typeof MessageEvent === 'function' && typeof ws.dispatchEvent === 'function') {
+          try {
+            ws.dispatchEvent(new MessageEvent('message', { data: raw }));
+            return;
+          } catch (_) {}
+        }
+        if (typeof ws.onmessage === 'function') {
+          ws.onmessage({ data: raw });
+        }
+      }, 0);
+    }
+
     function ProviderWebSocket(url, protocols) {
       var target = new URL(url instanceof URL ? url.href : String(url), window.location.origin);
       var page = new URL(window.location.origin);
       var gatewaySocket = target.host === page.host && target.pathname === '/api/v1/ws';
+      var socketProvider = target.searchParams.get('provider') || selectedProvider();
       if (gatewaySocket && !target.searchParams.has('provider')) {
-        target.searchParams.set('provider', selectedProvider());
+        target.searchParams.set('provider', socketProvider);
       }
       var ws = protocols === undefined
         ? new OriginalWebSocket(target.href)
@@ -118,9 +348,61 @@
       // 跟踪网关事件 WS:切换 Agent 时关掉它们,官方前端会自动重连,
       // 重连走新 provider 并触发它自己的全量重新同步——不需要整页 reload。
       if (gatewaySocket) {
+        ws._maLastActivityAt = Date.now();
+        ws._maProvider = socketProvider;
         providerSockets.add(ws);
+        if (typeof ws.send === 'function') {
+          var rawSend = ws.send;
+          ws.send = function (data) {
+            if (typeof data === 'string' && data.charAt(0) === '{') {
+              try {
+                var frame = JSON.parse(data);
+                var fType = frame && frame.type;
+                var sid = (fType === 'subscribe' || fType === 'unsubscribe')
+                  ? frame.session_id
+                  : (fType === 'subscribe_v2' || fType === 'unsubscribe_v2') && frame.payload
+                    ? frame.payload.session_id
+                    : null;
+                if (typeof sid === 'string' && sid) {
+                  var sidProv = providerFromSessionId(sid);
+                  if (sidProv !== ws._maProvider) {
+                    if (fType === 'subscribe' || fType === 'subscribe_v2') {
+                      if (sidProv === selectedProvider()) {
+                        try { ws.close(1000, 'provider-mismatch-reconnect'); } catch (_) {}
+                        return;
+                      }
+                      var okAck = fType === 'subscribe'
+                        ? { type: 'response', request_id: frame.request_id, code: 0, msg: 'success' }
+                        : {
+                            type: 'ack',
+                            id: frame.id,
+                            code: 0,
+                            msg: 'success',
+                            payload: { accepted: [sid], not_found: [], resync_required: [], cursors: {} },
+                          };
+                      emitSyntheticWsMessage(ws, okAck);
+                    }
+                    return;
+                  }
+                }
+              } catch (_) {}
+            }
+            return rawSend.call(this, data);
+          };
+        }
         if (ws && typeof ws.addEventListener === 'function') {
-          ws.addEventListener('close', function () { providerSockets.delete(ws); });
+          ws.addEventListener('open', function () {
+            ws._maLastActivityAt = Date.now();
+            clearWakeProbe(ws);
+          });
+          ws.addEventListener('message', function () {
+            ws._maLastActivityAt = Date.now();
+            clearWakeProbe(ws);
+          });
+          ws.addEventListener('close', function () {
+            clearWakeProbe(ws);
+            providerSockets.delete(ws);
+          });
         }
       }
       return ws;
@@ -130,33 +412,116 @@
     window.WebSocket = ProviderWebSocket;
   }
 
-  function closeProviderSockets() {
+  function clearWakeProbe(ws) {
+    if (ws && ws._maProbeTimer) {
+      clearTimeout(ws._maProbeTimer);
+      ws._maProbeTimer = null;
+    }
+  }
+
+  function closeProviderSockets(reason) {
     providerSockets.forEach(function (ws) {
-      try { ws.close(1000, 'provider-switch'); } catch (_) {}
+      clearWakeProbe(ws);
+      try { ws.close(1000, reason || 'provider-switch'); } catch (_) {}
     });
     providerSockets.clear();
   }
 
+  // 借鉴 ovis WS 健壮性:页面冻结唤醒或恢复联网时先对空闲 >10s 连接主动发 JSON ping 探活,
+  // 3s 无入站帧或总空闲超过 45s 则以 4008 关闭触发官方重连;pagehide 主动断连防 bfcache 幽灵投递。
+  function checkStaleSockets() {
+    var now = Date.now();
+    providerSockets.forEach(function (ws) {
+      var state = ws && ws.readyState;
+      if (state === 2 || state === 3) {
+        clearWakeProbe(ws);
+        providerSockets.delete(ws);
+        return;
+      }
+      var idleMs = ws._maLastActivityAt ? (now - ws._maLastActivityAt) : 0;
+      if ((state === undefined || state === 1) && idleMs > WS_STALE_WAKE_MS) {
+        clearWakeProbe(ws);
+        providerSockets.delete(ws);
+        try { ws.close(4008, 'stale-wakeup'); } catch (_) {}
+        return;
+      }
+      if ((state === undefined || state === 1) && idleMs >= WS_WAKE_PROBE_AFTER_MS && typeof ws.send === 'function' && !ws._maProbeTimer) {
+        var sentAt = ws._maLastActivityAt;
+        try {
+          ws.send(JSON.stringify({ type: 'ping' }));
+        } catch (_) {
+          clearWakeProbe(ws);
+          providerSockets.delete(ws);
+          try { ws.close(4008, 'stale-wakeup'); } catch (_) {}
+          return;
+        }
+        ws._maProbeTimer = setTimeout(function () {
+          ws._maProbeTimer = null;
+          if (ws._maLastActivityAt === sentAt && providerSockets.has(ws)) {
+            providerSockets.delete(ws);
+            try { ws.close(4008, 'stale-wakeup'); } catch (_) {}
+          }
+        }, WS_WAKE_PONG_TIMEOUT_MS);
+      }
+    });
+    syncUi();
+  }
+
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', function () {
+      closeProviderSockets('pagehide');
+    });
+    window.addEventListener('online', function () {
+      checkStaleSockets();
+    });
+  }
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', function () {
+      if (typeof document.visibilityState !== 'string' || document.visibilityState === 'visible') {
+        checkStaleSockets();
+      }
+    });
+  }
+
   // -- 可用 provider(按网关 /meta 实际安装情况过滤) ---------------------------
+
+  function readCredentialValue(raw) {
+    if (!raw) return null;
+    try {
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.credential === 'string' && parsed.credential) {
+          if (typeof parsed.expiresAt === 'number' && Number.isFinite(parsed.expiresAt) && parsed.expiresAt <= Date.now()) {
+            return null;
+          }
+          return parsed.credential;
+        }
+        return typeof parsed.token === 'string' && parsed.token ? parsed.token : null;
+      }
+      return null;
+    } catch (_) {
+      return raw;
+    }
+  }
 
   function tokenFromHash() {
     var match = /(?:^|[#&])token=([^&]+)/.exec(window.location.hash || '');
     if (match) {
       try { return decodeURIComponent(match[1]); } catch (_) { return match[1]; }
     }
-    // hash 没带 token 时回退官方前端存的服务凭证(登录后写入;JSON 或裸串)。
+    // hash 没带 token 时回退官方前端存的服务凭证(2.6.2 存 { version: 1, credential, expiresAt }, 旧版为 { token } 或裸串)。
     try {
       var stored = localStorage.getItem('kimi-web.server-credential');
-      if (!stored) return null;
-      try {
-        var parsed = JSON.parse(stored);
-        return parsed && typeof parsed.token === 'string' ? parsed.token : null;
-      } catch (_) {
-        return stored;
-      }
-    } catch (_) {
-      return null;
-    }
+      var fromLocal = readCredentialValue(stored);
+      if (fromLocal) return fromLocal;
+    } catch (_) {}
+    try {
+      var fromSession = typeof sessionStorage !== 'undefined' && sessionStorage
+        ? readCredentialValue(sessionStorage.getItem('kimi-web.server-credential'))
+        : null;
+      if (fromSession) return fromSession;
+    } catch (_) {}
+    return null;
   }
 
   // 没装 codex/claude 的机器不该在选择器里看到它们。网关 /meta 的 providers
@@ -303,6 +668,201 @@
     return facadeFromInstance(app && app._instance, 0);
   }
 
+  function findPinia() {
+    var root = document.querySelector('#app');
+    var app = root && root.__vue_app__;
+    var pinia = app && app.config && app.config.globalProperties && app.config.globalProperties.$pinia;
+    return pinia && pinia._s && typeof pinia._s.get === 'function' ? pinia : null;
+  }
+
+  function getPiniaStore(pinia, id) {
+    return pinia && pinia._s && typeof pinia._s.get === 'function' ? pinia._s.get(id) : null;
+  }
+
+  function authHeaders() {
+    var token = tokenFromHash();
+    if (token) return { authorization: 'Bearer ' + token };
+    return capturedAuthHeader ? { authorization: capturedAuthHeader } : undefined;
+  }
+
+  function mapWireModelToStore(entry) {
+    if (!entry || typeof entry !== 'object') return entry;
+    var modelId = entry.model || entry.id;
+    return {
+      id: modelId,
+      provider: entry.provider,
+      model: modelId,
+      displayName: entry.display_name || entry.displayName || modelId,
+      maxContextSize: entry.max_context_size !== undefined ? entry.max_context_size : entry.maxContextSize,
+      capabilities: entry.capabilities,
+      supportEfforts: entry.support_efforts !== undefined ? entry.support_efforts : entry.supportEfforts,
+      defaultEffort: entry.default_effort !== undefined ? entry.default_effort : entry.defaultEffort,
+      isDefault: Boolean(entry.is_default || entry.isDefault),
+    };
+  }
+
+  function pickDefaultCatalogId(catalog, ids) {
+    for (var i = 0; i < catalog.length; i += 1) {
+      var entry = catalog[i];
+      if (entry && entry.isDefault) {
+        var id = entry.model || entry.id;
+        if (typeof id === 'string' && ids.indexOf(id) !== -1) return id;
+      }
+    }
+    return ids[0];
+  }
+
+  function reconcilePiniaModel(pinia, provider) {
+    var modelsStore = getPiniaStore(pinia, 'kimi.models');
+    if (!modelsStore) return;
+    var catalog = unwrapRef(modelsStore.models);
+    if (!Array.isArray(catalog) || catalog.length === 0) return;
+    var ids = catalog
+      .map(function (entry) { return entry && (entry.model || entry.id); })
+      .filter(function (id) { return typeof id === 'string' && id; });
+    if (ids.length === 0) return;
+    var current = unwrapRef(modelsStore.draftModel) || unwrapRef(modelsStore.defaultModel);
+    var saved = modelMemory()[provider];
+    var target = (saved && ids.indexOf(saved) !== -1)
+      ? saved
+      : (current && ids.indexOf(current) !== -1)
+        ? current
+        : pickDefaultCatalogId(catalog, ids);
+    if (!target) return;
+    if (target !== unwrapRef(modelsStore.defaultModel) && typeof modelsStore.setDefaultModel === 'function') {
+      modelsStore.setDefaultModel(target);
+    }
+    if (target !== unwrapRef(modelsStore.draftModel) && typeof modelsStore.setDraftModel === 'function') {
+      modelsStore.setDraftModel(target);
+    }
+    if (target !== current) {
+      var headers = authHeaders() || {};
+      headers['content-type'] = 'application/json';
+      originalFetch
+        .call(window, '/api/v1/config?provider=' + encodeURIComponent(provider), {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ default_model: target }),
+        })
+        .catch(function () {});
+    }
+  }
+
+  function reconcileWorkspaceSelection(workspacesStore) {
+    if (!workspacesStore) return;
+    var list = unwrapRef(workspacesStore.workspaces);
+    var activeId = unwrapRef(workspacesStore.activeWorkspaceId);
+    if (!Array.isArray(list)) return;
+    if ((activeId && !list.some(function (w) { return w && w.id === activeId; })) || (!activeId && list.length > 0)) {
+      if (typeof workspacesStore.selectWorkspace === 'function') {
+        workspacesStore.selectWorkspace(list[0] ? list[0].id : null);
+      }
+    }
+  }
+
+  function clearCrossProviderState(pinia) {
+    var sessionsStore = getPiniaStore(pinia, 'kimi.sessions');
+    var workspacesStore = getPiniaStore(pinia, 'kimi.workspaces');
+    var modelsStore = getPiniaStore(pinia, 'kimi.models');
+    if (sessionsStore && typeof sessionsStore.setActiveSessionId === 'function') {
+      sessionsStore.setActiveSessionId(undefined);
+    }
+    if (sessionsStore && typeof sessionsStore.setSessions === 'function') {
+      sessionsStore.setSessions([]);
+    }
+    if (workspacesStore && Array.isArray(workspacesStore.workspaces)) {
+      workspacesStore.workspaces = [];
+    }
+    if (workspacesStore && typeof workspacesStore.selectWorkspace === 'function') {
+      workspacesStore.selectWorkspace(null);
+    }
+    if (modelsStore && typeof modelsStore.setModels === 'function') {
+      modelsStore.setModels([]);
+    }
+    if (modelsStore && typeof modelsStore.setDraftModel === 'function') {
+      modelsStore.setDraftModel(null);
+    }
+    if (modelsStore && typeof modelsStore.setDefaultModel === 'function') {
+      modelsStore.setDefaultModel(null);
+    }
+  }
+
+  function refreshPiniaData(pinia, provider) {
+    if (provider !== selectedProvider()) return Promise.resolve();
+    var configStore = getPiniaStore(pinia, 'kimi.config');
+    var modelsStore = getPiniaStore(pinia, 'kimi.models');
+    var workspacesStore = getPiniaStore(pinia, 'kimi.workspaces');
+    var sessionListStore = getPiniaStore(pinia, 'kimi.sessionList');
+
+    var metaTask = configStore && typeof configStore.refreshServerMeta === 'function'
+      ? Promise.resolve(configStore.refreshServerMeta()).catch(function () {})
+      : Promise.resolve();
+    var configTask = configStore && typeof configStore.loadConfig === 'function'
+      ? Promise.resolve(configStore.loadConfig()).catch(function () {})
+      : Promise.resolve();
+    var modelsHeaders = authHeaders();
+    var modelsTask = modelsStore && typeof modelsStore.setModels === 'function'
+      ? originalFetch
+          .call(window, '/api/v1/models?provider=' + encodeURIComponent(provider), modelsHeaders ? { headers: modelsHeaders } : undefined)
+          .then(function (res) { return res && res.ok ? res.json() : null; })
+          .then(function (body) {
+            if (provider !== selectedProvider()) return;
+            var items = (body && body.data && body.data.items) || (body && body.items);
+            if (!Array.isArray(items)) return;
+            modelsStore.setModels(items.map(mapWireModelToStore));
+            if (typeof modelsStore.setModelsReady === 'function') modelsStore.setModelsReady(true);
+          })
+          .catch(function () {})
+      : Promise.resolve();
+
+    return Promise.all([metaTask, configTask, modelsTask]).then(function () {
+      if (provider !== selectedProvider()) return;
+      reconcilePiniaModel(pinia, provider);
+      if (sessionListStore && typeof sessionListStore.resetSessionList === 'function') {
+        sessionListStore.resetSessionList();
+      }
+      if (workspacesStore && typeof workspacesStore.resetSessionGroupPagination === 'function') {
+        workspacesStore.resetSessionGroupPagination();
+      }
+      if (
+        sessionListStore
+        && typeof sessionListStore.fireFirstSessionGroupPage === 'function'
+        && typeof sessionListStore.loadInitialSessionsByWorkspace === 'function'
+      ) {
+        var first = sessionListStore.fireFirstSessionGroupPage({});
+        var wsPromise = workspacesStore && typeof workspacesStore.loadWorkspaces === 'function'
+          ? Promise.resolve(workspacesStore.loadWorkspaces()).catch(function () {})
+          : Promise.resolve();
+        return wsPromise.then(function () {
+          if (provider !== selectedProvider()) return null;
+          reconcileWorkspaceSelection(workspacesStore);
+          return Promise.resolve(sessionListStore.loadInitialSessionsByWorkspace({
+            firstPage: first && first.firstPage,
+            input: first && first.input,
+            serial: first && first.serial,
+            signal: first && first.signal,
+          })).catch(function () { return null; });
+        }).then(function (loaded) {
+          if (provider !== selectedProvider()) return;
+          if (loaded && Array.isArray(loaded.sessions) && typeof sessionListStore.setSessionsPreservingLiveUsage === 'function') {
+            sessionListStore.setSessionsPreservingLiveUsage(loaded.sessions);
+          }
+        });
+      }
+      var wsFallback = workspacesStore && typeof workspacesStore.loadWorkspaces === 'function'
+        ? Promise.resolve(workspacesStore.loadWorkspaces()).catch(function () {})
+        : Promise.resolve();
+      return wsFallback.then(function () {
+        if (provider !== selectedProvider()) return;
+        reconcileWorkspaceSelection(workspacesStore);
+        if (sessionListStore && typeof sessionListStore.ensureFlatSessions === 'function') {
+          return Promise.resolve(sessionListStore.ensureFlatSessions()).catch(function () {});
+        }
+        return undefined;
+      });
+    });
+  }
+
   // 慢 provider(codex 全量扫描实测 ~4s)的响应若在下次切换后才返回,
   // 会把列表覆盖回旧 provider;刷新串行排队,保证最后选中的 provider 最后落盘。
   var refreshChain = Promise.resolve();
@@ -310,42 +870,76 @@
 
   function refreshProviderData() {
     var facade = findFacade();
-    if (!facade || typeof facade.load !== 'function') {
-      // 0.39 不再 provide KimiWebClientFacade。整页 reload 会丢掉 runtimeProvider,
-      // 首页又强制 kimi,表现为点 Claude/Codex/Grok 立刻跳回 Kimi。
-      // fetch 已经带上新 provider;Vue 根实例出来后再 load。
+    var hasLegacyFacade = Boolean(facade && typeof facade.load === 'function');
+    var pinia = hasLegacyFacade ? null : findPinia();
+    var hasPinia = Boolean(pinia && (
+      getPiniaStore(pinia, 'kimi.sessionList')
+      || getPiniaStore(pinia, 'kimi.workspaces')
+      || getPiniaStore(pinia, 'kimi.models')
+      || getPiniaStore(pinia, 'kimi.config')
+    ));
+    if (!hasLegacyFacade && !hasPinia) {
+      // 0.39/2.6.2 挂载前拿不到实例。整页 reload 会丢掉 runtimeProvider,
+      // fetch 已经带上新 provider;Vue/Pinia 就绪后再加载。
       pendingProviderRefresh = true;
       return;
     }
     pendingProviderRefresh = false;
-    closeProviderSockets();
+    closeProviderSockets('provider-switch');
     // 入队时捕获 provider:慢 provider 的 load 落地时选择可能已变,旧 provider
     // 的目录不能用新 provider 的记忆/默认值去校正。
     var provider = selectedProvider();
-    // facade.load() 是官方应用自己的完整引导(工作区+会话+模型,实测不弹
-    // 全屏 splash);loadAllSessions 只服务搜索且有 sessionsFullyLoaded 早退,
-    // 不能用它刷新侧边栏。引导完成后把模型选择校正到当前 provider 的目录。
+    if (hasLegacyFacade) {
+      // facade.load() 是官方 0.38/0.39 的完整引导;引导完成后校正模型目录。
+      refreshChain = refreshChain.then(function () {
+        return Promise.resolve(facade.load()).catch(function () {});
+      }).then(function () {
+        if (provider !== selectedProvider()) return;
+        reconcileModel(facade, provider);
+      }).then(undefined, function () {
+        // 自愈:facade.load 同步抛错曾让链永久 rejected,后续刷新全部静默失效。
+      });
+      return;
+    }
+    clearCrossProviderState(pinia);
     refreshChain = refreshChain.then(function () {
-      return Promise.resolve(facade.load()).catch(function () {});
-    }).then(function () {
-      if (provider !== selectedProvider()) return;
-      reconcileModel(facade, provider);
-    }).then(undefined, function () {
-      // 自愈:facade.load 同步抛错曾让链永久 rejected,后续刷新全部静默失效。
-    });
+      return refreshPiniaData(pinia, provider);
+    }).then(undefined, function () {});
   }
 
   function switchProvider(provider) {
     if (!isProvider(provider) || provider === selectedProvider()) return;
     var facadeBefore = findFacade();
-    if (facadeBefore) rememberModel(selectedProvider(), unwrapRef(facadeBefore.defaultModel));
+    if (facadeBefore) {
+      rememberModel(selectedProvider(), unwrapRef(facadeBefore.defaultModel));
+    } else {
+      var piniaBefore = findPinia();
+      var modelsBefore = getPiniaStore(piniaBefore, 'kimi.models');
+      if (modelsBefore) {
+        rememberModel(
+          selectedProvider(),
+          unwrapRef(modelsBefore.draftModel) || unwrapRef(modelsBefore.defaultModel),
+        );
+      }
+    }
     var onSessionPage = /^\/sessions\//.test(window.location.pathname);
+    lastRouteProvider = provider;
     setProvider(provider);
+    var piniaNow = findPinia();
+    if (piniaNow) {
+      clearCrossProviderState(piniaNow);
+    }
     // 不整页 reload:在会话页先软导航回主页(官方路由监听 popstate),
-    // 再让官方 facade 按新 provider 重取工作区/会话/模型。
+    // 再让官方 facade/Pinia 按新 provider 重取工作区/会话/模型。
     if (onSessionPage) {
       window.history.pushState(null, '', '/');
       dispatchPopstate();
+    }
+    var rootFacade = findFacade();
+    if (rootFacade && typeof rootFacade.setSessionLoading === 'function') {
+      rootFacade.setSessionLoading(false);
+    } else if (rootFacade) {
+      rootFacade.sessionLoading = false;
     }
     refreshProviderData();
   }
@@ -404,8 +998,8 @@
   }
 
   // 桌面:挂在侧边栏 .side-footer(账号行)正上方,视觉对齐官方 status-seg。
-  // 移动端 0.39 不再渲染 Sidebar,改挂在会话 sheet 的 .view-tabs(flat / 按工作区)正上方。
-  // .user-menu-login 在 0.39 是传送到 body 的菜单项,不是挂载点。
+  // 移动端 0.39/2.6.2 不再渲染 Sidebar,改挂在会话 sheet 的 .view-tabs(flat / 按工作区)正上方。
+  // .user-menu-login 是传送到 body 的菜单项,不是挂载点。
   function findMountAnchor() {
     if (!document.querySelector) return null;
     var desktop = document.querySelector('.side-footer, .user-menu-trigger');
@@ -461,15 +1055,24 @@
         var labelNode = row.querySelector('[data-icon], .am-row-name, .mode-row-name, .am-name');
         var raw = labelNode ? String(labelNode.getAttribute && labelNode.getAttribute('name') || labelNode.textContent || '').trim().toLowerCase() : '';
         if (!raw) raw = String(row.textContent || '').trim().toLowerCase();
-        if (raw.indexOf('swarm') !== -1) id = 'swarm';
+        if (raw.indexOf('tower') !== -1) id = 'tower';
+        else if (raw.indexOf('swarm') !== -1) id = 'swarm';
         else if (raw.indexOf('goal') !== -1 || raw.indexOf('目标') !== -1) id = 'goal';
         else if (raw.indexOf('plan') !== -1 || raw.indexOf('计划') !== -1) id = 'plan';
         else if (raw.indexOf('file') !== -1 || raw.indexOf('附件') !== -1) id = 'files';
         if (id && row.setAttribute) row.setAttribute('data-mode-id', id);
       }
+      var isTower = id === 'tower' || id.indexOf('tower') !== -1;
       var isSwarm = id === 'swarm' || id.indexOf('swarm') !== -1;
       var isGoal = id === 'goal' || id.indexOf('goal') !== -1 || id.indexOf('目标') !== -1;
-      var hide = (provider === 'claude' || provider === 'grok') ? isSwarm || isGoal : provider === 'codex' ? isSwarm : false;
+      var isPlan = id === 'plan' || id.indexOf('plan') !== -1 || id.indexOf('计划') !== -1;
+      var hide = provider === 'pi'
+        ? (isTower || isSwarm || isGoal || isPlan)
+        : provider === 'claude'
+          ? (isTower || isSwarm || isGoal)
+          : (provider === 'codex' || provider === 'grok')
+            ? (isTower || isSwarm)
+            : false;
       if (hide) {
         row.hidden = true;
         row.style.display = 'none';
@@ -482,22 +1085,54 @@
     });
   }
 
-  // 官方 0.39 SlashMenu 仍内置 /swarm /goal /btw,也可能列出 /compact /undo。移动端走 .slash-menu.is-sheet。
-  // Kimi 全部保留。Claude compact 是真 /compact prompt,但无 rewind,藏 /undo。
-  // Grok compact/undo/fork 由 adapter 执行,只藏 /swarm /goal /btw。
-  // Codex compact/undo/goal 由网关执行,藏 /swarm /btw。
+  // 官方 2.6.2 SlashMenu 内置 /swarm /tower /goal /btw /compact /undo /fork 等。移动端走 .slash-menu.is-sheet。
+  // Kimi 全部保留。Claude compact 是真 /compact prompt,但无 rewind,藏 /undo /goal /swarm /tower /btw。
+  // Grok 1.0.77 支持 goal/compact/undo/fork,只藏 /swarm /tower /btw。
+  // Codex 支持 goal/compact/undo/fork,藏 /swarm /tower /btw。
+  // Pi 1.5.2 支持 compact/fork/clone/status/usage,无 goal/plan/undo/swarm/tower/btw,藏 /swarm /tower /goal /plan /btw /undo。
   function blockedSlashNames(provider) {
-    if (provider === 'grok') return ['/swarm', '/goal', '/btw'];
-    if (provider === 'claude') return ['/swarm', '/goal', '/btw', '/undo'];
-    if (provider === 'codex') return ['/swarm', '/btw'];
+    if (provider === 'grok' || provider === 'codex') return ['/swarm', '/tower', '/btw'];
+    if (provider === 'claude') return ['/swarm', '/tower', '/goal', '/btw', '/undo'];
+    if (provider === 'pi') return ['/swarm', '/tower', '/goal', '/btw', '/undo', '/plan'];
     return [];
+  }
+
+  function skillHintLookupName(label) {
+    var raw = String(label || '').trim().split(/\s+/)[0];
+    if (raw.charAt(0) === '/') raw = raw.slice(1);
+    if (raw.indexOf('skill:') === 0) raw = raw.slice(6);
+    return raw;
+  }
+
+  var synthesizingSlashKey = false;
+
+  function isSlashRowVisible(row) {
+    if (!row) return false;
+    if (typeof row.hasAttribute === 'function' && row.hasAttribute('data-multi-agent-slash-hidden')) return false;
+    return !row.style || row.style.display !== 'none';
+  }
+
+  function dispatchSlashArrow(target, key, count) {
+    if (!target || typeof target.dispatchEvent !== 'function' || typeof KeyboardEvent !== 'function') return;
+    var code = key === 'ArrowUp' ? 'ArrowUp' : 'ArrowDown';
+    synthesizingSlashKey = true;
+    try {
+      for (var i = 0; i < count; i += 1) {
+        target.dispatchEvent(new KeyboardEvent('keydown', { key: key, code: code, bubbles: true, cancelable: true }));
+      }
+    } finally {
+      synthesizingSlashKey = false;
+    }
   }
 
   function gateSlashMenu() {
     if (!document.querySelectorAll) return;
-    var blocked = blockedSlashNames(selectedProvider());
+    var provider = selectedProvider();
+    var blocked = blockedSlashNames(provider);
+    var hints = skillHintsByProvider[provider] || null;
     document.querySelectorAll('.slash-menu .slash-name').forEach(function (nameEl) {
-      var label = String(nameEl.textContent || '').trim().split(/\s+/)[0].toLowerCase();
+      var token = String(nameEl.textContent || '').trim().split(/\s+/)[0];
+      var label = token.toLowerCase();
       var hide = blocked.indexOf(label) !== -1;
       var row = nameEl.parentElement;
       if (!row || !row.style) return;
@@ -510,7 +1145,88 @@
         row.style.display = '';
         if (row.removeAttribute) row.removeAttribute('data-multi-agent-slash-hidden');
       }
+      if (!hide && typeof row.querySelector === 'function' && typeof document.createElement === 'function') {
+        var existingHint = row.querySelector('.multi-agent-slash-hint');
+        var hintText = provider !== 'kimi' && hints ? hints[skillHintLookupName(token)] : '';
+        if (hintText) {
+          if (!existingHint) {
+            existingHint = document.createElement('span');
+            existingHint.className = 'multi-agent-slash-hint';
+            if (typeof row.insertBefore === 'function') row.insertBefore(existingHint, nameEl.nextSibling || null);
+            else if (typeof row.appendChild === 'function') row.appendChild(existingHint);
+          }
+          if (existingHint.textContent !== hintText) existingHint.textContent = hintText;
+        } else if (existingHint && typeof existingHint.remove === 'function') {
+          existingHint.remove();
+        }
+      }
     });
+    var menu = document.querySelector && document.querySelector('.slash-menu');
+    if (menu && typeof menu.querySelectorAll === 'function' && document.activeElement) {
+      var rows = Array.prototype.slice.call(menu.querySelectorAll('.slash-item'));
+      var activeIdx = -1;
+      for (var i = 0; i < rows.length; i += 1) {
+        if (rows[i].classList && rows[i].classList.contains('active')) {
+          activeIdx = i;
+          break;
+        }
+      }
+      if (activeIdx >= 0 && !isSlashRowVisible(rows[activeIdx])) {
+        var steps = 1;
+        while (steps < rows.length) {
+          if (isSlashRowVisible(rows[(activeIdx + steps) % rows.length])) {
+            dispatchSlashArrow(document.activeElement, 'ArrowDown', steps);
+            break;
+          }
+          steps += 1;
+        }
+      }
+    }
+  }
+
+  function onSlashKeydown(e) {
+    if (synthesizingSlashKey || !e || e.isComposing) return;
+    var key = e.key;
+    if (key !== 'ArrowDown' && key !== 'ArrowUp' && key !== 'Enter' && key !== 'Tab') return;
+    var menu = document.querySelector && document.querySelector('.slash-menu');
+    if (!menu || typeof menu.querySelectorAll !== 'function') return;
+    var rows = Array.prototype.slice.call(menu.querySelectorAll('.slash-item'));
+    if (rows.length === 0) return;
+    var visibleCount = 0;
+    var activeIdx = -1;
+    for (var i = 0; i < rows.length; i += 1) {
+      if (isSlashRowVisible(rows[i])) visibleCount += 1;
+      if (activeIdx === -1 && rows[i].classList && rows[i].classList.contains('active')) activeIdx = i;
+    }
+    if (visibleCount === 0) {
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      return;
+    }
+    if (key === 'Enter' || key === 'Tab') {
+      if (activeIdx >= 0 && !isSlashRowVisible(rows[activeIdx])) {
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+        if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      }
+      return;
+    }
+    var cur = activeIdx >= 0 ? activeIdx : 0;
+    var delta = key === 'ArrowDown' ? 1 : -1;
+    var steps = 1;
+    while (steps <= rows.length) {
+      var candidate = (cur + delta * steps + rows.length * 2) % rows.length;
+      if (isSlashRowVisible(rows[candidate])) break;
+      steps += 1;
+    }
+    if (steps > 1 && steps <= rows.length) {
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      dispatchSlashArrow(e.target || document.activeElement, key, steps);
+    }
+  }
+
+  if (document.addEventListener) {
+    document.addEventListener('keydown', onSlashKeydown, true);
   }
 
   function syncUi() {
@@ -532,7 +1248,14 @@
     if (pendingProviderRefresh) refreshProviderData();
   }
 
+  var lastRouteProvider = selectedProvider();
   function onRouteChange() {
+    var nextProvider = selectedProvider();
+    if (nextProvider !== lastRouteProvider) {
+      lastRouteProvider = nextProvider;
+      closeProviderSockets('route-provider-change');
+      refreshProviderData();
+    }
     syncUi();
   }
 

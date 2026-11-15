@@ -25,6 +25,7 @@ import {
   encodePiCwdDir,
   encodePiModelId,
   mapPiStatsToUsage,
+  parsePiSessionEntry,
   piModelSupportedThinkingLevels,
   readPiActiveBranchHistory,
   resolvePiBin,
@@ -123,6 +124,7 @@ current_model = {
 }
 thinking_level = "medium"
 session_name = None
+auto_compaction = True
 message_count = 2 if "--session" in args else 0
 if os.environ.get("FAKE_EMPTY_SESSION") == "1":
     message_count = 0
@@ -168,6 +170,7 @@ while True:
                 "sessionFile": session_file,
                 "sessionId": session_id,
                 **({"sessionName": session_name} if session_name else {}),
+                "autoCompactionEnabled": auto_compaction,
                 "messageCount": message_count,
                 "pendingMessageCount": 0,
             },
@@ -215,7 +218,12 @@ while True:
             thinking_level = "low"
         send({"id": cid, "type": "response", "command": "set_model", "success": True, "data": current_model})
     elif ctype == "get_available_thinking_levels":
-        levels = ["low", "medium", "high"] if mode == "no_off_thinking" or current_model.get("id") == "no-off-model" else ["off", "minimal", "low", "medium", "high"]
+        if mode == "duplicate_thinking_levels":
+            levels = ["off", "low", "low", "medium", "high", "off"]
+        elif mode == "no_off_thinking" or current_model.get("id") == "no-off-model":
+            levels = ["low", "medium", "high"]
+        else:
+            levels = ["off", "minimal", "low", "medium", "high"]
         send({"id": cid, "type": "response", "command": "get_available_thinking_levels", "success": True, "data": {"levels": levels}})
     elif ctype == "set_thinking_level":
         req_lvl = cmd.get("level")
@@ -234,11 +242,20 @@ while True:
                 "commands": [
                     {"name": "skill:deploy", "description": "Deploy skill", "source": "skill", "sourceInfo": {"path": "/tmp/nonexistent/SKILL.md", "scope": "user"}},
                     {"name": "fix-tests", "description": "Fix tests", "source": "prompt", "sourceInfo": {"path": "/tmp/fix.md", "scope": "project"}},
+                    {"name": "mcp", "description": "Manage MCP servers", "source": "extension", "sourceInfo": {"path": "builtin:mcp", "scope": "temporary"}},
+                    {"name": "llama", "description": "Manage llama.cpp", "source": "extension", "sourceInfo": {"path": "builtin:llama.cpp", "scope": "temporary"}},
                     {"name": "undo", "description": "Unsupported TUI undo", "source": "extension", "sourceInfo": {"scope": "user"}},
                     {"name": "settings", "description": "TUI settings", "source": "extension", "sourceInfo": {"scope": "user"}},
                 ],
             },
         })
+    elif ctype == "set_auto_compaction":
+        auto_compaction = bool(cmd.get("enabled", True))
+        send({"id": cid, "type": "response", "command": "set_auto_compaction", "success": True})
+    elif ctype == "get_last_assistant_text":
+        send({"id": cid, "type": "response", "command": "get_last_assistant_text", "success": True, "data": {"text": "Pi last reply"}})
+    elif ctype == "get_tree":
+        send({"id": cid, "type": "response", "command": "get_tree", "success": True, "data": {"leafId": "e2", "tree": [{"entry": {"id": "e1", "type": "message", "message": {"role": "user"}}, "children": [{"entry": {"id": "e2", "type": "message", "message": {"role": "assistant"}}, "children": []}]}]}})
     elif ctype == "get_session_stats":
         if mode == "null_context_stats":
             send({
@@ -518,14 +535,20 @@ test('resolvePiBin precedence: piBin > PI_BIN > ~/.local/bin/pi > PATH', async (
   }
 });
 
-test('buildPiChildEnv strips GATEWAY_* env vars from spawned Pi child', async () => {
+test('buildPiChildEnv strips GATEWAY_*, PORT, NODE_ENV, and PI_WEB_PASSWORD env vars from spawned Pi child', async () => {
   const base = await mkdtemp(join(tmpdir(), 'pi-env-strip-'));
   let adapter: PiProviderAdapter | undefined;
   const prevGatewayToken = process.env.GATEWAY_TOKEN;
   const prevGatewayPort = process.env.GATEWAY_PORT;
+  const prevPort = process.env.PORT;
+  const prevNodeEnv = process.env.NODE_ENV;
+  const prevPassword = process.env.PI_WEB_PASSWORD;
   try {
     process.env.GATEWAY_TOKEN = 'secret-gateway-token';
     process.env.GATEWAY_PORT = '58629';
+    process.env.PORT = '8080';
+    process.env.NODE_ENV = 'production';
+    process.env.PI_WEB_PASSWORD = 'super-secret-password';
 
     const built = buildPiChildEnv({
       GATEWAY_EXTRA: 'should-be-stripped',
@@ -534,7 +557,22 @@ test('buildPiChildEnv strips GATEWAY_* env vars from spawned Pi child', async ()
     assert.equal('GATEWAY_TOKEN' in built, false);
     assert.equal('GATEWAY_PORT' in built, false);
     assert.equal('GATEWAY_EXTRA' in built, false);
+    assert.equal('PORT' in built, false);
+    assert.equal('NODE_ENV' in built, false);
+    assert.equal('PI_WEB_PASSWORD' in built, false);
     assert.equal(built.PI_CODING_AGENT_DIR, base);
+
+    // Also verify stripping when passed directly in extraEnv
+    const builtFromExtra = buildPiChildEnv({
+      PORT: '9000',
+      NODE_ENV: 'development',
+      PI_WEB_PASSWORD: 'plain-password',
+      GATEWAY_KEY: 'strip-me',
+    });
+    assert.equal('PORT' in builtFromExtra, false);
+    assert.equal('NODE_ENV' in builtFromExtra, false);
+    assert.equal('PI_WEB_PASSWORD' in builtFromExtra, false);
+    assert.equal('GATEWAY_KEY' in builtFromExtra, false);
 
     const { bin, envLog } = await writeContractFakePi(base);
     adapter = new PiProviderAdapter({
@@ -547,6 +585,9 @@ test('buildPiChildEnv strips GATEWAY_* env vars from spawned Pi child', async ()
 
     const childEnv = JSON.parse(await readFile(envLog, 'utf8')) as Record<string, string>;
     assert.equal(Object.keys(childEnv).some((k) => k.startsWith('GATEWAY_')), false);
+    assert.equal('PORT' in childEnv, false);
+    assert.equal('NODE_ENV' in childEnv, false);
+    assert.equal('PI_WEB_PASSWORD' in childEnv, false);
     assert.equal(childEnv.PI_CODING_AGENT_DIR, base);
   } finally {
     await adapter?.dispose().catch(() => undefined);
@@ -554,6 +595,12 @@ test('buildPiChildEnv strips GATEWAY_* env vars from spawned Pi child', async ()
     else process.env.GATEWAY_TOKEN = prevGatewayToken;
     if (prevGatewayPort === undefined) delete process.env.GATEWAY_PORT;
     else process.env.GATEWAY_PORT = prevGatewayPort;
+    if (prevPort === undefined) delete process.env.PORT;
+    else process.env.PORT = prevPort;
+    if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = prevNodeEnv;
+    if (prevPassword === undefined) delete process.env.PI_WEB_PASSWORD;
+    else process.env.PI_WEB_PASSWORD = prevPassword;
     await rm(base, { recursive: true, force: true });
   }
 });
@@ -1056,8 +1103,10 @@ test('reversible model encoding, dynamic thinking levels without off, commands w
     assert.ok(models[0]?.capabilities?.includes('vision'));
     assert.ok(models[0]?.capabilities?.includes('thinking'));
     assert.equal(models[0]?.supportsThinkingOff, true);
+    assert.equal(models[0]?.capabilities?.includes('always_thinking'), false);
     assert.equal(models[1]?.support_efforts?.includes('off'), false);
     assert.equal(models[1]?.supportsThinkingOff, false);
+    assert.equal(models[1]?.capabilities?.includes('always_thinking'), true);
 
     const sess = await adapter.create({ provider: 'pi', cwd: base });
     const levels = await adapter.listThinkingLevels(sess.id);
@@ -1068,6 +1117,7 @@ test('reversible model encoding, dynamic thinking levels without off, commands w
     const beforeSetCount = (await readFile(stdinLog, 'utf8')).trim().split('\n').length;
     await adapter.setThinking(sess.id, 'off');
     assert.equal(adapter.getThinking(sess.id), 'low');
+    assert.equal(((adapter as any).inner as any).appliedPreferences.get(sess.id)?.thinking, 'low');
     const afterSetLines = (await readFile(stdinLog, 'utf8'))
       .trim()
       .split('\n')
@@ -1983,6 +2033,239 @@ test('keeps turn active after disposition=handled for delayed agent_start runs a
   } finally {
     await lateAdapter?.dispose().catch(() => undefined);
     await abortAdapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('exposes Pi builtin extension commands (mcp/llama) and Web UI RPC helpers (auto-compact, copy, tree)', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-web-rpc-cmds-'));
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin } = await writeContractFakePi(base);
+    adapter = new PiProviderAdapter({ piBin: bin, sessionsDir: join(base, 'sessions') });
+    const s = await adapter.create({ provider: 'pi', cwd: base });
+    const cmds = await adapter.listCommands(s.id);
+    assert.ok(cmds.some((c) => c.name === 'mcp'));
+    assert.ok(cmds.some((c) => c.name === 'llama'));
+    assert.ok(cmds.some((c) => c.name === 'auto-compact'));
+    assert.ok(cmds.some((c) => c.name === 'tree'));
+    assert.ok(cmds.some((c) => c.name === 'copy'));
+    assert.ok(cmds.some((c) => c.name === 'name'));
+    assert.ok(cmds.some((c) => c.name === 'thinking'));
+
+    assert.equal(await adapter.getAutoCompaction(s.id), true);
+    assert.equal(await adapter.setAutoCompaction(s.id, false), false);
+    assert.equal(await adapter.getAutoCompaction(s.id), false);
+    assert.equal(await adapter.getLastAssistantText(s.id), 'Pi last reply');
+    const tree = await adapter.getSessionTree(s.id);
+    assert.equal(tree?.leafId, 'e2');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('PiProviderAdapter prioritizes settings.json defaultProvider/defaultModel in listModels and getModel(__default__)', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-default-model-settings-'));
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin } = await writeContractFakePi(base);
+    await writeFile(
+      join(base, 'settings.json'),
+      JSON.stringify({ defaultProvider: 'openrouter', defaultModel: 'anthropic/claude-sonnet-4' }),
+    );
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir: join(base, 'sessions'),
+      env: { PI_CODING_AGENT_DIR: base, FAKE_PI_MODE: 'no_off_thinking' },
+    });
+    const models = await adapter.listModels();
+    assert.equal(models[0]?.model, 'openrouter/anthropic/claude-sonnet-4');
+    assert.equal(models[0]?.isDefault, true);
+    assert.equal(adapter.getModel('__default__'), 'openrouter/anthropic/claude-sonnet-4');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('thinking level deduplication in getAvailableThinkingLevels and listThinkingLevels', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-thinking-dedup-'));
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin, stdinLog } = await writeContractFakePi(base);
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir: join(base, 'sessions'),
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_PI_MODE: 'duplicate_thinking_levels' },
+    });
+
+    const sess = await adapter.create({ provider: 'pi', cwd: base });
+    // 1. Thinking level deduplication via listThinkingLevels
+    const levels = await adapter.listThinkingLevels(sess.id);
+    assert.deepEqual(levels, ['off', 'low', 'medium', 'high']);
+
+    // Direct check on inner PiAdapter getAvailableThinkingLevels
+    const innerLevels = await (adapter as any).inner.getAvailableThinkingLevels(sess.id);
+    assert.deepEqual(innerLevels, ['off', 'low', 'medium', 'high']);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('clamped appliedPreferences synchronization in setThinkingLevel and fork/clone', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-applied-prefs-'));
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin, stdinLog } = await writeContractFakePi(base);
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir: join(base, 'sessions'),
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_PI_MODE: 'no_off_thinking' },
+    });
+
+    const sess = await adapter.create({ provider: 'pi', cwd: base });
+    const inner = (adapter as any).inner;
+
+    // Create a saved session on disk so clone/fork succeeds
+    const cwdDir = join(base, 'sessions', encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const fileName = `2026-11-14T22-00-00-000Z_${sess.id}.jsonl`;
+    await writeFile(
+      join(cwdDir, fileName),
+      [
+        JSON.stringify({ type: 'session', version: 3, id: sess.id, timestamp: '2026-11-14T22:00:00.000Z', cwd: base }),
+        JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-14T22:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'hi' }] } }),
+        JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-11-14T22:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }] } }),
+      ].join('\n') + '\n',
+    );
+
+    // Requesting 'off' is clamped by the model/mode to 'low'.
+    // appliedPreferences must record the clamped effective level 'low', not 'off'.
+    await adapter.setThinking(sess.id, 'off');
+    assert.equal(adapter.getThinking(sess.id), 'low');
+    assert.equal(inner.appliedPreferences.get(sess.id)?.thinking, 'low');
+
+    // Clone session — should inherit the clamped effective level 'low' in appliedPreferences
+    const cloned = await adapter.clone(sess.id);
+    assert.equal(adapter.getThinking(cloned.id), 'low');
+    assert.equal(inner.appliedPreferences.get(cloned.id)?.thinking, 'low');
+
+    // Fork session — should also record the clamped effective level 'low' in appliedPreferences
+    const forked = await adapter.fork(sess.id);
+    assert.equal(adapter.getThinking(forked.id), 'low');
+    assert.equal(inner.appliedPreferences.get(forked.id)?.thinking, 'low');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('parsePiSessionEntry and readPiActiveBranchHistory map bashExecution to assistant tool_use and tool result', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-bash-exec-'));
+  try {
+    // 1. Direct unit test of parsePiSessionEntry for role === 'bashExecution'
+    const entrySuccess = {
+      type: 'message',
+      id: 'entry_cmd_1',
+      timestamp: '2026-11-14T22:00:00.000Z',
+      message: {
+        role: 'bashExecution',
+        command: 'npm test',
+        output: 'All 10 tests passed',
+        exitCode: 0,
+        timestamp: 1763157600000,
+      },
+    };
+    const mapped = parsePiSessionEntry(entrySuccess, 'test-session-id');
+    assert.ok(Array.isArray(mapped));
+    assert.equal(mapped.length, 2);
+
+    const [callMsg, resultMsg] = mapped;
+    assert.equal(callMsg?.id, 'entry_cmd_1_call');
+    assert.equal(callMsg?.session_id, 'test-session-id');
+    assert.equal(callMsg?.role, 'assistant');
+    assert.deepEqual(callMsg?.content, [
+      {
+        type: 'tool_use',
+        tool_call_id: 'call_entry_cmd_1',
+        tool_name: 'bash',
+        input: { command: 'npm test' },
+      },
+    ]);
+
+    assert.equal(resultMsg?.id, 'entry_cmd_1_result');
+    assert.equal(resultMsg?.session_id, 'test-session-id');
+    assert.equal(resultMsg?.role, 'tool');
+    assert.deepEqual(resultMsg?.content, [
+      {
+        type: 'tool_result',
+        tool_call_id: 'call_entry_cmd_1',
+        output: 'All 10 tests passed',
+        is_error: false,
+      },
+    ]);
+
+    // Error case with custom toolCallId and non-zero exitCode
+    const entryError = {
+      type: 'message',
+      id: 'entry_cmd_2',
+      timestamp: '2026-11-14T22:01:00.000Z',
+      message: {
+        role: 'bashExecution',
+        toolCallId: 'custom_bash_call',
+        command: 'cat missing.txt',
+        output: 'cat: missing.txt: No such file or directory',
+        exitCode: 1,
+      },
+    };
+    const mappedError = parsePiSessionEntry(entryError, 'test-session-id');
+    assert.ok(Array.isArray(mappedError));
+    assert.equal(mappedError.length, 2);
+    assert.equal((mappedError[0]?.content[0] as any)?.tool_call_id, 'custom_bash_call');
+    assert.equal((mappedError[1]?.content[0] as any)?.tool_call_id, 'custom_bash_call');
+    assert.equal((mappedError[1]?.content[0] as any)?.is_error, true);
+    assert.equal((mappedError[1]?.content[0] as any)?.output, 'cat: missing.txt: No such file or directory');
+
+    // 2. Integration test via readPiActiveBranchHistory on disk
+    const sessionsDir = join(base, 'sessions');
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const sid = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const filePath = join(cwdDir, `2026-11-14T22-00-00-000Z_${sid}.jsonl`);
+    await writeFile(
+      filePath,
+      [
+        JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-14T22:00:00.000Z', cwd: base }),
+        JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-14T22:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'run status' }] } }),
+        JSON.stringify({
+          type: 'message',
+          id: 'b1',
+          parentId: 'u1',
+          timestamp: '2026-11-14T22:00:02.000Z',
+          message: { role: 'bashExecution', command: 'git status', output: 'clean', exitCode: 0 },
+        }),
+        JSON.stringify({ type: 'message', id: 'a1', parentId: 'b1', timestamp: '2026-11-14T22:00:03.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'All clean!' }] } }),
+      ].join('\n') + '\n',
+    );
+
+    const history = await readPiActiveBranchHistory(filePath, { sessionId: sid, sessionsRoot: sessionsDir });
+    assert.equal(history.length, 4);
+    assert.equal(history[0]?.role, 'user');
+    assert.equal(history[1]?.role, 'assistant');
+    assert.equal(history[1]?.content[0]?.type, 'tool_use');
+    assert.equal((history[1]?.content[0] as any)?.tool_name, 'bash');
+    assert.deepEqual((history[1]?.content[0] as any)?.input, { command: 'git status' });
+
+    assert.equal(history[2]?.role, 'tool');
+    assert.equal(history[2]?.content[0]?.type, 'tool_result');
+    assert.equal((history[2]?.content[0] as any)?.output, 'clean');
+    assert.equal((history[2]?.content[0] as any)?.is_error, false);
+
+    assert.equal(history[3]?.role, 'assistant');
+    assert.equal((history[3]?.content[0] as any)?.text, 'All clean!');
+  } finally {
     await rm(base, { recursive: true, force: true });
   }
 });

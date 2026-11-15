@@ -9,21 +9,36 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import * as fsp from 'node:fs/promises';
-import { CodexAdapter, type CodexEvent } from './codex-adapter.js';
-import { ClaudeAdapter, type ClaudeAdapterEvent } from './claude-adapter.js';
+import * as path from 'node:path';
+import {
+  CodexAdapter,
+  extractCodexReasoningSummary,
+  stripCodexMemoryCitations,
+  stripCodexSystemTags,
+  type CodexEvent,
+  type ReviewStartOptions,
+} from './codex-adapter.js';
+import {
+  ClaudeAdapter,
+  type ClaudeAdapterEvent,
+  type ResolveClaudeApprovalOptions,
+} from './claude-adapter.js';
 import { expandCodexSkill, listClaudeCommands, listCodexCommands } from './native-commands.js';
-import { findCodexRollout } from './local-transcript.js';
+import { extractSubagentIdFromOutput, findCodexRollout } from './local-transcript.js';
 import { SettingsStore } from './settings-store.js';
 import {
   ProviderError,
   type ApprovalDecision,
   type CreateSessionInput,
   type GatewayEvent,
+  type GranularApprovalDetails,
   type HistoryQuery,
   type ListSessionsQuery,
   type Message,
   type MessageContentPart,
+  type ModelUsageEntry,
   type NativeCommand,
   type NativeModel,
   type ProviderAdapter,
@@ -32,17 +47,28 @@ import {
   type SessionPage,
   type SessionUsage,
   type StartTurnInput,
+  type SteerInput,
+  type StructuredQuestion,
   type TurnAttachment,
   type TurnHandle,
 } from './types.js';
+
+export { GrokProviderAdapter } from './grok-adapter.js';
+export { PiProviderAdapter } from './pi-adapter.js';
 
 // ---------------------------------------------------------------------------
 // 通用小工具
 // ---------------------------------------------------------------------------
 
-function workspaceIdFromCwd(cwd: string, provider: string): string {
-  const slug = cwd.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
-  return `wd_${provider}_${slug}`.slice(0, 60);
+export function workspaceIdFromCwd(cwd: string, provider: string): string {
+  const resolved = path.resolve(cwd);
+  const normalized = (process.platform === 'win32' ? resolved.toLowerCase() : resolved)
+    .replace(/[\\/]+$/, '') || '/';
+  const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
+  const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  const prefix = `wd_${provider}_`;
+  const maxSlug = Math.max(1, 60 - prefix.length - 1 - hash.length);
+  return `${prefix}${slug.slice(0, maxSlug)}_${hash}`;
 }
 
 function nowIso(): string {
@@ -91,28 +117,134 @@ export function claudeCatalogAlias(model: string | undefined): ClaudeCatalogAlia
 
 function isCodexToolItem(type: unknown): boolean {
   return type === 'commandExecution'
+    || type === 'exec_command'
     || type === 'mcpToolCall'
     || type === 'fileChange'
     || type === 'webSearch'
     || type === 'dynamicToolCall'
     || type === 'imageView'
     || type === 'collabToolCall'
+    || type === 'collabAgentToolCall'
+    || type === 'subAgentActivity'
     || type === 'custom_tool_call';
 }
 
-/** codex 历史 item 的输出文本:aggregatedOutput / result / output 数组拼文本。 */
+function extractCodexContentItemsText(items: unknown): string | null {
+  if (!Array.isArray(items) || items.length === 0) return null;
+  const parts: string[] = [];
+  for (const entry of items) {
+    if (typeof entry === 'string' && entry) {
+      parts.push(entry);
+    } else if (entry && typeof entry === 'object') {
+      const rec = entry as Record<string, unknown>;
+      if (typeof rec.text === 'string' && rec.text) parts.push(rec.text);
+      else if (typeof rec.imageUrl === 'string' && rec.imageUrl) parts.push(`[image: ${rec.imageUrl}]`);
+    }
+  }
+  return parts.length > 0 ? parts.join('\n') : null;
+}
+
+/** codex 历史/事件 item 的输出文本:支持 aggregatedOutput / result / output / contentItems / agentsStates / error，不让空字符串屏蔽 output。 */
 function extractCodexToolOutput(item: Record<string, unknown>): string | null {
-  if (typeof item.aggregatedOutput === 'string') return item.aggregatedOutput;
-  if (typeof item.result === 'string') return item.result;
-  if (typeof item.output === 'string') return item.output;
+  if (typeof item.aggregatedOutput === 'string' && item.aggregatedOutput.length > 0) {
+    return item.aggregatedOutput;
+  }
+  if (typeof item.result === 'string' && item.result.length > 0) {
+    return item.result;
+  }
+  if (typeof item.output === 'string' && item.output.length > 0) {
+    return item.output;
+  }
   if (Array.isArray(item.output)) {
     const text = (item.output as Array<Record<string, unknown>>)
-      .map((part) => (part.text as string) ?? '')
+      .map((part) => (typeof part?.text === 'string' ? part.text : ''))
       .filter(Boolean)
       .join('\n');
-    return text || null;
+    if (text) return text;
   }
+  const contentItemsText = extractCodexContentItemsText(item.contentItems);
+  if (contentItemsText !== null) return contentItemsText;
+  if (item.agentsStates && typeof item.agentsStates === 'object') {
+    return JSON.stringify(item.agentsStates);
+  }
+  if (item.result !== undefined && item.result !== null) {
+    return typeof item.result === 'string' ? item.result : JSON.stringify(item.result);
+  }
+  if (item.output !== undefined && item.output !== null && !Array.isArray(item.output)) {
+    return typeof item.output === 'string' ? item.output : JSON.stringify(item.output);
+  }
+  if (item.error !== undefined && item.error !== null) {
+    if (typeof item.error === 'string') return item.error;
+    if (typeof item.error === 'object' && typeof (item.error as { message?: unknown }).message === 'string') {
+      return (item.error as { message: string }).message;
+    }
+    return JSON.stringify(item.error);
+  }
+  if (typeof item.aggregatedOutput === 'string') return item.aggregatedOutput;
   return null;
+}
+
+function extractCodexStructuredOutput(item: Record<string, unknown>): unknown {
+  if (item.structuredContent !== undefined) return item.structuredContent;
+  if (Array.isArray(item.contentItems) && item.contentItems.length > 0) return item.contentItems;
+  if (item.result && typeof item.result === 'object') return item.result;
+  if (item.agentsStates && typeof item.agentsStates === 'object') return item.agentsStates;
+  return undefined;
+}
+
+function isCodexToolItemError(item: Record<string, unknown>): boolean {
+  const exitCode = item.exitCode as number | undefined;
+  return item.status === 'failed'
+    || (exitCode !== undefined && exitCode !== 0)
+    || Boolean(item.error);
+}
+
+function normalizeCodexQuestions(raw: unknown): {
+  prompt: string;
+  options: string[];
+  questions: StructuredQuestion[];
+} {
+  if (!Array.isArray(raw)) {
+    return { prompt: '', options: [], questions: [] };
+  }
+  const questions: StructuredQuestion[] = [];
+  const flatOptions: string[] = [];
+  for (let i = 0; i < raw.length; i += 1) {
+    const entry = raw[i];
+    if (!entry || typeof entry !== 'object') continue;
+    const q = entry as Record<string, unknown>;
+    const id = typeof q.id === 'string' && q.id ? q.id : `q_${i}`;
+    const question =
+      typeof q.question === 'string'
+        ? q.question
+        : typeof q.header === 'string'
+          ? q.header
+          : '';
+    const options = Array.isArray(q.options)
+      ? (q.options as Array<Record<string, unknown>>)
+          .filter((o) => Boolean(o && typeof o === 'object'))
+          .map((o, j) => {
+            const label = String(o.label ?? o.id ?? `Option ${j + 1}`);
+            if (i === 0) flatOptions.push(label);
+            return {
+              id: String(o.id ?? o.label ?? `opt_${j}`),
+              label,
+              ...(typeof o.description === 'string' ? { description: o.description } : {}),
+            };
+          })
+      : [];
+    questions.push({
+      id,
+      question,
+      ...(typeof q.header === 'string' ? { header: q.header } : {}),
+      options,
+      ...(q.multiSelect === true || q.multi_select === true ? { multiSelect: true } : {}),
+      ...(q.isOther === true || q.allow_other === true ? { isOther: true } : {}),
+      ...(q.isSecret === true ? { isSecret: true } : {}),
+    });
+  }
+  const prompt = questions[0]?.question || JSON.stringify(raw);
+  return { prompt, options: flatOptions, questions };
 }
 
 /**
@@ -185,12 +317,18 @@ class EventStream<T> implements AsyncIterable<T> {
   }
 }
 
-function textOfInput(input: StartTurnInput['input']): string {
+function textOfInput(input: StartTurnInput['input'] | SteerInput): string {
   if (typeof input === 'string') return input;
-  return input
-    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
-    .map((p) => p.text)
-    .join('\n');
+  if (Array.isArray(input)) {
+    return input
+      .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+      .map((p) => p.text)
+      .join('\n');
+  }
+  if (input && typeof input === 'object' && 'input' in input) {
+    return textOfInput(input.input);
+  }
+  return '';
 }
 
 /** 历史消息的内容字段按 Kimi Web wire 约定,与内部 adapter 类型不同。 */
@@ -228,6 +366,34 @@ export class CodexProviderAdapter implements ProviderAdapter {
       questions: true,
       interrupt: true,
       history: true,
+      steer: true,
+      steerAttachments: true,
+      attachments: true,
+      compact: true,
+      fork: true,
+      clone: false,
+      rollback: true,
+      rename: true,
+      archive: true,
+      nativeArchive: true,
+      delete: true,
+      planMode: true,
+      permissionModes: ['manual', 'auto', 'yolo'],
+      manualApproval: true,
+      goals: true,
+      swarm: false,
+      tower: false,
+      btw: false,
+      subagents: true,
+      mcp: true,
+      terminals: true,
+      review: true,
+      models: true,
+      thinkingLevels: true,
+      commands: true,
+      skills: true,
+      usage: true,
+      elicitation: true,
     };
   }
 
@@ -377,24 +543,497 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.threadCwd.get(sessionId);
   }
 
+  private readonly activeThreadTurns = new Set<string>();
+  private readonly liveSubagents = new Map<
+    string,
+    Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>
+  >();
+
+  private recordLiveSubagent(
+    sessionId: string,
+    agentId: string | undefined,
+    parentToolUseId?: string,
+    description?: string,
+    subagentType?: string,
+  ): void {
+    if (!agentId || agentId === sessionId) return;
+    let bucket = this.liveSubagents.get(sessionId);
+    if (!bucket) {
+      bucket = new Map();
+      this.liveSubagents.set(sessionId, bucket);
+    }
+    const existing = bucket.get(agentId);
+    bucket.set(agentId, {
+      agentId,
+      parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
+      description: description ?? existing?.description,
+      subagentType: subagentType ?? existing?.subagentType,
+    });
+  }
+
   // thread/read 对大会话是秒级(901MB rollout 实测 9.4s),而页面加载会并发打
   // 2-3 个 getHistory。rollout 文件是真相源:按 mtimeMs:size 做缓存键,没变就
   // 复用同一个 Promise(并发合并),变了自然失效;失败删缓存不毒化。
   private historyCache = new Map<string, { key: string; p: Promise<Message[]> }>();
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
-    const rollout = await findCodexRollout(sessionId);
+    const isLive =
+      this.activeThreadTurns.has(sessionId) ||
+      (typeof (this.inner as any).findActiveTurnId === 'function' &&
+        Boolean((this.inner as any).findActiveTurnId(sessionId)));
+    const rollout = !isLive ? await findCodexRollout(sessionId) : null;
     const stat = rollout ? await fsp.stat(rollout).catch(() => null) : null;
-    if (!stat) return this.readCodexHistory(sessionId); // 未落盘新线程,不缓存
+    if (!rollout || !stat) return this.readCodexHistory(sessionId); // 未落盘新线程或有进行中 turn,走 readCodexHistory
     const key = `${stat.mtimeMs}:${stat.size}`;
     const hit = this.historyCache.get(sessionId);
     if (hit && hit.key === key) return hit.p;
-    const p = this.readCodexHistory(sessionId);
+    const p = (async () => {
+      const parsed = await this.readCodexRolloutHistory(rollout, sessionId, stat.size);
+      if (parsed.length > 0) return parsed;
+      return this.readCodexHistory(sessionId);
+    })();
     this.historyCache.set(sessionId, { key, p });
     p.catch(() => {
       if (this.historyCache.get(sessionId)?.p === p) this.historyCache.delete(sessionId);
     });
     return p;
+  }
+
+  private async readCodexRolloutHistory(
+    rolloutPath: string,
+    sessionId: string,
+    size: number,
+  ): Promise<Message[]> {
+    let fh: fsp.FileHandle;
+    try {
+      fh = await fsp.open(rolloutPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    } catch {
+      return [];
+    }
+
+    let text = '';
+    try {
+      const MAX_ROLLOUT_TAIL_BYTES = 16 * 1024 * 1024;
+      const startOffset = size > MAX_ROLLOUT_TAIL_BYTES ? size - MAX_ROLLOUT_TAIL_BYTES : 0;
+      const targetBytes = size - startOffset;
+      const buf = Buffer.allocUnsafe(targetBytes);
+      let totalRead = 0;
+      while (totalRead < targetBytes) {
+        const { bytesRead } = await fh.read(buf, totalRead, targetBytes - totalRead, startOffset + totalRead);
+        if (bytesRead === 0) break;
+        totalRead += bytesRead;
+      }
+      let slice = buf.subarray(0, totalRead);
+      if (startOffset > 0) {
+        const firstNl = slice.indexOf(0x0a);
+        slice = firstNl >= 0 ? slice.subarray(firstNl + 1) : Buffer.alloc(0);
+      }
+      text = slice.toString('utf8');
+    } finally {
+      await fh.close().catch(() => undefined);
+    }
+
+    if (!text.trim()) return [];
+
+    const messages: Message[] = [];
+    const seenItemIds = new Set<string>();
+    const seenToolCalls = new Set<string>();
+    const seenToolResults = new Set<string>();
+    const toolMetaByCallId = new Map<string, { agentId?: string; callMsg?: Message; resultMsg?: Message }>();
+    let lastAssistantMsg: Message | null = null;
+    let lastUserText: string | null = null;
+    let lastReasoningText: string | null = null;
+
+    const attachAgentToCall = (callId: string, agentId: string): void => {
+      if (!callId || !agentId) return;
+      const entry = toolMetaByCallId.get(callId) ?? {};
+      entry.agentId = agentId;
+      toolMetaByCallId.set(callId, entry);
+      if (entry.callMsg) {
+        entry.callMsg.metadata = { ...(entry.callMsg.metadata ?? {}), agent_id: agentId, agentId };
+      }
+      if (entry.resultMsg) {
+        entry.resultMsg.metadata = { ...(entry.resultMsg.metadata ?? {}), agent_id: agentId, agentId };
+        const part = entry.resultMsg.content[0] as Record<string, unknown> | undefined;
+        if (part && part.type === 'tool_result') {
+          const cur = typeof part.output === 'string' ? part.output : '';
+          if (!cur.includes('agent_id:')) {
+            part.output = cur ? `agent_id: ${agentId}\n${cur}` : `agent_id: ${agentId}`;
+          }
+        }
+      }
+    };
+
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      // Skip pure control / telemetry / developer records
+      if (
+        entry.type === 'session_meta'
+        || entry.type === 'world_state'
+        || entry.type === 'turn_context'
+        || entry.type === 'token_usage_record'
+        || entry.type === 'inter_agent_communication_metadata'
+      ) {
+        continue;
+      }
+
+      let it: Record<string, unknown>;
+      if (entry.type === 'event_msg' && entry.payload && typeof entry.payload === 'object') {
+        const p = entry.payload as Record<string, unknown>;
+        if (p.type === 'item_completed' && p.item && typeof p.item === 'object') {
+          it = p.item as Record<string, unknown>;
+        } else if (
+          p.type === 'task_started'
+          || p.type === 'task_complete'
+          || p.type === 'token_count'
+          || p.type === 'thread_settings_applied'
+        ) {
+          continue;
+        } else {
+          it = p;
+        }
+      } else if (entry.type === 'response_item' && entry.payload && typeof entry.payload === 'object') {
+        it = entry.payload as Record<string, unknown>;
+      } else {
+        it = entry as Record<string, unknown>;
+      }
+
+      const rawType = (typeof it.type === 'string'
+        ? it.type
+        : typeof entry.type === 'string'
+          ? entry.type
+          : '') as string;
+      const normType = rawType.toLowerCase();
+      const createdAt = isoFromCodexTime(
+        it.createdAt ?? it.updatedAt ?? it.startedAtMs ?? it.completedAtMs ?? entry.createdAt ?? entry.timestamp,
+      );
+      const itemId =
+        (typeof it.id === 'string' && it.id) || (typeof it.call_id === 'string' && it.call_id) || undefined;
+
+      // Skip developer / system / inter-agent messages in response_item
+      if (normType === 'additional_tools' || normType === 'agent_message' && entry.type === 'response_item') {
+        continue;
+      }
+      if (normType === 'message' && (it.role === 'developer' || it.role === 'system')) {
+        continue;
+      }
+
+      // User messages
+      if (normType === 'usermessage' || normType === 'user_message' || (normType === 'message' && it.role === 'user')) {
+        if (itemId && seenItemIds.has(itemId)) continue;
+        let userText = extractCodexText(it);
+        if (!userText && typeof it.message === 'string') userText = it.message;
+        userText = stripCodexSystemTags(userText).trim();
+        if (!userText) continue;
+        // Deduplicate response_item:message(user) vs event_msg:item_completed(UserMessage)
+        if (lastUserText === userText) {
+          if (itemId) seenItemIds.add(itemId);
+          continue;
+        }
+        if (itemId) seenItemIds.add(itemId);
+        lastUserText = userText;
+        messages.push({
+          id: itemId ?? `msg_${randomUUID()}`,
+          session_id: sessionId,
+          role: 'user',
+          content: [{ type: 'text', text: userText }],
+          created_at: createdAt,
+        });
+        lastAssistantMsg = null;
+        continue;
+      }
+
+      // Assistant messages (AgentMessage / agent_message / response_item message role=assistant)
+      if (normType === 'agentmessage' || normType === 'agent_message' || (normType === 'message' && it.role === 'assistant')) {
+        let agentText = typeof it.text === 'string' ? it.text : typeof it.message === 'string' ? it.message : '';
+        if (!agentText && Array.isArray(it.content)) {
+          agentText = it.content
+            .map((c: any) => (typeof c === 'string' ? c : (c?.text ?? '')))
+            .filter(Boolean)
+            .join('');
+        }
+        agentText = stripCodexSystemTags(agentText);
+        agentText = stripCodexMemoryCitations(agentText).trim();
+        const phase = typeof it.phase === 'string' ? it.phase : undefined;
+
+        if (itemId && seenItemIds.has(itemId)) {
+          if (phase && lastAssistantMsg?.metadata && !lastAssistantMsg.metadata.phase) {
+            lastAssistantMsg.metadata.phase = phase;
+          }
+          continue;
+        }
+
+        if (
+          lastAssistantMsg &&
+          lastAssistantMsg.role === 'assistant' &&
+          lastAssistantMsg.content.length === 1 &&
+          lastAssistantMsg.content[0].type === 'text' &&
+          lastAssistantMsg.content[0].text === agentText
+        ) {
+          if (phase && lastAssistantMsg.metadata && !lastAssistantMsg.metadata.phase) {
+            lastAssistantMsg.metadata.phase = phase;
+          }
+          if (itemId) seenItemIds.add(itemId);
+          continue;
+        }
+
+        if (!agentText && !phase) continue;
+        if (itemId) seenItemIds.add(itemId);
+        const msg: Message = {
+          id: itemId ?? `msg_${randomUUID()}`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [{ type: 'text', text: agentText, ...(phase ? { phase } : {}) }],
+          created_at: createdAt,
+          ...(phase ? { metadata: { phase } } : {}),
+        };
+        messages.push(msg);
+        lastAssistantMsg = msg;
+        continue;
+      }
+
+      // Reasoning
+      if (normType === 'reasoning') {
+        if (itemId && seenItemIds.has(itemId)) continue;
+        const summarySource: Record<string, unknown> = Array.isArray(it.summary_text) && !Array.isArray(it.summary)
+          ? { ...it, summary: it.summary_text }
+          : it;
+        let summary =
+          typeof it.summaryText === 'string' && it.summaryText.trim()
+            ? it.summaryText.trim()
+            : extractCodexReasoningSummary(summarySource);
+        if (summary) summary = stripCodexMemoryCitations(summary).replace(/ {2,}/g, ' ').trim();
+        if (!summary) continue;
+        if (lastReasoningText === summary) {
+          if (itemId) seenItemIds.add(itemId);
+          continue;
+        }
+        if (itemId) seenItemIds.add(itemId);
+        lastReasoningText = summary;
+        messages.push({
+          id: itemId ?? `msg_${randomUUID()}`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [kimiHistoryPart({ type: 'thinking', thinking: summary })],
+          created_at: createdAt,
+        });
+        lastAssistantMsg = null;
+        continue;
+      }
+
+      // Plan
+      if (normType === 'plan') {
+        if (itemId && seenItemIds.has(itemId)) continue;
+        let planText = typeof it.text === 'string' ? it.text.trim() : '';
+        if (planText) planText = stripCodexMemoryCitations(planText).trim();
+        if (!planText) continue;
+        if (itemId) seenItemIds.add(itemId);
+        messages.push({
+          id: itemId ?? `msg_${randomUUID()}`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [{ type: 'text', text: planText }],
+          created_at: createdAt,
+          metadata: { item_type: 'plan' },
+        });
+        lastAssistantMsg = null;
+        continue;
+      }
+
+      // Codex 0.169 SubAgentActivity links child thread ID back to the spawn_agent call_id
+      if (normType === 'subagentactivity') {
+        const callId = typeof it.id === 'string' ? it.id : '';
+        const childThreadId =
+          (typeof it.agent_thread_id === 'string' && it.agent_thread_id)
+          || (typeof it.agentThreadId === 'string' && it.agentThreadId)
+          || (typeof it.agentId === 'string' && it.agentId)
+          || '';
+        if (callId && childThreadId) {
+          attachAgentToCall(callId, childThreadId);
+        }
+        continue;
+      }
+
+      // Codex 0.169 response_item function_call / custom_tool_call
+      if (normType === 'function_call' || normType === 'custom_tool_call') {
+        const callId = (typeof it.call_id === 'string' && it.call_id) || (typeof it.id === 'string' && it.id) || randomUUID();
+        if (seenToolCalls.has(callId)) continue;
+        seenToolCalls.add(callId);
+        const rawName = (typeof it.name === 'string' && it.name) || 'tool';
+        let parsedArgs: unknown = it.arguments ?? it.input ?? {};
+        if (typeof parsedArgs === 'string') {
+          try { parsedArgs = JSON.parse(parsedArgs); } catch { /* keep string */ }
+        }
+        const linked = toolMetaByCallId.get(callId);
+        const callMsg: Message = {
+          id: `${callId}_call`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [kimiHistoryPart({
+            type: 'tool_use',
+            tool_call_id: callId,
+            tool_name: rawName,
+            input: parsedArgs,
+          })],
+          created_at: createdAt,
+          ...(linked?.agentId ? { metadata: { agent_id: linked.agentId, agentId: linked.agentId } } : {}),
+        };
+        toolMetaByCallId.set(callId, { ...linked, callMsg });
+        messages.push(callMsg);
+        lastAssistantMsg = null;
+        continue;
+      }
+
+      // Codex 0.169 response_item function_call_output / custom_tool_call_output
+      if (normType === 'function_call_output' || normType === 'custom_tool_call_output') {
+        const callId = (typeof it.call_id === 'string' && it.call_id) || (typeof it.id === 'string' && it.id) || '';
+        if (!callId || seenToolResults.has(callId)) continue;
+        seenToolResults.add(callId);
+        const rawOut = it.output;
+        let outText = typeof rawOut === 'string'
+          ? rawOut
+          : extractCodexContentItemsText(rawOut) ?? (rawOut !== undefined ? JSON.stringify(rawOut) : '');
+        const linked = toolMetaByCallId.get(callId);
+        if (linked?.agentId && !outText.includes('agent_id:')) {
+          outText = outText ? `agent_id: ${linked.agentId}\n${outText}` : `agent_id: ${linked.agentId}`;
+        }
+        const resultMsg: Message = {
+          id: `${callId}_result`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [kimiHistoryPart({
+            type: 'tool_result',
+            tool_call_id: callId,
+            output: outText,
+            is_error: isCodexToolItemError(it),
+          })],
+          created_at: createdAt,
+          ...(linked?.agentId ? { metadata: { agent_id: linked.agentId, agentId: linked.agentId } } : {}),
+        };
+        toolMetaByCallId.set(callId, { ...linked, resultMsg });
+        messages.push(resultMsg);
+        lastAssistantMsg = null;
+        continue;
+      }
+
+      // ThreadItem tool items (commandExecution, collabAgentToolCall, etc. - both camelCase and PascalCase)
+      const mappedItemType =
+        normType === 'commandexecution' || normType === 'exec_command' ? 'commandExecution'
+          : normType === 'collabagenttoolcall' || normType === 'collabtoolcall' ? 'collabAgentToolCall'
+            : normType === 'filechange' ? 'fileChange'
+              : normType === 'mcptoolcall' ? 'mcpToolCall'
+                : normType === 'websearch' ? 'webSearch'
+                  : normType === 'dynamictoolcall' ? 'dynamicToolCall'
+                    : normType === 'imageview' ? 'imageView'
+                      : rawType;
+      if (isCodexToolItem(mappedItemType)) {
+        const callId = (it.call_id as string) ?? (it.id as string) ?? randomUUID();
+        const rawName = (it.name as string) ?? (it.tool as string) ?? mappedItemType;
+        const input = it.input ?? it.command ?? it.arguments ?? it.query ?? it.changes ?? {};
+        const phase = typeof it.phase === 'string' ? it.phase : undefined;
+        const parentToolUseId = typeof it.parentToolUseId === 'string' ? it.parentToolUseId : undefined;
+
+        const receiverThreadIds = Array.isArray(it.receiverThreadIds)
+          ? (it.receiverThreadIds as string[])
+          : Array.isArray(it.receiver_thread_ids)
+            ? (it.receiver_thread_ids as string[])
+            : undefined;
+        const linked = toolMetaByCallId.get(callId);
+        const agentId =
+          (typeof it.agentId === 'string' && it.agentId) ||
+          (typeof it.agentThreadId === 'string' && it.agentThreadId) ||
+          (typeof it.agent_thread_id === 'string' && it.agent_thread_id) ||
+          (typeof it.receiverThreadId === 'string' && it.receiverThreadId) ||
+          receiverThreadIds?.[0] ||
+          linked?.agentId ||
+          undefined;
+
+        if (agentId && (mappedItemType === 'collabAgentToolCall' || rawName === 'spawn_agent')) {
+          attachAgentToCall(callId, agentId);
+        }
+
+        const hasToolMeta = Boolean(phase || agentId || receiverThreadIds);
+
+        if (!seenToolCalls.has(callId)) {
+          seenToolCalls.add(callId);
+          const callMsg: Message = {
+            id: `${callId}_call`,
+            session_id: sessionId,
+            role: 'assistant',
+            content: [kimiHistoryPart({
+              type: 'tool_use',
+              tool_call_id: callId,
+              tool_name: rawName,
+              input,
+              ...(phase ? { phase } : {}),
+              ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
+            })],
+            created_at: createdAt,
+            ...(hasToolMeta ? {
+              metadata: {
+                ...(phase ? { phase } : {}),
+                ...(agentId ? { agent_id: agentId, agentId } : {}),
+                ...(receiverThreadIds ? { receiverThreadIds } : {}),
+              },
+            } : {}),
+          };
+          toolMetaByCallId.set(callId, { ...linked, ...(agentId ? { agentId } : {}), callMsg });
+          messages.push(callMsg);
+        }
+
+        let outputText = extractCodexToolOutput({
+          ...it,
+          ...(it.agents_states && !it.agentsStates ? { agentsStates: it.agents_states } : {}),
+        });
+        if (mappedItemType === 'collabAgentToolCall' || rawName === 'collabAgentToolCall') {
+          if (agentId) {
+            if (outputText === null || outputText === undefined || outputText === '') {
+              outputText = `agent_id: ${agentId}`;
+            } else if (!outputText.includes('agent_id:')) {
+              outputText = `agent_id: ${agentId}\n${outputText}`;
+            }
+          }
+        }
+        const structuredOutput = extractCodexStructuredOutput(it);
+        if ((outputText !== null || structuredOutput !== undefined) && !seenToolResults.has(callId)) {
+          seenToolResults.add(callId);
+          const resultMsg: Message = {
+            id: `${callId}_result`,
+            session_id: sessionId,
+            role: 'assistant',
+            content: [kimiHistoryPart({
+              type: 'tool_result',
+              tool_call_id: callId,
+              output: outputText ?? '',
+              is_error: isCodexToolItemError(it),
+              ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+              ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
+            })],
+            created_at: createdAt,
+            ...(hasToolMeta ? {
+              metadata: {
+                ...(phase ? { phase } : {}),
+                ...(agentId ? { agent_id: agentId, agentId } : {}),
+                ...(receiverThreadIds ? { receiverThreadIds } : {}),
+              },
+            } : {}),
+          };
+          toolMetaByCallId.set(callId, { ...toolMetaByCallId.get(callId), ...(agentId ? { agentId } : {}), resultMsg });
+          messages.push(resultMsg);
+        }
+        lastAssistantMsg = null;
+        continue;
+      }
+    }
+
+    return messages;
   }
 
   private async readCodexHistory(sessionId: string): Promise<Message[]> {
@@ -404,11 +1043,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
       for (const item of (turn as { items?: unknown[] }).items ?? []) {
         const it = item as Record<string, unknown>;
         const type = it.type as string;
-        // thread/read 的 turn 用 startedAt/completedAt;item 本身通常没时间戳。
-        // 一律 nowIso 会让整页时间戳坍成"打开瞬间"。
         const turnRec = turn as { startedAt?: unknown; completedAt?: unknown };
         const createdAt = isoFromCodexTime(
-          it.createdAt ?? it.updatedAt ?? turnRec.startedAt ?? turnRec.completedAt,
+          it.createdAt ?? it.updatedAt ?? it.startedAtMs ?? it.completedAtMs ?? turnRec.startedAt ?? turnRec.completedAt,
         );
         if (type === 'userMessage') {
           messages.push({
@@ -419,18 +1056,20 @@ export class CodexProviderAdapter implements ProviderAdapter {
             created_at: createdAt,
           });
         } else if (type === 'agentMessage') {
+          const phase = typeof it.phase === 'string' ? it.phase : undefined;
           messages.push({
             id: (it.id as string) ?? randomUUID(),
             session_id: sessionId,
             role: 'assistant',
             content: [{ type: 'text', text: (it.text as string) ?? '' }],
             created_at: createdAt,
+            ...(phase ? { metadata: { phase } } : {}),
           });
         } else if (type === 'reasoning') {
-          // 思维链:summary 是分段数组,content 可能为 null(已加密)。
-          const summary = Array.isArray(it.summary)
-            ? (it.summary as Array<Record<string, unknown>>).map((s) => (s.text as string) ?? '').join('\n').trim()
-            : '';
+          const summary =
+            typeof it.summaryText === 'string' && it.summaryText.trim()
+              ? it.summaryText.trim()
+              : extractCodexReasoningSummary(it);
           if (!summary) continue;
           messages.push({
             id: (it.id as string) ?? randomUUID(),
@@ -439,22 +1078,84 @@ export class CodexProviderAdapter implements ProviderAdapter {
             content: [kimiHistoryPart({ type: 'thinking', thinking: summary })],
             created_at: createdAt,
           });
+        } else if (type === 'plan') {
+          const text = typeof it.text === 'string' ? it.text.trim() : '';
+          if (!text) continue;
+          messages.push({
+            id: (it.id as string) ?? randomUUID(),
+            session_id: sessionId,
+            role: 'assistant',
+            content: [{ type: 'text', text }],
+            created_at: createdAt,
+            metadata: { item_type: 'plan' },
+          });
+        } else if (type === 'enteredReviewMode' || type === 'exitedReviewMode') {
+          const text =
+            typeof it.text === 'string' && it.text.trim()
+              ? it.text.trim()
+              : typeof it.review === 'string' && it.review.trim()
+                ? it.review.trim()
+                : '';
+          if (!text) continue;
+          messages.push({
+            id: (it.id as string) ?? randomUUID(),
+            session_id: sessionId,
+            role: 'assistant',
+            content: [{ type: 'text', text }],
+            created_at: createdAt,
+            metadata: { item_type: type },
+          });
         } else if (isCodexToolItem(type)) {
-          // 工具卡:call 与 output 分属两个 item 时按 call_id 配对;单个 item 自带
-          // output/result 时直接成对(rollout 实测两种形态都有)。
           const callId = (it.call_id as string) ?? (it.id as string) ?? randomUUID();
-          const name = (it.name as string) ?? (type as string);
-          const input = it.input ?? it.command ?? it.arguments ?? it.query ?? {};
+          const name = (it.name as string) ?? (it.tool as string) ?? (type as string);
+          const input = it.input ?? it.command ?? it.arguments ?? it.query ?? it.changes ?? {};
+          const phase = typeof it.phase === 'string' ? it.phase : undefined;
+          const parentToolUseId = typeof it.parentToolUseId === 'string' ? it.parentToolUseId : undefined;
+
+          const receiverThreadIds = Array.isArray(it.receiverThreadIds)
+            ? (it.receiverThreadIds as string[])
+            : undefined;
+          const agentId =
+            (typeof it.agentId === 'string' && it.agentId) ||
+            (typeof it.agentThreadId === 'string' && it.agentThreadId) ||
+            (typeof it.receiverThreadId === 'string' && it.receiverThreadId) ||
+            receiverThreadIds?.[0] ||
+            undefined;
+          const hasToolMeta = Boolean(phase || agentId || receiverThreadIds);
+
           messages.push({
             id: `${callId}_call`,
             session_id: sessionId,
             role: 'assistant',
-            content: [kimiHistoryPart({ type: 'tool_use', tool_call_id: callId, tool_name: name, input })],
+            content: [kimiHistoryPart({
+              type: 'tool_use',
+              tool_call_id: callId,
+              tool_name: name,
+              input,
+              ...(phase ? { phase } : {}),
+              ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
+            })],
             created_at: createdAt,
+            ...(hasToolMeta ? {
+              metadata: {
+                ...(phase ? { phase } : {}),
+                ...(agentId ? { agent_id: agentId, agentId } : {}),
+                ...(receiverThreadIds ? { receiverThreadIds } : {}),
+              },
+            } : {}),
           });
-          const outputText = extractCodexToolOutput(it);
-          if (outputText !== null) {
-            const exitCode = it.exitCode as number | undefined;
+          let outputText = extractCodexToolOutput(it);
+          if (type === 'collabAgentToolCall' || type === 'subAgentActivity' || name === 'collabAgentToolCall') {
+            if (agentId) {
+              if (outputText === null || outputText === undefined || outputText === '') {
+                outputText = `agent_id: ${agentId}`;
+              } else if (!outputText.includes('agent_id:')) {
+                outputText = `agent_id: ${agentId}\n${outputText}`;
+              }
+            }
+          }
+          const structuredOutput = extractCodexStructuredOutput(it);
+          if (outputText !== null || structuredOutput !== undefined) {
             messages.push({
               id: `${callId}_result`,
               session_id: sessionId,
@@ -462,10 +1163,19 @@ export class CodexProviderAdapter implements ProviderAdapter {
               content: [kimiHistoryPart({
                 type: 'tool_result',
                 tool_call_id: callId,
-                output: outputText,
-                is_error: exitCode !== undefined && exitCode !== 0,
+                output: outputText ?? '',
+                is_error: isCodexToolItemError(it),
+                ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+                ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
               })],
               created_at: createdAt,
+              ...(hasToolMeta ? {
+                metadata: {
+                  ...(phase ? { phase } : {}),
+                  ...(agentId ? { agent_id: agentId, agentId } : {}),
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                },
+              } : {}),
             });
           }
         }
@@ -476,24 +1186,32 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
     let prompt = textOfInput(input.input);
+    const cwd = this.threadCwd.get(input.sessionId);
     // "/skill 参数" 命中 skills/list 目录时展开成 SKILL.md 正文再发(同
     // codex TUI 语义);网关代执行命令(compact/fork/...)在 gateway 层
     // 已被拦截,到这里仍未命中的原样发送。
     if (prompt.trimStart().startsWith('/')) {
-      const expanded = expandCodexSkill(prompt, await this.codexSkills());
+      const expanded = expandCodexSkill(prompt, await this.codexSkills(cwd));
       if (expanded != null) prompt = expanded;
     }
     // 'off' = 用户显式关掉 thinking 控制;codex 没有"关闭推理"的概念,
     // 诚实做法是回落到服务端默认 effort(不传),而不是造假一个档位。
-    const thinking = this.settings.getString('thinking', input.sessionId);
+    const thinking = this.getThinking(input.sessionId);
     const attachments = input.attachments ?? [];
     const turnInput: string | Array<Record<string, unknown>> =
       attachments.length > 0 ? codexInputItems(prompt, attachments) : prompt;
+    const serviceTier =
+      typeof this.inner.getThreadServiceTier === 'function'
+        ? this.inner.getThreadServiceTier(input.sessionId)
+        : undefined;
     const handle = await this.inner.startTurn(input.sessionId, turnInput, {
+      ...(cwd ? { cwd } : {}),
       model: this.settings.getString('model', input.sessionId),
       effort: thinking && thinking !== 'off' ? thinking : undefined,
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
       approvalPolicy: codexApprovalPolicy(this.settings.getString('permission', input.sessionId)),
     });
+    this.activeThreadTurns.add(input.sessionId);
     this.invalidateListCache(); // turn 会改动 preview/updatedAt,列表缓存失效
     const events = this.mapCodexEvents(input.sessionId, handle.turnId, handle.events);
     return { turnId: handle.turnId, events };
@@ -525,7 +1243,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
   }
 
   getThinking(sessionId: string): string | undefined {
-    return this.settings.getString('thinking', sessionId);
+    return this.settings.getString('thinking', sessionId)
+      ?? this.settings.getString('thinking', '__default__');
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
@@ -559,8 +1278,24 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   // -- 会话操作(RPC 直通,全部 0.147.0 实测存在) --------------------------------
 
-  async steer(sessionId: string, turnId: string, text: string): Promise<void> {
-    await this.inner.steerTurn(sessionId, turnId, text);
+  async steer(
+    sessionId: string,
+    turnId: string,
+    input: string | MessageContentPart[] | SteerInput,
+    attachments?: TurnAttachment[],
+  ): Promise<void> {
+    const rawInput =
+      input && typeof input === 'object' && !Array.isArray(input) && 'input' in input
+        ? input.input
+        : input;
+    const extraAttachments =
+      input && typeof input === 'object' && !Array.isArray(input) && 'attachments' in input
+        ? input.attachments ?? []
+        : [];
+    const mergedAttachments = [...extraAttachments, ...(attachments ?? [])];
+    const text = textOfInput(rawInput);
+    const payload = mergedAttachments.length > 0 ? codexInputItems(text, mergedAttachments) : text;
+    await this.inner.steerTurn(sessionId, turnId, payload);
   }
 
   async compact(sessionId: string): Promise<void> {
@@ -601,8 +1336,11 @@ export class CodexProviderAdapter implements ProviderAdapter {
    * inline review(review/start):review 以新 turn 运行,事件流经
    * mapCodexEvents 后与普通 turn 同形,网关按正常 turn 驱动 UI。
    */
-  async review(sessionId: string): Promise<TurnHandle> {
-    const handle = await this.inner.reviewTurn(sessionId);
+  async review(
+    sessionId: string,
+    options?: Parameters<NonNullable<ProviderAdapter['review']>>[1],
+  ): Promise<TurnHandle> {
+    const handle = await this.inner.reviewTurn(sessionId, options as ReviewStartOptions | undefined);
     this.invalidateListCache();
     return { turnId: handle.turnId, events: this.mapCodexEvents(sessionId, handle.turnId, handle.events) };
   }
@@ -610,11 +1348,11 @@ export class CodexProviderAdapter implements ProviderAdapter {
   // -- goal(codex 原生 thread/goal/*) -------------------------------------------
 
   async setGoal(sessionId: string, objective: string): Promise<Record<string, unknown> | null> {
-    return this.inner.goalSet(sessionId, objective);
+    return this.inner.goalSet(sessionId, objective, undefined, { origin: 'user' });
   }
 
   async getGoal(sessionId: string): Promise<Record<string, unknown> | null> {
-    return this.inner.goalGet(sessionId).catch(() => null);
+    return this.inner.goalGet(sessionId);
   }
 
   async controlGoal(sessionId: string, control: 'pause' | 'resume' | 'cancel'): Promise<Record<string, unknown> | null> {
@@ -623,7 +1361,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
       return null;
     }
     // objective 传 null = 不改动(thread/goal/set 字段可空),只切状态。
-    return this.inner.goalSet(sessionId, null, control === 'pause' ? 'paused' : 'active');
+    return this.inner.goalSet(sessionId, null, control === 'pause' ? 'paused' : 'active', { origin: 'user' });
   }
 
   getUsage(sessionId: string): SessionUsage | undefined {
@@ -638,7 +1376,25 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.inner.backgroundTerminals(sessionId);
   }
 
-  /** 原生模型目录:codex app-server 的 model/list(0.147.0 实测存在)。 */
+  async cleanTerminals(sessionId: string): Promise<void> {
+    await this.inner.cleanBackgroundTerminals(sessionId);
+  }
+
+  async gitDiff(sessionId: string): Promise<{ sha?: string; diff: string } | null> {
+    const cwd = this.threadCwd.get(sessionId);
+    if (!cwd) return null;
+    return this.inner.gitDiffToRemote(cwd);
+  }
+
+  async getRateLimits(): Promise<Record<string, unknown> | null> {
+    return this.inner.accountRateLimits();
+  }
+
+  async getAccountUsage(sessionId?: string): Promise<Record<string, unknown> | null> {
+    return this.inner.accountUsage(sessionId);
+  }
+
+  /** 原生模型目录:codex app-server 的 model/list(0.147.0–0.169.0)。 */
   async listModels(): Promise<NativeModel[]> {
     const rows = await this.inner.listModels();
     const out: NativeModel[] = [];
@@ -663,50 +1419,78 @@ export class CodexProviderAdapter implements ProviderAdapter {
         ...(modalities.includes('image') ? ['vision'] : []),
         ...(efforts?.length ? ['thinking'] : []),
       ];
+      const maxContextSize = num(r.maxContextSize ?? r.contextWindow);
+      const maxOutputTokens = typeof r.maxOutputTokens === 'number' && Number.isFinite(r.maxOutputTokens)
+        ? r.maxOutputTokens
+        : undefined;
       out.push({
         provider: 'codex',
         model,
         display_name: typeof r.displayName === 'string' ? r.displayName : model,
-        // model/list 不给上下文窗口大小;0 = 未知,前端不展示该字段。
-        max_context_size: 0,
+        ...(typeof r.description === 'string' && r.description ? { description: r.description } : {}),
+        max_context_size: maxContextSize,
+        ...(maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {}),
         capabilities: caps.length ? caps : undefined,
         support_efforts: efforts?.length ? efforts : undefined,
         default_effort:
           typeof r.defaultReasoningEffort === 'string' ? r.defaultReasoningEffort : undefined,
+        ...(Array.isArray(r.serviceTiers) ? { serviceTiers: r.serviceTiers as NativeModel['serviceTiers'] } : {}),
+        ...(r.defaultServiceTier !== undefined
+          ? { defaultServiceTier: r.defaultServiceTier as string | null }
+          : {}),
+        ...(r.isDefault === true ? { isDefault: true } : {}),
+        raw: r,
       });
     }
     return out;
   }
 
   /**
-   * skills/list 目录(5 分钟 TTL):listCommands 展示 + startTurn 里的
-   * skill 展开都要用。失败返回空数组,不阻断主流程。
+   * skills/list 目录(按 cwd + skillsVersion 缓存,5 分钟 TTL):
+   * listCommands 展示 + startTurn 里的 skill 展开都要用。失败返回空数组,不阻断主流程。
    */
-  private skillsCache: { ts: number; skills: Array<{ name: string; description: string; path: string }> } | null = null;
+  private skillsCache = new Map<
+    string,
+    { ts: number; version: number; skills: Array<{ name: string; description: string; path: string }> }
+  >();
 
-  private async codexSkills(): Promise<Array<{ name: string; description: string; path: string }>> {
-    if (this.skillsCache && Date.now() - this.skillsCache.ts < 5 * 60_000) {
-      return this.skillsCache.skills;
+  private async codexSkills(cwd?: string): Promise<Array<{ name: string; description: string; path: string }>> {
+    const key = cwd ?? '';
+    const version = typeof this.inner.getSkillsVersion === 'function' ? this.inner.getSkillsVersion() : 0;
+    const hit = this.skillsCache.get(key);
+    if (hit && hit.version === version && Date.now() - hit.ts < 5 * 60_000) {
+      return hit.skills;
+    }
+    if (hit && hit.version !== version) {
+      this.skillsCache.clear();
     }
     // 失败(如 app-server 还没起)只当场回空,不入缓存——否则一次瞬断会把
     // 空目录扩散 5 分钟,期间 /命令面板和 skill 展开全空(审查发现)。
-    const rows = await this.inner.listSkills().catch(() => null);
+    const rows = await this.inner.listSkills(cwd ? { cwd } : undefined).catch(() => null);
     if (rows === null) return [];
     const skills = rows
       .filter((s) => s && typeof s.name === 'string' && typeof s.path === 'string' && s.enabled !== false)
       .map((s) => ({ name: s.name as string, description: (s.description as string) ?? '', path: s.path as string }));
-    this.skillsCache = { ts: Date.now(), skills };
+    const postVersion = typeof this.inner.getSkillsVersion === 'function' ? this.inner.getSkillsVersion() : version;
+    if (postVersion === version) {
+      this.skillsCache.set(key, { ts: Date.now(), version, skills });
+    }
     return skills;
   }
 
-  /** 原生 skills 目录(透传 codex skills/list,带 5 分钟缓存)。 */
-  async listSkills(): Promise<Array<{ name: string; description: string; path: string; scope: string; enabled: boolean }>> {
-    return this.inner.listSkills();
+  /** 原生 skills 目录(透传 codex skills/list,按 session cwd 作用域)。 */
+  async listSkills(
+    sessionId?: string,
+    cwdOverride?: string,
+  ): Promise<Array<{ name: string; description: string; path: string; scope: string; enabled: boolean }>> {
+    const cwd = cwdOverride ?? (sessionId ? this.threadCwd.get(sessionId) : undefined);
+    return this.inner.listSkills(cwd ? { cwd } : undefined);
   }
 
-  /** 完整目录:client 命令 + 网关代执行命令 + skills(0.147.0 实测 93 条)。 */
-  async listCommands(): Promise<NativeCommand[]> {
-    return listCodexCommands(await this.codexSkills());
+  /** 完整目录:client 命令 + 网关代执行命令 + skills。 */
+  async listCommands(sessionId?: string, cwdOverride?: string): Promise<NativeCommand[]> {
+    const cwd = cwdOverride ?? (sessionId ? this.threadCwd.get(sessionId) : undefined);
+    return listCodexCommands(await this.codexSkills(cwd));
   }
 
   async interrupt(sessionId: string, turnId?: string): Promise<void> {
@@ -714,16 +1498,24 @@ export class CodexProviderAdapter implements ProviderAdapter {
     await this.inner.interrupt(sessionId, turnId);
   }
 
-  async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
+  async resolveApproval(
+    _sessionId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+    details?: GranularApprovalDetails,
+  ): Promise<void> {
     const map: Record<ApprovalDecision, 'accept' | 'acceptForSession' | 'decline'> = {
       approve: 'accept',
       approve_always: 'acceptForSession',
       reject: 'decline',
     };
-    // 重复点击/重试时 codex 侧 parked 请求已不存在:幂等成功而非 500(审查发现);
-    // 此前不 await,同步 throw 会变成未捕获异常。
+    const wireDecision = details?.decision === 'cancel' ? 'cancel' : map[decision];
     try {
-      this.inner.resolveApproval(approvalId, map[decision]);
+      if (details) {
+        this.inner.resolveApproval(approvalId, wireDecision, details);
+      } else {
+        this.inner.resolveApproval(approvalId, wireDecision);
+      }
     } catch (err) {
       if (err instanceof Error && /no pending server request/.test(err.message)) return;
       throw err;
@@ -748,6 +1540,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
   /** 进程级清理:杀 codex app-server。网关 shutdown 时调用(此前无调用方,
    *  预热拉起的常驻进程在网关退出后成孤儿)。 */
   async dispose(): Promise<void> {
+    this.settings.close();
     await this.inner.close();
   }
 
@@ -781,75 +1574,238 @@ export class CodexProviderAdapter implements ProviderAdapter {
     turnId: string,
     source: AsyncIterable<CodexEvent>,
   ): AsyncIterable<GatewayEvent> {
-    for await (const ev of source) {
-      const ts = Date.now();
-      switch (ev.type) {
-        case 'text-delta':
-          yield {
-            kind: 'message',
-            status: 'delta',
-            sessionId,
-            turnId,
-            timestamp: ts,
-            payload: { delta: ev.delta, message: emptyAssistantMessage(sessionId) },
-          };
-          break;
-        case 'reasoning-delta':
-          yield {
-            kind: 'thinking',
-            status: 'delta',
-            sessionId,
-            turnId,
-            timestamp: ts,
-            payload: { text: '', delta: ev.delta },
-          };
-          break;
-        case 'command-output-delta':
-          yield {
-            kind: 'tool',
-            status: 'delta',
-            sessionId,
-            turnId,
-            timestamp: ts,
-            payload: { toolCallId: ev.itemId, name: 'commandExecution', output: ev.delta },
-          };
-          break;
-        case 'item-started': {
-          const item = ev.item as Record<string, unknown>;
-          if (isCodexToolItem(item.type)) {
+    try {
+      for await (const ev of source) {
+        const ts = Date.now();
+        switch (ev.type) {
+          case 'text-delta':
             yield {
-              kind: 'tool',
-              status: 'started',
+              kind: 'message',
+              status: 'delta',
               sessionId,
               turnId,
               timestamp: ts,
-              payload: {
-                toolCallId: (item.id as string) ?? '',
-                name: item.type as string,
-                input: item.command ?? item.arguments ?? item.query ?? item.changes ?? item,
-              },
+              payload: { delta: ev.delta, message: emptyAssistantMessage(sessionId) },
             };
-          }
-          break;
-        }
-        case 'item-completed': {
-          const item = ev.item as Record<string, unknown>;
-          if (isCodexToolItem(item.type)) {
-            const output = (item.aggregatedOutput as string)
-              ?? (typeof item.result === 'string' ? item.result : '')
-              ?? (typeof item.output === 'string' ? item.output : '');
+            break;
+          case 'reasoning-delta':
+            yield {
+              kind: 'thinking',
+              status: 'delta',
+              sessionId,
+              turnId,
+              timestamp: ts,
+              payload: { text: '', delta: ev.delta, raw: ev },
+            };
+            break;
+          case 'command-output-delta':
             yield {
               kind: 'tool',
+              status: 'delta',
+              sessionId,
+              turnId,
+              timestamp: ts,
+              payload: { toolCallId: ev.itemId, name: 'commandExecution', output: ev.delta },
+            };
+            break;
+          case 'item-started': {
+            const item = ev.item as Record<string, unknown>;
+            const phase = typeof item.phase === 'string' ? item.phase : undefined;
+            const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+              ? (item.receiverThreadIds as string[])
+              : undefined;
+            const agentId =
+              (typeof item.agentId === 'string' && item.agentId) ||
+              (typeof item.agentThreadId === 'string' && item.agentThreadId) ||
+              (typeof item.receiverThreadId === 'string' && item.receiverThreadId) ||
+              receiverThreadIds?.[0] ||
+              undefined;
+            const parentToolUseId =
+              (typeof item.parentToolUseId === 'string' && item.parentToolUseId) ||
+              (item.type === 'subAgentActivity'
+                ? ((typeof item.call_id === 'string' && item.call_id)
+                  || (typeof item.id === 'string' && item.id && item.id !== agentId ? item.id : undefined))
+                : undefined);
+            if (isCodexToolItem(item.type)) {
+              const name =
+                (typeof item.name === 'string' && item.name) ||
+                (typeof item.tool === 'string' && item.tool) ||
+                (item.type as string);
+              if (agentId) {
+                this.recordLiveSubagent(sessionId, agentId, (item.id as string) ?? parentToolUseId);
+              }
+              yield {
+                kind: 'tool',
+                status: 'started',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                ...(phase ? { phase } : {}),
+                ...(parentToolUseId ? { parentToolUseId } : {}),
+                ...(agentId ? { agentId } : {}),
+                payload: {
+                  toolCallId: (item.id as string) ?? '',
+                  name,
+                  input: item.input ?? item.command ?? item.arguments ?? item.query ?? item.changes ?? item,
+                  ...(phase ? { phase } : {}),
+                  ...(parentToolUseId ? { parentToolUseId } : {}),
+                  ...(agentId ? { agentId, agent_id: agentId } : {}),
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                  raw: item,
+                },
+              };
+            } else if (item.type === 'subAgentActivity' && agentId) {
+              this.recordLiveSubagent(
+                sessionId,
+                agentId,
+                parentToolUseId,
+                typeof item.summary === 'string' ? item.summary : undefined,
+                typeof item.name === 'string' ? item.name : undefined,
+              );
+              yield {
+                kind: 'subagent',
+                status: 'started',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                agentId,
+                ...(parentToolUseId ? { parentToolUseId } : {}),
+                payload: {
+                  agentId,
+                  agent_id: agentId,
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                  ...(parentToolUseId ? { parentToolUseId } : {}),
+                  name: typeof item.name === 'string' ? item.name : undefined,
+                  status: typeof item.status === 'string' ? item.status : 'started',
+                  summary: typeof item.summary === 'string' ? item.summary : undefined,
+                  raw: item,
+                },
+              };
+            } else if (item.type === 'plan' && typeof item.text === 'string' && item.text) {
+              yield {
+                kind: 'plan',
+                status: 'started',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                payload: {
+                  planId: typeof item.id === 'string' ? item.id : undefined,
+                  text: item.text,
+                  raw: item,
+                },
+              };
+            }
+            break;
+          }
+          case 'item-completed': {
+            const item = ev.item as Record<string, unknown>;
+            const phase = typeof item.phase === 'string' ? item.phase : undefined;
+            const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+              ? (item.receiverThreadIds as string[])
+              : undefined;
+            const agentId =
+              (typeof item.agentId === 'string' && item.agentId) ||
+              (typeof item.agentThreadId === 'string' && item.agentThreadId) ||
+              (typeof item.receiverThreadId === 'string' && item.receiverThreadId) ||
+              receiverThreadIds?.[0] ||
+              undefined;
+            const parentToolUseId =
+              (typeof item.parentToolUseId === 'string' && item.parentToolUseId) ||
+              (item.type === 'subAgentActivity'
+                ? ((typeof item.call_id === 'string' && item.call_id)
+                  || (typeof item.id === 'string' && item.id && item.id !== agentId ? item.id : undefined))
+                : undefined);
+            if (isCodexToolItem(item.type)) {
+              const name =
+                (typeof item.name === 'string' && item.name) ||
+                (typeof item.tool === 'string' && item.tool) ||
+                (item.type as string);
+              let output = extractCodexToolOutput(item) ?? '';
+              const resolvedAgentId = agentId ?? extractSubagentIdFromOutput(output);
+              if (resolvedAgentId) {
+                this.recordLiveSubagent(sessionId, resolvedAgentId, (item.id as string) ?? parentToolUseId);
+              }
+              if (item.type === 'collabAgentToolCall' || item.type === 'subAgentActivity' || name === 'collabAgentToolCall') {
+                if (resolvedAgentId && !output.includes('agent_id:')) {
+                  output = output ? `agent_id: ${resolvedAgentId}\n${output}` : `agent_id: ${resolvedAgentId}`;
+                }
+              }
+              const structuredOutput = extractCodexStructuredOutput(item);
+              yield {
+                kind: 'tool',
+                status: 'completed',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                ...(phase ? { phase } : {}),
+                ...(parentToolUseId ? { parentToolUseId } : {}),
+                ...(resolvedAgentId ? { agentId: resolvedAgentId } : {}),
+                payload: {
+                  toolCallId: (item.id as string) ?? '',
+                  name,
+                  output,
+                  ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+                  is_error: isCodexToolItemError(item),
+                  ...(phase ? { phase } : {}),
+                  ...(parentToolUseId ? { parentToolUseId } : {}),
+                  ...(resolvedAgentId ? { agentId: resolvedAgentId, agent_id: resolvedAgentId } : {}),
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                  raw: item,
+                },
+              };
+            } else if (item.type === 'subAgentActivity' && agentId) {
+              this.recordLiveSubagent(
+                sessionId,
+                agentId,
+                parentToolUseId,
+                typeof item.summary === 'string' ? item.summary : undefined,
+                typeof item.name === 'string' ? item.name : undefined,
+              );
+              const st = typeof item.status === 'string' ? item.status : 'completed';
+              yield {
+                kind: 'subagent',
+                status: st === 'failed' ? 'failed' : st === 'cancelled' ? 'cancelled' : 'completed',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                agentId,
+                ...(parentToolUseId ? { parentToolUseId } : {}),
+                payload: {
+                  agentId,
+                  agent_id: agentId,
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                  ...(parentToolUseId ? { parentToolUseId } : {}),
+                  name: typeof item.name === 'string' ? item.name : undefined,
+                  status: st,
+                  summary: typeof item.summary === 'string' ? item.summary : undefined,
+                  raw: item,
+                },
+              };
+          } else if (item.type === 'plan') {
+            yield {
+              kind: 'plan',
               status: 'completed',
               sessionId,
               turnId,
               timestamp: ts,
               payload: {
-                toolCallId: (item.id as string) ?? '',
-                name: item.type as string,
-                output,
-                is_error: (item.exitCode as number) !== 0 && item.exitCode !== undefined,
+                planId: typeof item.id === 'string' ? item.id : undefined,
+                text: typeof item.text === 'string' ? item.text : '',
+                raw: item,
               },
+            };
+          } else if (item.type === 'enteredReviewMode' || item.type === 'exitedReviewMode') {
+            const message =
+              (typeof item.text === 'string' && item.text) ||
+              (typeof item.review === 'string' && item.review) ||
+              String(item.type);
+            yield {
+              kind: 'notice',
+              status: 'completed',
+              sessionId,
+              turnId,
+              timestamp: ts,
+              payload: { level: 'info', code: item.type, message, raw: item },
             };
           }
           break;
@@ -862,28 +1818,121 @@ export class CodexProviderAdapter implements ProviderAdapter {
             turnId,
             timestamp: ts,
             payload: {
-              approvalId: String(ev.requestId),
+              approvalId: ev.approvalId ?? String(ev.requestId),
+              kind: ev.kind,
               tool: ev.kind,
               input: ev.command ?? ev.params,
               itemId: ev.itemId,
+              ...(Array.isArray(ev.availableDecisions)
+                ? {
+                    availableDecisions: ev.availableDecisions as Array<string | Record<string, unknown>>,
+                    options: ev.availableDecisions.map((d) => (typeof d === 'string' ? d : JSON.stringify(d))),
+                  }
+                : {}),
+              ...(ev.reason ? { reason: ev.reason } : {}),
+              ...(ev.cwd ? { cwd: ev.cwd } : {}),
+              ...(ev.commandActions ? { commandActions: ev.commandActions } : {}),
+              ...(ev.networkApprovalContext !== undefined ? { networkContext: ev.networkApprovalContext } : {}),
+              ...(ev.additionalPermissions !== undefined || ev.permissions !== undefined
+                ? { additionalPermissions: ev.additionalPermissions ?? ev.permissions }
+                : {}),
+              ...(ev.proposedExecpolicyAmendment !== undefined
+                ? { proposedExecpolicyAmendment: ev.proposedExecpolicyAmendment }
+                : {}),
+              ...(ev.proposedNetworkPolicyAmendments
+                ? { proposedNetworkPolicyAmendments: ev.proposedNetworkPolicyAmendments }
+                : {}),
+              ...(ev.elicitation ? { elicitation: ev.elicitation } : {}),
+              raw: ev.params,
             },
           };
           break;
-        case 'question-request':
+        case 'question-request': {
+          const normalized = normalizeCodexQuestions(ev.questions);
           yield {
             kind: 'question',
             status: 'started',
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { questionId: String(ev.requestId), prompt: JSON.stringify(ev.questions), rawQuestions: ev.questions },
+            payload: {
+              questionId: String(ev.requestId),
+              prompt: normalized.prompt,
+              ...(normalized.options.length > 0 ? { options: normalized.options } : {}),
+              ...(typeof ev.isBlocking === 'boolean' ? { isBlocking: ev.isBlocking } : {}),
+              ...(normalized.questions.length > 0 ? { questions: normalized.questions } : {}),
+              rawQuestions: ev.questions,
+              ...(ev.itemId ? { itemId: ev.itemId } : {}),
+              raw: ev.params,
+            },
+          };
+          break;
+        }
+        case 'server-request':
+          yield {
+            kind: 'passthrough',
+            status: 'updated',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: { method: ev.method, data: ev.params, source: 'codex' },
+            raw: ev,
+          };
+          break;
+        case 'server-request-resolved':
+          yield {
+            kind: 'interaction_resolved',
+            status: 'completed',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: {
+              interactionId: String(ev.requestId),
+              ...(ev.interactionKind ? { interactionKind: ev.interactionKind } : {}),
+              resolution: 'resolved',
+              raw: ev,
+            },
+          };
+          break;
+        case 'plan-updated':
+          yield {
+            kind: 'plan',
+            status: 'updated',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: { explanation: ev.explanation, steps: ev.plan, raw: ev },
+          };
+          break;
+        case 'plan-delta':
+          yield {
+            kind: 'plan',
+            status: 'delta',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: { planId: ev.itemId, delta: ev.delta, raw: ev },
+          };
+          break;
+        case 'diff-updated':
+          yield {
+            kind: 'diff',
+            status: 'updated',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: { diff: ev.diff, raw: ev },
           };
           break;
         case 'token-usage': {
-          // 会话级用量(累计 + 最近一次 turn + 上下文窗口),sessionDto/step 用。
           const t = ev.usage.total;
           const last = ev.usage.last;
-          this.sessionUsage.set(sessionId, {
+          const prev = this.sessionUsage.get(sessionId);
+          const reasoning =
+            num(ev.usage.reasoningOutputTokens) ||
+            num(t.reasoningOutputTokens) ||
+            num(last.reasoningOutputTokens);
+          const nextUsage: SessionUsage = {
             input_tokens: num(t.inputTokens),
             output_tokens: num(t.outputTokens),
             cache_read_tokens: num(t.cachedInputTokens),
@@ -891,20 +1940,57 @@ export class CodexProviderAdapter implements ProviderAdapter {
             total_cost_usd: 0,
             context_tokens: num(last.totalTokens),
             context_limit: ev.usage.modelContextWindow ?? 0,
-            turn_count: 0,
-          });
+            turn_count: prev?.turn_count ?? 0,
+            ...(reasoning > 0 ? { reasoning_output_tokens: reasoning } : {}),
+            authoritative: true,
+          };
+          this.sessionUsage.set(sessionId, nextUsage);
+          yield {
+            kind: 'usage',
+            status: 'updated',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: { ...nextUsage },
+          };
           break;
         }
+        case 'goal-updated':
+          yield {
+            kind: 'passthrough',
+            status: 'updated',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: {
+              method: ev.cleared ? 'thread/goal/cleared' : 'thread/goal/updated',
+              data: { goal: ev.goal, cleared: ev.cleared === true },
+              source: 'codex',
+            },
+          };
+          break;
         case 'turn-completed': {
           const status = (ev.turn as Record<string, unknown>).status as string;
           const reason = status === 'completed' ? 'completed' : status === 'interrupted' ? 'cancelled' : 'failed';
+          const prevUsage = this.sessionUsage.get(sessionId);
+          if (prevUsage) {
+            this.sessionUsage.set(sessionId, {
+              ...prevUsage,
+              turn_count: prevUsage.turn_count + 1,
+            });
+          }
+          const usage = this.sessionUsage.get(sessionId);
           yield {
             kind: 'turn',
             status: reason === 'completed' ? 'completed' : reason === 'cancelled' ? 'cancelled' : 'failed',
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { reason },
+            payload: {
+              reason,
+              ...(reason === 'failed' && ev.error ? { error: ev.error } : {}),
+              ...(usage ? { usage } : {}),
+            },
           };
           break;
         }
@@ -926,6 +2012,90 @@ export class CodexProviderAdapter implements ProviderAdapter {
           break;
       }
     }
+    } finally {
+      this.activeThreadTurns.delete(sessionId);
+    }
+  }
+
+  async listSubagents(sessionId: string): Promise<Array<{
+    agentId: string;
+    parentToolUseId?: string;
+    description?: string;
+    subagentType?: string;
+  }>> {
+    const messages = await this.getHistory(sessionId).catch(() => []);
+    const subagentsMap = new Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>();
+
+    for (const liveSub of this.liveSubagents.get(sessionId)?.values() ?? []) {
+      subagentsMap.set(liveSub.agentId, liveSub);
+    }
+    for (const msg of messages) {
+      const meta = msg.metadata;
+      const metaAgentId = (meta?.agent_id as string) ?? (meta?.agentId as string);
+      if (metaAgentId && metaAgentId !== sessionId && !subagentsMap.has(metaAgentId)) {
+        subagentsMap.set(metaAgentId, {
+          agentId: metaAgentId,
+          parentToolUseId: (meta?.parent_tool_use_id as string) ?? (meta?.parentToolUseId as string),
+          description: meta?.description as string | undefined,
+          subagentType: meta?.subagentType as string | undefined,
+        });
+      }
+      for (const part of msg.content) {
+        if (
+          part.type === 'tool_use'
+          && (
+            part.tool_name === 'collabAgentToolCall'
+            || part.tool_name === 'collabToolCall'
+            || part.tool_name === 'spawn_agent'
+            || part.tool_name === 'Agent'
+          )
+        ) {
+          const input = part.input as Record<string, unknown> | undefined;
+          const aId = (input?.receiverThreadId as string)
+            ?? (Array.isArray(input?.receiverThreadIds) ? (input.receiverThreadIds[0] as string) : undefined)
+            ?? extractSubagentIdFromOutput(input);
+          if (aId && aId !== sessionId && !subagentsMap.has(aId)) {
+            subagentsMap.set(aId, {
+              agentId: aId,
+              parentToolUseId: part.tool_call_id,
+              description: (input?.prompt as string) ?? (input?.description as string) ?? (input?.message as string),
+              subagentType: (input?.agent_type as string) ?? (input?.subagentType as string) ?? 'collab',
+            });
+          }
+        }
+        if (part.type === 'tool_result') {
+          const aId = extractSubagentIdFromOutput(part.output ?? part.content)
+            ?? extractSubagentIdFromOutput(part.structured_output ?? part.structuredOutput);
+          if (aId && aId !== sessionId && !subagentsMap.has(aId)) {
+            subagentsMap.set(aId, {
+              agentId: aId,
+              parentToolUseId: part.tool_call_id,
+              subagentType: 'collab',
+            });
+          }
+        }
+      }
+    }
+    return Array.from(subagentsMap.values());
+  }
+
+  async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {
+    if (!agentId || agentId === sessionId || !/^[a-zA-Z0-9._-]+$/.test(agentId)) {
+      return [];
+    }
+    const allowed = await this.listSubagents(sessionId);
+    if (!allowed.some((s) => s.agentId === agentId)) {
+      return [];
+    }
+    const childHistory = await this.getHistory(agentId);
+    return childHistory.map((m) => ({
+      ...m,
+      metadata: {
+        ...(m.metadata ?? {}),
+        agent_id: agentId,
+        agentId,
+      },
+    }));
   }
 }
 
@@ -938,12 +2108,35 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly inner: ClaudeAdapter;
   /** 记录每个会话最近一次 turn 的 cwd,供 resume 时复用。 */
   private readonly sessionCwd = new Map<string, string>();
+  /** `/clear` 在 stream-json 下会生成新 CLI sessionId，保存逻辑 id → 实际 CLI id 映射。 */
+  private readonly resetSessionIds = new Map<string, string>();
+  /** 从 `system:init` 观察到的 `terminal_slash_commands` 列表。 */
+  private lastTerminalSlashCommands: string[] = [];
   /** 会话级设置持久化(重启不丢;只读路径回落 undefined = 未设置)。 */
   private readonly settings: SettingsStore;
+  private readonly liveSubagents = new Map<
+    string,
+    Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string }>
+  >();
+
+  private resolveEffectiveSessionId(sessionId: string): string {
+    return this.resetSessionIds.get(sessionId) ?? this.settings.getString('resetSessionId', sessionId) ?? sessionId;
+  }
+
+  private commitResetSessionId(sessionId: string, newId: string | undefined, cwd?: string): void {
+    if (!newId || newId === sessionId) return;
+    this.resetSessionIds.set(sessionId, newId);
+    this.settings.set('resetSessionId', sessionId, newId);
+    if (cwd) this.sessionCwd.set(newId, cwd);
+  }
 
   constructor(options?: ConstructorParameters<typeof ClaudeAdapter>[0] & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
-    this.inner = new ClaudeAdapter(innerOptions);
+    const claudeBin = innerOptions.claudeBin ?? process.env.CLAUDE_BIN;
+    this.inner = new ClaudeAdapter({
+      ...innerOptions,
+      ...(claudeBin ? { claudeBin } : {}),
+    });
     this.settings = new SettingsStore(settingsPath);
   }
 
@@ -956,15 +2149,41 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       questions: true, // AskUserQuestion / questions, when the CLI shape is obvious
       interrupt: true,
       history: true,
+      steer: true,
+      steerAttachments: false,
+      attachments: true,
+      compact: true,
+      fork: true,
+      clone: false,
+      rollback: false,
+      rename: true,
+      archive: true,
+      nativeArchive: true,
+      delete: true,
+      planMode: true,
+      permissionModes: ['manual', 'auto', 'yolo'],
+      manualApproval: true,
+      goals: false,
+      swarm: false,
+      tower: false,
+      btw: false,
+      subagents: true,
+      mcp: true,
+      terminals: false,
+      review: false,
+      models: true,
+      thinkingLevels: true,
+      commands: true,
+      skills: false,
+      usage: true,
     };
   }
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
-    // Claude CLI 没有原生归档:本网关用 SettingsStore 记 archived 标记。
-    // query.archived=true → 只列已归档(Done 页);缺省/false → 排除已归档(进行中)。
+    // 兼顾原生 <sessionId>/archived.json 与既有 SettingsStore sidecar 迁移。
     const sessions = (await this.inner.list()).filter((session) => {
       if (query.cwd && session.cwd !== query.cwd) return false;
-      const isArchived = this.settings.getBoolean('archived', session.sessionId) === true;
+      const isArchived = session.archived === true || this.settings.getBoolean('archived', session.sessionId) === true;
       return query.archived === true ? isArchived : !isArchived;
     });
     const start = query.cursor ? sessions.findIndex((session) => session.sessionId === query.cursor) + 1 : 0;
@@ -997,14 +2216,76 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
-    const history = await this.inner.getHistory(sessionId);
-    return history.map((m, index) => {
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    if (effectiveId !== sessionId && !this.inner.hasSessionFile(effectiveId)) {
+      return [];
+    }
+    const history = await this.inner.getHistory(effectiveId, { followContinuedIn: true });
+    const messages: Message[] = [];
+    for (let index = 0; index < history.length; index++) {
+      const m = history[index];
+      const nextM = history[index + 1];
+
+      // Merge adjacent <bash-input> + <bash-stdout>/<bash-stderr> user messages into a structured Bash tool_use + tool_result pair
+      if (
+        m.role === 'user' &&
+        m.text.startsWith('! ') &&
+        (!m.blocks || m.blocks.length === 0) &&
+        nextM &&
+        nextM.role === 'user' &&
+        nextM.isLocalBashOutput === true &&
+        (!nextM.blocks || nextM.blocks.length === 0) &&
+        !nextM.text.startsWith('! ')
+      ) {
+        const cmd = m.text.slice(2).trim();
+        const callId = `bash_${createHash('sha256')
+          .update(JSON.stringify([sessionId, index, cmd]))
+          .digest('hex')
+          .slice(0, 16)}`;
+        messages.push({
+          id: `msg_${callId}_use`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [kimiHistoryPart({
+            type: 'tool_use',
+            tool_call_id: callId,
+            tool_name: 'Bash',
+            input: { command: cmd },
+            ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
+          })],
+          created_at: m.timestamp ?? nowIso(),
+          ...(m.parentToolUseId ? { metadata: { parent_tool_use_id: m.parentToolUseId } } : {}),
+        });
+        messages.push({
+          id: `msg_${callId}_res`,
+          session_id: sessionId,
+          role: 'tool',
+          content: [kimiHistoryPart({
+            type: 'tool_result',
+            tool_call_id: callId,
+            output: nextM.text,
+            is_error: false,
+            ...(nextM.parentToolUseId ? { parent_tool_use_id: nextM.parentToolUseId } : {}),
+          })],
+          created_at: nextM.timestamp ?? nowIso(),
+          ...(nextM.parentToolUseId ? { metadata: { parent_tool_use_id: nextM.parentToolUseId } } : {}),
+        });
+        index++; // consumed nextM
+        continue;
+      }
+
       // 优先用结构化块(thinking/tool_use/tool_result),没有才退化成纯文本。
       const content: Message['content'] = m.blocks && m.blocks.length > 0
         ? m.blocks.map((b) => {
             if (b.type === 'thinking') return kimiHistoryPart({ type: 'thinking', thinking: b.text });
             if (b.type === 'tool_use') {
-              return kimiHistoryPart({ type: 'tool_use', tool_call_id: b.id, tool_name: b.name, input: b.input });
+              return kimiHistoryPart({
+                type: 'tool_use',
+                tool_call_id: b.id,
+                tool_name: b.name,
+                input: b.input,
+                ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
+              });
             }
             if (b.type === 'tool_result') {
               return kimiHistoryPart({
@@ -1012,12 +2293,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
                 tool_call_id: b.tool_use_id,
                 output: b.content,
                 is_error: b.is_error === true,
+                ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
               });
             }
             return { type: 'text' as const, text: b.text };
           })
         : [{ type: 'text' as const, text: m.text }];
-      return {
+      const hasMeta = Boolean(m.model || m.isError || m.agentId || m.parentToolUseId || m.isCompactSummary);
+      messages.push({
         id: `msg_${createHash('sha256')
           .update(JSON.stringify([sessionId, index, m.role, m.timestamp ?? '', m.text]))
           .digest('hex')
@@ -1028,24 +2311,26 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         role: content.length > 0 && content.every((part) => part.type === 'tool_result') ? 'tool' : m.role,
         content,
         created_at: m.timestamp ?? nowIso(),
-        ...(m.model || m.isError ? {
+        ...(hasMeta ? {
           metadata: {
             ...(m.model ? { model: m.model } : {}),
             ...(m.isError ? { is_error: true } : {}),
+            ...(m.agentId ? { agent_id: m.agentId } : {}),
+            ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
+            ...(m.isCompactSummary ? { is_compact_summary: true } : {}),
           },
         } : {}),
-      };
-    });
+      });
+    }
+    return messages;
   }
 
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
     const sessionId = input.sessionId;
-    // claude CLI 在 -p stream-json 模式下自己执行 "/name args"(2.1.226
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    // claude CLI 在 -p stream-json 模式下自己执行 "/name args"(2.1.226+
     // 实测 /compact /mcp 均产生真实输出),网关不展开、不拦截,原样直通。
     let prompt = textOfInput(input.input);
-    // 附件翻译(2.1.226 复核:stream-json user message 支持 image/document
-    // base64 block):图片/PDF 内联成原生块;读盘失败或其他类型物化成路径
-    // 文本(kap-server 话术),让模型自己用 Read 打开。
     const blocks: Array<Record<string, unknown>> = [];
     const notes: string[] = [];
     for (const a of input.attachments ?? []) {
@@ -1063,36 +2348,62 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       }
     }
     if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
-    // isNew 看 transcript 文件是否已落盘,而不是一次性内存标记(审查发现:
-    // 首轮 spawn 失败/网关重启后标记已丢,重试走 --resume 不存在的会话必败)。
-    // 文件不在 → --session-id 建档;文件在 → --resume(重复 --session-id 会被
-    // CLI 以 "session id 已存在" 直接退出,实测 turn 静默空转)。
-    const isNew = !this.inner.hasSessionFile(sessionId);
-    const cwd = this.sessionCwd.get(sessionId);
+    const isNew = !this.inner.hasSessionFile(effectiveId);
+    const cwd = this.sessionCwd.get(effectiveId) ?? this.sessionCwd.get(sessionId);
     const storedModel = this.settings.getString('model', sessionId);
-    const model = claudeCatalogAlias(storedModel);
+    const alias = storedModel && !/qwen/i.test(storedModel) ? claudeCatalogAlias(storedModel) : undefined;
+    // `'default'` 交给 Claude CLI 自身配置/ANTHROPIC_MODEL 决定;显式传 `--model default`
+    // 在 2.1.325 上会绕过 ANTHROPIC_MODEL 回落到内部默认模型。
+    const model =
+      storedModel && !/qwen/i.test(storedModel)
+        ? (alias === 'default' ? undefined : (alias ?? storedModel))
+        : undefined;
     // thinking 'off' = 用户显式关闭 → 不传 --effort(CLI 无 off 档)。
-    const thinking = this.settings.getString('thinking', sessionId);
+    const thinking = this.getThinking(sessionId);
     const effort = thinking && thinking !== 'off' ? thinking : undefined;
-    // plan 模式优先:CLI 的 plan 是 --permission-mode 的一个取值,与权限
-    // 三档互斥,开启时直接覆盖。
     const permissionMode = this.settings.getBoolean('plan', sessionId)
       ? 'plan'
       : claudePermissionMode(this.settings.getString('permission', sessionId));
     const turnId = randomUUID();
     const stream = new EventStream<GatewayEvent>();
+    const subagentTasks = new Set<string>();
+    let sawConversationReset = false;
+    let pendingResetId: string | undefined;
+    let sawAssistantOutput = false;
 
     const emit = (ev: ClaudeAdapterEvent): void => {
       const ts = Date.now();
       switch (ev.type) {
+        case 'init':
+          if (Array.isArray(ev.terminalSlashCommands) && ev.terminalSlashCommands.length > 0) {
+            this.lastTerminalSlashCommands = ev.terminalSlashCommands;
+          }
+          if (sawConversationReset && ev.sessionId && ev.sessionId !== effectiveId) {
+            pendingResetId = ev.sessionId;
+          }
+          break;
+        case 'conversation_reset':
+          sawConversationReset = true;
+          if (ev.newConversationId && ev.newConversationId !== effectiveId) {
+            pendingResetId = ev.newConversationId;
+          }
+          break;
         case 'text_delta':
+          sawAssistantOutput = true;
           stream.push({
             kind: 'message',
             status: 'delta',
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { delta: ev.text, message: emptyAssistantMessage(sessionId) },
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            payload: {
+              delta: ev.text,
+              message: emptyAssistantMessage(sessionId),
+              ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            },
           });
           break;
         case 'thinking_delta':
@@ -1102,19 +2413,32 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { text: '', delta: ev.text },
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            payload: {
+              text: '',
+              delta: ev.text,
+              ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            },
           });
           break;
         case 'synthetic_text':
-          // 本地命令(/mcp /usage 等)的整段输出:无 stream delta,一次性
-          // 作为完整消息文本推给前端。
+          sawAssistantOutput = true;
           stream.push({
             kind: 'message',
             status: 'delta',
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { delta: ev.text, message: emptyAssistantMessage(sessionId) },
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            payload: {
+              delta: ev.text,
+              message: emptyAssistantMessage(sessionId),
+              ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            },
           });
           break;
         case 'tool_use':
@@ -1124,7 +2448,15 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { toolCallId: ev.toolUseId, name: ev.name, input: ev.input },
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            payload: {
+              toolCallId: ev.toolUseId,
+              name: ev.name,
+              input: ev.input,
+              ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            },
           });
           break;
         case 'tool_result':
@@ -1134,9 +2466,154 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { toolCallId: ev.toolUseId, name: '', output: ev.content, is_error: ev.isError },
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            payload: {
+              toolCallId: ev.toolUseId,
+              name: '',
+              output: ev.content,
+              ...(ev.toolUseResult !== undefined ? { structuredOutput: ev.toolUseResult } : {}),
+              is_error: ev.isError,
+              ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+            },
           });
           break;
+        case 'tool_progress':
+          stream.push({
+            kind: 'tool',
+            status: 'delta',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            payload: {
+              toolCallId: ev.toolUseId,
+              name: ev.toolName,
+              output: `running (${ev.elapsedTimeSeconds}s)`,
+              ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+              raw: ev,
+            },
+          });
+          break;
+        case 'task_started':
+          stream.push({
+            kind: 'task',
+            status: 'started',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            ...(ev.toolUseId ? { parentToolUseId: ev.toolUseId } : {}),
+            payload: {
+              taskId: ev.taskId,
+              description: ev.description,
+              ...(ev.toolUseId ? { toolUseId: ev.toolUseId } : {}),
+              ...(ev.subagentType ? { subagentType: ev.subagentType } : {}),
+              ...(ev.isBackgrounded !== undefined ? { isBackgrounded: ev.isBackgrounded } : {}),
+              ...(ev.spawnDepth !== undefined ? { spawnDepth: ev.spawnDepth } : {}),
+              ...(ev.parentTaskId ? { parentTaskId: ev.parentTaskId } : {}),
+              ...(ev.taskType ? { taskType: ev.taskType } : {}),
+              raw: ev,
+            },
+          });
+          if (ev.subagentType || ev.taskType === 'subagent') {
+            subagentTasks.add(ev.taskId);
+            const liveList = this.liveSubagents.get(effectiveId) ?? [];
+            if (!liveList.some((l) => l.agentId === ev.taskId || l.taskId === ev.taskId)) {
+              liveList.push({
+                agentId: ev.taskId,
+                taskId: ev.taskId,
+                parentToolUseId: ev.toolUseId,
+                description: ev.description,
+                subagentType: ev.subagentType,
+              });
+              this.liveSubagents.set(effectiveId, liveList);
+              this.liveSubagents.set(sessionId, liveList);
+            }
+            stream.push({
+              kind: 'subagent',
+              status: 'started',
+              sessionId,
+              turnId,
+              timestamp: ts,
+              agentId: ev.taskId,
+              ...(ev.toolUseId ? { parentToolUseId: ev.toolUseId } : {}),
+              payload: {
+                agentId: ev.taskId,
+                ...(ev.toolUseId ? { parentToolUseId: ev.toolUseId } : {}),
+                name: ev.subagentType,
+                status: 'started',
+                summary: ev.description,
+                raw: ev,
+              },
+            });
+          }
+          break;
+        case 'task_progress':
+        case 'task_updated':
+          stream.push({
+            kind: 'task',
+            status: 'updated',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: ev.type === 'task_progress'
+              ? {
+                  taskId: ev.taskId,
+                  description: ev.description,
+                  ...(ev.toolUseId ? { toolUseId: ev.toolUseId } : {}),
+                  ...(ev.subagentType ? { subagentType: ev.subagentType } : {}),
+                  ...(ev.usage ? { usage: ev.usage } : {}),
+                  ...(ev.lastToolName ? { lastToolName: ev.lastToolName } : {}),
+                  ...(ev.summary ? { summary: ev.summary } : {}),
+                  raw: ev,
+                }
+              : { taskId: ev.taskId, patch: ev.patch, raw: ev },
+          });
+          break;
+        case 'task_notification': {
+          const st = ev.status === 'failed' || ev.status === 'error'
+            ? 'failed'
+            : ev.status === 'cancelled'
+              ? 'cancelled'
+              : 'completed';
+          stream.push({
+            kind: 'task',
+            status: st,
+            sessionId,
+            turnId,
+            timestamp: ts,
+            ...(ev.toolUseId ? { parentToolUseId: ev.toolUseId } : {}),
+            payload: {
+              taskId: ev.taskId,
+              status: ev.status,
+              summary: ev.summary,
+              ...(ev.toolUseId ? { toolUseId: ev.toolUseId } : {}),
+              ...(ev.outputFile ? { outputFile: ev.outputFile } : {}),
+              ...(ev.usage ? { usage: ev.usage } : {}),
+              raw: ev,
+            },
+          });
+          if (subagentTasks.delete(ev.taskId) && ev.toolUseId) {
+            stream.push({
+              kind: 'subagent',
+              status: st,
+              sessionId,
+              turnId,
+              timestamp: ts,
+              agentId: ev.taskId,
+              parentToolUseId: ev.toolUseId,
+              payload: {
+                agentId: ev.taskId,
+                parentToolUseId: ev.toolUseId,
+                status: ev.status,
+                summary: ev.summary,
+                raw: ev,
+              },
+            });
+          }
+          break;
+        }
         case 'permission_denied':
           stream.push({
             kind: 'tool',
@@ -1159,11 +2636,28 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId,
             timestamp: ts,
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
             payload: {
               approvalId: ev.approvalId,
               tool: ev.tool,
               input: ev.input,
               ...(ev.itemId ? { itemId: ev.itemId } : {}),
+              ...(ev.suggestions ? { suggestions: ev.suggestions } : {}),
+              ...(ev.blockedPath ? { blockedPath: ev.blockedPath } : {}),
+              ...(ev.decisionReason ? { reason: ev.decisionReason } : {}),
+              ...(ev.decisionReasonType ? { reasonType: ev.decisionReasonType } : {}),
+              ...(ev.suppressAlwaysAllow !== undefined ? { suppressAlwaysAllow: ev.suppressAlwaysAllow } : {}),
+              ...(ev.defaultToNo !== undefined ? { defaultToNo: ev.defaultToNo } : {}),
+              ...(ev.requiresUserInteraction !== undefined
+                ? { requiresUserInteraction: ev.requiresUserInteraction }
+                : {}),
+              ...(ev.title ? { title: ev.title } : {}),
+              ...(ev.displayName ? { displayName: ev.displayName } : {}),
+              ...(ev.description ? { description: ev.description } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+              ...(ev.mcpServer ? { mcpServer: ev.mcpServer } : {}),
+              raw: ev,
             },
           });
           break;
@@ -1174,38 +2668,99 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId,
             timestamp: ts,
+            ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+            ...(ev.agentId ? { agentId: ev.agentId } : {}),
             payload: {
               questionId: ev.questionId,
               prompt: ev.prompt,
-              rawQuestions: ev.rawQuestions,
+              ...(ev.rawQuestions ? { rawQuestions: ev.rawQuestions } : {}),
+              ...(ev.itemId ? { itemId: ev.itemId } : {}),
+              ...(ev.agentId ? { agentId: ev.agentId } : {}),
+              raw: ev,
+            },
+          });
+          break;
+        case 'control_cancelled':
+          stream.push({
+            kind: 'interaction_resolved',
+            status: 'cancelled',
+            sessionId,
+            turnId,
+            timestamp: ts,
+            payload: {
+              interactionId: ev.requestId,
+              interactionKind: ev.kind,
+              resolution: 'cancelled',
+              raw: ev,
             },
           });
           break;
         case 'done': {
-          // result 事件的 usage 是单 turn 量(input_tokens /
-          // cache_read_input_tokens / output_tokens / total_cost_usd,
-          // 2.1.226 产物实测),累计成会话级 SessionUsage 供 /status 展示。
+          if (sawConversationReset) {
+            const finalResetId =
+              (ev.sessionId && ev.sessionId !== effectiveId ? ev.sessionId : undefined)
+              ?? pendingResetId;
+            this.commitResetSessionId(sessionId, finalResetId, cwd);
+            if (!sawAssistantOutput) {
+              stream.push({
+                kind: 'message',
+                status: 'delta',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                payload: {
+                  delta: '✓ 已清空 Claude 会话上下文（/clear）。',
+                  message: emptyAssistantMessage(sessionId),
+                },
+              });
+            }
+          }
           const u = ev.usage;
-          if (u) {
+          const modelUsage = normalizeClaudeModelUsage(ev.modelUsage);
+          const hasAuthoritativeUsage = Boolean(u || modelUsage || ev.totalCostUsd !== undefined);
+          let nextUsage: SessionUsage | undefined;
+          if (hasAuthoritativeUsage) {
             const prev = this.sessionUsage.get(sessionId) ?? {
               input_tokens: 0, output_tokens: 0, cache_read_tokens: 0,
               cache_creation_tokens: 0, total_cost_usd: 0, context_tokens: 0,
               context_limit: 0, turn_count: 0,
             };
-            const input = num(u.input_tokens);
-            const cacheRead = num(u.cache_read_input_tokens);
-            const cacheCreate = num(u.cache_creation_input_tokens);
+            const input = num(u?.input_tokens);
+            const output = num(u?.output_tokens);
+            const cacheRead = num(u?.cache_read_input_tokens);
+            const cacheCreate = num(u?.cache_creation_input_tokens);
+            const reasoning = num(u?.thinking_tokens ?? u?.reasoning_output_tokens);
+            const turnCost = ev.totalCostUsd !== undefined ? num(ev.totalCostUsd) : num(u?.total_cost_usd);
             const model = this.getModel(sessionId) ?? '';
-            this.sessionUsage.set(sessionId, {
+            const contextTokens = input + cacheRead + cacheCreate;
+            const modelLimit = firstPositiveModelWindow(modelUsage);
+            const contextLimit = modelLimit > 0 ? modelLimit : claudeContextWindow(model);
+            const contextUnavailable = !u || (contextTokens === 0 && output === 0);
+            const mergedModelUsage = mergeModelUsage(prev.model_usage, modelUsage);
+            nextUsage = {
               input_tokens: prev.input_tokens + input,
-              output_tokens: prev.output_tokens + num(u.output_tokens),
+              output_tokens: prev.output_tokens + output,
               cache_read_tokens: prev.cache_read_tokens + cacheRead,
               cache_creation_tokens: prev.cache_creation_tokens + cacheCreate,
-              total_cost_usd: prev.total_cost_usd + num(u.total_cost_usd),
-              // 上下文占用 = 本 turn 输入侧总量;窗口大小按模型目录约定。
-              context_tokens: input + cacheRead + cacheCreate,
-              context_limit: claudeContextWindow(model),
-              turn_count: prev.turn_count + 1,
+              total_cost_usd: prev.total_cost_usd + turnCost,
+              context_tokens: contextTokens,
+              context_limit: contextLimit,
+              turn_count: prev.turn_count + (typeof ev.numTurns === 'number' && ev.numTurns > 0 ? ev.numTurns : 1),
+              ...((prev.reasoning_output_tokens ?? 0) + reasoning > 0
+                ? { reasoning_output_tokens: (prev.reasoning_output_tokens ?? 0) + reasoning }
+                : {}),
+              ...(mergedModelUsage ? { model_usage: mergedModelUsage } : {}),
+              authoritative: true,
+              context_unavailable: contextUnavailable,
+            };
+            this.sessionUsage.set(sessionId, nextUsage);
+            stream.push({
+              kind: 'usage',
+              status: 'updated',
+              sessionId,
+              turnId,
+              timestamp: ts,
+              payload: { ...nextUsage },
             });
           }
           stream.push({
@@ -1214,7 +2769,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId,
             timestamp: ts,
-            payload: { reason: ev.isError ? 'failed' : 'completed', ...(ev.isError ? { error: ev.result } : {}) },
+            payload: {
+              reason: ev.isError ? 'failed' : 'completed',
+              ...(ev.isError ? { error: ev.result } : {}),
+              ...(nextUsage ? { usage: nextUsage } : {}),
+            },
           });
           stream.end();
           break;
@@ -1250,7 +2809,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const contentBlocks =
       blocks.length > 0 ? [...blocks, ...(prompt.trim() ? [{ type: 'text', text: prompt }] : [])] : undefined;
     void this.inner
-      .startTurn({ sessionId, prompt, cwd, isNew, model, effort, permissionMode, contentBlocks, onEvent: emit })
+      .startTurn({ sessionId: effectiveId, prompt, cwd, isNew, model, effort, permissionMode, contentBlocks, onEvent: emit })
       .catch((err: unknown) => {
         stream.push({
           kind: 'turn',
@@ -1267,16 +2826,47 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    this.inner.interrupt(sessionId);
+    this.inner.interrupt(this.resolveEffectiveSessionId(sessionId));
   }
 
-  async steer(sessionId: string, _turnId: string, text: string): Promise<void> {
-    await this.inner.steer(sessionId, text);
+  async steer(
+    sessionId: string,
+    _turnId: string,
+    input: string | MessageContentPart[] | SteerInput,
+  ): Promise<void> {
+    const raw =
+      input && typeof input === 'object' && !Array.isArray(input) && 'input' in input
+        ? input.input
+        : input;
+    await this.inner.steer(this.resolveEffectiveSessionId(sessionId), textOfInput(raw));
   }
 
-  async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
-    const behavior = decision === 'reject' ? 'deny' : 'allow';
-    await this.inner.resolveApproval(sessionId, approvalId, behavior);
+  async resolveApproval(
+    sessionId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+    details?: GranularApprovalDetails,
+  ): Promise<void> {
+    const isCancel = details?.decision === 'cancel';
+    const behavior =
+      decision === 'reject' || isCancel
+        ? 'deny'
+        : decision === 'approve_always'
+          ? 'approve_always'
+          : 'allow';
+    const opts: ResolveClaudeApprovalOptions = {};
+    if (details?.updatedPermissions) opts.updatedPermissions = details.updatedPermissions;
+    if (details?.updatedInput && typeof details.updatedInput === 'object' && !Array.isArray(details.updatedInput)) {
+      opts.updatedInput = details.updatedInput as Record<string, unknown>;
+    }
+    if (typeof details?.message === 'string') opts.message = details.message;
+    if (typeof details?.scope === 'string') opts.scope = details.scope;
+    if (isCancel) opts.interrupt = true;
+    if (Object.keys(opts).length > 0) {
+      await this.inner.resolveApproval(this.resolveEffectiveSessionId(sessionId), approvalId, behavior, opts);
+    } else {
+      await this.inner.resolveApproval(this.resolveEffectiveSessionId(sessionId), approvalId, behavior);
+    }
   }
 
   async resolveQuestion(
@@ -1284,7 +2874,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     questionId: string,
     answer: string | Record<string, string[]>,
   ): Promise<void> {
-    await this.inner.resolveQuestion(sessionId, questionId, answer);
+    await this.inner.resolveQuestion(this.resolveEffectiveSessionId(sessionId), questionId, answer);
   }
 
   async setGoal(): Promise<Record<string, unknown> | null> {
@@ -1305,6 +2895,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   /** 进程级清理:杀所有 running turn 进程。网关 shutdown 时调用。 */
   async dispose(): Promise<void> {
+    this.settings.close();
     await this.inner.close();
   }
 
@@ -1313,13 +2904,17 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    const alias = claudeCatalogAlias(model);
-    if (!alias) return;
-    this.settings.set('model', sessionId, alias);
+    if (!model.trim() || /qwen/i.test(model)) return;
+    const value = claudeCatalogAlias(model) ?? model.trim();
+    this.settings.set('model', sessionId, value);
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
     this.renames.set(sessionId, title);
+    await this.inner.rename(this.resolveEffectiveSessionId(sessionId), title).catch((err: unknown) => {
+      if (err instanceof ProviderError && err.code === 'not_found') return;
+      throw err;
+    });
   }
 
   // -- thinking / permission / plan / usage(持久态,turn 启动时透传 CLI 旗标) --
@@ -1331,7 +2926,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   getThinking(sessionId: string): string | undefined {
-    return this.settings.getString('thinking', sessionId);
+    return this.settings.getString('thinking', sessionId)
+      ?? this.settings.getString('thinking', '__default__');
   }
 
   async setPermission(sessionId: string, mode: string): Promise<void> {
@@ -1355,65 +2951,106 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     return this.sessionUsage.get(sessionId);
   }
 
+  async listMcpServers(sessionId?: string): Promise<Array<Record<string, unknown>>> {
+    const effectiveId = sessionId ? this.resolveEffectiveSessionId(sessionId) : undefined;
+    const cwd = effectiveId ? (this.sessionCwd.get(effectiveId) ?? this.sessionCwd.get(sessionId!)) : undefined;
+    return this.inner.mcpStatus(effectiveId, cwd);
+  }
+
   getModel(sessionId: string): string | undefined {
-    // 选择器只展示 CLI 别名。ANTHROPIC_MODEL / 旧会话里的 qwen 不是目录项。
+    // 忽略 ANTHROPIC_MODEL 与旧会话里的 qwen 残留值;保留官方别名与合法动态非 qwen 模型 ID。
     const stored = this.settings.getString('model', sessionId)
       ?? this.settings.getString('model', '__default__');
-    return claudeCatalogAlias(stored);
+    if (!stored || /qwen/i.test(stored)) return undefined;
+    return claudeCatalogAlias(stored) ?? stored;
   }
 
   /**
-   * 选择器目录永远来自 CLI initialize 握手(default/sonnet/fable/opus/haiku)。
-   * value 收成官方别名;display_name 用 Kimi Web 友好文案,不用握手里的
-   * 端点名(自定义端点常把 displayName 写成 qwen3.6-flash[1m],前端会按
-   * display_name 聚合成 "qwen3.6-flash[1m](default/opus/sonnet)")。
+   * 选择器目录来自 CLI initialize 握手:
+   * - 官方别名(default/sonnet/fable/opus/haiku)收敛为官方别名和友好 display_name,
+   *   绝不泄漏自定义端点的 qwen 名称;
+   * - 其他非 qwen 动态模型保留完整 ID 与能力元数据。
    * 握手失败如实抛错,不伪造空目录,也不进缓存。
    */
   async listModels(): Promise<NativeModel[]> {
     const builtin = await this.inner.listBuiltinModels();
-    const seen = new Set<ClaudeCatalogAlias>();
+    const seen = new Set<string>();
     const out: NativeModel[] = [];
     for (const model of builtin) {
+      if (!model.value || /qwen/i.test(model.value)) continue;
       const alias = claudeCatalogAlias(model.value);
-      if (!alias || seen.has(alias)) continue;
-      seen.add(alias);
+      const modelId = alias ?? model.value.trim();
+      if (!modelId || seen.has(modelId)) continue;
+      seen.add(modelId);
+      const safeResolved =
+        model.resolvedModel && !/qwen/i.test(model.resolvedModel) ? model.resolvedModel : undefined;
+      const safeDescription =
+        model.description && !/qwen/i.test(model.description) ? model.description : undefined;
+      const displayName = alias
+        ? CLAUDE_CATALOG_DISPLAY_NAME[alias]
+        : model.displayName && !/qwen/i.test(model.displayName)
+          ? model.displayName
+          : modelId;
+      const caps: string[] = [];
+      if (model.supportsEffort || model.supportsAdaptiveThinking) caps.push('thinking');
+      if (model.supportsAdaptiveThinking) caps.push('adaptive_thinking');
+      if (model.fastMode) caps.push('fast_mode');
       out.push({
         provider: 'claude',
-        model: alias,
-        display_name: CLAUDE_CATALOG_DISPLAY_NAME[alias],
-        max_context_size: claudeContextWindow(alias, model.value, model.resolvedModel),
-        capabilities: model.supportsEffort ? ['thinking'] : [],
+        model: modelId,
+        display_name: displayName,
+        ...(safeDescription ? { description: safeDescription } : {}),
+        max_context_size: claudeContextWindow(modelId, model.value, safeResolved),
+        capabilities: caps,
         ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
+        ...(model.supportsAdaptiveThinking !== undefined
+          ? { supportsAdaptiveThinking: model.supportsAdaptiveThinking }
+          : {}),
+        ...(model.supportsThinkingOff !== undefined
+          ? { supportsThinkingOff: model.supportsThinkingOff }
+          : {}),
+        ...(model.fastMode !== undefined ? { fastMode: model.fastMode } : {}),
+        ...(model.supportsAutoMode !== undefined ? { supportsAutoMode: model.supportsAutoMode } : {}),
+        ...(alias === 'default' ? { isDefault: true } : {}),
       });
     }
     return out;
   }
 
-  async listCommands(sessionId?: string): Promise<NativeCommand[]> {
+  async listCommands(sessionId?: string, cwdOverride?: string): Promise<NativeCommand[]> {
     // 项目级命令发现需要 cwd:本进程新建的会话在 sessionCwd 里;历史会话
     // 从 transcript 摘要列表查(热态 ~15ms)。
-    let cwd = sessionId ? this.sessionCwd.get(sessionId) : undefined;
-    if (!cwd && sessionId) {
+    const effectiveId = sessionId ? this.resolveEffectiveSessionId(sessionId) : undefined;
+    let cwd = cwdOverride ?? (effectiveId ? (this.sessionCwd.get(effectiveId) ?? this.sessionCwd.get(sessionId!)) : undefined);
+    if (!cwd && effectiveId) {
       const sessions = await this.inner.list().catch(() => []);
-      cwd = sessions.find((s) => s.sessionId === sessionId)?.cwd;
+      cwd = sessions.find((s) => s.sessionId === effectiveId || s.sessionId === sessionId)?.cwd;
     }
-    // 权威目录 = CLI initialize 握手回包(154 条:插件命令 + skills +
-    // 内置 compact/usage/mcp 等,2.1.226 实测),短命进程带 5 分钟缓存。
-    // 握手失败如实抛错(/commands 500),不吞成空目录冒充"没有命令"。
+    // 权威目录 = CLI initialize 握手回包(内置 + 插件 + skills,失败回退零子进程磁盘发现)。
     const catalog = await this.inner.listSlashCommands(cwd);
-    return listClaudeCommands(catalog);
+    return listClaudeCommands(catalog, this.lastTerminalSlashCommands);
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
-    // Claude 无原生 archive RPC;落本机 sidecar。true 写入,false 删除键。
     if (archived) this.settings.set('archived', sessionId, true);
     else this.settings.delete('archived', sessionId);
+    await this.inner.setArchived(this.resolveEffectiveSessionId(sessionId), archived).catch((err: unknown) => {
+      if (err instanceof ProviderError && err.code === 'not_found') return;
+      throw err;
+    });
   }
 
   async delete(sessionId: string): Promise<void> {
-    await this.inner.delete(sessionId);
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    await this.inner.delete(effectiveId);
+    if (effectiveId !== sessionId) {
+      await this.inner.delete(sessionId).catch(() => undefined);
+    }
+    this.resetSessionIds.delete(sessionId);
+    this.settings.delete('resetSessionId', sessionId);
     this.renames.delete(sessionId);
     this.sessionCwd.delete(sessionId);
+    this.sessionCwd.delete(effectiveId);
     this.settings.delete('model', sessionId);
     this.settings.delete('thinking', sessionId);
     this.settings.delete('permission', sessionId);
@@ -1423,15 +3060,17 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async fork(sessionId: string): Promise<Session> {
-    let cwd = this.sessionCwd.get(sessionId);
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    let cwd = this.sessionCwd.get(effectiveId) ?? this.sessionCwd.get(sessionId);
     if (!cwd) {
       const sessions = await this.inner.list().catch(() => []);
-      cwd = sessions.find((s) => s.sessionId === sessionId)?.cwd;
+      cwd = sessions.find((s) => s.sessionId === effectiveId || s.sessionId === sessionId)?.cwd;
     }
     cwd = cwd || process.cwd();
-    const { sessionId: newId } = await this.inner.forkSession(sessionId, cwd);
+    const { sessionId: newId } = await this.inner.forkSession(effectiveId, cwd);
     this.sessionCwd.set(newId, cwd);
     this.settings.copySession(sessionId, newId);
+    this.settings.delete('resetSessionId', newId);
     const title = this.renames.get(sessionId) ?? `Claude ${newId.slice(0, 8)}`;
     return {
       id: newId,
@@ -1450,22 +3089,24 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     title: string;
     cwd: string;
     updatedAt: string;
+    createdAt?: string;
+    firstPrompt?: string;
+    archived?: boolean;
   }): Session {
     // 历史会话(transcript 扫描而来)也回填 cwd——否则 resume 时 startTurn
     // 只能退回 HOME 目录启动 CLI(审查发现),项目级命令发现同样依赖它。
     if (s.cwd) this.sessionCwd.set(s.sessionId, s.cwd);
     const title = this.renames.get(s.sessionId) ?? (s.title || `Claude ${s.sessionId.slice(0, 8)}`);
-    const archived = this.settings.getBoolean('archived', s.sessionId) === true;
+    const archived = s.archived === true || this.settings.getBoolean('archived', s.sessionId) === true;
     return {
       id: s.sessionId,
       workspace_id: workspaceIdFromCwd(s.cwd, 'claude'),
       title,
-      created_at: s.updatedAt,
+      created_at: s.createdAt ?? s.updatedAt,
       updated_at: s.updatedAt,
       busy: false,
       archived,
-      // 0.37 Done 页会丢掉 last_prompt 为空的归档项;没有更准的预览时用标题顶上。
-      extras: { last_prompt: title },
+      extras: { last_prompt: s.firstPrompt || title },
       metadata: { cwd: s.cwd },
       provider: 'claude',
     };
@@ -1474,6 +3115,122 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   /** 网关 getSession 兜底用:新建未落盘的会话也能拿到真实 cwd,不造 HOME 假目录。 */
   getCwd(sessionId: string): string | undefined {
     return this.sessionCwd.get(sessionId);
+  }
+
+  async listSubagents(sessionId: string): Promise<Array<{
+    agentId: string;
+    parentToolUseId?: string;
+    description?: string;
+    subagentType?: string;
+  }>> {
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    const diskDetails: Array<{
+      agentId: string;
+      parentToolUseId?: string;
+      description?: string;
+      subagentType?: string;
+      taskId?: string;
+    }> = typeof (this.inner as any).listSubagentDetails === 'function'
+      ? await (this.inner as any).listSubagentDetails(effectiveId)
+      : (await this.inner.listSubagents(effectiveId)).map((id: string) => ({ agentId: id }));
+
+    const byAgentId = new Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>();
+    for (const d of diskDetails) {
+      byAgentId.set(d.agentId, {
+        agentId: d.agentId,
+        ...(d.parentToolUseId ? { parentToolUseId: d.parentToolUseId } : {}),
+        ...(d.description ? { description: d.description } : {}),
+        ...(d.subagentType ? { subagentType: d.subagentType } : {}),
+      });
+    }
+
+    const live = this.liveSubagents.get(effectiveId) ?? this.liveSubagents.get(sessionId) ?? [];
+    for (const l of live) {
+      if (!byAgentId.has(l.agentId)) {
+        byAgentId.set(l.agentId, {
+          agentId: l.agentId,
+          ...(l.parentToolUseId ? { parentToolUseId: l.parentToolUseId } : {}),
+          ...(l.description ? { description: l.description } : {}),
+          ...(l.subagentType ? { subagentType: l.subagentType } : {}),
+        });
+      }
+    }
+
+    return Array.from(byAgentId.values());
+  }
+
+  async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    let resolvedId = agentId;
+
+    const diskDetails: Array<{ agentId: string; parentToolUseId?: string; taskId?: string }> =
+      typeof (this.inner as any).listSubagentDetails === 'function'
+        ? await (this.inner as any).listSubagentDetails(effectiveId)
+        : [];
+    const matchedDisk = diskDetails.find(
+      (d) => d.agentId === agentId || d.parentToolUseId === agentId || d.taskId === agentId,
+    );
+    if (matchedDisk) {
+      resolvedId = matchedDisk.agentId;
+    } else {
+      const live = this.liveSubagents.get(effectiveId) ?? this.liveSubagents.get(sessionId) ?? [];
+      const matchedLive = live.find(
+        (l) => l.agentId === agentId || l.parentToolUseId === agentId || l.taskId === agentId,
+      );
+      if (matchedLive) {
+        resolvedId = matchedLive.agentId;
+      }
+    }
+
+    const rawMsgs = await this.inner.getSubagentMessages(effectiveId, resolvedId);
+    return rawMsgs.map((m, index) => {
+      const content: Message['content'] = m.blocks && m.blocks.length > 0
+        ? m.blocks.map((b) => {
+            if (b.type === 'thinking') return kimiHistoryPart({ type: 'thinking', thinking: b.text });
+            if (b.type === 'tool_use') {
+              return kimiHistoryPart({
+                type: 'tool_use',
+                tool_call_id: b.id,
+                tool_name: b.name,
+                input: b.input,
+                ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
+              });
+            }
+            if (b.type === 'tool_result') {
+              return kimiHistoryPart({
+                type: 'tool_result',
+                tool_call_id: b.tool_use_id,
+                output: b.content,
+                is_error: b.is_error === true,
+                ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
+              });
+            }
+            return { type: 'text' as const, text: b.text };
+          })
+        : [{ type: 'text' as const, text: m.text }];
+
+      const hasMeta = Boolean(m.model || m.isError || m.agentId || resolvedId || m.parentToolUseId || m.isCompactSummary);
+      return {
+        id: `sub_${createHash('sha256')
+          .update(JSON.stringify([sessionId, resolvedId, index, m.role, m.timestamp ?? '', m.text]))
+          .digest('hex')
+          .slice(0, 24)}`,
+        session_id: sessionId,
+        role: content.length > 0 && content.every((part) => part.type === 'tool_result') ? 'tool' : m.role,
+        content,
+        created_at: m.timestamp ?? nowIso(),
+        ...(hasMeta ? {
+          metadata: {
+            agent_id: resolvedId,
+            agentId: resolvedId,
+            ...(m.model ? { model: m.model } : {}),
+            ...(m.isError ? { is_error: true } : {}),
+            ...(m.parentToolUseId ? { parent_tool_use_id: m.parentToolUseId } : {}),
+            ...(m.isCompactSummary ? { is_compact_summary: true } : {}),
+          },
+        } : {}),
+      };
+    });
   }
 }
 
@@ -1527,6 +3284,74 @@ function codexApprovalPolicy(mode: string | undefined): 'untrusted' | 'on-reques
     case 'yolo': return 'never';
     default: return undefined;
   }
+}
+
+function normalizeClaudeModelUsage(
+  raw: Record<string, unknown> | undefined,
+): Record<string, ModelUsageEntry> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, ModelUsageEntry> = {};
+  for (const [modelName, val] of Object.entries(raw)) {
+    if (!val || typeof val !== 'object' || Array.isArray(val)) continue;
+    const rec = val as Record<string, unknown>;
+    const contextWindow = num(rec.contextWindow ?? rec.context_window);
+    const maxOutputTokens = num(rec.maxOutputTokens ?? rec.max_output_tokens);
+    const cacheRead = num(rec.cacheReadInputTokens ?? rec.cache_read_input_tokens ?? rec.cache_read_tokens);
+    const cacheCreate = num(rec.cacheCreationInputTokens ?? rec.cache_creation_input_tokens ?? rec.cache_creation_tokens);
+    const reasoning = num(rec.thinkingTokens ?? rec.reasoningOutputTokens ?? rec.reasoning_output_tokens);
+    const totalCost = num(rec.costUSD ?? rec.totalCostUsd ?? rec.total_cost_usd);
+    out[modelName] = {
+      input_tokens: num(rec.inputTokens ?? rec.input_tokens),
+      output_tokens: num(rec.outputTokens ?? rec.output_tokens),
+      ...(cacheRead > 0 ? { cache_read_tokens: cacheRead } : {}),
+      ...(cacheCreate > 0 ? { cache_creation_tokens: cacheCreate } : {}),
+      ...(reasoning > 0 ? { reasoning_output_tokens: reasoning } : {}),
+      ...(totalCost > 0 ? { total_cost_usd: totalCost } : {}),
+      ...(contextWindow > 0 ? { context_window: contextWindow } : {}),
+      ...(maxOutputTokens > 0 ? { max_output_tokens: maxOutputTokens } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function mergeModelUsage(
+  prev: Record<string, ModelUsageEntry | Record<string, unknown>> | undefined,
+  next: Record<string, ModelUsageEntry> | undefined,
+): Record<string, ModelUsageEntry | Record<string, unknown>> | undefined {
+  if (!next) return prev;
+  const merged: Record<string, ModelUsageEntry | Record<string, unknown>> = { ...(prev ?? {}) };
+  for (const [model, entry] of Object.entries(next)) {
+    const old = merged[model] as ModelUsageEntry | undefined;
+    if (!old) {
+      merged[model] = entry;
+      continue;
+    }
+    merged[model] = {
+      ...old,
+      ...entry,
+      input_tokens: num(old.input_tokens) + entry.input_tokens,
+      output_tokens: num(old.output_tokens) + entry.output_tokens,
+      cache_read_tokens: num(old.cache_read_tokens) + num(entry.cache_read_tokens),
+      cache_creation_tokens: num(old.cache_creation_tokens) + num(entry.cache_creation_tokens),
+      ...(num(old.reasoning_output_tokens) + num(entry.reasoning_output_tokens) > 0
+        ? { reasoning_output_tokens: num(old.reasoning_output_tokens) + num(entry.reasoning_output_tokens) }
+        : {}),
+      ...(num(old.total_cost_usd) + num(entry.total_cost_usd) > 0
+        ? { total_cost_usd: num(old.total_cost_usd) + num(entry.total_cost_usd) }
+        : {}),
+    };
+  }
+  return merged;
+}
+
+function firstPositiveModelWindow(modelUsage: Record<string, ModelUsageEntry> | undefined): number {
+  if (!modelUsage) return 0;
+  for (const entry of Object.values(modelUsage)) {
+    if (typeof entry.context_window === 'number' && entry.context_window > 0) {
+      return entry.context_window;
+    }
+  }
+  return 0;
 }
 
 /** kimi wire 权限值 → claude --permission-mode(2.1.226 choices 实测)。 */

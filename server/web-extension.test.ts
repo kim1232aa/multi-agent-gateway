@@ -69,7 +69,7 @@ async function loadShim(pathname = '/', options: { readyState?: string; querySel
 
 async function loadModeShim(): Promise<{ api: any; rows: any[] }> {
   const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
-  const rows = ['Plan', 'Swarm', 'Goal'].map((label) => {
+  const rows = ['Plan', 'Swarm', 'Goal', 'Tower'].map((label) => {
     const attributes = new Map<string, string>([['data-mode-id', label.toLowerCase()]]);
     const classes = new Set(['am-row']);
     const labelNode = { textContent: label, getAttribute: () => null };
@@ -127,7 +127,7 @@ async function loadModeShim(): Promise<{ api: any; rows: any[] }> {
 
 test('rewrites global API URLs for the selected provider and pins prefixed sessions', async () => {
   const api = await loadShim('/');
-  assert.equal(Array.from(api.providers).join(','), 'kimi,claude,codex,grok');
+  assert.equal(Array.from(api.providers).join(','), 'kimi,claude,codex,grok,pi');
   assert.equal(api.selectedProvider(), 'kimi');
   assert.equal(api.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'kimi');
   api.setProvider('claude');
@@ -136,15 +136,20 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   assert.equal(api.rewriteApiUrl('/api/v2/sessions').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v2/sessions:archive').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v2/sessions:restore').searchParams.get('provider'), 'claude');
-  // 设置页供应商目录是 Kimi 全局态,不跟 Agent 切换走。
+  // 设置页供应商目录、官方 MCP 认证为 Kimi 全局态;工作区项目配置目录/信任/主目录均按当前 provider 分流。
   assert.equal(api.rewriteApiUrl('/api/v1/providers').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/catalog/providers').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v2/mcp/auth-statuses').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/workspaces/project-config-dirs').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v1/workspaces/wd_1/trust').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v1/workspaces/wd_1/primary').searchParams.get('provider'), 'claude');
   // 登录是全局 Kimi 状态:/auth 永不带 provider,UI 只显示 Kimi 的登录态。
   assert.equal(api.rewriteApiUrl('/api/v1/auth').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/sessions/codex_abc/snapshot').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/files/abc').searchParams.get('provider'), 'claude');
-  // 0.39 remote control / capabilities / plugins 是 Kimi 全局态,不跟 Agent 走。
+  // 2.6.2 / 0.39 remote control / capabilities / plugins 是 Kimi 全局态,不跟 Agent 走。
   assert.equal(api.rewriteApiUrl('/v1/remote/devices').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/remote-control/status').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/capabilities').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/plugins').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/plugins/marketplace').searchParams.has('provider'), false);
@@ -154,6 +159,9 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   const grokSession = await loadShim('/sessions/grok_abc');
   assert.equal(grokSession.selectedProvider(), 'grok');
   assert.equal(grokSession.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'grok');
+  const piSession = await loadShim('/sessions/pi_abc');
+  assert.equal(piSession.selectedProvider(), 'pi');
+  assert.equal(piSession.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'pi');
 });
 
 test('routes only same-origin gateway WebSockets through the selected provider', async () => {
@@ -184,9 +192,79 @@ test('routes filesystem APIs through the selected provider', async () => {
   assert.equal(api.rewriteApiUrl('/api/v1/fs:home').searchParams.get('provider'), 'codex');
   assert.equal(api.rewriteApiUrl('/api/v1/fs:browse?path=%2Ftmp').searchParams.get('provider'), 'codex');
   assert.equal(api.rewriteApiUrl('/api/v1/workspace/fs:search').searchParams.get('provider'), 'codex');
-  // 网关没有 suggest/content 的本地实现;打标会让非 Kimi 路径 404。
-  assert.equal(api.rewriteApiUrl('/api/v1/workspace/fs:suggest').searchParams.has('provider'), false);
+  assert.equal(api.rewriteApiUrl('/api/v1/workspace/fs:list').searchParams.get('provider'), 'codex');
+  assert.equal(api.rewriteApiUrl('/api/v1/workspace/fs:suggest').searchParams.get('provider'), 'codex');
+  assert.equal(api.rewriteApiUrl('/api/v1/fs:suggest').searchParams.get('provider'), 'codex');
+  // 网关没有 /fs:content 的本地实现;打标会让非 Kimi 路径 404。
   assert.equal(api.rewriteApiUrl('/api/v1/fs:content').searchParams.has('provider'), false);
+});
+
+test('prevents cross-provider WebSocket subscribe frames from hitting the wrong backend', async () => {
+  const sentFrames: string[] = [];
+  const closedReasons: Array<{ code?: number; reason?: string }> = [];
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
+  class FakeSocket {
+    url: string;
+    readyState = 1;
+    onmessage: ((ev: { data: string }) => void) | null = null;
+    constructor(url: string) {
+      this.url = url;
+    }
+    send(data: string) { sentFrames.push(data); }
+    close(code?: number, reason?: string) { closedReasons.push({ code, reason }); }
+    addEventListener() {}
+  }
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+    WebSocket: FakeSocket,
+  };
+  const documentObject: any = {
+    readyState: 'loading',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    addEventListener: () => {},
+  };
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 }),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const api = windowObject.__multiAgent;
+  api.setProvider('codex');
+  const ws = new windowObject.WebSocket('ws://localhost:58630/api/v1/ws');
+  const received: Array<Record<string, unknown>> = [];
+  ws.onmessage = (ev: { data: string }) => received.push(JSON.parse(ev.data));
+
+  // Stale subscribe from previous session (claude_1) while current provider is codex -> acked locally, never sent!
+  ws.send(JSON.stringify({ type: 'subscribe', request_id: 'r1', session_id: 'claude_1', agent_ids: ['main'] }));
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(sentFrames.length, 0);
+  assert.deepEqual(received[0], { type: 'response', request_id: 'r1', code: 0, msg: 'success' });
+
+  // Valid matching subscribe -> sent through to server
+  ws.send(JSON.stringify({ type: 'subscribe', request_id: 'r2', session_id: 'codex_1', agent_ids: ['main'] }));
+  assert.equal(sentFrames.length, 1);
+
+  // Subscribe matching current selectedProvider (pi) on stale codex socket -> triggers reconnect instead of mismatch
+  api.setProvider('pi');
+  ws.send(JSON.stringify({ type: 'subscribe', request_id: 'r3', session_id: 'pi_1', agent_ids: ['main'] }));
+  assert.equal(sentFrames.length, 1);
+  assert.deepEqual(closedReasons, [{ code: 1000, reason: 'provider-mismatch-reconnect' }]);
 });
 
 test('renders the Agent switcher as an official-style segmented control', async () => {
@@ -601,7 +679,7 @@ test('keeps all providers when the meta request fails', async () => {
   const api = await loadDomShim({ metaFails: true });
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.deepEqual(Array.from(api.providers), ['kimi', 'claude', 'codex', 'grok']);
+  assert.deepEqual(Array.from(api.providers), ['kimi', 'claude', 'codex', 'grok', 'pi']);
 });
 
 test('reconciles the draft model to the provider catalog after switching', async () => {
@@ -681,16 +759,18 @@ test('removes and restores the Agent selector with the official account row', as
 test('shows only provider-supported modes', async () => {
   const { api, rows } = await loadModeShim();
   api.setProvider('codex');
-  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', '']);
-  api.setProvider('claude');
-  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none']);
+  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', '', 'none']);
   api.setProvider('grok');
-  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none']);
+  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', '', 'none']);
+  api.setProvider('claude');
+  assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none', 'none']);
+  api.setProvider('pi');
+  assert.deepEqual(rows.map((row) => row.style.display), ['none', 'none', 'none', 'none']);
   api.setProvider('kimi');
-  assert.deepEqual(rows.map((row) => row.style.display), ['', '', '']);
+  assert.deepEqual(rows.map((row) => row.style.display), ['', '', '', '']);
 });
 
-test('recognizes 0.37 composer mode rows from real zh/en labels without data-mode-id', async () => {
+test('recognizes 2.6.2 composer mode rows from real zh/en labels without data-mode-id', async () => {
   // 官方 .am-row 没有 data-mode-id,gateModes 只能靠文案识别;之前测试全预置了 id。
   const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
   const makeRow = (label: string) => {
@@ -712,12 +792,14 @@ test('recognizes 0.37 composer mode rows from real zh/en labels without data-mod
     makeRow('启用 swarm 模式'),
     makeRow('设定目标并持续推进'),
     makeRow('计划'),
+    makeRow('启用 tower 模式'),
   ];
   const rowsEn = [
     makeRow('Files'),
     makeRow('Turn swarm mode on'),
     makeRow('Set a goal and keep going'),
     makeRow('Plan'),
+    makeRow('Tower'),
   ];
   for (const rows of [rowsZh, rowsEn]) {
     const storage = new Map<string, string>();
@@ -758,8 +840,12 @@ test('recognizes 0.37 composer mode rows from real zh/en labels without data-mod
     assert.equal(rows[1].style.display, 'none');
     assert.equal(rows[2].style.display, 'none');
     assert.equal(rows[3].style.display, '');
+    assert.equal(rows[4].style.display, 'none');
     assert.equal(rows[1].getAttribute('data-mode-id'), 'swarm');
     assert.equal(rows[2].getAttribute('data-mode-id'), 'goal');
+    assert.equal(rows[4].getAttribute('data-mode-id'), 'tower');
+    api.setProvider('pi');
+    assert.equal(rows[3].style.display, 'none');
   }
 });
 
@@ -779,7 +865,7 @@ test('hides official slash items that are not Kimi slots for the current provide
     (nameEl as { parentElement?: typeof row }).parentElement = row;
     return { nameEl, row };
   };
-  const items = ['/compact', '/swarm', '/goal', '/btw', '/status', '/undo'].map(makeItem);
+  const items = ['/compact', '/swarm', '/goal', '/btw', '/status', '/undo', '/tower'].map(makeItem);
   const api = await loadShim('/', {
     querySelectorAll: (selector: string) => {
       if (selector === '.slash-menu .slash-name') return items.map((item) => item.nameEl);
@@ -787,27 +873,28 @@ test('hides official slash items that are not Kimi slots for the current provide
     },
   });
   api.setProvider('claude');
-  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', 'none']);
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', 'none', 'none']);
+  api.setProvider('pi');
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', 'none', 'none']);
   api.setProvider('grok');
-  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', 'none', 'none', '', '']);
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '', 'none']);
   api.setProvider('codex');
-  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '']);
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '', 'none']);
   api.setProvider('kimi');
-  assert.deepEqual(items.map((item) => item.row.style.display), ['', '', '', '', '', '']);
+  assert.deepEqual(items.map((item) => item.row.style.display), ['', '', '', '', '', '', '']);
 });
 
 test('leaves unlabeled official mode rows unchanged', async () => {
   const { api, rows } = await loadModeShim();
-  rows[1].querySelector = () => null;
-  rows[2].querySelector = () => null;
-  rows[1].textContent = '';
-  rows[2].textContent = '';
-  rows[1].setAttribute('data-mode-id', '');
-  rows[2].setAttribute('data-mode-id', '');
+  for (const idx of [1, 2, 3]) {
+    rows[idx].querySelector = () => null;
+    rows[idx].textContent = '';
+    rows[idx].setAttribute('data-mode-id', '');
+  }
 
   api.setProvider('claude');
 
-  assert.deepEqual(rows.map((row) => row.style.display), ['', '', '']);
+  assert.deepEqual(rows.map((row) => row.style.display), ['', '', '', '']);
 });
 
 test('ignores transcript DOM mutations outside extension controls', async () => {
@@ -1037,4 +1124,715 @@ test('resyncs when the mobile session list tabs are mounted', async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.ok(queryCount > initialQueryCount);
+});
+
+test('refreshes Kimi 2.6.2 Pinia stores and reconciles models when KimiWebClientFacade is absent', async () => {
+  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const storage = new Map<string, string>();
+  const fetchCalls: Array<{ url: string; method: string; auth?: string; body?: string }> = [];
+  const callLog: string[] = [];
+
+  const configStore = {
+    refreshServerMeta: async () => { callLog.push('refreshServerMeta'); },
+    loadConfig: async () => { callLog.push('loadConfig'); },
+  };
+  const modelsStore: any = {
+    models: [{ id: 'kimi-code/k3', model: 'kimi-code/k3' }],
+    defaultModel: 'kimi-code/k3',
+    draftModel: 'kimi-code/k3',
+    modelsReady: false,
+    setModels: (items: any[]) => { callLog.push('setModels'); modelsStore.models = items; },
+    setModelsReady: (v: boolean) => { modelsStore.modelsReady = v; },
+    setDefaultModel: (id: string) => { callLog.push(`setDefaultModel:${id}`); modelsStore.defaultModel = id; },
+    setDraftModel: (id: string) => { callLog.push(`setDraftModel:${id}`); modelsStore.draftModel = id; },
+  };
+  const workspacesStore = {
+    resetSessionGroupPagination: () => { callLog.push('resetSessionGroupPagination'); },
+    loadWorkspaces: async () => { callLog.push('loadWorkspaces'); },
+  };
+  const sessionListStore = {
+    resetSessionList: () => { callLog.push('resetSessionList'); },
+    fireFirstSessionGroupPage: () => {
+      callLog.push('fireFirstSessionGroupPage');
+      return { firstPage: Promise.resolve({}), input: {}, serial: 1, signal: {} };
+    },
+    loadInitialSessionsByWorkspace: async () => {
+      callLog.push('loadInitialSessionsByWorkspace');
+      return { sessions: [{ id: 'pi_1' }] };
+    },
+    setSessionsPreservingLiveUsage: (items: any[]) => {
+      callLog.push(`setSessionsPreservingLiveUsage:${items.length}`);
+    },
+  };
+  const sessionsStore = {
+    activeSessionId: 'kimi-1',
+    setActiveSessionId: (id: unknown) => {
+      callLog.push(`setActiveSessionId:${String(id)}`);
+      sessionsStore.activeSessionId = id as any;
+    },
+  };
+  const storeMap = new Map<string, any>([
+    ['kimi.config', configStore],
+    ['kimi.models', modelsStore],
+    ['kimi.workspaces', workspacesStore],
+    ['kimi.sessionList', sessionListStore],
+    ['kimi.sessions', sessionsStore],
+  ]);
+
+  const location: any = {
+    origin: 'http://localhost:58630',
+    pathname: '/sessions/kimi-1',
+    search: '',
+    hash: '#token=gw-secret',
+    reload: () => { throw new Error('must not reload page'); },
+  };
+  const appRoot = {
+    __vue_app__: {
+      _context: { provides: {} },
+      _instance: { setupState: {} },
+      config: { globalProperties: { $pinia: { _s: storeMap } } },
+    },
+  };
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: fakeElement('html'),
+    addEventListener: () => {},
+    createElement: (tag: string) => fakeElement(tag),
+    querySelector: (selector: string) => (selector === '#app' ? appRoot : null),
+    querySelectorAll: () => [],
+  };
+  const windowObject: any = {
+    location,
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
+    sessionStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
+    addEventListener: () => {},
+    dispatchEvent: () => true,
+    history: {
+      pushState: (...args: any[]) => {
+        if (typeof args[2] === 'string') location.pathname = new URL(args[2], location.origin).pathname;
+      },
+      replaceState: () => {},
+    },
+    WebSocket: class {
+      addEventListener() {}
+      close() {}
+    },
+  };
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    Event: class { type: string; constructor(t: string) { this.type = t; } },
+    PopStateEvent: class { type: string; constructor(t: string) { this.type = t; } },
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async (input: unknown, init?: { method?: string; headers?: Record<string, string>; body?: string }) => {
+      const url = String((input as { url?: string })?.url ?? input);
+      fetchCalls.push({
+        url,
+        method: init?.method ?? 'GET',
+        auth: init?.headers?.authorization,
+        body: init?.body,
+      });
+      if (url.includes('/api/v1/meta')) {
+        return new Response(JSON.stringify({ code: 0, data: { providers: ['kimi', 'claude', 'codex', 'grok', 'pi'] } }));
+      }
+      if (url.includes('/api/v1/models')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            items: [{
+              provider: 'pi',
+              model: 'anthropic/claude-sonnet-4',
+              display_name: 'Claude Sonnet 4',
+              max_context_size: 200000,
+              capabilities: ['thinking'],
+              support_efforts: ['low', 'high'],
+              default_effort: 'low',
+            }],
+          },
+        }));
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }));
+    },
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  windowObject.__multiAgent.switchProvider('pi');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(windowObject.__multiAgent.selectedProvider(), 'pi');
+  assert.equal(location.pathname, '/');
+  assert.equal(sessionsStore.activeSessionId, undefined);
+  assert.equal(modelsStore.models[0]?.displayName, 'Claude Sonnet 4');
+  assert.equal(modelsStore.models[0]?.maxContextSize, 200000);
+  assert.equal(modelsStore.defaultModel, 'anthropic/claude-sonnet-4');
+  assert.equal(modelsStore.draftModel, 'anthropic/claude-sonnet-4');
+  assert.ok(callLog.includes('refreshServerMeta'));
+  assert.ok(callLog.includes('loadConfig'));
+  assert.ok(callLog.includes('loadWorkspaces'));
+  assert.ok(callLog.includes('loadInitialSessionsByWorkspace'));
+  assert.ok(callLog.includes('setSessionsPreservingLiveUsage:1'));
+  const modelsReq = fetchCalls.find((c) => c.url.includes('/api/v1/models?provider=pi'));
+  assert.equal(modelsReq?.auth, 'Bearer gw-secret');
+  const configSync = fetchCalls.find((c) => c.url.includes('/api/v1/config?provider=pi') && c.method === 'POST');
+  assert.equal(JSON.parse(configSync?.body ?? '{}').default_model, 'anthropic/claude-sonnet-4');
+});
+
+test('closes stale gateway WebSockets on visibility/online wakeup and closes all on pagehide', async () => {
+  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const winListeners = new Map<string, Array<() => void>>();
+  const docListeners = new Map<string, Array<() => void>>();
+  const createdSockets: any[] = [];
+  let fakeNow = 100_000;
+
+  class FakeWs {
+    url: string;
+    readyState = 1;
+    closedWith: Array<{ code?: number; reason?: string }> = [];
+    private listeners = new Map<string, Array<() => void>>();
+    constructor(url: string | URL) {
+      this.url = String(url);
+      createdSockets.push(this);
+    }
+    addEventListener(type: string, fn: () => void) {
+      const list = this.listeners.get(type) ?? [];
+      list.push(fn);
+      this.listeners.set(type, list);
+    }
+    emit(type: string) {
+      for (const fn of this.listeners.get(type) ?? []) fn();
+    }
+    close(code?: number, reason?: string) {
+      this.readyState = 3;
+      this.closedWith.push({ code, reason });
+      this.emit('close');
+    }
+  }
+
+  const RealDate = Date;
+  class FakeDate extends RealDate {
+    static override now() { return fakeNow; }
+  }
+
+  const documentObject: any = {
+    readyState: 'complete',
+    visibilityState: 'visible',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    addEventListener: (name: string, fn: () => void) => {
+      const list = docListeners.get(name) ?? [];
+      list.push(fn);
+      docListeners.set(name, list);
+    },
+    createElement: () => ({}),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    WebSocket: FakeWs,
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: (name: string, fn: () => void) => {
+      const list = winListeners.get(name) ?? [];
+      list.push(fn);
+      winListeners.set(name, list);
+    },
+    history: { pushState() {}, replaceState() {} },
+  };
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    Date: FakeDate,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response('{}'),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const staleWs = new windowObject.WebSocket('ws://localhost:58630/api/v1/ws?client_id=stale');
+  const freshWs = new windowObject.WebSocket('ws://localhost:58630/api/v1/ws?client_id=fresh');
+  fakeNow += 40_000;
+  freshWs.emit('message');
+  fakeNow += 10_000; // staleWs silent for 50s (> 45s), freshWs silent for 10s
+  for (const fn of docListeners.get('visibilitychange') ?? []) fn();
+
+  assert.deepEqual(staleWs.closedWith, [{ code: 4008, reason: 'stale-wakeup' }]);
+  assert.deepEqual(freshWs.closedWith, []);
+
+  for (const fn of winListeners.get('pagehide') ?? []) fn();
+  assert.deepEqual(freshWs.closedWith, [{ code: 1000, reason: 'pagehide' }]);
+});
+
+test('blocks /plan for Pi and renders cached skill argument_hint in slash menu', async () => {
+  const hintsCreated: Array<{ className: string; textContent: string }> = [];
+  const makeRow = (name: string) => {
+    const attrs = new Map<string, string>();
+    const children: any[] = [];
+    const nameEl: any = { textContent: name, nextSibling: null };
+    const row: any = {
+      hidden: false,
+      style: { display: '' },
+      children: [nameEl],
+      getAttribute: (k: string) => attrs.get(k) ?? null,
+      setAttribute: (k: string, v: string) => attrs.set(k, v),
+      hasAttribute: (k: string) => attrs.has(k),
+      removeAttribute: (k: string) => attrs.delete(k),
+      querySelector: (sel: string) => sel === '.multi-agent-slash-hint' ? children.find((c) => c.className === 'multi-agent-slash-hint') ?? null : null,
+      insertBefore: (node: any) => {
+        node.remove = () => {
+          const i = children.indexOf(node);
+          if (i >= 0) children.splice(i, 1);
+        };
+        children.push(node);
+      },
+    };
+    nameEl.parentElement = row;
+    return { nameEl, row, children };
+  };
+  const rows = ['/plan', '/review', '/skill:deploy'].map(makeRow);
+
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: (sel: string) => sel === '.slash-menu .slash-name' ? rows.map((r) => r.nameEl) : [],
+    addEventListener: () => {},
+    createElement: () => {
+      const node = { className: '', textContent: '' };
+      hintsCreated.push(node);
+      return node;
+    },
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response(JSON.stringify({
+      code: 0,
+      data: {
+        skills: [
+          { name: 'review', description: 'Review changes', argument_hint: '[instructions]' },
+          { name: 'deploy', description: 'Deploy env', argument_hint: '<env>' },
+        ],
+      },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const api = windowObject.__multiAgent;
+  api.setProvider('codex');
+  await windowObject.fetch('/api/v1/sessions/codex_s1/skills');
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(rows[0].row.style.display, '');
+  assert.equal(rows[1].children[0]?.textContent, '[instructions]');
+  assert.equal(rows[2].children[0]?.textContent, '<env>');
+
+  api.setProvider('pi');
+  assert.equal(rows[0].row.style.display, 'none');
+  assert.equal(rows[1].children.length, 0);
+});
+
+test('slash menu keyboard navigation skips hidden rows and blocks hidden active Enter', async () => {
+  const makeSlashItem = (label: string, active: boolean) => {
+    const attrs = new Map<string, string>();
+    const classes = new Set<string>(active ? ['slash-item', 'active'] : ['slash-item']);
+    const nameEl: any = { textContent: label, nextSibling: null };
+    const row: any = {
+      hidden: false,
+      style: { display: '' },
+      classList: { contains: (c: string) => classes.has(c), add: (c: string) => classes.add(c), remove: (c: string) => classes.delete(c) },
+      getAttribute: (k: string) => attrs.get(k) ?? null,
+      setAttribute: (k: string, v: string) => attrs.set(k, v),
+      hasAttribute: (k: string) => attrs.has(k),
+      removeAttribute: (k: string) => attrs.delete(k),
+      querySelector: () => null,
+    };
+    nameEl.parentElement = row;
+    return { nameEl, row, classes };
+  };
+
+  const items = [makeSlashItem('/compact', true), makeSlashItem('/plan', false), makeSlashItem('/help', false)];
+  const dispatched: string[] = [];
+  const docListeners = new Map<string, Array<(e: any) => void>>();
+  const activeTarget: any = {
+    dispatchEvent: (ev: any) => {
+      dispatched.push(ev.key);
+      return true;
+    },
+  };
+  const menuEl: any = {
+    querySelectorAll: (sel: string) => sel === '.slash-item' ? items.map((i) => i.row) : [],
+  };
+
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    activeElement: activeTarget,
+    querySelector: (sel: string) => sel === '.slash-menu' ? menuEl : null,
+    querySelectorAll: (sel: string) => sel === '.slash-menu .slash-name' ? items.map((i) => i.nameEl) : [],
+    addEventListener: (type: string, fn: (e: any) => void) => {
+      const list = docListeners.get(type) ?? [];
+      list.push(fn);
+      docListeners.set(type, list);
+    },
+    createElement: () => ({ className: '', textContent: '' }),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+  class FakeKeyboardEvent {
+    key: string;
+    code: string;
+    constructor(_type: string, init: any) {
+      this.key = init.key;
+      this.code = init.code;
+    }
+  }
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    KeyboardEvent: FakeKeyboardEvent,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 }),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  windowObject.__multiAgent.setProvider('pi');
+  assert.equal(items[1].row.hasAttribute('data-multi-agent-slash-hidden'), true);
+
+  let prevented = false;
+  let stopped = false;
+  for (const fn of docListeners.get('keydown') ?? []) {
+    fn({
+      key: 'ArrowDown',
+      code: 'ArrowDown',
+      target: activeTarget,
+      preventDefault: () => { prevented = true; },
+      stopImmediatePropagation: () => { stopped = true; },
+    });
+  }
+  assert.equal(prevented, true);
+  assert.equal(stopped, true);
+  assert.deepEqual(dispatched, ['ArrowDown', 'ArrowDown']);
+
+  // Enter when active row itself is hidden must be blocked
+  items[0].classes.delete('active');
+  items[1].classes.add('active');
+  let enterPrevented = false;
+  for (const fn of docListeners.get('keydown') ?? []) {
+    fn({
+      key: 'Enter',
+      code: 'Enter',
+      target: activeTarget,
+      preventDefault: () => { enterPrevented = true; },
+      stopImmediatePropagation: () => {},
+    });
+  }
+  assert.equal(enterPrevented, true);
+});
+
+test('reads 2.6.2 credential field and isolates Pinia model/workspace state across rapid provider switches', async () => {
+  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const storage = new Map<string, string>();
+  storage.set(
+    'kimi-web.server-credential',
+    JSON.stringify({ version: 1, credential: 'cred-262-secret', expiresAt: Date.now() + 60_000 }),
+  );
+  const fetchCalls: Array<{ url: string; auth?: string }> = [];
+  let releaseCodex!: () => void;
+  const codexGate = new Promise<void>((resolve) => { releaseCodex = resolve; });
+
+  const configStore = {
+    refreshServerMeta: async () => {},
+    loadConfig: async () => {
+      if (windowObject.__multiAgent.selectedProvider() === 'pi') {
+        modelsStore.setDefaultModel('ccwu/gemini-3.8-flash');
+      } else if (windowObject.__multiAgent.selectedProvider() === 'codex') {
+        modelsStore.setDefaultModel('gemini-3.8-flash');
+      }
+    },
+  };
+  const modelsStore: any = {
+    models: [{ id: 'default', provider: 'claude', model: 'default' }],
+    defaultModel: 'default',
+    draftModel: 'default',
+    modelsReady: true,
+    setModels: (items: any[]) => { modelsStore.models = items; },
+    setModelsReady: (v: boolean) => { modelsStore.modelsReady = v; },
+    setDefaultModel: (id: string | null) => { modelsStore.defaultModel = id; },
+    setDraftModel: (id: string | null) => { modelsStore.draftModel = id; },
+  };
+  const workspacesStore: any = {
+    workspaces: [{ id: 'wd_claude_only', root: '/tmp/claude' }],
+    activeWorkspaceId: 'wd_claude_only',
+    selectWorkspace: (id: string | null) => { workspacesStore.activeWorkspaceId = id; },
+    resetSessionGroupPagination: () => {},
+    loadWorkspaces: async () => {
+      const p = windowObject.__multiAgent.selectedProvider();
+      workspacesStore.workspaces = p === 'pi' ? [{ id: 'wd_pi_only', root: '/tmp/pi' }] : [];
+    },
+  };
+  const sessionsStore: any = {
+    activeSessionId: 'claude_s1',
+    sessions: [{ id: 'claude_s1', workspaceId: 'wd_claude_only' }],
+    setActiveSessionId: (id: unknown) => { sessionsStore.activeSessionId = id; },
+    setSessions: (items: any[]) => { sessionsStore.sessions = items; },
+  };
+  const sessionListStore: any = {
+    resetSessionList: () => {},
+    fireFirstSessionGroupPage: () => ({ firstPage: Promise.resolve({}), input: {}, serial: 1, signal: {} }),
+    loadInitialSessionsByWorkspace: async () => ({ sessions: [] }),
+    setSessionsPreservingLiveUsage: () => {},
+  };
+  const storeMap = new Map<string, any>([
+    ['kimi.config', configStore],
+    ['kimi.models', modelsStore],
+    ['kimi.workspaces', workspacesStore],
+    ['kimi.sessions', sessionsStore],
+    ['kimi.sessionList', sessionListStore],
+  ]);
+
+  const location: any = { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' };
+  const appRoot = {
+    __vue_app__: {
+      _context: { provides: {} },
+      _instance: { setupState: {} },
+      config: { globalProperties: { $pinia: { _s: storeMap } } },
+    },
+  };
+  const windowObject: any = {
+    location,
+    localStorage: {
+      getItem: (k: string) => storage.get(k) ?? null,
+      setItem: (k: string, v: string) => storage.set(k, v),
+    },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    dispatchEvent: () => true,
+    history: { pushState() {}, replaceState() {} },
+    WebSocket: class { addEventListener() {} close() {} },
+  };
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: {
+      readyState: 'complete',
+      documentElement: fakeElement('html'),
+      addEventListener: () => {},
+      createElement: (tag: string) => fakeElement(tag),
+      querySelector: (sel: string) => (sel === '#app' ? appRoot : null),
+      querySelectorAll: () => [],
+    },
+    location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    Event: class { type: string; constructor(t: string) { this.type = t; } },
+    PopStateEvent: class { type: string; constructor(t: string) { this.type = t; } },
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async (input: unknown, init?: { headers?: Record<string, string> }) => {
+      const url = String((input as { url?: string })?.url ?? input);
+      fetchCalls.push({ url, auth: init?.headers?.authorization });
+      if (url.includes('/api/v1/meta')) {
+        return new Response(JSON.stringify({ code: 0, data: { providers: ['kimi', 'claude', 'codex', 'grok', 'pi'] } }));
+      }
+      if (url.includes('/api/v1/models?provider=codex')) {
+        await codexGate;
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { items: [{ provider: 'codex', model: 'gemini-3.8-flash', display_name: 'Gemini 3.8 Flash', is_default: true }] },
+        }));
+      }
+      if (url.includes('/api/v1/models?provider=pi')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            items: [
+              { provider: 'pi', model: 'ccwu/gemini-3.8-flash', display_name: 'Gemini 3.8 Flash (ccwu)', is_default: true },
+              { provider: 'pi', model: 'xai/grok-4.6', display_name: 'Grok 4.6 (xai)' },
+            ],
+          },
+        }));
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }));
+    },
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  windowObject.__multiAgent.setProvider('claude');
+  windowObject.__multiAgent.switchProvider('codex');
+  // Switching immediately clears stale Claude models/draft/workspaces before network settles
+  assert.equal(modelsStore.models.length, 0);
+  assert.equal(modelsStore.draftModel, null);
+  assert.equal(workspacesStore.workspaces.length, 0);
+  assert.equal(workspacesStore.activeWorkspaceId, null);
+  assert.equal(sessionsStore.sessions.length, 0);
+
+  // Rapid switch to Pi while Codex request is still pending
+  windowObject.__multiAgent.switchProvider('pi');
+  releaseCodex();
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(windowObject.__multiAgent.selectedProvider(), 'pi');
+  assert.equal(modelsStore.models[0]?.provider, 'pi');
+  assert.equal(modelsStore.models[0]?.id, 'ccwu/gemini-3.8-flash');
+  assert.equal(modelsStore.defaultModel, 'ccwu/gemini-3.8-flash');
+  assert.equal(modelsStore.draftModel, 'ccwu/gemini-3.8-flash');
+  assert.equal(workspacesStore.activeWorkspaceId, 'wd_pi_only');
+  assert.equal(fetchCalls.find((c) => c.url.includes('/api/v1/models?provider=pi'))?.auth, 'Bearer cred-262-secret');
+  assert.equal(fetchCalls.find((c) => c.url.includes('/api/v1/meta'))?.auth, 'Bearer cred-262-secret');
+});
+
+test('sends active ping probe on wakeup after 10s idle and closes at 3s if pong never arrives', async () => {
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
+  const docListeners = new Map<string, Array<() => void>>();
+  let fakeNow = 100_000;
+
+  class ProbeWs {
+    url: string;
+    readyState = 1;
+    sent: string[] = [];
+    closedWith: Array<{ code?: number; reason?: string }> = [];
+    private listeners = new Map<string, Array<(ev?: unknown) => void>>();
+    constructor(url: string | URL) {
+      this.url = String(url);
+    }
+    addEventListener(type: string, fn: (ev?: unknown) => void) {
+      const list = this.listeners.get(type) ?? [];
+      list.push(fn);
+      this.listeners.set(type, list);
+    }
+    emit(type: string, ev?: unknown) {
+      for (const fn of this.listeners.get(type) ?? []) fn(ev);
+    }
+    send(data: string) {
+      this.sent.push(data);
+    }
+    close(code?: number, reason?: string) {
+      this.readyState = 3;
+      this.closedWith.push({ code, reason });
+      this.emit('close');
+    }
+  }
+
+  const RealDate = Date;
+  class FakeDate extends RealDate {
+    static override now() { return fakeNow; }
+  }
+
+  const documentObject: any = {
+    readyState: 'complete',
+    visibilityState: 'visible',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    addEventListener: (name: string, fn: () => void) => {
+      const list = docListeners.get(name) ?? [];
+      list.push(fn);
+      docListeners.set(name, list);
+    },
+    createElement: () => ({}),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    WebSocket: ProbeWs,
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+  const scheduled: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
+  const fakeSetTimeout = (fn: () => void, ms = 0) => {
+    const entry = { fn, ms, cleared: false };
+    scheduled.push(entry);
+    return entry as unknown as ReturnType<typeof setTimeout>;
+  };
+  const fakeClearTimeout = (id: ReturnType<typeof setTimeout>) => {
+    const entry = id as unknown as { cleared?: boolean };
+    if (entry && typeof entry === 'object') entry.cleared = true;
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    Date: FakeDate,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response('{}'),
+    console,
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+  }, { filename: 'boot.js' });
+
+  const healthyWs = new windowObject.WebSocket('ws://localhost:58630/api/v1/ws?client_id=healthy');
+  const deadWs = new windowObject.WebSocket('ws://localhost:58630/api/v1/ws?client_id=dead');
+
+  // 15s idle (> 10s probe threshold, < 45s hard stale threshold)
+  fakeNow += 15_000;
+  for (const fn of docListeners.get('visibilitychange') ?? []) fn();
+
+  assert.deepEqual(healthyWs.sent, [JSON.stringify({ type: 'ping' })]);
+  assert.deepEqual(deadWs.sent, [JSON.stringify({ type: 'ping' })]);
+
+  // Healthy socket receives pong before 3s timer fires
+  fakeNow += 100;
+  healthyWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+
+  for (const t of scheduled) {
+    if (!t.cleared && t.ms === 3000) t.fn();
+  }
+
+  assert.deepEqual(healthyWs.closedWith, []);
+  assert.deepEqual(deadWs.closedWith, [{ code: 4008, reason: 'stale-wakeup' }]);
 });

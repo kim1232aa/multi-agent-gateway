@@ -118,7 +118,7 @@ export interface GrokAcpOptions {
   env?: Record<string, string>;
   /** Pass `--always-approve` (yolo / bypassPermissions only). */
   alwaysApprove?: boolean;
-  /** Timeout for initialize / session/new / load. Default 15_000. */
+  /** Timeout for initialize / session/new / load. Default 20_000. */
   requestTimeoutMs?: number;
   /** Timeout for session/prompt. 0 = none. Default 0. */
   promptTimeoutMs?: number;
@@ -185,7 +185,7 @@ export class GrokAcpClient {
     this.grokBin = options.grokBin;
     this.env = options.env ?? {};
     this.alwaysApprove = options.alwaysApprove === true;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 20_000;
     this.promptTimeoutMs = options.promptTimeoutMs ?? 0;
     this.onStderr = options.onStderr;
   }
@@ -1005,7 +1005,11 @@ function parseModelState(raw: unknown): GrokAcpModelState | null {
     const modelId = String(item.modelId ?? item.id ?? '');
     if (!modelId) continue;
     const meta = isRecord(item._meta) ? item._meta : {};
-    const rawEfforts = Array.isArray(meta.reasoningEfforts) ? meta.reasoningEfforts : [];
+    const rawEfforts = Array.isArray(item.reasoningEfforts)
+      ? item.reasoningEfforts
+      : Array.isArray(meta.reasoningEfforts)
+        ? meta.reasoningEfforts
+        : [];
     const reasoningEfforts: GrokAcpModelEffort[] = [];
     for (const eff of rawEfforts) {
       if (!isRecord(eff)) continue;
@@ -1019,15 +1023,32 @@ function parseModelState(raw: unknown): GrokAcpModelState | null {
         ...(typeof eff.default === 'boolean' ? { default: eff.default } : {}),
       });
     }
+    const supportsReasoningEffort =
+      typeof item.supportsReasoningEffort === 'boolean'
+        ? item.supportsReasoningEffort
+        : typeof meta.supportsReasoningEffort === 'boolean'
+          ? meta.supportsReasoningEffort
+          : undefined;
+    const totalContextTokens =
+      typeof item.totalContextTokens === 'number'
+        ? item.totalContextTokens
+        : typeof meta.totalContextTokens === 'number'
+          ? meta.totalContextTokens
+          : undefined;
+    const reasoningEffort =
+      typeof item.reasoningEffort === 'string'
+        ? item.reasoningEffort
+        : typeof meta.reasoningEffort === 'string'
+          ? meta.reasoningEffort
+          : undefined;
+
     availableModels.push({
       modelId,
       ...(typeof item.name === 'string' ? { name: item.name } : {}),
       ...(typeof item.description === 'string' ? { description: item.description } : {}),
-      ...(typeof meta.totalContextTokens === 'number' ? { totalContextTokens: meta.totalContextTokens } : {}),
-      ...(typeof meta.supportsReasoningEffort === 'boolean'
-        ? { supportsReasoningEffort: meta.supportsReasoningEffort }
-        : {}),
-      ...(typeof meta.reasoningEffort === 'string' ? { reasoningEffort: meta.reasoningEffort } : {}),
+      ...(typeof totalContextTokens === 'number' ? { totalContextTokens } : {}),
+      ...(typeof supportsReasoningEffort === 'boolean' ? { supportsReasoningEffort } : {}),
+      ...(typeof reasoningEffort === 'string' ? { reasoningEffort } : {}),
       ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
     });
   }

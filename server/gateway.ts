@@ -2,11 +2,11 @@
  * gateway:对外讲 Kimi kap-server 协议的 HTTP + WebSocket 服务。
  *
  * 路由规则:
- * - provider 通过 URL query `?provider=kimi|claude|codex|grok` 显式指定,或由会话 id 前缀推断。
- * - Kimi 会话(id 无前缀)→ 由 kimi-proxy 无损转发到 58627。
- * - Codex / Claude / Grok 会话 → facade 适配层,把各家协议翻译成 Kimi wire 格式。
+ * - provider 通过 URL query `?provider=kimi|claude|codex|grok|pi` 显式指定,或由会话 id 前缀推断。
+ * - Kimi 会话(id 无前缀)→ 由 kimi-proxy 无损转发到 kap-server。
+ * - Codex / Claude / Grok / Pi 会话 → facade 适配层,把各家协议翻译成 Kimi wire 格式。
  *
- * 只实现"能用 Kimi / Claude / Codex / Grok 会话"的最小 API 面:
+ * 只实现"能用 Kimi / Claude / Codex / Grok / Pi 会话"的最小 API 面:
  *   meta / auth / healthz / workspaces / sessions(CRUD+snapshot)/ prompts(提交/中止)
  *   / approvals / questions,加 /api/v1/ws 事件推送。
  */
@@ -16,22 +16,35 @@ import { createConnection } from 'node:net';
 import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import type { Duplex } from 'node:stream';
 import * as fsp from 'node:fs/promises';
-import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, readFileSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadWebShell, type WebShell } from './web-assets.js';
-import { createKimiHttpProxy, createKimiWsUpgrader } from './kimi-proxy.js';
+import { createKimiHttpProxy, createKimiWsUpgrader, isKimiApiPath } from './kimi-proxy.js';
 import { followKimiServer, spawnKimiServer, type KimiChild } from './kimi-child.js';
 import { createStaticServer } from './static.js';
 import { CodexProviderAdapter, ClaudeProviderAdapter, claudeContextWindow } from './facade.js';
 import { GrokProviderAdapter } from './grok-adapter.js';
-import { codexGatewayCommandNames, grokGatewayCommandNames } from './native-commands.js';
-import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsSearch } from './fs-local.js';
+import { PiProviderAdapter } from './pi-adapter.js';
+import { SettingsStore } from './settings-store.js';
+import {
+  claudeGatewayCommandNames,
+  claudeUnsupportedTuiCommandNames,
+  codexGatewayCommandNames,
+  grokGatewayCommandNames,
+  grokUnsupportedTuiCommandNames,
+  piGatewayCommandNames,
+  piUnsupportedTuiCommandNames,
+} from './native-commands.js';
+import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsRepoDiff, fsSearch } from './fs-local.js';
 import {
   buildLocalTranscriptPage,
+  extractSubagentIdFromOutput,
   LocalTranscriptHub,
+  normalizeKimiWebTool,
   type LocalTranscriptTurn,
   type TranscriptEmission,
+  type TranscriptTask,
 } from './local-transcript.js';
 import {
   demoEnabled,
@@ -46,8 +59,10 @@ import {
   ProviderError,
   isProviderName,
   type GatewayEvent,
+  type GranularApprovalDetails,
   type Message,
   type NativeCommand,
+  type NativeModel,
   type ProviderAdapter,
   type ProviderName,
   type Session,
@@ -61,6 +76,9 @@ import {
 // 配置
 // ---------------------------------------------------------------------------
 
+type LocalProviderName = Exclude<ProviderName, 'kimi'>;
+const LOCAL_PROVIDERS: readonly LocalProviderName[] = ['codex', 'claude', 'grok', 'pi'];
+
 export interface GatewayOptions {
   port?: number;
   host?: string;
@@ -69,11 +87,12 @@ export interface GatewayOptions {
   codex?: CodexProviderAdapter;
   claude?: ClaudeProviderAdapter;
   grok?: ProviderAdapter;
+  pi?: ProviderAdapter;
   /**
    * Kimi 路径的上游来源:
    * - 'spawn'(默认):网关自起 `kimi web` 子进程并解析它的 token;
    * - { upstream, token }:用外部 kap-server(需调用方提供 token);
-   * - 'off':不提供 Kimi 路径(仅剩 Codex/Claude/Grok)。
+   * - 'off':不提供 Kimi 路径(仅剩 Codex/Claude/Grok/Pi)。
    */
   kimi?: 'spawn' | 'off' | { upstream: string; token?: string };
   /** kimi-web 构建产物目录(SPA 静态托管);默认仓库 web-dist。 */
@@ -88,7 +107,7 @@ export interface GatewayOptions {
    */
   settingsDir?: string;
   /**
-   * 对外展示的可用 provider(默认按本机二进制探测:claude/codex/grok 没装就不出现
+   * 对外展示的可用 provider(默认按本机二进制探测:claude/codex/grok/pi 没装就不出现
    * 在选择器里,避免用户点了才发现不存在)。测试可显式覆盖。
    */
   availableProviders?: ProviderName[];
@@ -103,6 +122,8 @@ export function detectAvailableProviders(env: NodeJS.ProcessEnv = process.env): 
   if (existsSync(grokBin) || onPath('grok', env.PATH)) providers.push('grok');
   const codexPath = env.CODEX_PATH;
   if (codexPath ? existsSync(codexPath) : onPath('codex', env.PATH)) providers.push('codex');
+  const piBin = env.PI_BIN ?? path.join(os.homedir(), '.local', 'bin', 'pi');
+  if (existsSync(piBin) || onPath('pi', env.PATH)) providers.push('pi');
   return providers;
 }
 
@@ -132,10 +153,11 @@ const API = '/api/v1';
 // provider 路由:id 前缀 ↔ provider
 // ---------------------------------------------------------------------------
 
-const ID_PREFIX: Record<Exclude<ProviderName, 'kimi' | 'pi'>, string> = {
+const ID_PREFIX: Record<LocalProviderName, string> = {
   codex: 'codex_',
   claude: 'claude_',
   grok: 'grok_',
+  pi: 'pi_',
 };
 
 /** Preview transcripts. Bound per startGateway() instance — never module-global. */
@@ -148,18 +170,27 @@ function mergeDemoSessions(provider: ProviderName, items: Session[], demoActive:
   return [...items, ...extra].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 }
 
+function tryHistoryWithDemo(
+  adapter: ProviderAdapter | null,
+  provider: ProviderName,
+  nativeId: string,
+  demoActive: boolean,
+): Promise<Message[] | null> {
+  if (demoActive) {
+    const demo = getDemoHistory(provider, nativeId);
+    if (demo) return Promise.resolve(demo);
+  }
+  if (!adapter) return Promise.resolve([]);
+  return adapter.getHistory(nativeId).catch(() => null);
+}
+
 function historyWithDemo(
   adapter: ProviderAdapter | null,
   provider: ProviderName,
   nativeId: string,
   demoActive: boolean,
 ): Promise<Message[]> {
-  if (demoActive) {
-    const demo = getDemoHistory(provider, nativeId);
-    if (demo) return Promise.resolve(demo);
-  }
-  if (!adapter) return Promise.resolve([]);
-  return adapter.getHistory(nativeId).catch(() => [] as Message[]);
+  return tryHistoryWithDemo(adapter, provider, nativeId, demoActive).then((h) => h ?? []);
 }
 
 function kimiDemoAdapter(): ProviderAdapter {
@@ -204,8 +235,8 @@ function kimiDemoAdapter(): ProviderAdapter {
   };
 }
 
-function isLocalProvider(value: string | null | undefined): value is Exclude<ProviderName, 'kimi' | 'pi'> {
-  return value === 'claude' || value === 'codex' || value === 'grok';
+function isLocalProvider(value: string | null | undefined): value is LocalProviderName {
+  return value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi';
 }
 
 /** Official grok-4.6 / grok-4.5 window (https://docs.x.ai/developers/models/grok-4.6). */
@@ -238,8 +269,8 @@ async function generateLocalSessionTitle(adapter: ProviderAdapter, nativeId: str
   return existing || 'New session';
 }
 
-function providerFromSessionId(id: string): { provider: Exclude<ProviderName, 'pi'>; nativeId: string } {
-  for (const [provider, prefix] of Object.entries(ID_PREFIX) as [Exclude<ProviderName, 'kimi' | 'pi'>, string][]) {
+function providerFromSessionId(id: string): { provider: ProviderName; nativeId: string } {
+  for (const [provider, prefix] of Object.entries(ID_PREFIX) as [LocalProviderName, string][]) {
     if (id.startsWith(prefix)) {
       return { provider, nativeId: id.slice(prefix.length) };
     }
@@ -314,6 +345,15 @@ interface ActiveTurn {
   pendingApprovals: Map<string, { tool: string; input?: unknown; itemId?: string }>;
   pendingQuestions: Map<string, { prompt: string; rawQuestions?: unknown[] }>;
   transcript?: LocalTranscriptTurn;
+  v262TurnId: string;
+  v262Ordinal: number;
+  v262StartedAt: string;
+  v262StepIndex: number;
+  v262AssistantItemId?: string;
+  v262ThinkingItemId?: string;
+  v262ThinkingStartedAt?: number;
+  v262Items: Array<Record<string, unknown>>;
+  v262ItemMap: Map<string, Record<string, unknown>>;
 }
 
 /** 排队中的 prompt(busy 时提交;对齐 kap-server 的 queued 语义)。 */
@@ -330,6 +370,7 @@ class SessionHub {
   readonly queued = new Map<string, QueuedPrompt[]>();
   readonly transcript = new LocalTranscriptHub();
   private readonly listeners = new Map<string, Set<(ev: Record<string, unknown>) => void>>();
+  private readonly v262Listeners = new Map<string, Set<(ev: Record<string, unknown>) => void>>();
   private readonly globalListeners = new Set<(ev: Record<string, unknown>) => void>();
   /**
    * 每会话的非 volatile 帧环形缓冲(WS 断线重连后按 cursor 重放)。
@@ -361,6 +402,24 @@ class SessionHub {
     return () => {
       set.delete(fn);
     };
+  }
+
+  subscribeV262(sessionId: string, fn: (ev: Record<string, unknown>) => void): () => void {
+    let set = this.v262Listeners.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.v262Listeners.set(sessionId, set);
+    }
+    set.add(fn);
+    return () => {
+      set.delete(fn);
+    };
+  }
+
+  broadcastV262(sessionId: string, payload: Record<string, unknown>): void {
+    const targets = this.v262Listeners.get(sessionId);
+    if (!targets || targets.size === 0) return;
+    for (const fn of targets) fn(payload);
   }
 
   subscribeGlobal(fn: (ev: Record<string, unknown>) => void): () => void {
@@ -420,17 +479,33 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const settingsDir = options.settingsDir
     ?? process.env.GATEWAY_SETTINGS_DIR
     ?? path.join(os.homedir(), '.config', 'multi-agent-gateway');
-  const adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter> = {
+  const uploadStore = createUploadStore(settingsDir);
+  const workspaceStore = new SettingsStore(
+    options.settingsDir || process.env.GATEWAY_SETTINGS_DIR
+      ? path.join(settingsDir, 'workspaces.json')
+      : undefined,
+  );
+  const adapters: Record<LocalProviderName, ProviderAdapter> = {
     codex: options.codex ?? new CodexProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.codex.json') }),
-    claude: options.claude ?? new ClaudeProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.claude.json') }),
+    claude: options.claude ?? new ClaudeProviderAdapter({
+      settingsPath: path.join(settingsDir, 'session-settings.claude.json'),
+      claudeBin: process.env.CLAUDE_BIN,
+    }),
     grok: options.grok ?? new GrokProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.grok.json'),
       grokBin: process.env.GROK_BIN,
+    }),
+    pi: options.pi ?? new PiProviderAdapter({
+      settingsPath: path.join(settingsDir, 'session-settings.pi.json'),
+      piBin: process.env.PI_BIN,
     }),
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
   const sessionPageCursors = new Map<string, string>();
+  const manifestPathForVersion = options.manifestPath
+    ?? (options.staticDir ? path.join(path.resolve(options.staticDir, '..'), 'web-origin-manifest.json') : undefined);
+  const kimiCompatVersion = readManifestCompatVersion(manifestPathForVersion);
 
   // 解析 Kimi 上游:没有官方 `/web` 实例时才自起 fallback Core。
   // owned fallback 始终作为 standby 保留；当前 shell 执行 `/web` 后改接该
@@ -526,17 +601,20 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
   const server = createServer((req, res) => {
     void (async () => {
-      // 鉴权先于一切路由和代理(审查发现:provider=kimi 透传曾在鉴权之前执行,
-      // 无凭证请求被重写 Authorization 后直达上游 = 完整鉴权绕过)。healthz 免鉴权;
-      // 与 route 内的检查并存(双保险),WS 握手走 upgrade 通道不受影响。
+      // 鉴权先于一切路由和代理(含 /api/v1, /api/v2, /v1/remote):无凭证请求
+      // 绝不能绕过直接进 proxyKimiHttp 换票直达上游。healthz 免鉴权;OPTIONS 放行给 CORS。
       const preAuthUrl = new URL(req.url ?? '/', 'http://localhost');
-      // CORS preflight(OPTIONS)不含凭据,必须放行到 route 的 OPTIONS 处理器。
-      if (req.method !== 'OPTIONS' && (preAuthUrl.pathname.startsWith(API) || preAuthUrl.pathname.startsWith('/api/v2')) && preAuthUrl.pathname !== `${API}/healthz` && !authed(req, token)) {
+      if (
+        req.method !== 'OPTIONS'
+        && (isKimiApiPath(req.url) || preAuthUrl.pathname === `${API}/ws`)
+        && preAuthUrl.pathname !== `${API}/healthz`
+        && !authed(req, token)
+      ) {
         fail(res, 401, 40101, 'Unauthorized', ulid());
         return;
       }
       // Kimi 会话(id 无前缀)的 REST → 无损代理到原版 kap-server。
-      if (shouldProxyToKimi(req)) {
+      if (shouldProxyToKimi(req, (id) => uploadStore.has(id))) {
         await refreshKimi();
         if (kimiHttp) {
           const handled = await kimiHttp(req, res);
@@ -546,7 +624,6 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       await route(req, res);
     })().catch((err: unknown) => {
       const requestId = ulid();
-      // 以前零服务端日志:运维只能在浏览器看到 500,网关日志一片空白。
       console.error(
         `[gateway] request failed ${requestId} ${req.method} ${req.url}:`,
         err instanceof Error ? err.stack ?? err.message : err,
@@ -570,7 +647,6 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
 
     // 非 API 路径 → SPA 静态托管;没配静态目录则 404。
-    // /api/v2/sessions 及 :archive/:restore 是 0.37 Done/会话管理页用的本地路由。
     if (
       !url.pathname.startsWith(API)
       && url.pathname !== '/api/v2/sessions'
@@ -596,12 +672,22 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const archived = url.searchParams.get('meta.archived') === 'true';
       const view = url.searchParams.get('view');
       const v1 = new URL(url.href);
-      // 侧栏 load 走 view=by_workspace,不带 page_size;分组需要全量会话,不能停在默认 50。
+      // 侧栏 load 走 view=by_workspace,不带 page_size;分组需要全量会话,不能在 100 条处截断。
       v1.searchParams.set('page_size', view === 'by_workspace' ? '500' : (url.searchParams.get('page_size') || '50'));
       if (archived) v1.searchParams.set('archived_only', 'true');
       const pageToken = url.searchParams.get('page_token');
       if (pageToken) v1.searchParams.set('before_id', pageToken);
-      const data = await listSessions(adapters, kimiFetch, v1, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive);
+      const data = await listSessions(
+        adapters,
+        kimiFetch,
+        v1,
+        provider,
+        (sid) => hub.busy.has(sid),
+        sessionPageCursors,
+        demoActive,
+        view === 'by_workspace',
+        workspaceStore,
+      );
       const items = ((data.items ?? []) as Record<string, unknown>[]).map((item) => sessionV2Dto(item, Boolean(item.busy)));
       if (view === 'by_workspace') {
         return ok(res, sessionGroupsV2(items, url), requestId);
@@ -609,8 +695,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       return ok(res, { items, has_more: Boolean(data.has_more), next_page_token: data.has_more ? String(items[items.length - 1]?.id ?? '') : null }, requestId);
     }
 
-    // 0.37 会话管理页批量归档/恢复。claude/codex 走本地 adapter;kimi 不该到这里
-    // (shouldProxyToKimi 已把无 provider 前缀的 /api/v2 交给上游)。
+    // 会话管理页批量归档/恢复。claude/codex/grok/pi 走本地 adapter;kimi 走上游。
     if (
       (url.pathname === '/api/v2/sessions:archive' || url.pathname === '/api/v2/sessions:restore')
       && req.method === 'POST'
@@ -619,8 +704,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const body = (await readBody(req).catch(() => ({}))) as { ids?: unknown };
       const ids = Array.isArray(body.ids) ? body.ids.filter((id): id is string => typeof id === 'string' && id.length > 0) : [];
       if (ids.length === 0) throw new ProviderError('invalid_request', 'ids required', 400);
-      // 先全量校验,避免中途抛错造成"前面已归档、响应却是失败"。
-      const planned: Array<{ id: string; provider: Exclude<ProviderName, 'kimi' | 'pi'>; nativeId: string }> = [];
+      const planned: Array<{ id: string; provider: LocalProviderName; nativeId: string }> = [];
       for (const id of ids) {
         const { provider: sp, nativeId } = providerFromSessionId(id);
         if (sp === 'kimi') {
@@ -634,9 +718,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       for (const item of planned) {
         try {
           await adapters[item.provider].setArchived!(item.nativeId, archived);
-          // busy 会话保留 replay,避免归档瞬间把进行中 turn 的补帧清掉。
           if (archived && !hub.busy.has(item.id)) hub.drop(item.id);
           clearSessionPageCursors(sessionPageCursors, item.id);
+          hub.broadcast(item.id, frame(item.id, hub, archived ? 'event.session.archived' : 'event.session.restored', { sessionId: item.id }));
           succeeded.push(item.id);
         } catch (err) {
           failed.push({ id: item.id, reason: err instanceof Error ? err.message : String(err) });
@@ -654,11 +738,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     // --- 元信息 ---
     if (sub === '/healthz') return ok(res, { ok: true }, requestId);
     if (sub === '/meta') {
-      // 官方字段从 Kimi 上游合并(版本/能力展示不受影响),providers 是本机
-      // 实际安装的 provider——前端选择器只显示这些。
       const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
       return ok(res, {
-        server_version: 'multi-agent-gateway/0.1 (Kimi 0.40.1 compatible)',
+        server_version: `multi-agent-gateway/0.1 (Kimi ${kimiCompatVersion} compatible)`,
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
         server_id: 'multi-agent-gateway',
         started_at: new Date(0).toISOString(),
@@ -749,11 +831,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
     }
     if (sub === '/models' && req.method === 'GET') {
-      // claude/codex/grok → 各自 adapter 的原生目录。失败必须如实报错(500),
+      // claude/codex/grok/pi → 各自 adapter 的原生目录。失败必须如实报错(500),
       // 不能吞成空列表或演示目录——那会把"没装好/握手失败"显示成"有模型"。
       if (isLocalProvider(provider)) {
         const adapter = adapters[provider];
-        const items = adapter.listModels ? await adapter.listModels() : [];
+        const rawItems = adapter.listModels ? await adapter.listModels() : [];
+        const items = rawItems.map((model) => wireModelDto(model));
         return ok(res, { items }, requestId);
       }
       if (!kimi) {
@@ -774,15 +857,16 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/files' && req.method === 'POST') {
       const part = await readMultipart(req);
       if (!part) throw new ProviderError('invalid_request', 'expected multipart/form-data with a file field', 400);
-      return ok(res, await storeUpload(part.filename, part.contentType, part.data), requestId);
+      return ok(res, await uploadStore.store(part.filename, part.contentType, part.data), requestId);
     }
     const fileMatch = /^\/files\/([^/:]+)$/.exec(sub);
     if (fileMatch && req.method === 'GET') {
-      const f = await readUpload(decodeURIComponent(fileMatch[1]));
+      const f = await uploadStore.read(decodeURIComponent(fileMatch[1]));
       if (!f) return fail(res, 404, 40401, 'file not found', requestId);
       res.writeHead(200, {
         'content-type': f.media_type,
         'content-length': String(f.data.byteLength),
+        'x-content-type-options': 'nosniff',
         'cache-control': 'no-store',
         'access-control-allow-origin': '*',
       });
@@ -808,16 +892,98 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
     const workspaceSkills = /^\/workspaces\/([^/:]+)\/skills$/.exec(sub);
     if (workspaceSkills && isLocalProvider(provider) && req.method === 'GET') {
-      return ok(res, { skills: await adapterSkills(adapters[provider], provider) }, requestId);
+      const wid = decodeURIComponent(workspaceSkills[1]);
+      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore).catch(() => ({ items: [] }));
+      const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
+      const hit = wsItems.find((w) => w.id === wid);
+      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : undefined;
+      return ok(res, { skills: await adapterSkills(adapters[provider], undefined, cwd) }, requestId);
     }
 
     // --- workspaces ---
+    if (sub === '/workspaces/project-config-dirs' && req.method === 'GET' && (!kimi || isLocalProvider(provider))) {
+      return ok(res, { additional_dirs: [] }, requestId);
+    }
+    const workspaceTrustMatch = /^\/workspaces\/([^/:]+)\/trust$/.exec(sub);
+    if (workspaceTrustMatch && (req.method === 'GET' || req.method === 'POST') && (!kimi || isLocalProvider(provider))) {
+      return ok(res, { trusted: true }, requestId);
+    }
+    const workspacePrimaryMatch = /^\/workspaces\/([^/:]+)\/primary$/.exec(sub);
+    if (workspacePrimaryMatch && req.method === 'POST' && (!kimi || isLocalProvider(provider))) {
+      const wid = decodeURIComponent(workspacePrimaryMatch[1]);
+      const body = (await readBody(req).catch(() => ({}))) as { path?: string };
+      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
+      const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
+      const hit = wsItems.find((w) => w.id === wid);
+      const root = typeof body.path === 'string' && body.path.trim()
+        ? body.path.trim()
+        : (typeof hit?.root === 'string' ? hit.root : '');
+      const existingDirs = Array.isArray(hit?.additional_dirs)
+        ? hit.additional_dirs.filter((d): d is string => typeof d === 'string' && d.trim().length > 0 && d !== root)
+        : [];
+      const nextName = typeof hit?.name === 'string' ? hit.name : undefined;
+      const dto: Record<string, unknown> = hit
+        ? {
+            ...hit,
+            id: wid,
+            root,
+            additional_dirs: existingDirs,
+            last_opened_at: new Date().toISOString(),
+          }
+        : {
+            ...workspaceDto(root || os.homedir(), nextName, { kind: 'managed', additionalDirs: existingDirs }),
+            id: wid,
+            root,
+          };
+      if (isLocalProvider(provider) && root) {
+        upsertStoredWorkspace(workspaceStore, provider, {
+          id: wid,
+          root,
+          name: typeof dto.name === 'string' ? dto.name : undefined,
+          kind: 'managed',
+          additional_dirs: existingDirs,
+          created_at: typeof dto.created_at === 'string' ? dto.created_at : undefined,
+          last_opened_at: String(dto.last_opened_at),
+        });
+      }
+      return ok(res, dto, requestId);
+    }
     if (sub === '/workspaces' && req.method === 'GET') {
-      return ok(res, await listWorkspaces(adapters, kimiFetch, provider, demoActive), requestId);
+      return ok(res, await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore), requestId);
     }
     if (sub === '/workspaces' && req.method === 'POST') {
-      const body = (await readBody(req)) as { root: string; name?: string };
-      return ok(res, workspaceDto(body.root, body.name), requestId);
+      const body = (await readBody(req)) as { root?: unknown; name?: unknown; additional_dirs?: unknown };
+      const root = typeof body.root === 'string' ? body.root.trim() : '';
+      if (!root) {
+        throw new ProviderError('invalid_request', 'workspace root is required', 400);
+      }
+      const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
+      const additionalDirs = Array.isArray(body.additional_dirs)
+        ? body.additional_dirs.filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
+        : [];
+      const baseDto = workspaceDto(root, name, { kind: 'managed', additionalDirs });
+      if (isLocalProvider(provider)) {
+        const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore).catch(() => ({ items: [] }));
+        const existing = ((all as { items?: Array<Record<string, unknown>> }).items ?? []).find((w) => w.id === baseDto.id);
+        const createdAt = typeof existing?.created_at === 'string' ? existing.created_at : String(baseDto.created_at);
+        const sessionCount = typeof existing?.session_count === 'number' ? existing.session_count : 0;
+        const dto: Record<string, unknown> = {
+          ...baseDto,
+          created_at: createdAt,
+          session_count: sessionCount,
+        };
+        upsertStoredWorkspace(workspaceStore, provider, {
+          id: String(dto.id),
+          root,
+          name: String(dto.name),
+          kind: 'managed',
+          additional_dirs: additionalDirs,
+          created_at: createdAt,
+          last_opened_at: String(dto.last_opened_at),
+        });
+        return ok(res, dto, requestId);
+      }
+      return ok(res, baseDto, requestId);
     }
     const workspaceIdMatch = /^\/workspaces\/([^/:]+)$/.exec(sub);
     if (workspaceIdMatch && (req.method === 'PATCH' || req.method === 'DELETE')) {
@@ -826,27 +992,80 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       // no-ops never matched Claude/Codex/Grok workspaces from workspaceDto.
       if (isLocalProvider(provider)) {
         if (req.method === 'DELETE') {
+          workspaceStore.delete(provider, wid);
           return ok(res, { deleted: wid }, requestId);
         }
-        const body = (await readBody(req).catch(() => ({}))) as { name?: string };
-        const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive);
+        const body = (await readBody(req).catch(() => ({}))) as { name?: unknown; additional_dirs?: unknown };
+        const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
         const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
         const hit = wsItems.find((w) => w.id === wid);
-        return ok(res, { ...(hit ?? { id: wid, root: '' }), name: body.name ?? '' }, requestId);
+        const nextName = typeof body.name === 'string'
+          ? body.name
+          : (typeof hit?.name === 'string' ? hit.name : '');
+        const nextDirs = Array.isArray(body.additional_dirs)
+          ? body.additional_dirs.filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
+          : (Array.isArray(hit?.additional_dirs)
+              ? hit.additional_dirs.filter((d): d is string => typeof d === 'string')
+              : []);
+        const now = new Date().toISOString();
+        const dto = hit
+          ? {
+              ...hit,
+              id: wid,
+              name: nextName,
+              additional_dirs: nextDirs,
+              last_opened_at: now,
+            }
+          : {
+              ...workspaceDto('', nextName || wid, { kind: 'managed', additionalDirs: nextDirs }),
+              id: wid,
+              root: '',
+              name: nextName,
+              additional_dirs: nextDirs,
+              last_opened_at: now,
+            };
+        if (typeof hit?.root === 'string' && hit.root) {
+          upsertStoredWorkspace(workspaceStore, provider, {
+            id: wid,
+            root: hit.root,
+            name: nextName || String(hit.name ?? ''),
+            kind: 'managed',
+            additional_dirs: nextDirs,
+            created_at: typeof hit.created_at === 'string' ? hit.created_at : now,
+            last_opened_at: now,
+          });
+        }
+        return ok(res, dto, requestId);
       }
     }
-    if (sub === '/workspace/fs:search' && req.method === 'POST' && provider && provider !== 'kimi') {
-      const body = (await readBody(req)) as { workspace?: string; query?: string; limit?: number };
-      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive);
+    if (sub === '/workspace/fs:list' && req.method === 'POST' && provider && provider !== 'kimi') {
+      const body = (await readBody(req).catch(() => ({}))) as { workspace?: string; path?: string; depth?: number; include_git_status?: boolean };
+      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
       const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
       const hit = wsItems.find((w) => w.id === body.workspace);
-      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : process.env.HOME ?? '/home/ubuntu';
+      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : os.homedir();
+      return ok(res, await fsList(cwd, body), requestId);
+    }
+    if ((sub === '/workspace/fs:search' || sub === '/workspace/fs:suggest') && req.method === 'POST' && provider && provider !== 'kimi') {
+      const body = (await readBody(req)) as { workspace?: string; query?: string; limit?: number };
+      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
+      const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
+      const hit = wsItems.find((w) => w.id === body.workspace);
+      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : os.homedir();
       return ok(res, await fsSearch(cwd, { query: body.query ?? '', limit: body.limit }), requestId);
+    }
+    if (sub === '/fs:suggest' && req.method === 'POST' && provider && provider !== 'kimi') {
+      const body = (await readBody(req).catch(() => ({}))) as { roots?: unknown[]; query?: string; limit?: number };
+      const roots = Array.isArray(body.roots) ? body.roots.filter((r): r is string => typeof r === 'string' && r.length > 0) : [];
+      const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
+      const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
+      const allowedRoot = roots.find((r) => wsItems.some((w) => w.root === r)) ?? (typeof wsItems[0]?.root === 'string' ? wsItems[0].root : os.homedir());
+      return ok(res, await fsSearch(allowedRoot, { query: body.query ?? '', limit: body.limit }), requestId);
     }
 
     // --- sessions ---
     if (sub === '/sessions' && req.method === 'GET') {
-      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive), requestId);
+      return ok(res, await listSessions(adapters, kimiFetch, url, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive, false, workspaceStore), requestId);
     }
     if (sub === '/sessions' && req.method === 'POST') {
       if (!provider || provider === 'kimi') {
@@ -855,7 +1074,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (!isLocalProvider(provider)) {
         throw new ProviderError('unsupported', `${provider} is not wired in gateway yet`, 400);
       }
-      return ok(res, await createLocalSession(adapters, await readBody(req), provider), requestId);
+      return ok(res, await createLocalSession(adapters, await readBody(req), provider, workspaceStore), requestId);
     }
 
     const sessMatch = /^\/sessions\/([^/:]+)(.*)$/.exec(sub);
@@ -869,93 +1088,138 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }
       }
       const adapter = sp === 'kimi' ? kimiDemoAdapter() : adapters[sp];
+      const caps = adapter.capabilities();
 
       if (tail === '' && req.method === 'GET') {
         return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
       }
-      if (tail === '' && req.method === 'DELETE') {
-        if (!adapter.delete) throw new ProviderError('unsupported', `${sp} 不支持删除会话`, 400);
+      if (tail === '' && req.method === 'PATCH') {
+        const body = (await readBody(req)) as Record<string, unknown>;
+        return ok(res, await applySessionProfilePatch(adapter, sp, nativeId, caps, body, hub, demoActive), requestId);
+      }
+      if ((tail === '' && req.method === 'DELETE') || (tail === ':delete' && req.method === 'POST')) {
+        if (caps.delete === false || !adapter.delete) throw new ProviderError('unsupported', `${sp} 不支持删除会话`, 400);
         await adapter.delete(nativeId);
         // 清掉 hub 里的残留态(队列/回放缓冲),避免删后重建同 id 会话串味。
         const sid = prefixedId(sp, nativeId);
         hub.drop(sid);
         clearSessionPageCursors(sessionPageCursors, sid);
+        hub.broadcast(sid, frame(sid, hub, 'event.session.deleted', { sessionId: sid }));
         return ok(res, { deleted: true }, requestId);
       }
       if (tail === ':archive' && req.method === 'POST') {
-        if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持归档`, 400);
+        if (caps.archive === false || !adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持归档`, 400);
         await adapter.setArchived(nativeId, true);
         const sid = prefixedId(sp, nativeId);
         if (!hub.busy.has(sid)) hub.drop(sid);
         clearSessionPageCursors(sessionPageCursors, sid);
+        hub.broadcast(sid, frame(sid, hub, 'event.session.archived', { sessionId: sid }));
         return ok(res, { archived: true }, requestId);
       }
       if (tail === ':restore' && req.method === 'POST') {
-        if (!adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持恢复归档`, 400);
+        if (caps.archive === false || !adapter.setArchived) throw new ProviderError('unsupported', `${sp} 不支持恢复归档`, 400);
         await adapter.setArchived(nativeId, false);
-        clearSessionPageCursors(sessionPageCursors, prefixedId(sp, nativeId));
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
+        const sid = prefixedId(sp, nativeId);
+        clearSessionPageCursors(sessionPageCursors, sid);
+        hub.broadcast(sid, frame(sid, hub, 'event.session.restored', { sessionId: sid }));
+        return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(sid)), requestId);
+      }
+      if (tail === ':reload' && req.method === 'POST') {
+        const sid = prefixedId(sp, nativeId);
+        (adapter as { clearCommandsCache?: () => void }).clearCommandsCache?.();
+        const session = await getSession(adapter, sp, nativeId, demoActive);
+        clearSessionPageCursors(sessionPageCursors, sid);
+        hub.transcript.invalidateHistory(sid);
+        const history = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
+        if (history !== null) {
+          const page = sliceV262Turns(turnsFromHistory(history, hub.busy.get(sid)), undefined, 20);
+          hub.broadcastV262(sid, { type: 'turns', session_id: sid, agent_id: 'main', turns: page.turns, has_more: page.has_more });
+        }
+        return ok(res, sessionDto(session, adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(sid)), requestId);
       }
       if (tail === ':btw' && req.method === 'POST') {
-        // 0.37 侧边对话是 Kimi 原生能力;Claude/Codex 暂无等价通道。
+        // 0.37 侧边对话是 Kimi 原生能力;本地 provider 暂无等价通道。
         // 明确 400,避免前端把裸 404 当成路由错误。
         throw new ProviderError('unsupported', `${sp} 不支持侧边对话(:btw)`, 400);
       }
       if (tail === ':swarm' && req.method === 'POST') {
         throw new ProviderError('unsupported', `${sp} 不支持 Swarm`, 400);
       }
+      if (tail === ':tower' && req.method === 'POST') {
+        throw new ProviderError('unsupported', `${sp} 不支持 tower 模式(:tower)`, 400);
+      }
       if (tail === ':undo' && req.method === 'POST') {
-        // 撤销最近 count 轮。codex:thread/rollback(0.147.0 实测历史真消失,
-        // 但官方已标 DEPRECATED)。claude:stream-json 下 /rewind 是 TUI 专用
-        // (二进制注册表 supportsNonInteractive:false),无可用机制,如实 400。
-        if (!adapter.rollback) throw new ProviderError('unsupported', `${sp} 不支持撤销`, 400);
+        // 撤销最近 count 轮。codex:thread/rollback;claude:stream-json 下无 /rewind;pi:不支持 undo。
+        if (caps.rollback === false || !adapter.rollback) throw new ProviderError('unsupported', `${sp} 不支持撤销`, 400);
         const body = (await readBody(req).catch(() => ({}))) as { count?: number };
         const count = Math.max(1, Math.min(50, Number(body.count ?? 1) || 1));
+        const sid = prefixedId(sp, nativeId);
+        const beforeHistory = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
+        const beforeTurns = beforeHistory ? turnsFromHistory(beforeHistory) : [];
         await adapter.rollback(nativeId, count);
-        hub.transcript.invalidateHistory(prefixedId(sp, nativeId));
-        return ok(res, { undone: true, count }, requestId);
+        hub.transcript.invalidateHistory(sid);
+        const removedTurnIds = beforeTurns.slice(-count).map((t) => String(t.turn_id));
+        if (removedTurnIds.length > 0) {
+          hub.broadcastV262(sid, {
+            type: 'turns.removed',
+            session_id: sid,
+            agent_id: 'main',
+            turn_ids: removedTurnIds,
+          });
+        }
+        return ok(res, { undone: true, count, removed_turn_ids: removedTurnIds }, requestId);
       }
       if (tail === ':compact' && req.method === 'POST') {
         const body = (await readBody(req).catch(() => ({}))) as { instruction?: string };
         const sid = prefixedId(sp, nativeId);
-        // busy 时压缩会排队/互串,直接 409(与网关代执行命令同一 guard);
-        // 否则会假 started(审查发现)。
         if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再压缩', 409);
-        // grok headless 把 `/compact` 当普通 prompt 发给模型(本机 1.0.5 实测
-        // `-p /compact` 卡住 waiting_for_model)。没有 adapter.compact 且不是
-        // claude 的 /compact 回退时,必须在 compaction.started 之前 400。
-        if (!adapter.compact && sp !== 'claude') {
+        if (caps.compact === false || (!adapter.compact && sp !== 'claude')) {
           throw new ProviderError('unsupported', `${sp} 不支持压缩`, 400);
         }
         hub.broadcast(sid, frame(sid, hub, 'compaction.started', { trigger: 'manual', ...(body.instruction ? { instruction: body.instruction } : {}) }));
+        emitV262AgentState(hub, adapter, sp, nativeId, sid, 'idle', true);
         if (adapter.compact) {
-          // codex:adapter.compact 等到 contextCompaction item 完成才返回
-          // (0.147.0 复核:item/completed + type==='contextCompaction' 是真完成
-          // 信号),completed 广播在真实完成点(对齐 kap-server worker 尾部)。
-          await adapter.compact(nativeId);
+          try {
+            await adapter.compact(nativeId, body.instruction);
+          } finally {
+            emitV262AgentState(hub, adapter, sp, nativeId, sid, 'idle', false);
+          }
           hub.transcript.invalidateHistory(sid);
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: {} }));
+          const refreshed = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
+          if (refreshed !== null) {
+            const page = sliceV262Turns(turnsFromHistory(refreshed, hub.busy.get(sid)), undefined, 20);
+            hub.broadcastV262(sid, { type: 'turns', session_id: sid, agent_id: 'main', turns: page.turns, has_more: page.has_more });
+          }
           return ok(res, { compacted: true }, requestId);
         }
         const text = `/compact${body.instruction ? ` ${body.instruction}` : ''}`;
         const result = await driveTurn(adapter, sp, nativeId, text, () => adapter.startTurn({ sessionId: nativeId, input: text }), hub, randomUUID(), (reason) => {
+          emitV262AgentState(hub, adapter, sp, nativeId, sid, 'idle', false);
           hub.broadcast(sid, frame(sid, hub, 'compaction.completed', { result: { reason } }));
-        }, demoActive);
+        }, demoActive, uploadStore);
         return ok(res, result, requestId);
       }
       if (tail === ':fork' && req.method === 'POST') {
-        // codex:thread/fork(0.147.0 实测);claude 的 --fork-session 要新 spawn
-        // 流程,未做,如实 400。
-        if (!adapter.fork) throw new ProviderError('unsupported', `${sp} 不支持分叉`, 400);
+        if (caps.fork === false || !adapter.fork) throw new ProviderError('unsupported', `${sp} 不支持分叉`, 400);
         const forked = await adapter.fork(nativeId);
-        // 前端拿到新会话后直接跳转;广播 session.created 让列表刷新。
         const sid = prefixedId(sp, forked.id);
         hub.broadcast(sid, frame(sid, hub, 'event.session.created', { session: sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)) }));
         return ok(res, sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)), requestId);
       }
+      if (tail === ':clone' && req.method === 'POST') {
+        if (caps.clone === false || !adapter.clone) throw new ProviderError('unsupported', `${sp} 不支持克隆`, 400);
+        const cloned = await adapter.clone(nativeId);
+        const sid = prefixedId(sp, cloned.id);
+        hub.broadcast(sid, frame(sid, hub, 'event.session.created', { session: sessionDto(cloned, adapter.getModel?.(cloned.id), adapter.getUsage?.(cloned.id)) }));
+        return ok(res, sessionDto(cloned, adapter.getModel?.(cloned.id), adapter.getUsage?.(cloned.id)), requestId);
+      }
       if (tail === '/warnings' && req.method === 'GET') {
         // 前端每次打开会话自动拉;本地 provider 无警告机制,回空。
         return ok(res, { warnings: [] }, requestId);
+      }
+      if (tail === '/file-history/changes' && req.method === 'GET') {
+        return ok(res, { recorded: false, changes: [] }, requestId);
       }
       if (tail === '/children' && req.method === 'GET') {
         // 前端目前无调用(client 层未接线);如实回空页。
@@ -966,16 +1230,38 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
       if (tail === '/skills' && req.method === 'GET') {
         if (sp === 'kimi') return ok(res, { skills: [] }, requestId);
-        return ok(res, { skills: await adapterSkills(adapter, sp, nativeId) }, requestId);
+        return ok(res, { skills: await adapterSkills(adapter, nativeId) }, requestId);
       }
-      const skillActivate = /^\/skills\/([^/:]+):activate$/.exec(tail);
+      const skillActivate = /^\/skills\/(.+):activate$/.exec(tail);
       if (skillActivate && req.method === 'POST') {
-        // 激活 = 把 "/skill名 参数" 作为 prompt 发出:claude CLI 原生执行;
-        // codex 由 facade 在 startTurn 里展开 SKILL.md 正文(实测可用路径)。
-        const body = (await readBody(req).catch(() => ({}))) as { args?: string };
+        // 激活 = 把 "/skill名 参数" 作为 prompt 发出:claude/pi CLI 原生执行;
+        // codex/grok 由 adapter 在 startTurn 里展开 SKILL.md 正文;同时透传附件。
+        // Kimi 2.6.2 前端会带入 [name](kimi-code://skill/name) 芯片标记，先剥离避免误当参数。
+        const body = (await readBody(req).catch(() => ({}))) as {
+          args?: string;
+          prompt_id?: string;
+          attachments?: Array<Record<string, unknown>>;
+        };
         const name = decodeURIComponent(skillActivate[1]);
-        const text = `/${name}${body.args ? ` ${body.args}` : ''}`;
-        await submitPrompt(adapter, sp, nativeId, { content: [{ type: 'text', text }] }, hub, demoActive);
+        const metadataText = typeof (body as { metadata?: { display_text?: unknown } }).metadata?.display_text === 'string'
+          ? sanitizePromptSkillChips((body as { metadata?: { display_text?: string } }).metadata!.display_text!)
+          : '';
+        const rawArgs = typeof body.args === 'string' && body.args.trim() && body.args.trim() !== `/${name}`
+          ? body.args
+          : metadataText;
+        const cleanArgs = sanitizeSkillActivateArgs(name, rawArgs)
+          .replace(new RegExp(`^/${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'i'), '')
+          .trim();
+        const effort = nativeEffortFromCommand(name, cleanArgs);
+        if (effort && adapter.setThinking) await adapter.setThinking(nativeId, effort);
+        const text = `/${name}${cleanArgs ? ` ${cleanArgs}` : ''}`;
+        const content: Array<Record<string, unknown>> = [{ type: 'text', text }];
+        if (Array.isArray(body.attachments)) {
+          for (const att of body.attachments) {
+            if (att && typeof att === 'object') content.push(att);
+          }
+        }
+        await submitPrompt(adapter, sp, nativeId, { prompt_id: body.prompt_id, content }, hub, demoActive, uploadStore);
         return ok(res, { activated: true, skill_name: name }, requestId);
       }
       // --- fs:*(文件树/@提及/搜索/git 状态;网关本机实现,cwd 沙箱防穿越) ---
@@ -1003,6 +1289,38 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           const body = (await readBody(req).catch(() => ({}))) as { paths?: string[] };
           return ok(res, await fsGitStatus(cwd, body.paths), requestId);
         }
+        if (tail === '/fs:git_status:batch' && req.method === 'POST') {
+          const body = (await readBody(req).catch(() => ({}))) as { roots?: unknown[] };
+          const roots = Array.isArray(body.roots)
+            ? body.roots.filter((r): r is string => typeof r === 'string' && r.length > 0)
+            : [];
+          const targets = roots.length > 0 ? roots : [cwd];
+          const results: Record<string, unknown> = {};
+          const errors: Record<string, { code: number; message: string }> = {};
+          const realCwd = await fsp.realpath(cwd).catch(() => path.resolve(cwd));
+          const realPrefix = realCwd === '/' ? '/' : `${realCwd}${path.sep}`;
+          for (const rawRoot of targets) {
+            const realRoot = await fsp.realpath(rawRoot).catch(() => null);
+            if (!realRoot) {
+              errors[rawRoot] = { code: 40401, message: 'directory not found' };
+              continue;
+            }
+            if (realRoot !== realCwd && !realRoot.startsWith(realPrefix)) {
+              errors[rawRoot] = { code: 40301, message: 'root outside session cwd' };
+              continue;
+            }
+            const stat = await fsp.stat(realRoot).catch(() => null);
+            if (!stat || !stat.isDirectory()) {
+              errors[rawRoot] = { code: 40401, message: 'directory not found' };
+              continue;
+            }
+            results[rawRoot] = await fsGitStatus(realRoot);
+          }
+          return ok(res, { results, errors }, requestId);
+        }
+        if (tail === '/fs:pull_request:batch' && req.method === 'POST') {
+          return ok(res, { results: {}, errors: {} }, requestId);
+        }
         if (tail === '/fs:diff' && req.method === 'POST') {
           const body = (await readBody(req)) as { path: string };
           return ok(res, await fsDiff(cwd, body), requestId);
@@ -1011,8 +1329,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         throw new ProviderError('unsupported', `${tail} 未实现(打开/下载在纯 web 端无意义)`, 400);
       }
       if (tail === '/goal' && req.method === 'GET') {
-        if (!adapter.getGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
-        return ok(res, codexGoalToWire(await adapter.getGoal(nativeId)), requestId);
+        if (caps.goals === false || !adapter.getGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+        return ok(res, localGoalToWire(await adapter.getGoal(nativeId), nativeId), requestId);
       }
       if (tail === '/export' && req.method === 'POST') {
         const session = await getSession(adapter, sp, nativeId, demoActive);
@@ -1032,56 +1350,11 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         return;
       }
       if (tail === '/profile' && req.method === 'POST') {
-        // 本地 provider 可落地的字段:model / thinking / title / permission /
-        // plan_mode / goal(goal_objective 设目标,goal_control 暂停/恢复/取消)。
-        // swarm_mode 本地 provider 无机制,明确 400,不能接受后忽略。
-        const body = (await readBody(req)) as {
-          title?: string;
-          agent_config?: {
-            model?: string;
-            thinking?: string;
-            permission_mode?: string;
-            plan_mode?: boolean;
-            goal_objective?: string;
-            goal_control?: 'pause' | 'resume' | 'cancel';
-            swarm_mode?: boolean;
-          };
-        };
-        if (typeof body?.title === 'string' && body.title.trim() && adapter.rename) {
-          await adapter.rename(nativeId, body.title.trim());
-        }
-        const cfg = body?.agent_config ?? {};
-        if (cfg.swarm_mode === true) {
-          throw new ProviderError('unsupported', `${sp} 不支持 swarm_mode`, 400);
-        }
-        if (cfg.model && adapter.setModel) await adapter.setModel(nativeId, cfg.model);
-        if (typeof cfg.thinking === 'string' && adapter.setThinking) {
-          await adapter.setThinking(nativeId, cfg.thinking);
-        }
-        if (typeof cfg.permission_mode === 'string' && adapter.setPermission) {
-          await adapter.setPermission(nativeId, cfg.permission_mode);
-        }
-        if (typeof cfg.plan_mode === 'boolean' && adapter.setPlanMode) {
-          await adapter.setPlanMode(nativeId, cfg.plan_mode);
-        }
-        if (typeof cfg.goal_objective === 'string') {
-          if (!adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
-          await adapter.setGoal(nativeId, cfg.goal_objective);
-        }
-        if (typeof cfg.goal_control === 'string') {
-          if (!adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
-          await adapter.controlGoal(nativeId, cfg.goal_control);
-        }
-        return ok(res, sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(prefixedId(sp, nativeId))), requestId);
+        const body = (await readBody(req)) as Record<string, unknown>;
+        return ok(res, await applySessionProfilePatch(adapter, sp, nativeId, caps, body, hub, demoActive), requestId);
       }
       if (tail === '/status' && req.method === 'GET') {
-        // 前端 refreshSessionStatus 的唯一回读通道:live model/thinking/permission/
-        // plan/上下文占用。usage 来自 adapter 的会话级累计(codex tokenUsage
-        // 通知 / claude result.usage)。
         const usage = adapter.getUsage?.(nativeId);
-        // 上下文窗口回退(审查发现首轮前恒 0):claude 按模型名启发式(与 facade
-        // 的 done 事件口径一致);codex 只信 tokenUsage 下发的 modelContextWindow,
-        // 没有就诚实 0——不编造窗口值。
         let contextLimit = usage?.context_limit ?? 0;
         const model = adapter.getModel?.(nativeId) ?? getDemoModel(sp, nativeId) ?? '';
         if (contextLimit <= 0 && sp === 'claude') {
@@ -1090,16 +1363,21 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (contextLimit <= 0 && sp === 'grok') {
           contextLimit = grokStatusContextFallback();
         }
+        const contextUnavailable = usage?.context_unavailable === true;
         return ok(res, {
           model,
           thinking_level: adapter.getThinking?.(nativeId) ?? '',
           permission: adapter.getPermission?.(nativeId) ?? 'default',
-          plan_mode: adapter.getPlanMode?.(nativeId) ?? false,
+          plan_mode: caps.planMode === false ? false : (adapter.getPlanMode?.(nativeId) ?? false),
           swarm_mode: false,
-          context_tokens: usage?.context_tokens ?? 0,
+          tower_mode: false,
+          context_tokens: contextUnavailable ? 0 : (usage?.context_tokens ?? 0),
           max_context_tokens: contextLimit,
           context_usage:
-            usage && contextLimit > 0 ? Math.min(1, usage.context_tokens / contextLimit) : 0,
+            !contextUnavailable && usage && contextLimit > 0
+              ? Math.min(1, usage.context_tokens / contextLimit)
+              : 0,
+          ...(contextUnavailable ? { context_unavailable: true } : {}),
         }, requestId);
       }
       if (tail === '/commands' && req.method === 'GET') {
@@ -1109,14 +1387,34 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (tail === '/messages' && req.method === 'GET') {
         return ok(res, await listAdapterMessages(adapter, sp, nativeId, url, demoActive), requestId);
       }
+      const turnsMatch = /^\/agents\/([^/:]+)\/turns$/.exec(tail);
+      if (turnsMatch && req.method === 'GET') {
+        const agentId = decodeURIComponent(turnsMatch[1]);
+        const sid = prefixedId(sp, nativeId);
+        const beforeRaw = url.searchParams.get('before_ordinal');
+        const beforeOrdinal = beforeRaw !== null && beforeRaw !== '' ? Number(beforeRaw) : undefined;
+        const pageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('page_size') ?? 20) || 20));
+        if (agentId !== 'main') {
+          const subHistory = adapter.getSubagentMessages
+            ? await adapter.getSubagentMessages(nativeId, agentId).catch(() => [])
+            : [];
+          const subTurns = turnsFromHistory(subHistory);
+          return ok(res, sliceV262Turns(subTurns, Number.isFinite(beforeOrdinal) ? beforeOrdinal : undefined, pageSize), requestId);
+        }
+        const history = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
+        const allTurns = turnsFromHistory(history ?? [], hub.busy.get(sid));
+        return ok(res, sliceV262Turns(allTurns, Number.isFinite(beforeOrdinal) ? beforeOrdinal : undefined, pageSize), requestId);
+      }
       if (tail === '/transcript' && req.method === 'GET') {
         const agentId = url.searchParams.get('agent_id');
         if (!agentId) throw new ProviderError('invalid_request', 'agent_id is required', 400);
         const pageSize = Number(url.searchParams.get('page_size') ?? 20);
         const sid = prefixedId(sp, nativeId);
-        const history = await historyWithDemo(adapter, sp, nativeId, demoActive);
+        const history = agentId !== 'main' && adapter.getSubagentMessages
+          ? await adapter.getSubagentMessages(nativeId, agentId).catch(() => [])
+          : await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
         // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
-        if (history) hub.transcript.observeHistory(sid, history);
+        if (history !== null && history.length > 0) hub.transcript.observeHistory(sid, history);
         return ok(res, buildLocalTranscriptPage(history ?? [], {
           agentId,
           beforeTurn: url.searchParams.get('before_turn') ?? undefined,
@@ -1150,31 +1448,36 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (tail === '/prompts' && req.method === 'GET') {
         return ok(res, listPrompts(prefixedId(sp, nativeId), hub), requestId);
       }
-      if (tail === '/prompts' && req.method === 'POST') {
+      if ((tail === '/prompts' || tail === '/steer') && req.method === 'POST') {
         const body = (await readBody(req)) as {
+          prompt_id?: string;
           content: { type: string; text?: string }[];
           model?: string; thinking?: string; permission_mode?: string; plan_mode?: boolean;
           swarm_mode?: boolean;
+          tower_mode?: boolean;
           goal_objective?: string;
           goal_control?: 'pause' | 'resume' | 'cancel';
         };
-        // 前端 toWirePromptSubmission 会带 swarm/goal。Kimi 官方会当真;
-        // 本地 provider 没有对等物时必须 400,不能当普通 prompt 默默跑。
         if (body.swarm_mode === true) {
           throw new ProviderError('unsupported', `${sp} 不支持 swarm_mode`, 400);
         }
+        if (body.tower_mode === true) {
+          throw new ProviderError('unsupported', `${sp} 不支持 tower_mode`, 400);
+        }
+        if (body.permission_mode === 'manual' && (caps.manualApproval === false || caps.approvals === false)) {
+          throw new ProviderError('unsupported', `${sp} 不支持 manual 审批模式`, 400);
+        }
+        if (body.plan_mode === true && (caps.planMode === false || !adapter.setPlanMode)) {
+          throw new ProviderError('unsupported', `${sp} 不支持 plan_mode`, 400);
+        }
         if (typeof body.goal_objective === 'string') {
-          if (!adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+          if (caps.goals === false || !adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
           await adapter.setGoal(nativeId, body.goal_objective);
         }
         if (typeof body.goal_control === 'string') {
-          if (!adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+          if (caps.goals === false || !adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
           await adapter.controlGoal(nativeId, body.goal_control);
         }
-        // 前端每条 prompt 都带全套控制字段(mappers.toWirePromptSubmission),
-        // 设计上以 prompt 为本 turn 权威——此前网关只读 content,草稿态开 Plan
-        // 发首条消息实际不是 plan 跑的(审查发现)。apply-if-changed,避免每
-        // 条 prompt 都白打一遍 RPC。
         if (body.model && adapter.setModel && adapter.getModel?.(nativeId) !== body.model) {
           await adapter.setModel(nativeId, body.model);
         }
@@ -1184,28 +1487,27 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (body.permission_mode && adapter.setPermission && adapter.getPermission?.(nativeId) !== body.permission_mode) {
           await adapter.setPermission(nativeId, body.permission_mode);
         }
-        if (typeof body.plan_mode === 'boolean' && adapter.setPlanMode && adapter.getPlanMode?.(nativeId) !== body.plan_mode) {
+        if (typeof body.plan_mode === 'boolean' && caps.planMode !== false && adapter.setPlanMode && adapter.getPlanMode?.(nativeId) !== body.plan_mode) {
           await adapter.setPlanMode(nativeId, body.plan_mode);
         }
-        return ok(res, await submitPrompt(adapter, sp, nativeId, body, hub, demoActive), requestId);
+        if (tail === '/steer' && hub.busy.has(prefixedId(sp, nativeId))) {
+          return ok(res, await steerDirectPrompt(adapter, sp, nativeId, body, hub, uploadStore), requestId);
+        }
+        return ok(res, await submitPrompt(adapter, sp, nativeId, body, hub, demoActive, uploadStore), requestId);
       }
       if (tail === ':abort' && req.method === 'POST') {
-        const aborted = await abortTurn(adapter, sp, nativeId, hub, demoActive);
+        const aborted = await abortTurn(adapter, sp, nativeId, hub, demoActive, uploadStore);
         return ok(res, { aborted }, requestId);
       }
       const promptAbort = /^\/prompts\/([^/:]+):abort$/.exec(tail);
       if (promptAbort && req.method === 'POST') {
         const pid = decodeURIComponent(promptAbort[1]);
-        // 命中排队中的 prompt → 出队即中止;命中活动 turn → interrupt;
-        // 都不命中 → 该 prompt 已完结,如实回 aborted:false(前端按已完成处理)。
         const sid = prefixedId(sp, nativeId);
         const queue = hub.queued.get(sid);
         const qIdx = queue?.findIndex((q) => q.promptId === pid) ?? -1;
         if (queue && qIdx >= 0) {
           queue.splice(qIdx, 1);
           if (queue.length === 0) hub.queued.delete(sid);
-          // 排队 prompt 从未开 turn:发 prompt.aborted(不是 prompt.completed),
-          // 前端投影器靠它清 in-flight 状态。
           hub.transcript.finishPrompt(sid, pid, 'aborted');
           hub.broadcast(sid, frame(sid, hub, 'prompt.aborted', { promptId: pid, abortedAt: new Date().toISOString() }));
           return ok(res, { aborted: true }, requestId);
@@ -1214,15 +1516,49 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (active && active.promptId !== pid) {
           return ok(res, { aborted: false }, requestId);
         }
-        const aborted = await abortTurn(adapter, sp, nativeId, hub, demoActive);
+        const aborted = await abortTurn(adapter, sp, nativeId, hub, demoActive, uploadStore);
         return ok(res, { aborted }, requestId);
+      }
+      const interactionResolve = /^\/interactions\/([^/:]+)$/.exec(tail);
+      if (interactionResolve && req.method === 'POST') {
+        const iid = decodeURIComponent(interactionResolve[1]);
+        const sid = prefixedId(sp, nativeId);
+        const active = hub.busy.get(sid);
+        const body = (await readBody(req)) as Record<string, unknown> & {
+          kind?: string;
+          decision?: string;
+          scope?: string;
+          answers?: Record<string, unknown>;
+          text?: string;
+          dismissed?: boolean;
+        };
+        const isQuestion = body.kind === 'question' || (!body.kind && active?.pendingQuestions.has(iid));
+        if (isQuestion) {
+          if (caps.questions === false) {
+            throw new ProviderError('unsupported', `${sp} 不支持交互提问`, 400);
+          }
+          if (body.dismissed === true) {
+            await dismissQuestion(adapter, sp, nativeId, iid, hub);
+            return ok(res, { outcome: 'dismissed', ended_at: new Date().toISOString() }, requestId);
+          }
+          await resolveQuestion(adapter, sp, nativeId, iid, body, hub);
+          return ok(res, { outcome: 'answered', ended_at: new Date().toISOString() }, requestId);
+        }
+        if (caps.approvals === false) {
+          throw new ProviderError('unsupported', `${sp} 不支持交互审批`, 400);
+        }
+        await resolveApproval(adapter, sp, nativeId, iid, body as { decision: string; scope?: string }, hub);
+        return ok(res, { outcome: body.decision === 'approved' ? 'approved' : 'rejected', ended_at: new Date().toISOString() }, requestId);
       }
       if (tail === '/approvals' && req.method === 'GET') {
         return ok(res, { items: pendingApprovals(prefixedId(sp, nativeId), hub) }, requestId);
       }
       const approvalResolve = /^\/approvals\/([^/:]+)$/.exec(tail);
       if (approvalResolve && req.method === 'POST') {
-        const body = (await readBody(req)) as { decision: string };
+        if (caps.approvals === false) {
+          throw new ProviderError('unsupported', `${sp} 不支持交互审批`, 400);
+        }
+        const body = (await readBody(req)) as Record<string, unknown> & { decision: string; scope?: string };
         await resolveApproval(adapter, sp, nativeId, decodeURIComponent(approvalResolve[1]), body, hub);
         return ok(res, { resolved: true, resolved_at: new Date().toISOString() }, requestId);
       }
@@ -1231,36 +1567,22 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
       const questionResolve = /^\/questions\/([^/:]+)$/.exec(tail);
       if (questionResolve && req.method === 'POST') {
+        if (caps.questions === false) {
+          throw new ProviderError('unsupported', `${sp} 不支持交互提问`, 400);
+        }
         const body = (await readBody(req)) as { answers?: Record<string, unknown>; text?: string };
         await resolveQuestion(adapter, sp, nativeId, decodeURIComponent(questionResolve[1]), body, hub);
         return ok(res, { resolved: true, resolved_at: new Date().toISOString() }, requestId);
       }
       const questionDismiss = /^\/questions\/([^/:]+):dismiss$/.exec(tail);
       if (questionDismiss && req.method === 'POST') {
-        const qid = decodeURIComponent(questionDismiss[1]);
-        // 空答案 = 跳过(对齐 adapter autoApprove 的 {answers:{}} 形状)。
-        await adapter.resolveQuestion(nativeId, qid, {}).catch(() => undefined);
-        const sid = prefixedId(sp, nativeId);
-        hub.busy.get(sid)?.pendingQuestions.delete(qid);
-        hub.transcript.resolveInteraction(sid, qid, 'dismissed', null);
-        hub.broadcast(sid, frame(sid, hub, 'event.question.dismissed', {
-          question_id: qid, dismissed_at: new Date().toISOString(),
-        }));
-        const activeAfterDismiss = hub.busy.get(sid);
-        const pendingAfterDismiss = (activeAfterDismiss?.pendingApprovals.size ?? 0) > 0
-          ? 'approval'
-          : (activeAfterDismiss?.pendingQuestions.size ?? 0) > 0 ? 'question' : 'none';
-        hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', {
-          busy: activeAfterDismiss !== undefined,
-          main_turn_active: activeAfterDismiss !== undefined,
-          pending_interaction: pendingAfterDismiss,
-        }));
+        if (caps.questions === false) {
+          throw new ProviderError('unsupported', `${sp} 不支持交互提问`, 400);
+        }
+        await dismissQuestion(adapter, sp, nativeId, decodeURIComponent(questionDismiss[1]), hub);
         return ok(res, { dismissed: true, dismissed_at: new Date().toISOString() }, requestId);
       }
       if (tail === '/prompts:steer' && req.method === 'POST') {
-        // 把排队中的 prompt 注入进行中的 turn(codex turn/steer)。前端仅在
-        // 拿到 status:'queued' 后调用;无活动 turn 时 404(前端静默忽略,
-        // 排队 prompt 会在当前 turn 结束后自动开自己的 turn)。
         const body = (await readBody(req)) as { prompt_ids?: string[] };
         const ids = body.prompt_ids ?? [];
         const sid = prefixedId(sp, nativeId);
@@ -1268,26 +1590,41 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (!active || !active.turnId) {
           throw new ProviderError('not_found', 'PROMPT_NOT_FOUND: no active turn to steer into', 404);
         }
-        if (!adapter.steer) {
+        if (caps.steer === false || !adapter.steer) {
           throw new ProviderError('unsupported', `${sp} 不支持 steer(排队消息将在本轮结束后自动发出)`, 400);
         }
         const queue = hub.queued.get(sid) ?? [];
         const steered: string[] = [];
-        const steeredContent: Array<{ type: 'text'; text: string }> = [];
+        const steeredContent: Array<Record<string, unknown>> = [];
         for (const id of ids) {
           const idx = queue.findIndex((q) => q.promptId === id);
           if (idx === -1) continue;
-          // 先 steer 成功再出队——steer 失败时 prompt 留在队列里,
-          // 当前 turn 结束后仍会作为自己的 turn 发出(审查发现丢消息)。
-          await adapter.steer(nativeId, active.turnId, queue[idx].text);
-          const [q] = queue.splice(idx, 1);
+          const q = queue[idx];
+          const attachments = q.attachments ?? [];
+          let steerText = q.text;
+          if (attachments.length > 0 && caps.steerAttachments !== true) {
+            const notes = attachments
+              .map((a) => a.path
+                ? `[attached ${a.kind === 'localImage' ? 'image' : 'file'}: ${a.path}]`
+                : `[attached ${a.kind}]`)
+              .join('\n');
+            steerText = steerText ? `${steerText}\n${notes}` : notes;
+          }
+          if (caps.steerAttachments === true && attachments.length > 0) {
+            await adapter.steer(nativeId, active.turnId, steerText, attachments);
+          } else {
+            await adapter.steer(nativeId, active.turnId, steerText);
+          }
+          queue.splice(idx, 1);
           steered.push(id);
-          steeredContent.push({ type: 'text', text: q.text });
+          const msgContent = queuedContentBlocks(q.text, attachments);
+          steeredContent.push(...msgContent);
+          emitV262SteerUserItem(hub, sid, active, id, q.text, attachments);
           // 用户消息回显:前端靠 messageCreated(prompt_id 匹配)落乐观气泡。
           hub.broadcast(sid, frame(sid, hub, 'event.message.created', {
             message: {
               id: randomUUID(), session_id: sid, role: 'user', prompt_id: id,
-              content: [{ type: 'text', text: q.text }], created_at: new Date().toISOString(),
+              content: msgContent, created_at: new Date().toISOString(),
             },
           }));
         }
@@ -1296,9 +1633,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         return ok(res, { steered: steered.length > 0, prompt_ids: steered }, requestId);
       }
       if (tail === '/tasks' && req.method === 'GET') {
-        // codex 子 agent 线程不作为任务暴露(用户明确要求列表只显示主会话);
-        // claude 无后台任务机制。如实回空。
-        return ok(res, { items: [] }, requestId);
+        const sid = prefixedId(sp, nativeId);
+        return ok(res, { items: await collectSessionWireTasks(adapter, nativeId, sid, hub) }, requestId);
       }
       // 0.39 运行中卡片「移到后台」调 POST /tasks/:id:detach。Kimi 走上游代理;
       // 本地 provider 无对等物,明确 400,避免前端把裸 404 当成路由错误。
@@ -1349,6 +1685,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     gatewaySockets,
     kimiSockets,
     kimiOpt === 'off',
+    demoActive,
   );
 
   await new Promise<void>((resolveListen, rejectListen) => {
@@ -1356,7 +1693,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     server.listen(port, host, () => resolveListen());
   });
 
-  void hydrateUploadsFromDisk();
+  await uploadStore.hydrate();
   // 预热只打本机已安装的 provider。没装的 CLI 会在 handshake 上空等 ~20s,
   // 抢首屏 /auth + WS,把官方「连接中」拖长。
   const warm: Array<Promise<unknown>> = [];
@@ -1365,7 +1702,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     warmNames.push(name);
     warm.push(task);
   };
-  for (const p of ['codex', 'claude', 'grok'] as const) {
+  for (const p of LOCAL_PROVIDERS) {
     if (!availableProviders.includes(p)) continue;
     enqueueWarm(`${p}.list`, adapters[p].list({ limit: 100 }));
     enqueueWarm(`${p}.models`, adapters[p].listModels?.() ?? Promise.resolve(null));
@@ -1397,6 +1734,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     close: () =>
       new Promise((resolveClose) => {
         if (kimiFollowTimer) clearInterval(kimiFollowTimer);
+        uploadStore.close();
+        workspaceStore.close();
         for (const socket of gatewaySockets) socket.destroy();
         server.close(() => {
           // 关停也要释放 provider 子进程;allSettled 保证一个挂了不拖住整体。
@@ -1405,6 +1744,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
             adapters.claude.dispose?.() ?? Promise.resolve(),
             adapters.codex.dispose?.() ?? Promise.resolve(),
             adapters.grok.dispose?.() ?? Promise.resolve(),
+            adapters.pi.dispose?.() ?? Promise.resolve(),
           ]).then(() => resolveClose());
         });
         // 流式/长连接会挡住 server.close 的回调,主动掐掉空闲 keep-alive。
@@ -1431,14 +1771,14 @@ function authed(req: IncomingMessage, token: string): boolean {
 // Kimi 代理判定:无 provider 前缀的会话 id / Kimi 专属路由 → 转发 58627
 // ---------------------------------------------------------------------------
 
-function shouldProxyToKimi(req: IncomingMessage): boolean {
+function shouldProxyToKimi(req: IncomingMessage, hasUpload: (id: string) => boolean): boolean {
   const url = new URL(req.url ?? '/', 'http://localhost');
-  // 0.36+ /api/v2：Kimi 会话列表仍走 kap;claude/codex/grok 必须留在本网关,
+  // 0.36+ /api/v2：Kimi 会话列表仍走 kap;claude/codex/grok/pi 必须留在本网关,
   // 否则平铺视图/搜索/已归档只看得到 Kimi。
   if (url.pathname === '/v1/remote' || url.pathname.startsWith('/v1/remote/')) return true;
   if (url.pathname.startsWith('/api/v2')) {
     const v2Provider = url.searchParams.get('provider');
-    // 列表与批量归档/恢复:只有显式 claude/codex/grok 才留在本网关;其余透传 kap。
+    // 列表与批量归档/恢复:只有显式本地 provider 才留在本网关;其余透传 kap。
     // boot.js 会给这些路径补 ?provider=,所以本地 provider 侧边栏操作不会误进上游。
     if (isLocalProvider(v2Provider)) return false;
     return true;
@@ -1456,7 +1796,7 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
   const sessMatch = /^\/api\/v1\/sessions\/([^/:]+)/.exec(url.pathname);
   if (sessMatch) {
     const id = decodeURIComponent(sessMatch[1]);
-    return !id.startsWith('codex_') && !id.startsWith('claude_') && !id.startsWith('grok_');
+    return providerFromSessionId(id).provider === 'kimi';
   }
 
   // Official file preview URLs do not carry provider. Keep only gateway-owned
@@ -1468,7 +1808,7 @@ function shouldProxyToKimi(req: IncomingMessage): boolean {
     } catch {
       return true;
     }
-    return !uploads.has(id);
+    return !hasUpload(id);
   }
 
   // No provider is the unmodified official Kimi client. Keep only the gateway
@@ -1486,7 +1826,7 @@ function isProviderRefreshRoute(sub: string): boolean {
   return sub === '/providers:refresh' || sub === '/providers:refresh_oauth' || /^\/providers\/[^/:]+:refresh$/.test(sub);
 }
 
-async function providerDto(provider: Exclude<ProviderName, 'kimi' | 'pi'>, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
+async function providerDto(provider: LocalProviderName, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
   // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
   const models = adapter.listModels ? await adapter.listModels() : [];
   return {
@@ -1499,29 +1839,261 @@ async function providerDto(provider: Exclude<ProviderName, 'kimi' | 'pi'>, adapt
   };
 }
 
+const SKILL_CHIP_RE = /\[([^\]]+)\]\((?:kimi-code:\/\/skill\/|kimi-code-composer:\/\/skills\/)([^)\s?]+)(?:[?#][^)]*)?\)/g;
+
+function sanitizeSkillActivateArgs(skillName: string, rawArgs: unknown): string {
+  if (typeof rawArgs !== 'string' || !rawArgs) return '';
+  const target = skillName.trim().toLowerCase();
+  const cleaned = rawArgs.replace(SKILL_CHIP_RE, (_full, label: string, encodedSlug: string) => {
+    let slug = encodedSlug;
+    try { slug = decodeURIComponent(encodedSlug); } catch { /* keep raw */ }
+    if (slug.toLowerCase() === target || label.trim().toLowerCase() === target) {
+      return '';
+    }
+    return slug ? `/${slug}` : label;
+  });
+  return cleaned.replace(/\s+/g, ' ').trim();
+}
+
+function stripCommandSkillChips(text: string): string {
+  return text.replace(
+    /(^|\n)([ \t]*\/([^\s]+))(?:[ \t]+\[([^\]]+)\]\((?:kimi-code:\/\/skill\/|kimi-code-composer:\/\/skills\/)([^)\s?]+)(?:[?#][^)]*)?\))+/g,
+    (full, lead: string, cmdPart: string, cmdName: string, label: string, encodedSlug: string) => {
+      let slug = encodedSlug;
+      try { slug = decodeURIComponent(encodedSlug); } catch { /* keep raw */ }
+      if (slug.toLowerCase() === cmdName.toLowerCase() || label.trim().toLowerCase() === cmdName.toLowerCase()) {
+        return `${lead}${cmdPart}`;
+      }
+      return full;
+    },
+  );
+}
+
+function sanitizePromptSkillChips(text: string): string {
+  if (!text || (!text.includes('kimi-code://skill/') && !text.includes('kimi-code-composer://skills/'))) {
+    return text;
+  }
+  let out = stripCommandSkillChips(text);
+  out = out.replace(SKILL_CHIP_RE, (_full, label: string, encodedSlug: string) => {
+    let slug = encodedSlug;
+    try { slug = decodeURIComponent(encodedSlug); } catch { /* keep raw */ }
+    return slug ? `/${slug}` : label;
+  });
+  return out.trim();
+}
+
+const NATIVE_EFFORTS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'auto']);
+
+function nativeEffortFromCommand(name: string, args: string): string | undefined {
+  if (!/^(effort|thinking)$/i.test(name)) return undefined;
+  const token = args.trim().split(/\s+/)[0]?.toLowerCase();
+  return token && NATIVE_EFFORTS.has(token) ? token : undefined;
+}
+
+function parseWireThinkingPatch(raw: unknown): string | undefined {
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const rec = raw as { enabled?: unknown; effort?: unknown };
+    if (rec.enabled === false) return 'off';
+    if (typeof rec.effort === 'string' && rec.effort.trim()) return rec.effort.trim();
+    if (rec.enabled === true) return 'on';
+  }
+  return undefined;
+}
+
+function toWireThinkingConfig(thinking: string | undefined): Record<string, unknown> | undefined {
+  if (!thinking) return undefined;
+  if (thinking === 'off') return { enabled: false };
+  if (thinking === 'on') return { enabled: true };
+  return { enabled: true, effort: thinking };
+}
+
+function mergeAgentRefs(
+  existing: unknown,
+  ids: Array<string | undefined>,
+): Array<{ agent_id: string; role: 'child' }> | undefined {
+  const out: Array<{ agent_id: string; role: 'child' }> = [];
+  const seen = new Set<string>();
+  if (Array.isArray(existing)) {
+    for (const item of existing) {
+      if (!item || typeof item !== 'object') continue;
+      const rec = item as { agent_id?: unknown; agentId?: unknown };
+      const id = typeof rec.agent_id === 'string' && rec.agent_id
+        ? rec.agent_id
+        : typeof rec.agentId === 'string' && rec.agentId
+          ? rec.agentId
+          : '';
+      if (id && id !== 'main' && !seen.has(id)) {
+        seen.add(id);
+        out.push({ agent_id: id, role: 'child' });
+      }
+    }
+  }
+  for (const rawId of ids) {
+    const id = typeof rawId === 'string' ? rawId.trim() : '';
+    if (id && id !== 'main' && !seen.has(id)) {
+      seen.add(id);
+      out.push({ agent_id: id, role: 'child' });
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function toWireTask(t: TranscriptTask): Record<string, unknown> {
+  const isRunning = t.state === 'running';
+  const outcome = t.state === 'completed'
+    ? 'completed'
+    : t.state === 'failed' || t.state === 'timed_out'
+      ? 'failed'
+      : t.state === 'killed'
+        ? 'cancelled'
+        : isRunning
+          ? undefined
+          : 'lost';
+  return {
+    task_id: t.taskId,
+    kind: t.kind,
+    status: isRunning ? 'running' : 'ended',
+    ...(outcome ? { outcome } : {}),
+    detached: t.detached,
+    ...(t.description ? { description: t.description } : {}),
+    ...(t.agentId ? { child_agent_id: t.agentId } : {}),
+    ...(t.parentToolUseId ? { parent_tool_call_id: t.parentToolUseId } : {}),
+    ...(t.startedAt ? { started_at: t.startedAt } : {}),
+    ...(t.endedAt ? { ended_at: t.endedAt } : {}),
+    ...(t.resultSummary ? { result_summary: t.resultSummary } : {}),
+    ...(t.error ? { state_reason: t.error } : {}),
+  };
+}
+
+async function collectSessionWireTasks(
+  adapter: ProviderAdapter | null | undefined,
+  nativeId: string,
+  sid: string,
+  hub: SessionHub,
+): Promise<Array<Record<string, unknown>>> {
+  const items = hub.transcript.currentTasks(sid).map(toWireTask);
+  const seenAgentIds = new Set<string>();
+  const seenTaskIds = new Set<string>();
+  for (const item of items) {
+    if (typeof item.task_id === 'string') seenTaskIds.add(item.task_id);
+    if (typeof item.child_agent_id === 'string') seenAgentIds.add(item.child_agent_id);
+  }
+  if (adapter?.listSubagents) {
+    const subs = await adapter.listSubagents(nativeId).catch(() => []);
+    for (const sub of subs) {
+      if (!sub?.agentId || seenAgentIds.has(sub.agentId) || seenTaskIds.has(sub.agentId)) continue;
+      seenAgentIds.add(sub.agentId);
+      items.push({
+        task_id: sub.agentId,
+        kind: 'subagent',
+        status: 'ended',
+        outcome: 'completed',
+        detached: false,
+        ...(sub.description ? { description: sub.description } : {}),
+        child_agent_id: sub.agentId,
+        ...(sub.parentToolUseId ? { parent_tool_call_id: sub.parentToolUseId } : {}),
+      });
+    }
+  }
+  return items;
+}
+
+async function applySessionProfilePatch(
+  adapter: ProviderAdapter,
+  sp: ProviderName,
+  nativeId: string,
+  caps: ReturnType<ProviderAdapter['capabilities']>,
+  body: Record<string, unknown>,
+  hub: SessionHub,
+  demoActive: boolean,
+): Promise<Record<string, unknown>> {
+  const title = typeof body?.title === 'string' && body.title.trim() ? body.title.trim() : undefined;
+  if (title) {
+    if (caps.rename === false || !adapter.rename) {
+      throw new ProviderError('unsupported', `${sp} 不支持重命名`, 400);
+    }
+    await adapter.rename(nativeId, title);
+  }
+  const nestedCfg = body?.agent_config && typeof body.agent_config === 'object' && !Array.isArray(body.agent_config)
+    ? (body.agent_config as Record<string, unknown>)
+    : {};
+  const cfg = { ...body, ...nestedCfg };
+  if (cfg.swarm_mode === true) {
+    throw new ProviderError('unsupported', `${sp} 不支持 swarm_mode`, 400);
+  }
+  if (cfg.tower_mode === true) {
+    throw new ProviderError('unsupported', `${sp} 不支持 tower_mode`, 400);
+  }
+  if (typeof cfg.model === 'string' && cfg.model && adapter.setModel) {
+    await adapter.setModel(nativeId, cfg.model);
+  }
+  const parsedThinking = parseWireThinkingPatch(cfg.thinking);
+  if (parsedThinking !== undefined && adapter.setThinking) {
+    await adapter.setThinking(nativeId, parsedThinking);
+  }
+  if (typeof cfg.permission_mode === 'string') {
+    if (cfg.permission_mode === 'manual' && (caps.manualApproval === false || caps.approvals === false)) {
+      throw new ProviderError('unsupported', `${sp} 不支持 manual 审批模式`, 400);
+    }
+    if (adapter.setPermission) await adapter.setPermission(nativeId, cfg.permission_mode);
+  }
+  if (typeof cfg.plan_mode === 'boolean') {
+    if (cfg.plan_mode === true && (caps.planMode === false || !adapter.setPlanMode)) {
+      throw new ProviderError('unsupported', `${sp} 不支持 plan_mode`, 400);
+    }
+    if (adapter.setPlanMode && caps.planMode !== false) {
+      await adapter.setPlanMode(nativeId, cfg.plan_mode);
+    }
+  }
+  if (typeof cfg.goal_objective === 'string') {
+    if (caps.goals === false || !adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+    await adapter.setGoal(nativeId, cfg.goal_objective);
+  }
+  if (typeof cfg.goal_control === 'string') {
+    if (caps.goals === false || !adapter.controlGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+    await adapter.controlGoal(nativeId, cfg.goal_control as 'pause' | 'resume' | 'cancel');
+  }
+  const sid = prefixedId(sp, nativeId);
+  emitV262AgentState(hub, adapter, sp, nativeId, sid, hub.busy.has(sid) ? 'running' : 'idle');
+  return sessionDto(await getSession(adapter, sp, nativeId, demoActive), adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(sid));
+}
+
 async function providerConfigView(
-  provider: Exclude<ProviderName, 'kimi' | 'pi'>,
+  provider: LocalProviderName,
   adapter: ProviderAdapter,
   kimiFetch: KimiFetch,
   patch: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const base = (await kimiFetch('/config').catch(() => ({ providers: {} }))) as Record<string, unknown>;
-  // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
   const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
   const requestedModel = typeof patch.default_model === 'string' ? patch.default_model : undefined;
   if (requestedModel && adapter.setModel) await adapter.setModel('__default__', requestedModel);
+  const requestedThinking = patch.thinking !== undefined ? parseWireThinkingPatch(patch.thinking) : undefined;
+  if (requestedThinking && adapter.setThinking) await adapter.setThinking('__default__', requestedThinking);
   const defaultModel = requestedModel ?? adapter.getModel?.('__default__') ?? models[0]?.model ?? '';
-  const baseProviders = base.providers && typeof base.providers === 'object'
-    ? (base.providers as Record<string, unknown>)
-    : {};
-  return {
-    ...base,
-    ...patch,
-    models: models.map((model) => ({
-      id: model.model,
-      display_name: model.display_name ?? model.model,
+  const wireThinking = toWireThinkingConfig(adapter.getThinking?.('__default__'));
+  const modelMap: Record<string, Record<string, unknown>> = {};
+  for (const model of models) {
+    const dto = wireModelDto(model);
+    modelMap[model.model] = {
       provider,
-    })),
+      model: model.model,
+      displayName: model.display_name ?? model.model,
+      ...(typeof model.max_context_size === 'number' && model.max_context_size > 0
+        ? { maxContextSize: model.max_context_size }
+        : {}),
+      ...(Array.isArray(dto.capabilities) ? { capabilities: dto.capabilities } : {}),
+      ...(Array.isArray(dto.support_efforts) ? { supportEfforts: dto.support_efforts } : {}),
+      ...(typeof dto.default_effort === 'string' ? { defaultEffort: dto.default_effort } : {}),
+    };
+  }
+  const { thinking: _kimiThinking, ...restBase } = base;
+  return {
+    ...restBase,
+    ...patch,
+    ...(wireThinking ? { thinking: wireThinking } : {}),
+    models: modelMap,
     providers: {
       [provider]: {
         type: provider,
@@ -1534,64 +2106,172 @@ async function providerConfigView(
   };
 }
 
-function skillDto(command: NativeCommand, provider: Exclude<ProviderName, 'kimi' | 'pi'>): Record<string, unknown> {
+/** Kimi Web 2.6.2 前端 `xM` 已内置的斜杠命令名，避免在 SlashMenu 中与 `/skills` 重复渲染。 */
+const KIMI_BUILTIN_SLASH_NAMES = new Set([
+  'new', 'clear', 'login', 'plan', 'swarm', 'tower', 'goal', 'btw',
+  'compact', 'undo', 'fork', 'reload', 'export', 'status',
+]);
+
+function skillDto(command: NativeCommand, cwd?: string): Record<string, unknown> {
+  const isDiskEntry = Boolean(command.path) && command.builtin !== true;
+  const source = isDiskEntry
+    ? (command.scope === 'project' ? 'project' : 'user')
+    : 'builtin';
   return {
     name: command.name,
     description: command.description,
-    path: '',
-    source: provider,
+    path: command.path ?? '',
+    source,
+    ...(source === 'project' && cwd ? { workspace_dir: cwd } : {}),
     type: 'prompt',
+    accepts_input: command.acceptsInput !== false,
+    ...(command.argumentHint ? { argument_hint: command.argumentHint } : {}),
+    ...(command.aliases && command.aliases.length > 0 ? { aliases: command.aliases } : {}),
     disable_model_invocation: false,
   };
 }
 
 async function adapterSkills(
   adapter: ProviderAdapter,
-  provider: Exclude<ProviderName, 'kimi' | 'pi'>,
   sessionId?: string,
+  cwdOverride?: string,
 ): Promise<Record<string, unknown>[]> {
   const byName = new Map<string, Record<string, unknown>>();
+  const cwd = cwdOverride ?? (sessionId ? adapter.getCwd?.(sessionId) : undefined);
   if (adapter.listSkills) {
-    const skills = await adapter.listSkills(sessionId).catch(() => []);
+    const skills = await adapter.listSkills(sessionId, cwd).catch(() => []);
     for (const skill of skills) {
-      if (!skill || typeof skill.name !== 'string' || skill.enabled === false) continue;
+      if (
+        !skill
+        || typeof skill.name !== 'string'
+        || skill.enabled === false
+        || KIMI_BUILTIN_SLASH_NAMES.has(skill.name)
+      ) {
+        continue;
+      }
+      const source = skill.scope === 'project' ? 'project' : 'user';
       byName.set(skill.name, {
         name: skill.name,
         description: skill.description ?? '',
         path: skill.path ?? '',
-        source: provider,
+        source,
+        ...(source === 'project' && cwd ? { workspace_dir: cwd } : {}),
         type: 'prompt',
+        accepts_input: true,
         disable_model_invocation: false,
       });
     }
   }
   if (adapter.listCommands) {
-    const commands = await adapter.listCommands(sessionId).catch(() => [] as NativeCommand[]);
+    const commands = await adapter.listCommands(sessionId, cwd).catch(() => [] as NativeCommand[]);
     for (const command of commands) {
-      if (command.kind !== 'prompt' || byName.has(command.name)) continue;
-      byName.set(command.name, skillDto(command, provider));
+      if (
+        command.kind !== 'prompt'
+        || command.terminalOnly === true
+        || KIMI_BUILTIN_SLASH_NAMES.has(command.name)
+        || byName.has(command.name)
+      ) {
+        continue;
+      }
+      byName.set(command.name, skillDto(command, cwd));
     }
   }
   return [...byName.values()];
 }
 
-function workspaceDto(root: string, name?: string): Record<string, unknown> {
-  const slug = root.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
-  const hash = createHash('sha256').update(root).digest('hex').slice(0, 12);
+function normalizeWorkspaceRoot(root: string): string {
+  const trimmed = root.trim();
+  if (!trimmed) return '';
+  const resolved = path.resolve(trimmed);
+  return (process.platform === 'win32' ? resolved.toLowerCase() : resolved).replace(/[\\/]+$/, '') || '/';
+}
+
+interface WorkspaceDtoOptions {
+  kind?: 'implicit' | 'managed';
+  additionalDirs?: string[];
+  createdAt?: string;
+  lastOpenedAt?: string;
+  sessionCount?: number;
+}
+
+interface StoredLocalWorkspace {
+  id: string;
+  root: string;
+  name?: string;
+  kind?: 'implicit' | 'managed';
+  additional_dirs?: string[];
+  created_at?: string;
+  last_opened_at?: string;
+}
+
+function readStoredWorkspaces(
+  store: SettingsStore | undefined,
+  provider: LocalProviderName,
+): StoredLocalWorkspace[] {
+  if (!store) return [];
+  const entries = store.listStrings(provider);
+  const out: StoredLocalWorkspace[] = [];
+  for (const [id, raw] of Object.entries(entries)) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<StoredLocalWorkspace>;
+      if (parsed && typeof parsed.root === 'string' && parsed.root.trim()) {
+        out.push({
+          id: typeof parsed.id === 'string' && parsed.id ? parsed.id : id,
+          root: parsed.root.trim(),
+          name: typeof parsed.name === 'string' ? parsed.name : undefined,
+          kind: parsed.kind === 'implicit' ? 'implicit' : 'managed',
+          additional_dirs: Array.isArray(parsed.additional_dirs)
+            ? parsed.additional_dirs.filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
+            : [],
+          created_at: typeof parsed.created_at === 'string' ? parsed.created_at : undefined,
+          last_opened_at: typeof parsed.last_opened_at === 'string' ? parsed.last_opened_at : undefined,
+        });
+      }
+    } catch {
+      // ignore corrupt persisted workspace entry
+    }
+  }
+  return out;
+}
+
+function upsertStoredWorkspace(
+  store: SettingsStore | undefined,
+  provider: LocalProviderName,
+  record: StoredLocalWorkspace,
+): void {
+  if (!store) return;
+  store.set(provider, record.id, JSON.stringify(record));
+}
+
+function workspaceDto(root: string, name?: string, opts?: WorkspaceDtoOptions): Record<string, unknown> {
+  const normalized = normalizeWorkspaceRoot(root) || root;
+  const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
+  const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+  const maxSlug = Math.max(1, 60 - 'wd_'.length - 1 - hash.length);
+  const now = new Date().toISOString();
+  const baseName = normalized ? path.posix.basename(normalized.replace(/\\/g, '/')) : '';
+  const fallbackName = baseName || slug;
   return {
-    id: `wd_${slug}_${hash}`.slice(0, 60),
+    id: `wd_${slug.slice(0, maxSlug)}_${hash}`,
     root,
-    name: name ?? slug,
-    created_at: new Date().toISOString(),
+    name: name && name.trim() ? name.trim() : fallbackName,
+    kind: opts?.kind ?? 'implicit',
+    additional_dirs: opts?.additionalDirs ?? [],
+    created_at: opts?.createdAt ?? now,
+    last_opened_at: opts?.lastOpenedAt ?? opts?.createdAt ?? now,
+    session_count: opts?.sessionCount ?? 0,
   };
 }
 
-async function listAllSessions(adapter: ProviderAdapter): Promise<Session[]> {
+async function listAllSessions(
+  adapter: ProviderAdapter,
+  query: { cwd?: string; archived?: boolean } = {},
+): Promise<Session[]> {
   const items: Session[] = [];
   const seen = new Set<string>();
   let cursor: string | undefined;
   for (;;) {
-    const page = await adapter.list({ limit: 100, cursor });
+    const page = await adapter.list({ limit: 100, cursor, ...query });
     items.push(...page.items);
     if (!page.next_cursor || seen.has(page.next_cursor)) return items;
     seen.add(page.next_cursor);
@@ -1600,10 +2280,11 @@ async function listAllSessions(adapter: ProviderAdapter): Promise<Session[]> {
 }
 
 async function listWorkspaces(
-  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
+  adapters: Record<LocalProviderName, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
   provider: ProviderName | undefined,
   demoActive: boolean,
+  workspaceStore?: SettingsStore,
 ): Promise<Record<string, unknown>> {
   const roots = new Map<string, Record<string, unknown>>();
   // Kimi 工作区:直接取上游视图(自带 session_count)。
@@ -1611,29 +2292,44 @@ async function listWorkspaces(
     const data = (await kimiFetch('/workspaces').catch(() => null)) as { items?: Record<string, unknown>[] } | null;
     for (const w of data?.items ?? []) {
       const root = String(w.root ?? w.id ?? '');
-      if (root) roots.set(root, w);
+      const norm = normalizeWorkspaceRoot(root) || root;
+      if (norm) roots.set(norm, w);
     }
   }
   if (demoActive && (!provider || provider === 'kimi')) {
     for (const session of listDemoSessions('kimi')) {
       const cwd = session.metadata.cwd;
-      if (!roots.has(cwd)) roots.set(cwd, workspaceDto(cwd));
-      const workspace = roots.get(cwd);
+      const norm = normalizeWorkspaceRoot(cwd) || cwd;
+      if (!roots.has(norm)) roots.set(norm, workspaceDto(cwd));
+      const workspace = roots.get(norm);
       if (workspace) {
         workspace.session_count = (typeof workspace.session_count === 'number' ? workspace.session_count : 0) + 1;
       }
     }
   }
-  // Codex/Claude:沿各自原生 cursor 聚合全部主会话。固定上限会漏掉老项目,
+  // Codex/Claude/Grok/Pi:沿各自原生 cursor 聚合全部主会话。固定上限会漏掉老项目,
   // 还会让前端的 session_count 与“加载更多”不一致。
-  const localProviders: Exclude<ProviderName, 'kimi' | 'pi'>[] = ['codex', 'claude', 'grok'];
-  const targets: Exclude<ProviderName, 'kimi' | 'pi'>[] = !provider
-    ? localProviders
+  const targets: LocalProviderName[] = !provider
+    ? [...LOCAL_PROVIDERS]
     : isLocalProvider(provider)
       ? [provider]
       : [];
   for (const p of targets) {
-    const adapter = adapters[p as Exclude<ProviderName, 'kimi' | 'pi'>];
+    for (const stored of readStoredWorkspaces(workspaceStore, p)) {
+      const norm = normalizeWorkspaceRoot(stored.root) || stored.root;
+      if (!roots.has(norm)) {
+        const dto = workspaceDto(stored.root, stored.name, {
+          kind: stored.kind ?? 'managed',
+          additionalDirs: stored.additional_dirs ?? [],
+          createdAt: stored.created_at,
+          lastOpenedAt: stored.last_opened_at,
+          sessionCount: 0,
+        });
+        dto.id = stored.id;
+        roots.set(norm, dto);
+      }
+    }
+    const adapter = adapters[p];
     const sessions = mergeDemoSessions(
       p,
       await listAllSessions(adapter).catch((err) => {
@@ -1645,11 +2341,12 @@ async function listWorkspaces(
     const counts = new Map<string, number>();
     for (const session of sessions) {
       const cwd = session.metadata.cwd;
-      if (!roots.has(cwd)) roots.set(cwd, workspaceDto(cwd));
-      counts.set(cwd, (counts.get(cwd) ?? 0) + 1);
+      const norm = normalizeWorkspaceRoot(cwd) || cwd;
+      if (!roots.has(norm)) roots.set(norm, workspaceDto(cwd));
+      counts.set(norm, (counts.get(norm) ?? 0) + 1);
     }
-    for (const [cwd, count] of counts) {
-      const workspace = roots.get(cwd);
+    for (const [norm, count] of counts) {
+      const workspace = roots.get(norm);
       if (workspace) {
         workspace.session_count = (typeof workspace.session_count === 'number' ? workspace.session_count : 0) + count;
       }
@@ -1659,7 +2356,7 @@ async function listWorkspaces(
 }
 
 function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boolean): Record<string, unknown> {
-  // facade 的 Session.busy 是硬编码 false(三家适配器都不跟踪 live 状态);
+  // facade 的 Session.busy 是硬编码 false(适配器默认不跟踪网关 live turn 状态);
   // 真值只能从网关 hub(turn 登记处)拿,调用方有 hub 就传 busy 覆盖——否则
   // 进行中的会话刷新后月亮熄灭、前端误判 turn 结束(审查实测)。
   const isBusy = busy ?? s.busy;
@@ -1689,9 +2386,8 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boo
 }
 
 /**
- * 0.38 侧栏 load 调 listSessionGroupsV2: GET /api/v2/sessions?view=by_workspace,
- * 解包 `groups` 再 `[...Ie.groups]`。本地 provider 以前只回 items,groups 缺失
- * 直接 TypeError。Kimi 无 provider 仍走 shouldProxyToKimi,本函数只服务 claude/codex/grok。
+ * 0.38+ 侧栏 load 调 listSessionGroupsV2: GET /api/v2/sessions?view=by_workspace,
+ * 解包 `groups` 再 `[...Ie.groups]`。Kimi 无 provider 仍走 shouldProxyToKimi,本函数服务本地 provider。
  */
 function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<string, unknown> {
   const groupPageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('group.page_size') ?? 5) || 5));
@@ -1757,40 +2453,53 @@ function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<stri
 }
 
 async function listSessions(
-  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
+  adapters: Record<LocalProviderName, ProviderAdapter>,
   kimiFetch: KimiFetch | null,
   url: URL,
   provider: ProviderName | undefined,
   busyOf: (sid: string) => boolean,
   pageCursors: Map<string, string>,
   demoActive: boolean,
+  fetchAll = false,
+  workspaceStore?: SettingsStore,
 ): Promise<Record<string, unknown>> {
-  const limit = Math.min(Number(url.searchParams.get('page_size') ?? 50) || 50, 100);
+  const limit = fetchAll ? Number.MAX_SAFE_INTEGER : Math.min(Number(url.searchParams.get('page_size') ?? 50) || 50, 100);
   const beforeId = url.searchParams.get('before_id') ?? undefined;
   const excludeEmpty = url.searchParams.get('exclude_empty') === 'true';
   const archivedOnly = url.searchParams.get('archived_only') === 'true';
-  // 前端按工作区逐组拉首页(page_size 很小)并用 before_id 翻页:kimi 透传
-  // workspace_id 给上游;codex/claude 由本网关按 cwd 派生的工作区 id 过滤。
-  // 本地适配器有缓存,直接拉全量合并后在网关侧分页(before_id 语义对齐上游:
-  // 返回比该 id 更旧的一页)。
-  const FETCH_ALL = 500;
   const workspaceId = url.searchParams.get('workspace_id') ?? undefined;
   const items: Record<string, unknown>[] = [];
-  // 前端按 cwd 把三家会话归到任一同 root 的工作区。先把 workspace_id 解析回
-  // root,再按 root 过滤,而不是比 id——kimi 上游的工作区 id 规则(slug 取
-  // basename,如 wd_ubuntu_*)与网关派生规则(全路径,如 wd_home-ubuntu_*)
-  // 不同,直接透传会被上游 40410 拒掉(实测),所以 kimi 也在本地按 cwd 过滤。
   let workspaceRoot: string | undefined;
   if (workspaceId) {
-    const all = (await listWorkspaces(adapters, kimiFetch, provider, demoActive).catch(() => null)) as
+    const all = (await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore).catch(() => null)) as
       | { items?: Record<string, unknown>[] }
       | null;
     const hit = (all?.items ?? []).find((w) => w.id === workspaceId);
     workspaceRoot = typeof hit?.root === 'string' && hit.root ? hit.root : undefined;
   }
-  const rootNorm = workspaceRoot?.replace(/\/+$/, '');
+  const rootNorm = workspaceRoot ? normalizeWorkspaceRoot(workspaceRoot) : undefined;
   if (isLocalProvider(provider)) {
     const adapter = adapters[provider];
+    if (fetchAll && !beforeId) {
+      let allItems = await listAllSessions(adapter, { cwd: workspaceRoot, archived: archivedOnly || undefined }).catch((err) => {
+        console.error(`[gateway] listSessions: ${provider}.list 失败:`, err instanceof Error ? err.message : err);
+        return [] as Session[];
+      });
+      allItems = mergeDemoSessions(provider, allItems, demoActive);
+      if (rootNorm) {
+        allItems = allItems.filter((session) => normalizeWorkspaceRoot(String(session.metadata?.cwd ?? '')) === rootNorm);
+      }
+      allItems = archivedOnly
+        ? allItems.filter((session) => session.archived === true)
+        : allItems.filter((session) => session.archived !== true);
+      const localItems = allItems.map((session) => sessionDto(
+        session,
+        adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
+        adapter.getUsage?.(session.id),
+        busyOf(prefixedId(provider, session.id)),
+      ));
+      return { items: localItems, has_more: false };
+    }
     // Open/Done 翻页游标必须带 archived 维度,否则两边页尾 id 相同时会串用。
     const archiveLane = archivedOnly ? 'ar' : 'op';
     const cursorKey = (id: string): string => `${provider}\u0000${workspaceId ?? ''}\u0000${archiveLane}\u0000${id}`;
@@ -1803,7 +2512,7 @@ async function listSessions(
       }
       if (!cursor) return { items: [], has_more: false };
     }
-    let page: SessionPage = await adapter.list({ limit, cursor, cwd: rootNorm, archived: archivedOnly || undefined }).catch((err) => {
+    let page: SessionPage = await adapter.list({ limit, cursor, cwd: workspaceRoot, archived: archivedOnly || undefined }).catch((err) => {
       console.error(`[gateway] listSessions: ${provider}.list 失败:`, err instanceof Error ? err.message : err);
       return { items: [] as Session[] };
     });
@@ -1814,7 +2523,7 @@ async function listSessions(
       page = await adapter.list({
         limit,
         cursor: page.next_cursor,
-        cwd: rootNorm,
+        cwd: workspaceRoot,
         archived: archivedOnly || undefined,
       });
     }
@@ -1822,7 +2531,7 @@ async function listSessions(
     if (rootNorm) {
       page = {
         ...page,
-        items: page.items.filter((session) => String(session.metadata?.cwd ?? '').replace(/\/+$/, '') === rootNorm),
+        items: page.items.filter((session) => normalizeWorkspaceRoot(String(session.metadata?.cwd ?? '')) === rootNorm),
       };
     }
     if (archivedOnly) {
@@ -1857,7 +2566,7 @@ async function listSessions(
           const cwd = typeof (it.metadata as Record<string, unknown> | undefined)?.cwd === 'string'
             ? String((it.metadata as Record<string, unknown>).cwd)
             : '';
-          if (cwd.replace(/\/+$/, '') !== rootNorm) continue;
+          if (normalizeWorkspaceRoot(cwd) !== rootNorm) continue;
         }
         items.push(it);
       }
@@ -1868,7 +2577,7 @@ async function listSessions(
   }
   if (demoActive && (!provider || provider === 'kimi')) {
     for (const session of listDemoSessions('kimi')) {
-      if (rootNorm && session.metadata.cwd.replace(/\/+$/, '') !== rootNorm) continue;
+      if (rootNorm && normalizeWorkspaceRoot(session.metadata.cwd) !== rootNorm) continue;
       items.push(sessionDto(session, getDemoModel('kimi', session.id)));
     }
   }
@@ -1882,19 +2591,17 @@ async function listSessions(
     }
     return { items: items.slice(start, start + limit), has_more: start + limit < items.length };
   }
-  const targets: Exclude<ProviderName, 'kimi' | 'pi'>[] =
-    provider === 'pi' ? [] : ['codex', 'claude', 'grok'];
-  for (const p of targets) {
-    const page = await adapters[p].list({ limit: FETCH_ALL }).catch((err) => {
+  for (const p of LOCAL_PROVIDERS) {
+    const pageItems = await listAllSessions(adapters[p], { archived: archivedOnly || undefined }).catch((err) => {
       console.error(`[gateway] listSessions: ${p}.list 失败:`, err instanceof Error ? err.message : err);
-      return { items: [] as Session[] };
+      return [] as Session[];
     });
-    for (const s of mergeDemoSessions(p, page.items, demoActive)) {
+    for (const s of mergeDemoSessions(p, pageItems, demoActive)) {
+      if (archivedOnly ? s.archived !== true : s.archived === true) continue;
       if (workspaceId) {
-        // 解析不到 root 的工作区 id(已被移除的派生工作区)= 没有会话。
         if (!rootNorm) continue;
         const cwd = typeof s.metadata?.cwd === 'string' ? String(s.metadata.cwd) : '';
-        if (cwd.replace(/\/+$/, '') !== rootNorm) continue;
+        if (normalizeWorkspaceRoot(cwd) !== rootNorm) continue;
       }
       items.push(sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id))));
     }
@@ -1911,16 +2618,26 @@ async function listSessions(
 }
 
 async function createLocalSession(
-  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
+  adapters: Record<LocalProviderName, ProviderAdapter>,
   body: unknown,
-  provider: Exclude<ProviderName, 'kimi' | 'pi'>,
+  provider: LocalProviderName,
+  workspaceStore?: SettingsStore,
 ): Promise<Record<string, unknown>> {
-  const b = body as { metadata?: { cwd?: string }; cwd?: string; title?: string };
-  const cwd = b.metadata?.cwd ?? b.cwd ?? process.env.HOME ?? '/home/ubuntu';
-  const session = await adapters[provider].create({ provider, cwd, title: b.title, metadata: b.metadata });
-  // 新建会话时前端已让用户选了模型/thinking(composer 的 pick 随 create 一起
-  // 来);不应用的话首轮 turn 会跑在默认模型上,UI 却显示用户的选择(审查发现)。
+  const b = body as { metadata?: { cwd?: string }; cwd?: string; workspace_id?: string; title?: string };
+  let resolvedWorkspaceRoot: string | undefined;
+  if (!b.metadata?.cwd && !b.cwd && typeof b.workspace_id === 'string' && b.workspace_id) {
+    const storedHit = readStoredWorkspaces(workspaceStore, provider).find((w) => w.id === b.workspace_id);
+    if (storedHit) {
+      resolvedWorkspaceRoot = storedHit.root;
+    } else {
+      const all = await listWorkspaces(adapters, null, provider, false, workspaceStore).catch(() => ({ items: [] }));
+      const hit = ((all as { items?: Array<Record<string, unknown>> }).items ?? []).find((w) => w.id === b.workspace_id);
+      if (typeof hit?.root === 'string' && hit.root) resolvedWorkspaceRoot = hit.root;
+    }
+  }
+  const cwd = b.metadata?.cwd ?? b.cwd ?? resolvedWorkspaceRoot ?? os.homedir();
   const adapter = adapters[provider];
+  const caps = adapter.capabilities();
   const createCfg = (b as {
     agent_config?: {
       model?: string;
@@ -1929,6 +2646,15 @@ async function createLocalSession(
       plan_mode?: boolean;
     };
   }).agent_config;
+  if (createCfg?.permission_mode === 'manual' && (caps.manualApproval === false || caps.approvals === false)) {
+    throw new ProviderError('unsupported', `${provider} 不支持 manual 审批模式`, 400);
+  }
+  if (createCfg?.plan_mode === true && (caps.planMode === false || !adapter.setPlanMode)) {
+    throw new ProviderError('unsupported', `${provider} 不支持 plan_mode`, 400);
+  }
+  const session = await adapter.create({ provider, cwd, title: b.title, metadata: b.metadata });
+  // 新建会话时前端已让用户选了模型/thinking(composer 的 pick 随 create 一起
+  // 来);不应用的话首轮 turn 会跑在默认模型上,UI 却显示用户的选择(审查发现)。
   if (createCfg?.model && adapter.setModel) await adapter.setModel(session.id, createCfg.model);
   if (typeof createCfg?.thinking === 'string' && adapter.setThinking) {
     await adapter.setThinking(session.id, createCfg.thinking);
@@ -1936,7 +2662,7 @@ async function createLocalSession(
   if (typeof createCfg?.permission_mode === 'string' && adapter.setPermission) {
     await adapter.setPermission(session.id, createCfg.permission_mode);
   }
-  if (typeof createCfg?.plan_mode === 'boolean' && adapter.setPlanMode) {
+  if (typeof createCfg?.plan_mode === 'boolean' && caps.planMode !== false && adapter.setPlanMode) {
     await adapter.setPlanMode(session.id, createCfg.plan_mode);
   }
   return sessionDto(session, adapter.getModel?.(session.id), adapter.getUsage?.(session.id));
@@ -1998,12 +2724,22 @@ async function snapshot(
   hub: SessionHub,
   demoActive: boolean,
 ): Promise<Record<string, unknown>> {
-  const [session, history] = await Promise.all([
+  const sid = prefixedId(provider, nativeId);
+  const [session, history, wireTasks] = await Promise.all([
     getSession(adapter, provider, nativeId, demoActive),
     historyWithDemo(adapter, provider, nativeId, demoActive),
+    collectSessionWireTasks(adapter, nativeId, sid, hub),
   ]);
-  const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
+  const subagents = wireTasks
+    .filter((t) => t.kind === 'subagent')
+    .map((t) => ({
+      agent_id: t.child_agent_id ?? t.task_id,
+      ...(t.parent_tool_call_id ? { parent_tool_call_id: t.parent_tool_call_id } : {}),
+      ...(t.description ? { description: t.description } : {}),
+      status: t.status,
+      ...(t.outcome ? { outcome: t.outcome } : {}),
+    }));
   return {
     as_of_seq: hub.nextSeq(),
     epoch: hub.epoch,
@@ -2025,7 +2761,7 @@ async function snapshot(
           current_prompt_id: active.promptId,
         }
       : null,
-    subagents: [],
+    subagents,
     pending_approvals: pendingApprovals(sid, hub),
     pending_questions: pendingQuestions(sid, hub),
   };
@@ -2098,6 +2834,7 @@ function listPrompts(sid: string, hub: SessionHub): Record<string, unknown> {
   const toWire = (prompt: (typeof prompts)[number]) => ({
     prompt_id: prompt.promptId,
     user_message_id: prompt.userMessageId ?? prompt.promptId,
+    origin: (prompt as { origin?: unknown }).origin ?? { kind: 'user' },
     status: prompt.status,
     content: prompt.content,
     created_at: prompt.createdAt,
@@ -2115,7 +2852,10 @@ function listPrompts(sid: string, hub: SessionHub): Record<string, unknown> {
  * 诚实降级为文字引用——codex turn/start 的 image 项只收 data URL)。
  * 上传单丢失(重启后内存元数据没了)时降级为文字说明,不让 prompt 整个失败。
  */
-function extractAttachments(content: Array<Record<string, unknown>>): { text: string; attachments: TurnAttachment[] } {
+function extractAttachments(
+  content: Array<Record<string, unknown>>,
+  uploadStore: UploadStore,
+): { text: string; attachments: TurnAttachment[] } {
   const texts: string[] = [];
   const attachments: TurnAttachment[] = [];
   for (const c of content ?? []) {
@@ -2129,15 +2869,15 @@ function extractAttachments(content: Array<Record<string, unknown>>): { text: st
       const src = c.source as Record<string, unknown> | undefined;
       const kind = src?.kind as string | undefined;
       if (kind === 'file' && typeof src?.file_id === 'string') {
-        const meta = uploads.get(src.file_id);
+        const meta = uploadStore.get(src.file_id);
         if (!meta) {
           texts.push(`[attached ${type} unavailable: upload expired]`);
           continue;
         }
-        const p = path.join(UPLOAD_DIR, meta.id);
+        const p = uploadStore.filePath(meta.id);
         // codex 有 localImage 没有 video 输入项:图片给路径,视频物化成文本。
         attachments.push(
-          type === 'image'
+          type === 'image' && meta.media_type.startsWith('image/')
             ? { kind: 'localImage', path: p, name: meta.name, mediaType: meta.media_type, size: meta.size }
             : { kind: 'filePathText', path: p, name: meta.name, mediaType: meta.media_type, size: meta.size },
         );
@@ -2156,68 +2896,119 @@ function extractAttachments(content: Array<Record<string, unknown>>): { text: st
     }
     if (type === 'file') {
       const fileId = c.file_id as string | undefined;
-      const meta = fileId ? uploads.get(fileId) : undefined;
+      const meta = fileId ? uploadStore.get(fileId) : undefined;
       if (meta) {
-        attachments.push({ kind: 'filePathText', path: path.join(UPLOAD_DIR, meta.id), name: meta.name, mediaType: meta.media_type, size: meta.size });
+        attachments.push({ kind: 'filePathText', path: uploadStore.filePath(meta.id), name: meta.name, mediaType: meta.media_type, size: meta.size });
       } else {
         texts.push(`[attached file unavailable: ${String(c.name ?? 'unknown')}]`);
       }
     }
   }
-  return { text: texts.join('\n'), attachments };
+  return { text: sanitizePromptSkillChips(texts.join('\n')), attachments };
+}
+
+function queuedContentBlocks(text: string, attachments: TurnAttachment[]): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [{ type: 'text', text }];
+  for (const att of attachments) {
+    out.push({
+      type: att.kind === 'localImage' || att.kind === 'imageDataUrl' ? 'image' : 'file',
+      ...(att.name ? { name: att.name } : {}),
+      ...(att.path ? { path: att.path } : {}),
+      ...(att.mediaType ? { media_type: att.mediaType } : {}),
+      ...(att.size !== undefined ? { size: att.size } : {}),
+    });
+  }
+  return out;
 }
 
 async function submitPrompt(
   adapter: ProviderAdapter,
   provider: ProviderName,
   nativeId: string,
-  body: { content: Array<Record<string, unknown>> },
+  body: { prompt_id?: string; content: Array<Record<string, unknown>> },
   hub: SessionHub,
   demoActive: boolean,
+  uploadStore: UploadStore,
 ): Promise<Record<string, unknown>> {
-  // hub 键统一用带 provider 前缀的 wire id:codex/claude 的原生 id 都是 UUID,
-  // 只用 nativeId 会让同名会话跨 provider 互串 busy/广播(审查发现)。
   const sid = prefixedId(provider, nativeId);
-  const { text, attachments } = extractAttachments(body.content ?? []);
+  const { text, attachments } = extractAttachments(body.content ?? [], uploadStore);
   if (!text.trim() && attachments.length === 0) throw new ProviderError('invalid_request', 'empty prompt', 400);
+  const requestedPromptId = typeof body.prompt_id === 'string' && body.prompt_id.trim()
+    ? body.prompt_id.trim()
+    : undefined;
 
-  // codex 网关代执行命令(/compact /fork /undo /status /usage /mcp /review):
-  // app-server 没有 slash 概念,名字命中时映射到对应 RPC。/review 是真 turn,
-  // 走 driveTurn;其余是即时代执行,输出以系统消息形式广播。claude 不拦截
-  // —— CLI 在 stream-json 模式下自己执行斜杠命令(2.1.226 实测)。
-  // 必须在 busy 排队之前拦截:代执行命令走 RPC 而非 turn/start,排进队列会被
-  // drainQueue 当普通 prompt 发给模型。turn 进行中返回 409——既避免即时代执行
-  // 帧与真 turn 帧在投影器里互串,也防止命令文本泄漏给模型(审查发现)。
-  const cmd = provider === 'codex' || provider === 'grok' ? /^\/(\S+)\s*([\s\S]*)$/.exec(text.trim()) : null;
+  const cmd = isLocalProvider(provider)
+    ? /^\/(\S+)\s*([\s\S]*)$/.exec(text.trim())
+    : null;
   if (cmd && provider === 'codex' && codexGatewayCommandNames().has(cmd[1])) {
     if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
-    const [, name, argsText] = cmd;
+    const [, name, rawArgs] = cmd;
+    const argsText = (rawArgs ?? '').trim();
     if (name === 'review') {
       if (!adapter.review) throw new ProviderError('unsupported', 'review 不可用', 400);
-      return driveTurn(adapter, provider, nativeId, '/review', () => adapter.review!(nativeId), hub, undefined, undefined, demoActive);
+      const reviewOptions = parseCodexReviewOptions(argsText);
+      const promptLabel = argsText ? `/review ${argsText}` : '/review';
+      return driveTurn(
+        adapter,
+        provider,
+        nativeId,
+        promptLabel,
+        () => adapter.review!(nativeId, reviewOptions),
+        hub,
+        requestedPromptId ?? randomUUID(),
+        undefined,
+        demoActive,
+        uploadStore,
+      );
     }
-    return runCodexLocalCommand(adapter, provider, nativeId, name, (argsText ?? '').trim(), hub);
+    return runLocalGatewayCommand(adapter, provider, nativeId, name, argsText, hub, requestedPromptId, demoActive, uploadStore);
   }
-  if (cmd && provider === 'grok' && grokGatewayCommandNames().has(cmd[1])) {
+  if (
+    cmd
+    && provider === 'grok'
+    && (grokGatewayCommandNames().has(cmd[1]) || grokUnsupportedTuiCommandNames().has(cmd[1]))
+  ) {
     if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
-    const [, name, argsText] = cmd;
-    return runGrokLocalCommand(adapter, provider, nativeId, name, (argsText ?? '').trim(), hub);
+    const [, name, rawArgs] = cmd;
+    return runLocalGatewayCommand(adapter, provider, nativeId, name, (rawArgs ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
+  }
+  if (cmd && provider === 'pi') {
+    if (cmd[1] === 'undo') {
+      throw new ProviderError('unsupported', 'pi 不支持 /undo', 400);
+    }
+    if (piGatewayCommandNames().has(cmd[1]) || piUnsupportedTuiCommandNames().has(cmd[1])) {
+      if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+      const [, name, rawArgs] = cmd;
+      return runLocalGatewayCommand(adapter, provider, nativeId, name, (rawArgs ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
+    }
+  }
+  if (cmd && provider === 'claude') {
+    if (cmd[1] === 'undo') {
+      throw new ProviderError('unsupported', 'claude 不支持 /undo', 400);
+    }
+    if (claudeGatewayCommandNames().has(cmd[1]) || claudeUnsupportedTuiCommandNames().has(cmd[1])) {
+      if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+      const [, name, rawArgs] = cmd;
+      return runLocalGatewayCommand(adapter, provider, nativeId, name, (rawArgs ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
+    }
   }
 
   // busy → 排队(对齐 kap-server:前端 steer 流依赖 status:'queued';队列里
   // 的 prompt 在当前 turn 结束后自动开自己的 turn,或被 prompts:steer 注入)。
   if (hub.busy.has(sid)) {
-    const promptId = randomUUID();
+    const promptId = requestedPromptId ?? randomUUID();
     const createdAt = new Date().toISOString();
     const q = hub.queued.get(sid) ?? [];
     q.push({ promptId, text, attachments, createdAt });
     hub.queued.set(sid, q);
-    hub.transcript.submitPrompt(sid, promptId, 'queued', [{ type: 'text', text }], createdAt);
+    const content = queuedContentBlocks(text, attachments);
+    hub.transcript.submitPrompt(sid, promptId, 'queued', content, createdAt);
     return {
       prompt_id: promptId,
       user_message_id: promptId,
+      origin: { kind: 'user' },
       status: 'queued',
-      content: [{ type: 'text', text }],
+      content,
       created_at: createdAt,
     };
   }
@@ -2231,10 +3022,70 @@ async function submitPrompt(
       ? Promise.resolve(demoStartTurn(provider, nativeId, text))
       : adapter.startTurn({ sessionId: nativeId, input: text, attachments })),
     hub,
-    undefined,
+    requestedPromptId ?? randomUUID(),
     undefined,
     demoActive,
+    uploadStore,
   );
+}
+
+async function steerDirectPrompt(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  body: { prompt_id?: string; content: Array<Record<string, unknown>> },
+  hub: SessionHub,
+  uploadStore: UploadStore,
+): Promise<Record<string, unknown>> {
+  const sid = prefixedId(provider, nativeId);
+  const active = hub.busy.get(sid);
+  if (!active || !active.turnId) {
+    throw new ProviderError('not_found', 'PROMPT_NOT_FOUND: no active turn to steer into', 404);
+  }
+  const caps = adapter.capabilities();
+  if (caps.steer === false || !adapter.steer) {
+    throw new ProviderError('unsupported', `${provider} 不支持 steer`, 400);
+  }
+  const { text, attachments } = extractAttachments(body.content ?? [], uploadStore);
+  if (!text.trim() && attachments.length === 0) {
+    throw new ProviderError('invalid_request', 'empty steer prompt', 400);
+  }
+  let steerText = text;
+  if (attachments.length > 0 && caps.steerAttachments !== true) {
+    const notes = attachments
+      .map((a) => a.path
+        ? `[attached ${a.kind === 'localImage' ? 'image' : 'file'}: ${a.path}]`
+        : `[attached ${a.kind}]`)
+      .join('\n');
+    steerText = steerText ? `${steerText}\n${notes}` : notes;
+  }
+  if (caps.steerAttachments === true && attachments.length > 0) {
+    await adapter.steer(nativeId, active.turnId, steerText, attachments);
+  } else {
+    await adapter.steer(nativeId, active.turnId, steerText);
+  }
+  const promptId = typeof body.prompt_id === 'string' && body.prompt_id.trim()
+    ? body.prompt_id.trim()
+    : randomUUID();
+  const createdAt = new Date().toISOString();
+  const msgContent = queuedContentBlocks(text, attachments);
+  emitV262SteerUserItem(hub, sid, active, promptId, text, attachments);
+  hub.broadcast(sid, frame(sid, hub, 'event.message.created', {
+    message: {
+      id: randomUUID(), session_id: sid, role: 'user', prompt_id: promptId,
+      content: msgContent, created_at: createdAt,
+    },
+  }));
+  hub.transcript.submitPrompt(sid, promptId, 'queued', msgContent, createdAt);
+  hub.transcript.steerPrompts(sid, active.promptId, [promptId], msgContent);
+  return {
+    prompt_id: promptId,
+    user_message_id: promptId,
+    origin: { kind: 'user' },
+    status: 'running',
+    content: msgContent,
+    created_at: createdAt,
+  };
 }
 
 /**
@@ -2251,12 +3102,14 @@ async function driveTurn(
   promptId: string = randomUUID(),
   onSettled?: (reason: 'completed' | 'failed') => void,
   demoActive: boolean = false,
+  uploadStore?: UploadStore,
 ): Promise<Record<string, unknown>> {
   const sid = prefixedId(provider, nativeId);
   const turn = newActiveTurn(nativeId, promptId);
   hub.busy.set(sid, turn);
   const startedAt = Date.now();
   const createdAt = new Date(startedAt).toISOString();
+  turn.v262StartedAt = createdAt;
   hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text }], createdAt);
   // startTurn 与历史读取并行。用 settled 结果承接 rejection，避免历史较慢时
   // acquire 的拒绝先变成未处理 Promise。
@@ -2265,10 +3118,10 @@ async function driveTurn(
     (error: unknown) => ({ ok: false as const, error }),
   );
   if (!hub.transcript.hasObservedHistory(sid)) {
-    // 拉取失败不能当成"空历史"落进 hub——historyObserved 被提前固化后,
-    // 真实历史回灌时会与运行中 turn 撞号(审查实测会静默丢 live turn)。
-    const history = await historyWithDemo(adapter, provider, nativeId, demoActive);
-    if (history.length > 0) hub.transcript.observeHistory(sid, history);
+    const history = await tryHistoryWithDemo(adapter, provider, nativeId, demoActive);
+    if (history !== null && !hub.transcript.hasObservedHistory(sid) && history.length > 0) {
+      hub.transcript.observeHistory(sid, history);
+    }
   }
   const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
     hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));
@@ -2277,10 +3130,54 @@ async function driveTurn(
   // 的 transcript turn，也不能重新广播 turn.started。
   if (!turn.cancelled && hub.busy.get(sid) === turn) {
     turn.transcript = hub.transcript.beginTurn(sid, text, createdAt);
-    // 事件序列对齐 kap-server:legacy 与 transcript v2 同时投影同一真实事件流。
+    turn.v262Ordinal = Math.max(0, turn.transcript.ordinal - 1);
     emit('session.meta.updated', { patch: { lastPrompt: text } });
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
     emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: text });
+
+    const openerItem: Record<string, unknown> = {
+      item_id: `${promptId}_user`,
+      type: 'user_message',
+      placement: 'opener',
+      origin: { kind: 'user' },
+      text,
+      prompt_ids: [promptId],
+      attachments: [],
+      skills: [],
+      created_at: createdAt,
+    };
+    turn.v262Items.push(openerItem);
+    turn.v262ItemMap.set(String(openerItem.item_id), openerItem);
+    hub.broadcastV262(sid, {
+      type: 'turn.started',
+      session_id: sid,
+      agent_id: 'main',
+      turn: {
+        turn_id: turn.v262TurnId,
+        ordinal: turn.v262Ordinal,
+        turn_number: turn.v262Ordinal + 1,
+        kind: 'agent',
+        status: 'running',
+        started_at: createdAt,
+        steps: [{ index: 0 }],
+        items: [],
+      },
+    });
+    hub.broadcastV262(sid, {
+      type: 'item.started',
+      session_id: sid,
+      agent_id: 'main',
+      turn_id: turn.v262TurnId,
+      item: openerItem,
+    });
+    hub.broadcastV262(sid, {
+      type: 'item.ended',
+      session_id: sid,
+      agent_id: 'main',
+      turn_id: turn.v262TurnId,
+      item: openerItem,
+    });
+    emitV262AgentState(hub, adapter, provider, nativeId, sid, 'running');
   }
 
   const acquireResult = await acquired;
@@ -2289,13 +3186,33 @@ async function driveTurn(
     if (hub.busy.get(sid) === turn) {
       hub.busy.delete(sid);
       const durationMs = Date.now() - startedAt;
+      const errMsg = acquireResult.error instanceof Error ? acquireResult.error.message : String(acquireResult.error);
       turn.transcript?.end('failed', durationMs);
       hub.transcript.finishPrompt(sid, promptId, 'failed');
       emit('turn.ended', { turnId: 0, reason: 'failed', durationMs });
       emit('prompt.completed', { promptId, reason: 'failed' });
       emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: 'failed' });
-      // 队列里还有等着的 prompt:busy 已清,接力给下一个(审查实测会卡死)。
-      drainQueue(adapter, provider, nativeId, hub, demoActive);
+      hub.broadcastV262(sid, {
+        type: 'turn.ended',
+        session_id: sid,
+        agent_id: 'main',
+        turn: {
+          turn_id: turn.v262TurnId,
+          ordinal: turn.v262Ordinal,
+          turn_number: turn.v262Ordinal + 1,
+          kind: 'agent',
+          status: 'ended',
+          outcome: 'failed',
+          duration_ms: durationMs,
+          started_at: createdAt,
+          ended_at: new Date().toISOString(),
+          error: { message: errMsg },
+          steps: [{ index: 0 }],
+          items: [],
+        },
+      });
+      emitV262AgentState(hub, adapter, provider, nativeId, sid, 'idle');
+      drainQueue(adapter, provider, nativeId, hub, demoActive, uploadStore);
     }
     throw acquireResult.error;
   }
@@ -2309,6 +3226,7 @@ async function driveTurn(
     return {
       prompt_id: promptId,
       user_message_id: promptId,
+      origin: { kind: 'user' },
       status: 'aborted',
       content: [{ type: 'text', text }],
       created_at: new Date().toISOString(),
@@ -2324,35 +3242,42 @@ async function driveTurn(
       turn.thinkingText = '';
       emit('turn.step.started', { turnId: 0, step });
       stepActive = true;
+      turn.v262StepIndex = step;
     }
   };
   const completeStep = (state: 'completed' | 'failed' = 'completed'): void => {
     if (stepActive) {
+      closeV262Thinking(hub, sid, turn);
+      closeV262Assistant(hub, sid, turn);
       turn.transcript?.completeStep(state);
       emit('turn.step.completed', { turnId: 0, step, usage: {} });
       stepActive = false;
       step += 1;
+      turn.v262StepIndex = step;
     }
   };
 
   // 后台消费事件流:累积文本 + 广播 WS + 清理忙态。
   void (async () => {
     let reason: 'completed' | 'failed' = 'completed';
+    let turnError: string | undefined;
     try {
       for await (const ev of handle.events) {
-        // 已被 abort/被新 turn 取代:残余事件直接丢弃,不串扰新 turn 的 UI。
         if (hub.busy.get(sid) !== turn) break;
-        // 适配器层的失败(如 CLI 无 result 退出)以 turn/failed 事件上来,
-        // 必须传导到终态,否则 UI 显示假成功。
-        if (ev.kind === 'turn' && (ev.status === 'failed' || ev.status === 'cancelled')) reason = 'failed';
-        consumeEvent(ev, turn, emit, ensureStep, completeStep, sid, hub);
+        if (ev.kind === 'turn' && (ev.status === 'failed' || ev.status === 'cancelled')) {
+          reason = 'failed';
+          const errText = (ev.payload as { error?: string } | undefined)?.error;
+          if (typeof errText === 'string' && errText) turnError = errText;
+        }
+        consumeEvent(ev, turn, emit, ensureStep, completeStep, sid, hub, provider);
       }
-    } catch {
+    } catch (err) {
       reason = 'failed';
+      turnError = err instanceof Error ? err.message : String(err);
     } finally {
       completeStep(reason === 'failed' ? 'failed' : 'completed');
-      // 只有自己仍是当前 turn 时才清理+广播终态。abort 路径由 abortTurn
-      // 广播;若新 turn 已占位,旧流静默退出,避免误删新 turn 的 busy。
+      closeV262Thinking(hub, sid, turn);
+      closeV262Assistant(hub, sid, turn);
       if (hub.busy.get(sid) === turn) {
         hub.busy.delete(sid);
         const durationMs = Date.now() - startedAt;
@@ -2362,10 +3287,28 @@ async function driveTurn(
         emit('prompt.completed', { promptId, reason });
         const pending = turn.pendingApprovals.size > 0 ? 'approval' : turn.pendingQuestions.size > 0 ? 'question' : 'none';
         emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: pending, last_turn_reason: reason });
-        // 接力:队列里的下一个 prompt 作为自己的 turn 启动(kap-server 语义)。
-        drainQueue(adapter, provider, nativeId, hub, demoActive);
-        // 终态广播后的收尾钩子(:compact 的 completed 帧在这发,时机对齐
-        // kap-server 的 worker 尾部)。
+        hub.broadcastV262(sid, {
+          type: 'turn.ended',
+          session_id: sid,
+          agent_id: 'main',
+          turn: {
+            turn_id: turn.v262TurnId,
+            ordinal: turn.v262Ordinal,
+            turn_number: turn.v262Ordinal + 1,
+            kind: 'agent',
+            status: 'ended',
+            outcome: reason === 'failed' ? 'failed' : 'completed',
+            duration_ms: durationMs,
+            started_at: createdAt,
+            ended_at: new Date().toISOString(),
+            ...(reason === 'failed' && turnError ? { error: { message: turnError } } : {}),
+            steps: Array.from({ length: Math.max(1, step) }, (_, idx) => ({ index: idx })),
+            items: [],
+          },
+        });
+        emitV262AgentState(hub, adapter, provider, nativeId, sid, 'idle');
+        emitV262Usage(hub, adapter, provider, nativeId, sid);
+        drainQueue(adapter, provider, nativeId, hub, demoActive, uploadStore);
         onSettled?.(reason);
       }
     }
@@ -2374,6 +3317,7 @@ async function driveTurn(
   return {
     prompt_id: promptId,
     user_message_id: promptId,
+    origin: { kind: 'user' },
     status: 'running',
     content: [{ type: 'text', text }],
     created_at: createdAt,
@@ -2383,120 +3327,322 @@ async function driveTurn(
 /**
  * 排空会话队列:busy 已清时取队首开新 turn;startTurn 失败继续取下一个,
  * 直到队列空或某个 turn 成功起跑(它的终态会再次调本函数接力)。
- * 审查实测:任何一个排队 prompt 启动失败都会让后续全部永久卡住。
  */
-function drainQueue(adapter: ProviderAdapter, provider: ProviderName, nativeId: string, hub: SessionHub, demoActive: boolean = false): void {
+function drainQueue(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  hub: SessionHub,
+  demoActive: boolean = false,
+  uploadStore?: UploadStore,
+): void {
   const sid = prefixedId(provider, nativeId);
   if (hub.busy.has(sid)) return;
   const next = hub.queued.get(sid)?.shift();
   if (!next) return;
   if ((hub.queued.get(sid)?.length ?? 0) === 0) hub.queued.delete(sid);
-  void driveTurn(adapter, provider, nativeId, next.text, () => adapter.startTurn({ sessionId: nativeId, input: next.text, attachments: next.attachments }), hub, next.promptId, undefined, demoActive)
-    .catch((err: unknown) => {
-      console.error('[gateway] 队列 prompt 接力失败:', err instanceof Error ? err.message : err);
-      drainQueue(adapter, provider, nativeId, hub, demoActive);
-    });
+  void driveTurn(
+    adapter,
+    provider,
+    nativeId,
+    next.text,
+    () => adapter.startTurn({ sessionId: nativeId, input: next.text, attachments: next.attachments }),
+    hub,
+    next.promptId,
+    undefined,
+    demoActive,
+    uploadStore,
+  ).catch((err: unknown) => {
+    console.error('[gateway] 队列 prompt 接力失败:', err instanceof Error ? err.message : err);
+    drainQueue(adapter, provider, nativeId, hub, demoActive, uploadStore);
+  });
 }
 
 /**
- * codex 网关代执行命令(非 turn 类):执行 RPC,把结果以一轮"系统消息"
- * (起手帧 + assistant.delta + 终态帧)广播给订阅者。不与 busy 互斥——
- * 这些 RPC 与进行中的 turn 独立;turn 进行中投影器会把它显示在同一流里。
+ * 网关代执行命令(codex / grok / pi 非 turn 类):执行 RPC 并把结果作为系统响应广播。
  */
-async function runCodexLocalCommand(
+async function runLocalGatewayCommand(
   adapter: ProviderAdapter,
-  provider: ProviderName,
+  provider: LocalProviderName,
   nativeId: string,
   name: string,
   argsText: string,
   hub: SessionHub,
+  requestedPromptId?: string,
+  demoActive: boolean = false,
+  uploadStore?: UploadStore,
 ): Promise<Record<string, unknown>> {
   const sid = prefixedId(provider, nativeId);
-  const promptId = randomUUID();
+  const promptId = requestedPromptId ?? randomUUID();
   const promptText = `/${name}${argsText ? ` ${argsText}` : ''}`;
   const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
     hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));
+  const turn = newActiveTurn(nativeId, promptId);
+  hub.busy.set(sid, turn);
   const startedAt = Date.now();
   const createdAt = new Date(startedAt).toISOString();
-  hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text: promptText }], createdAt);
-  const transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
-  emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: promptText });
-  let output: string;
-  let reason: 'completed' | 'failed' = 'completed';
+  let lastReason: 'completed' | 'failed' = 'completed';
   try {
-    output = await (provider === 'grok' ? executeGrokCommand : executeCodexCommand)(adapter, nativeId, name);
-  } catch (err) {
-    reason = 'failed';
-    output = `✗ ${promptText} 执行失败:${err instanceof Error ? err.message : String(err)}`;
+    const history = await tryHistoryWithDemo(adapter, provider, nativeId, demoActive);
+    if (history !== null && !hub.transcript.hasObservedHistory(sid) && history.length > 0) {
+      hub.transcript.observeHistory(sid, history);
+    }
+    const ordinal = history ? turnsFromHistory(history).length : 0;
+    const v262TurnId = `turn_${promptId}`;
+    hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text: promptText }], createdAt);
+    const transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
+    emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
+    emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: promptText });
+    const openerItem: Record<string, unknown> = {
+      item_id: `${promptId}_user`,
+      type: 'user_message',
+      placement: 'opener',
+      origin: { kind: 'user' },
+      text: promptText,
+      prompt_ids: [promptId],
+      attachments: [],
+      skills: [],
+      created_at: createdAt,
+    };
+    hub.broadcastV262(sid, {
+      type: 'turn.started',
+      session_id: sid,
+      agent_id: 'main',
+      turn: {
+        turn_id: v262TurnId,
+        ordinal,
+        turn_number: ordinal + 1,
+        kind: 'agent',
+        status: 'running',
+        started_at: createdAt,
+        steps: [{ index: 0 }],
+        items: [],
+      },
+    });
+    hub.broadcastV262(sid, { type: 'item.started', session_id: sid, agent_id: 'main', turn_id: v262TurnId, item: openerItem });
+    hub.broadcastV262(sid, { type: 'item.ended', session_id: sid, agent_id: 'main', turn_id: v262TurnId, item: openerItem });
+    emitV262AgentState(hub, adapter, provider, nativeId, sid, 'running');
+
+    let output: string;
+    let reason: 'completed' | 'failed' = 'completed';
+    try {
+      output = await (
+        provider === 'grok'
+          ? executeGrokCommand(adapter, nativeId, name, argsText)
+          : provider === 'pi'
+            ? executePiCommand(adapter, nativeId, name, argsText)
+            : provider === 'claude'
+              ? executeClaudeCommand(adapter, nativeId, name, argsText)
+              : executeCodexCommand(adapter, nativeId, name, argsText)
+      );
+      if (name === 'compact' || name === 'undo') {
+        hub.transcript.invalidateHistory(sid);
+      }
+    } catch (err) {
+      reason = 'failed';
+      output = `✗ ${promptText} 执行失败:${err instanceof Error ? err.message : String(err)}`;
+    }
+    lastReason = reason;
+    emit('turn.step.started', { turnId: 0, step: 0 });
+    transcript.append('assistant', output);
+    emit('assistant.delta', { turnId: 0, delta: output }, true, 0);
+    transcript.completeStep(reason === 'completed' ? 'completed' : 'failed');
+    emit('turn.step.completed', { turnId: 0, step: 0, usage: {} });
+    const durationMs = Date.now() - startedAt;
+    transcript.end(reason, durationMs);
+    hub.transcript.finishPrompt(sid, promptId, reason);
+    emit('turn.ended', { turnId: 0, reason, durationMs });
+    emit('prompt.completed', { promptId, reason });
+
+    const replyItem: Record<string, unknown> = {
+      item_id: `${promptId}_reply`,
+      type: 'assistant_message',
+      status: 'ended',
+      text: output,
+      created_at: new Date().toISOString(),
+      step_index: 0,
+    };
+    hub.broadcastV262(sid, { type: 'item.started', session_id: sid, agent_id: 'main', turn_id: v262TurnId, item: { ...replyItem, status: 'running', text: '' } });
+    hub.broadcastV262(sid, { type: 'item.delta', session_id: sid, agent_id: 'main', turn_id: v262TurnId, item_id: replyItem.item_id, field: 'text', delta: output });
+    hub.broadcastV262(sid, { type: 'item.ended', session_id: sid, agent_id: 'main', turn_id: v262TurnId, item: replyItem });
+    hub.broadcastV262(sid, {
+      type: 'turn.ended',
+      session_id: sid,
+      agent_id: 'main',
+      turn: {
+        turn_id: v262TurnId,
+        ordinal,
+        turn_number: ordinal + 1,
+        kind: 'agent',
+        status: 'ended',
+        outcome: reason === 'failed' ? 'failed' : 'completed',
+        duration_ms: durationMs,
+        started_at: createdAt,
+        ended_at: new Date().toISOString(),
+        steps: [{ index: 0 }],
+        items: [],
+      },
+    });
+    return {
+      prompt_id: promptId,
+      user_message_id: promptId,
+      origin: { kind: 'user' },
+      status: 'running',
+      content: [{ type: 'text', text: promptText }],
+      created_at: createdAt,
+    };
+  } finally {
+    if (hub.busy.get(sid) === turn) {
+      hub.busy.delete(sid);
+      emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: lastReason });
+      emitV262AgentState(hub, adapter, provider, nativeId, sid, 'idle');
+      drainQueue(adapter, provider, nativeId, hub, demoActive, uploadStore);
+    }
   }
-  // 投影器的 assistant.delta 要求 currentAssistantMsgId 已存在,而它只由
-  // turn.step.started 创建(审查实测:缺这一帧命令输出被静默丢弃,kap-server
-  // 原版也是 step.started 先于该 step 全部 delta)。
-  emit('turn.step.started', { turnId: 0, step: 0 });
-  transcript.append('assistant', output);
-  emit('assistant.delta', { turnId: 0, delta: output }, true, 0);
-  transcript.completeStep(reason === 'completed' ? 'completed' : 'failed');
-  emit('turn.step.completed', { turnId: 0, step: 0, usage: {} });
-  const durationMs = Date.now() - startedAt;
-  transcript.end(reason, durationMs);
-  hub.transcript.finishPrompt(sid, promptId, reason);
-  emit('turn.ended', { turnId: 0, reason, durationMs });
-  emit('prompt.completed', { promptId, reason });
-  return {
-    prompt_id: promptId,
-    user_message_id: promptId,
-    status: 'running',
-    content: [{ type: 'text', text: promptText }],
-    created_at: createdAt,
-  };
+}
+
+function parseCodexReviewOptions(argsText: string): Parameters<NonNullable<ProviderAdapter['review']>>[1] {
+  const trimmed = argsText.trim();
+  if (!trimmed) return undefined;
+  const baseMatch = /^--base(?:=|\s+)(\S+)$/.exec(trimmed);
+  if (baseMatch) {
+    return { target: { type: 'baseBranch', branch: baseMatch[1] } };
+  }
+  const commitMatch = /^--commit(?:=|\s+)(\S+)(?:\s+([\s\S]+))?$/.exec(trimmed);
+  if (commitMatch) {
+    return {
+      target: {
+        type: 'commit',
+        sha: commitMatch[1],
+        title: commitMatch[2]?.trim() || null,
+      },
+    };
+  }
+  return { instructions: trimmed };
 }
 
 /** codex 代执行命令 → RPC 映射,返回给用户的输出文本。 */
-async function executeCodexCommand(adapter: ProviderAdapter, nativeId: string, name: string): Promise<string> {
+async function executeCodexCommand(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  name: string,
+  argsText: string,
+): Promise<string> {
   switch (name) {
     case 'compact':
-      await adapter.compact!(nativeId);
+      if (!adapter.compact) throw new ProviderError('unsupported', 'codex compact 不可用', 400);
+      await adapter.compact(nativeId);
       return '✓ 已发起上下文压缩(thread/compact/start)。';
     case 'undo':
-      await adapter.rollback!(nativeId, 1);
+      if (!adapter.rollback) throw new ProviderError('unsupported', 'codex undo 不可用', 400);
+      await adapter.rollback(nativeId, 1);
       return '✓ 已回滚最近 1 个 turn(thread/rollback)。';
     case 'fork': {
-      const s = await adapter.fork!(nativeId);
+      if (!adapter.fork) throw new ProviderError('unsupported', 'codex fork 不可用', 400);
+      const s = await adapter.fork(nativeId);
       return `⑂ 已分叉新会话:「${s.title}」\nID:${prefixedId('codex', s.id)}\n刷新会话列表后可见。`;
+    }
+    case 'goal': {
+      const sub = argsText.trim();
+      const lower = sub.toLowerCase();
+      if (!sub || lower === 'status') {
+        if (!adapter.getGoal) throw new ProviderError('unsupported', 'codex goal 不可用', 400);
+        return renderGoalSummary(await adapter.getGoal(nativeId));
+      }
+      if (lower === 'pause' || lower === 'resume' || lower === 'cancel' || lower === 'clear') {
+        if (!adapter.controlGoal) throw new ProviderError('unsupported', 'codex goal 不可用', 400);
+        const ctrl = lower === 'clear' ? 'cancel' : (lower as 'pause' | 'resume' | 'cancel');
+        const next = await adapter.controlGoal(nativeId, ctrl);
+        return ctrl === 'cancel' ? '✓ 已清除会话目标。' : renderGoalSummary(next);
+      }
+      if (!adapter.setGoal) throw new ProviderError('unsupported', 'codex goal 不可用', 400);
+      return renderGoalSummary(await adapter.setGoal(nativeId, sub));
+    }
+    case 'diff': {
+      const remote = adapter.gitDiff ? await adapter.gitDiff(nativeId).catch(() => null) : null;
+      if (remote && remote.diff.trim()) {
+        const clipped = remote.diff.length > 48 * 1024 ? `${remote.diff.slice(0, 48 * 1024)}\n…(已截断)` : remote.diff;
+        return `### Git Diff (相对远端 ${remote.sha || 'HEAD'})\n\`\`\`diff\n${clipped.trimEnd()}\n\`\`\``;
+      }
+      return renderRepoDiffCommand(adapter, nativeId);
     }
     case 'status':
       return renderCodexStatus(adapter, nativeId);
     case 'usage':
       return renderCodexUsage(adapter, nativeId);
     case 'mcp':
-      return renderMcpServers(await adapter.listMcpServers!(nativeId).catch(() => []));
+      return renderMcpServers(adapter.listMcpServers ? await adapter.listMcpServers(nativeId).catch(() => []) : []);
+    case 'terminals': {
+      const terms = adapter.listTerminals ? await adapter.listTerminals(nativeId).catch(() => []) : [];
+      if (terms.length === 0) return '后台终端:无活动进程(0)。';
+      return ['后台终端列表', ...terms.map((t) => `· ${String(t.id ?? '?')} — ${String(t.command ?? t.status ?? 'running')}`)].join('\n');
+    }
+    case 'terminals-clean': {
+      if (!adapter.cleanTerminals) throw new ProviderError('unsupported', 'codex terminals-clean 不可用', 400);
+      await adapter.cleanTerminals(nativeId);
+      return '✓ 已清理本线程的后台终端。';
+    }
+    case 'skills':
+      return renderProviderSkills(adapter, 'codex', nativeId);
+    case 'help':
+      return renderProviderHelp(adapter, 'codex', nativeId);
     default:
       throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
   }
 }
 
-async function runGrokLocalCommand(
+async function executeGrokCommand(
   adapter: ProviderAdapter,
-  provider: ProviderName,
   nativeId: string,
   name: string,
   argsText: string,
-  hub: SessionHub,
-): Promise<Record<string, unknown>> {
-  return runCodexLocalCommand(adapter, provider, nativeId, name, argsText, hub);
-}
-
-async function executeGrokCommand(adapter: ProviderAdapter, nativeId: string, name: string): Promise<string> {
+): Promise<string> {
   switch (name) {
     case 'compact':
-      await adapter.compact!(nativeId);
-      return '✓ 已压缩对话上下文(x.ai/compact_conversation)。';
+      if (!adapter.compact) throw new ProviderError('unsupported', 'grok compact 不可用', 400);
+      await adapter.compact(nativeId);
+      return '✓ 已压缩对话上下文(_x.ai/compact_conversation)。';
     case 'undo':
-      await adapter.rollback!(nativeId, 1);
-      return '✓ 已回滚最近 1 个 turn(x.ai/rewind)。';
+      if (!adapter.rollback) throw new ProviderError('unsupported', 'grok undo 不可用', 400);
+      await adapter.rollback(nativeId, 1);
+      return '✓ 已回滚最近 1 个 turn(_x.ai/rewind/execute)。';
     case 'fork': {
-      const s = await adapter.fork!(nativeId);
+      if (!adapter.fork) throw new ProviderError('unsupported', 'grok fork 不可用', 400);
+      const s = await adapter.fork(nativeId);
       return `⑂ 已分叉新会话:「${s.title}」\nID:${prefixedId('grok', s.id)}\n刷新会话列表后可见。`;
+    }
+    case 'status':
+    case 'info':
+    case 'session-info':
+      return renderGrokStatus(adapter, nativeId);
+    case 'thinking':
+    case 'effort': {
+      const level = argsText.trim().split(/\s+/)[0]?.toLowerCase();
+      if (!level || !NATIVE_EFFORTS.has(level)) {
+        return `用法: /${name} <off|minimal|low|medium|high|xhigh|max>`;
+      }
+      if (!adapter.setThinking) throw new ProviderError('unsupported', 'grok thinking 不可用', 400);
+      await adapter.setThinking(nativeId, level);
+      return `✓ 已设置思考档位: ${level}`;
+    }
+    case 'always-approve': {
+      const arg = argsText.trim().toLowerCase();
+      const current = adapter.getPermission?.(nativeId) ?? 'default';
+      let nextMode: string;
+      if (!arg) {
+        nextMode = current === 'yolo' ? 'manual' : 'yolo';
+      } else if (arg === 'on' || arg === 'true' || arg === '1') {
+        nextMode = 'yolo';
+      } else if (arg === 'off' || arg === 'false' || arg === '0') {
+        nextMode = 'manual';
+      } else {
+        return `用法: /always-approve [on|off]（当前权限: ${current}）`;
+      }
+      if (!adapter.setPermission) throw new ProviderError('unsupported', 'grok 权限切换不可用', 400);
+      await adapter.setPermission(nativeId, nextMode);
+      return nextMode === 'yolo'
+        ? '✓ 已开启 always-approve（当前会话权限: yolo）。'
+        : '✓ 已关闭 always-approve（当前会话权限: manual）。';
     }
     case 'usage': {
       const usage = adapter.getUsage?.(nativeId);
@@ -2508,7 +3654,150 @@ async function executeGrokCommand(adapter: ProviderAdapter, nativeId: string, na
         `· context: ${usage.context_tokens}/${usage.context_limit || grokContextWindowSafe()}`,
       ].join('\n');
     }
+    case 'diff':
+      return renderRepoDiffCommand(adapter, nativeId);
+    case 'skills':
+      return renderProviderSkills(adapter, 'grok', nativeId);
+    case 'help':
+      return renderProviderHelp(adapter, 'grok', nativeId);
+    case 'feedback':
+    case 'loop':
+      return `ℹ Grok /${name} 仅在原生终端模式提供，当前 Web 协议接口不支持。输入 /help 查看 Web UI 可用命令。`;
     default:
+      throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
+  }
+}
+
+async function executePiCommand(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  name: string,
+  argsText: string,
+): Promise<string> {
+  switch (name) {
+    case 'compact':
+      if (!adapter.compact) throw new ProviderError('unsupported', 'pi compact 不可用', 400);
+      await adapter.compact(nativeId, argsText || undefined);
+      return '✓ 已压缩 Pi 会话上下文。';
+    case 'auto-compact': {
+      const arg = argsText.trim().toLowerCase();
+      if (!adapter.setAutoCompaction) throw new ProviderError('unsupported', 'pi auto-compact 不可用', 400);
+      let next: boolean;
+      if (!arg) {
+        const cur = adapter.getAutoCompaction ? await adapter.getAutoCompaction(nativeId) : undefined;
+        next = cur === undefined ? true : !cur;
+      } else if (arg === 'on' || arg === 'true' || arg === '1') {
+        next = true;
+      } else if (arg === 'off' || arg === 'false' || arg === '0') {
+        next = false;
+      } else {
+        return '用法: /auto-compact [on|off]';
+      }
+      const effective = await adapter.setAutoCompaction(nativeId, next);
+      return `✓ Pi 自动压缩已${effective ? '开启' : '关闭'}。`;
+    }
+    case 'clone': {
+      if (!adapter.clone) throw new ProviderError('unsupported', 'pi clone 不可用', 400);
+      const s = await adapter.clone(nativeId);
+      return `⎘ 已克隆新会话:「${s.title}」\nID:${prefixedId('pi', s.id)}\n刷新会话列表后可见。`;
+    }
+    case 'fork': {
+      if (!adapter.fork) throw new ProviderError('unsupported', 'pi fork 不可用', 400);
+      const s = await adapter.fork(nativeId);
+      return `⑂ 已分叉新会话:「${s.title}」\nID:${prefixedId('pi', s.id)}\n刷新会话列表后可见。`;
+    }
+    case 'name':
+    case 'rename': {
+      const title = argsText.trim();
+      if (!title) return '用法: /name <新会话标题>';
+      if (!adapter.rename) throw new ProviderError('unsupported', 'pi 重命名不可用', 400);
+      await adapter.rename(nativeId, title);
+      return `✓ 已更新会话标题为:「${title}」`;
+    }
+    case 'thinking': {
+      const level = argsText.trim();
+      if (!level) {
+        const cur = adapter.getThinking?.(nativeId) ?? '(默认)';
+        return `当前思考档位: ${cur}\n用法: /thinking <off|minimal|low|medium|high|xhigh>`;
+      }
+      if (!adapter.setThinking) throw new ProviderError('unsupported', 'pi 思考档位切换不可用', 400);
+      await adapter.setThinking(nativeId, level);
+      return `✓ 已将 Pi 思考档位设为: ${adapter.getThinking?.(nativeId) ?? level}`;
+    }
+    case 'status':
+      return renderPiStatus(adapter, nativeId);
+    case 'session':
+      return renderPiSessionStats(adapter, nativeId);
+    case 'usage':
+      return renderPiUsage(adapter, nativeId);
+    case 'copy': {
+      if (!adapter.getLastAssistantText) throw new ProviderError('unsupported', 'pi copy 不可用', 400);
+      const last = await adapter.getLastAssistantText(nativeId);
+      if (!last || !last.trim()) return '当前会话还没有可复制的助手回复。';
+      return `### 最近一条助手回复\n\n${last}`;
+    }
+    case 'tree': {
+      if (!adapter.getSessionTree) throw new ProviderError('unsupported', 'pi tree 不可用', 400);
+      return renderPiTree(await adapter.getSessionTree(nativeId));
+    }
+    case 'diff':
+      return renderRepoDiffCommand(adapter, nativeId);
+    case 'skills':
+      return renderProviderSkills(adapter, 'pi', nativeId);
+    case 'help':
+      return renderProviderHelp(adapter, 'pi', nativeId);
+    case 'settings':
+      return renderPiSettings(adapter, nativeId);
+    case 'export':
+      return 'ℹ 在 Web UI 中可直接使用 `/export` 快捷键或会话菜单「导出」下载完整会话 ZIP。';
+    case 'reload':
+      return 'ℹ 在 Web UI 中可直接使用 `/reload` 快捷键重新加载会话与命令目录。';
+    case 'resume':
+      return 'ℹ 请在左侧会话列表中直接点击切换要恢复的 Pi 会话。';
+    default:
+      if (piUnsupportedTuiCommandNames().has(name)) {
+        return `ℹ Pi /${name} 属于本地终端交互命令，在 Web UI 中已为您拦截（输入 /help 查看所有可用的网页命令）。`;
+      }
+      throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
+  }
+}
+
+async function executeClaudeCommand(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  name: string,
+  argsText: string,
+): Promise<string> {
+  switch (name) {
+    case 'status':
+      return renderClaudeStatus(adapter, nativeId);
+    case 'diff':
+      return renderRepoDiffCommand(adapter, nativeId);
+    case 'skills':
+      return renderProviderSkills(adapter, 'claude', nativeId);
+    case 'permissions': {
+      const arg = argsText.trim().toLowerCase();
+      const cur = adapter.getPermission?.(nativeId) ?? 'default';
+      if (!arg) {
+        return `当前 Claude 权限模式: ${cur}\n用法: /permissions <manual|auto|yolo>`;
+      }
+      if (arg !== 'manual' && arg !== 'auto' && arg !== 'yolo') {
+        return `不支持的权限模式: ${arg}\n可选值: manual | auto | yolo`;
+      }
+      if (!adapter.setPermission) throw new ProviderError('unsupported', 'claude 权限切换不可用', 400);
+      await adapter.setPermission(nativeId, arg);
+      return `✓ 已将 Claude 权限模式设为: ${arg}`;
+    }
+    case 'tasks':
+      return '当前会话无挂起的后台任务；运行中的子代理与工具进度会直接显示在对话消息卡片中。';
+    case 'help':
+      return renderProviderHelp(adapter, 'claude', nativeId);
+    case 'resume':
+      return 'ℹ 请在左侧会话列表中直接点击历史会话进行恢复。';
+    default:
+      if (claudeUnsupportedTuiCommandNames().has(name)) {
+        return `ℹ Claude /${name} 依赖本地终端交互界面，Web UI 中暂不支持（输入 /help 查看所有网页可用命令）。`;
+      }
       throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
   }
 }
@@ -2517,7 +3806,7 @@ function grokContextWindowSafe(): number {
   return 500_000;
 }
 
-function renderCodexStatus(adapter: ProviderAdapter, nativeId: string): string {
+async function renderCodexStatus(adapter: ProviderAdapter, nativeId: string): Promise<string> {
   const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
   const thinking = adapter.getThinking?.(nativeId);
   const permission = adapter.getPermission?.(nativeId) ?? 'default';
@@ -2531,18 +3820,250 @@ function renderCodexStatus(adapter: ProviderAdapter, nativeId: string): string {
     const pct = ((usage.context_tokens / usage.context_limit) * 100).toFixed(1);
     lines.push(`· 上下文:${usage.context_tokens.toLocaleString()} / ${usage.context_limit.toLocaleString()} tokens(${pct}%)`);
   }
+  const limits = adapter.getRateLimits ? await adapter.getRateLimits().catch(() => null) : null;
+  const limitSummary = formatCodexRateLimits(limits);
+  if (limitSummary) lines.push(limitSummary);
   return lines.join('\n');
 }
 
-function renderCodexUsage(adapter: ProviderAdapter, nativeId: string): string {
+async function renderCodexUsage(adapter: ProviderAdapter, nativeId: string): Promise<string> {
   const u = adapter.getUsage?.(nativeId);
-  if (!u || (u.input_tokens === 0 && u.output_tokens === 0)) return '∑ 暂无用量数据(完成一轮对话后可见)。';
-  return [
+  const limits = adapter.getRateLimits ? await adapter.getRateLimits().catch(() => null) : null;
+  const limitSummary = formatCodexRateLimits(limits);
+  if (!u || (u.input_tokens === 0 && u.output_tokens === 0)) {
+    return limitSummary ? `∑ 暂无本会话累计用量。\n${limitSummary}` : '∑ 暂无用量数据(完成一轮对话后可见)。';
+  }
+  const lines = [
     '∑ 用量统计(本会话累计)',
     `· 输入 tokens:${u.input_tokens.toLocaleString()}`,
     `· 输出 tokens:${u.output_tokens.toLocaleString()}`,
     `· 缓存读:${u.cache_read_tokens.toLocaleString()} · 缓存写:${u.cache_creation_tokens.toLocaleString()}`,
+  ];
+  if (limitSummary) lines.push(limitSummary);
+  return lines.join('\n');
+}
+
+function formatCodexRateLimits(raw: Record<string, unknown> | null): string | null {
+  if (!raw) return null;
+  const snap = raw.rateLimits as Record<string, unknown> | undefined;
+  if (!snap || typeof snap !== 'object') return null;
+  const parts: string[] = [];
+  for (const [label, bucket] of [['主窗口', snap.primary], ['周窗口', snap.secondary]] as const) {
+    const b = bucket as Record<string, unknown> | undefined;
+    if (b && typeof b.usedPercent === 'number') {
+      parts.push(`${label}已用 ${Math.round(b.usedPercent)}%`);
+    }
+  }
+  return parts.length > 0 ? `· 配额:${parts.join(' · ')}` : null;
+}
+
+function renderGoalSummary(goal: Record<string, unknown> | null): string {
+  if (!goal) return '🎯 当前会话暂无活动目标。用法: /goal <目标描述>';
+  const obj = String(goal.objective ?? '').trim() || '(无目标内容)';
+  const status = String(goal.status ?? 'active');
+  const tokens = typeof goal.tokensUsed === 'number' ? goal.tokensUsed : undefined;
+  const lines = [`🎯 会话目标 [${status}]`, `· 内容: ${obj}`];
+  if (tokens !== undefined) lines.push(`· 已用 tokens: ${tokens.toLocaleString()}`);
+  return lines.join('\n');
+}
+
+function renderClaudeStatus(adapter: ProviderAdapter, nativeId: string): string {
+  const model = adapter.getModel?.(nativeId) ?? '(default)';
+  const thinking = adapter.getThinking?.(nativeId);
+  const permission = adapter.getPermission?.(nativeId) ?? 'default';
+  const plan = adapter.getPlanMode?.(nativeId) === true;
+  const usage = adapter.getUsage?.(nativeId);
+  const lines = [
+    '⚙ Claude 会话状态',
+    `· 模型: ${model}${thinking && thinking !== 'off' ? ` (effort: ${thinking})` : ''}`,
+    `· 权限: ${permission}${plan ? ' · Plan 模式: 开启' : ''}`,
+  ];
+  if (usage && usage.context_limit > 0 && !usage.context_unavailable) {
+    const pct = ((usage.context_tokens / usage.context_limit) * 100).toFixed(1);
+    lines.push(`· 上下文: ${usage.context_tokens.toLocaleString()} / ${usage.context_limit.toLocaleString()} tokens (${pct}%)`);
+  }
+  if (usage && usage.total_cost_usd > 0) {
+    lines.push(`· 累计费用: $${usage.total_cost_usd.toFixed(4)}`);
+  }
+  return lines.join('\n');
+}
+
+function renderGrokStatus(adapter: ProviderAdapter, nativeId: string): string {
+  const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
+  const thinking = adapter.getThinking?.(nativeId);
+  const permission = adapter.getPermission?.(nativeId) ?? 'default';
+  const plan = adapter.getPlanMode?.(nativeId) === true;
+  const usage = adapter.getUsage?.(nativeId);
+  const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : grokContextWindowSafe();
+  const lines = [
+    '⚙ Grok 会话状态',
+    `· 模型: ${model}${thinking && thinking !== 'off' ? ` (effort: ${thinking})` : ''}`,
+    `· 权限: ${permission}${plan ? ' · Plan 模式: 开启' : ''}`,
+  ];
+  if (usage) {
+    const pct = limit > 0 ? ((usage.context_tokens / limit) * 100).toFixed(1) : '0.0';
+    lines.push(`· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`);
+    lines.push(`· 累计用量: input ${usage.input_tokens.toLocaleString()} · output ${usage.output_tokens.toLocaleString()}`);
+  }
+  return lines.join('\n');
+}
+
+function renderPiStatus(adapter: ProviderAdapter, nativeId: string): string {
+  const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
+  const thinking = adapter.getThinking?.(nativeId);
+  const usage = adapter.getUsage?.(nativeId);
+  const lines = [
+    '⚙ Pi 会话状态',
+    `· 模型:${model}${thinking && thinking !== 'off' ? ` (thinking: ${thinking})` : ''}`,
+  ];
+  if (usage?.context_unavailable) {
+    lines.push('· 上下文:已压缩,待下轮刷新');
+  } else if (usage && usage.context_limit > 0) {
+    const pct = ((usage.context_tokens / usage.context_limit) * 100).toFixed(1);
+    lines.push(`· 上下文:${usage.context_tokens.toLocaleString()} / ${usage.context_limit.toLocaleString()} tokens(${pct}%)`);
+  }
+  return lines.join('\n');
+}
+
+async function renderPiSettings(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+  const pa = adapter as ProviderAdapter & {
+    getSessionState?: (id: string) => Promise<Record<string, unknown>>;
+  };
+  const state = pa.getSessionState ? await pa.getSessionState(nativeId).catch(() => null) : null;
+  const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
+  const thinking = String(state?.thinkingLevel ?? adapter.getThinking?.(nativeId) ?? 'default');
+  const autoCompact = state?.autoCompactionEnabled === true ? '开启' : state?.autoCompactionEnabled === false ? '关闭' : '未知';
+  const steeringMode = typeof state?.steeringMode === 'string' ? state.steeringMode : 'one-at-a-time';
+  const followUpMode = typeof state?.followUpMode === 'string' ? state.followUpMode : 'one-at-a-time';
+  return [
+    '⚙ Pi 当前会话配置',
+    `· 模型: ${model}`,
+    `· 思考档位: ${thinking}（可用 /thinking <level> 切换）`,
+    `· 自动压缩: ${autoCompact}（可用 /auto-compact on|off 切换）`,
+    `· 插话队列模式: steering=${steeringMode} · followUp=${followUpMode}`,
   ].join('\n');
+}
+
+async function renderPiSessionStats(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+  const pa = adapter as ProviderAdapter & {
+    getSessionStats?: (id: string) => Promise<Record<string, unknown>>;
+  };
+  const stats = pa.getSessionStats ? await pa.getSessionStats(nativeId).catch(() => null) : null;
+  if (!stats) return renderPiUsage(adapter, nativeId);
+  const tokens = (stats.tokens && typeof stats.tokens === 'object' ? stats.tokens : {}) as Record<string, unknown>;
+  const ctx = (stats.contextUsage && typeof stats.contextUsage === 'object' ? stats.contextUsage : null) as
+    | { tokens?: number | null; contextWindow?: number; percent?: number | null }
+    | null;
+  const lines = [
+    '📊 Pi 会话统计',
+    `· 消息数: 用户 ${Number(stats.userMessages ?? 0)} · 助手 ${Number(stats.assistantMessages ?? 0)} · 工具调用 ${Number(stats.toolCalls ?? 0)}`,
+    `· Tokens: input ${Number(tokens.input ?? 0).toLocaleString()} · output ${Number(tokens.output ?? 0).toLocaleString()} · cacheRead ${Number(tokens.cacheRead ?? 0).toLocaleString()}`,
+  ];
+  if (ctx && typeof ctx.contextWindow === 'number' && ctx.contextWindow > 0) {
+    const used = typeof ctx.tokens === 'number' ? ctx.tokens.toLocaleString() : '待刷新';
+    const pct = typeof ctx.percent === 'number' ? ` (${ctx.percent.toFixed(1)}%)` : '';
+    lines.push(`· 上下文窗口: ${used} / ${ctx.contextWindow.toLocaleString()}${pct}`);
+  }
+  if (typeof stats.cost === 'number' && stats.cost > 0) {
+    lines.push(`· 累计费用: $${stats.cost.toFixed(4)}`);
+  }
+  return lines.join('\n');
+}
+
+function renderPiTree(raw: Record<string, unknown> | null): string {
+  if (!raw || !Array.isArray(raw.tree) || raw.tree.length === 0) {
+    return '当前会话树为空（发送消息后即可查看分支结构）。';
+  }
+  const leafId = typeof raw.leafId === 'string' ? raw.leafId : '';
+  const lines: string[] = ['🌳 Pi 会话分支树'];
+  const visit = (nodes: unknown[], depth: number): void => {
+    for (const rawNode of nodes) {
+      if (lines.length >= 45) break;
+      if (!rawNode || typeof rawNode !== 'object') continue;
+      const node = rawNode as {
+        entry?: { id?: string; type?: string; role?: string; message?: { role?: string } };
+        children?: unknown[];
+      };
+      const id = String(node.entry?.id ?? '').slice(0, 8);
+      const kind = String(node.entry?.message?.role ?? node.entry?.type ?? 'node');
+      const marker = leafId && node.entry?.id === leafId ? ' ← 当前叶节点' : '';
+      lines.push(`${'  '.repeat(Math.min(depth, 6))}· [${id || '?'}] ${kind}${marker}`);
+      if (Array.isArray(node.children) && node.children.length > 0) {
+        visit(node.children, depth + 1);
+      }
+    }
+  };
+  visit(raw.tree, 0);
+  if (lines.length >= 45) lines.push('…（已截断部分深层节点）');
+  return lines.join('\n');
+}
+
+async function renderRepoDiffCommand(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+  const cwd = adapter.getCwd?.(nativeId);
+  if (!cwd) return '当前会话没有关联工作目录，无法读取 git diff。';
+  const res = await fsRepoDiff(cwd).catch(() => null);
+  if (!res) return `读取工作目录 ${cwd} 的 git diff 失败。`;
+  if (!res.isGitRepo) return `当前工作目录不是 Git 仓库（${cwd}），无法读取 diff。`;
+  const changedFiles = Object.entries(res.entries);
+  if (changedFiles.length === 0 && !res.diff.trim()) {
+    return `工作区干净（分支: ${res.branch || 'HEAD'}，无未提交改动）。`;
+  }
+  const fileList = changedFiles.slice(0, 20).map(([p, st]) => `- \`${st}\` ${p}`).join('\n');
+  const moreFiles = changedFiles.length > 20 ? `\n- …共 ${changedFiles.length} 个文件` : '';
+  const parts = [`### Git 状态（分支: ${res.branch || 'HEAD'}）\n${fileList || '（仅已暂存/跟踪改动）'}${moreFiles}`];
+  if (res.diff.trim()) {
+    parts.push(`\`\`\`diff\n${res.diff.trimEnd()}\n\`\`\`${res.truncated ? '\n_（diff 超过 48KB 已截断）_' : ''}`);
+  }
+  return parts.join('\n\n');
+}
+
+async function renderProviderSkills(
+  adapter: ProviderAdapter,
+  provider: LocalProviderName,
+  nativeId: string,
+): Promise<string> {
+  const skills = await adapterSkills(adapter, nativeId);
+  if (skills.length === 0) return `当前 ${provider} 会话暂无可用斜杠命令或技能。`;
+  const lines = [`### ${provider} 可用命令与技能（${skills.length}）`];
+  for (const item of skills.slice(0, 60)) {
+    const name = String(item.name ?? '');
+    const hint = typeof item.argument_hint === 'string' && item.argument_hint ? ` ${item.argument_hint}` : '';
+    const desc = String(item.description ?? '').replace(/\s+/g, ' ').slice(0, 100);
+    lines.push(`- \`/${name}${hint}\`${desc ? ` — ${desc}` : ''}`);
+  }
+  if (skills.length > 60) lines.push(`- …共 ${skills.length} 项`);
+  return lines.join('\n');
+}
+
+async function renderProviderHelp(
+  adapter: ProviderAdapter,
+  provider: LocalProviderName,
+  nativeId: string,
+): Promise<string> {
+  const cmds = adapter.listCommands ? await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[]) : [];
+  const runnable = cmds.filter((c) => !c.terminalOnly);
+  const lines = [`### ${provider} Web UI 可用命令（${runnable.length}）`];
+  for (const c of runnable.slice(0, 50)) {
+    const hint = c.argumentHint ? ` ${c.argumentHint}` : '';
+    const aliasText = c.aliases && c.aliases.length > 0 ? `（别名: ${c.aliases.map((a) => `/${a}`).join(', ')}）` : '';
+    const desc = c.description.replace(/\s+/g, ' ').slice(0, 90);
+    lines.push(`- \`/${c.name}${hint}\` ${aliasText}— ${desc}`);
+  }
+  if (runnable.length > 50) lines.push(`- …输入 \`/\` 打开完整命令菜单（共 ${runnable.length} 项）`);
+  return lines.join('\n');
+}
+
+function renderPiUsage(adapter: ProviderAdapter, nativeId: string): string {
+  const u = adapter.getUsage?.(nativeId);
+  if (!u || (u.input_tokens === 0 && u.output_tokens === 0)) return '∑ 暂无用量数据(完成一轮对话后可见)。';
+  const lines = [
+    '∑ Pi 用量统计(本会话累计)',
+    `· 输入 tokens:${u.input_tokens.toLocaleString()}`,
+    `· 输出 tokens:${u.output_tokens.toLocaleString()}`,
+    `· 缓存读:${u.cache_read_tokens.toLocaleString()} · 缓存写:${u.cache_creation_tokens.toLocaleString()}`,
+  ];
+  if (u.total_cost_usd > 0) lines.push(`· 费用:$${u.total_cost_usd.toFixed(4)}`);
+  return lines.join('\n');
 }
 
 function renderMcpServers(servers: Array<Record<string, unknown>>): string {
@@ -2567,10 +4088,189 @@ function newActiveTurn(sessionId: string, promptId: string): ActiveTurn {
     runningTools: new Map(),
     pendingApprovals: new Map(),
     pendingQuestions: new Map(),
+    v262TurnId: `turn_${promptId}`,
+    v262Ordinal: 0,
+    v262StartedAt: new Date().toISOString(),
+    v262StepIndex: 0,
+    v262Items: [],
+    v262ItemMap: new Map(),
   };
 }
 
+function closeV262Thinking(hub: SessionHub, sid: string, turn: ActiveTurn): void {
+  if (!turn.v262ThinkingItemId) return;
+  const item = turn.v262ItemMap.get(turn.v262ThinkingItemId);
+  turn.v262ThinkingItemId = undefined;
+  if (!item) return;
+  item.status = 'ended';
+  if (turn.v262ThinkingStartedAt !== undefined) {
+    item.duration_ms = Math.max(0, Date.now() - turn.v262ThinkingStartedAt);
+  }
+  hub.broadcastV262(sid, {
+    type: 'item.ended',
+    session_id: sid,
+    agent_id: 'main',
+    turn_id: turn.v262TurnId,
+    item,
+  });
+}
+
+function closeV262Assistant(hub: SessionHub, sid: string, turn: ActiveTurn): void {
+  if (!turn.v262AssistantItemId) return;
+  const item = turn.v262ItemMap.get(turn.v262AssistantItemId);
+  turn.v262AssistantItemId = undefined;
+  if (!item) return;
+  item.status = 'ended';
+  hub.broadcastV262(sid, {
+    type: 'item.ended',
+    session_id: sid,
+    agent_id: 'main',
+    turn_id: turn.v262TurnId,
+    item,
+  });
+}
+
+function emitV262SteerUserItem(
+  hub: SessionHub,
+  sid: string,
+  turn: ActiveTurn,
+  promptId: string,
+  text: string,
+  attachments: TurnAttachment[],
+): void {
+  const item: Record<string, unknown> = {
+    item_id: `${promptId}_steer`,
+    type: 'user_message',
+    placement: 'steer',
+    origin: { kind: 'user' },
+    text,
+    prompt_ids: [promptId],
+    attachments: attachments.map((a) => ({
+      kind: a.kind === 'localImage' || a.kind === 'imageDataUrl' ? 'image' : 'file',
+      ...(a.name ? { name: a.name } : {}),
+      ...(a.mediaType ? { media_type: a.mediaType } : {}),
+      ...(a.size !== undefined ? { size: a.size } : {}),
+    })),
+    skills: [],
+    created_at: new Date().toISOString(),
+  };
+  turn.v262Items.push(item);
+  turn.v262ItemMap.set(String(item.item_id), item);
+  hub.broadcastV262(sid, {
+    type: 'item.started',
+    session_id: sid,
+    agent_id: 'main',
+    turn_id: turn.v262TurnId,
+    item,
+  });
+  hub.broadcastV262(sid, {
+    type: 'item.ended',
+    session_id: sid,
+    agent_id: 'main',
+    turn_id: turn.v262TurnId,
+    item,
+  });
+}
+
+function emitV262AgentState(
+  hub: SessionHub,
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  sid: string,
+  status: 'idle' | 'running',
+  compacting = false,
+): void {
+  const caps = adapter.capabilities();
+  const thinking = adapter.getThinking?.(nativeId);
+  hub.broadcastV262(sid, {
+    type: 'agent',
+    session_id: sid,
+    agent_id: 'main',
+    status,
+    compacting,
+    model: adapter.getModel?.(nativeId) ?? '',
+    ...(thinking ? { thinking } : {}),
+    permission_mode: adapter.getPermission?.(nativeId) ?? 'default',
+    plan_mode: caps.planMode === false ? false : (adapter.getPlanMode?.(nativeId) ?? false),
+    swarm_mode: false,
+    tower_mode: false,
+  });
+}
+
+function emitV262Usage(
+  hub: SessionHub,
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  sid: string,
+): void {
+  const usage = adapter.getUsage?.(nativeId);
+  if (!usage) return;
+  let contextLimit = usage.context_limit ?? 0;
+  const model = adapter.getModel?.(nativeId) ?? '';
+  if (contextLimit <= 0 && provider === 'claude' && model) contextLimit = claudeContextWindow(model);
+  if (contextLimit <= 0 && provider === 'grok') contextLimit = grokStatusContextFallback();
+  hub.broadcastV262(sid, {
+    type: 'usage',
+    session_id: sid,
+    agent_id: 'main',
+    context_tokens: usage.context_unavailable ? 0 : (usage.context_tokens ?? 0),
+    max_context_tokens: contextLimit,
+  });
+}
+
 type Emit = (type: string, payload: Record<string, unknown>, volatile?: boolean, offset?: number) => void;
+
+function emitAssistantDeltaText(
+  delta: string,
+  turn: ActiveTurn,
+  emit: Emit,
+  ensureStep: () => void,
+  sid: string,
+  hub: SessionHub,
+): void {
+  if (!delta) return;
+  ensureStep();
+  const offset = turn.assistantText.length;
+  turn.assistantText += delta;
+  turn.transcript?.append('assistant', delta);
+  emit('assistant.delta', { turnId: 0, delta }, true, offset);
+
+  closeV262Thinking(hub, sid, turn);
+  if (!turn.v262AssistantItemId) {
+    const itemId = `${turn.v262TurnId}_asst_${turn.v262Items.length}`;
+    const item: Record<string, unknown> = {
+      item_id: itemId,
+      type: 'assistant_message',
+      status: 'running',
+      text: '',
+      created_at: new Date().toISOString(),
+      step_index: turn.v262StepIndex,
+    };
+    turn.v262AssistantItemId = itemId;
+    turn.v262Items.push(item);
+    turn.v262ItemMap.set(itemId, item);
+    hub.broadcastV262(sid, {
+      type: 'item.started',
+      session_id: sid,
+      agent_id: 'main',
+      turn_id: turn.v262TurnId,
+      item: { ...item },
+    });
+  }
+  const asst = turn.v262ItemMap.get(turn.v262AssistantItemId)!;
+  asst.text = `${String(asst.text ?? '')}${delta}`;
+  hub.broadcastV262(sid, {
+    type: 'item.delta',
+    session_id: sid,
+    agent_id: 'main',
+    turn_id: turn.v262TurnId,
+    item_id: turn.v262AssistantItemId,
+    field: 'text',
+    delta,
+  });
+}
 
 function consumeEvent(
   ev: GatewayEvent,
@@ -2580,15 +4280,11 @@ function consumeEvent(
   completeStep: () => void,
   sid: string,
   hub: SessionHub,
+  provider: ProviderName = 'kimi',
 ): void {
   if (ev.kind === 'message' && ev.status === 'delta') {
     const delta = (ev.payload as { delta?: string }).delta ?? '';
-    if (!delta) return;
-    ensureStep();
-    const offset = turn.assistantText.length;
-    turn.assistantText += delta;
-    turn.transcript?.append('assistant', delta);
-    emit('assistant.delta', { turnId: 0, delta }, true, offset);
+    emitAssistantDeltaText(delta, turn, emit, ensureStep, sid, hub);
   } else if (ev.kind === 'thinking' && ev.status === 'delta') {
     const delta = (ev.payload as { delta?: string }).delta ?? '';
     if (!delta) return;
@@ -2597,38 +4293,290 @@ function consumeEvent(
     turn.thinkingText += delta;
     turn.transcript?.append('thinking', delta);
     emit('thinking.delta', { turnId: 0, delta }, true, offset);
+
+    closeV262Assistant(hub, sid, turn);
+    if (!turn.v262ThinkingItemId) {
+      const itemId = `${turn.v262TurnId}_think_${turn.v262Items.length}`;
+      const now = Date.now();
+      const iso = new Date(now).toISOString();
+      const item: Record<string, unknown> = {
+        item_id: itemId,
+        type: 'reasoning',
+        status: 'running',
+        text: '',
+        started_at: iso,
+        created_at: iso,
+        step_index: turn.v262StepIndex,
+      };
+      turn.v262ThinkingItemId = itemId;
+      turn.v262ThinkingStartedAt = now;
+      turn.v262Items.push(item);
+      turn.v262ItemMap.set(itemId, item);
+      hub.broadcastV262(sid, {
+        type: 'item.started',
+        session_id: sid,
+        agent_id: 'main',
+        turn_id: turn.v262TurnId,
+        item: { ...item },
+      });
+    }
+    const think = turn.v262ItemMap.get(turn.v262ThinkingItemId)!;
+    think.text = `${String(think.text ?? '')}${delta}`;
+    hub.broadcastV262(sid, {
+      type: 'item.delta',
+      session_id: sid,
+      agent_id: 'main',
+      turn_id: turn.v262TurnId,
+      item_id: turn.v262ThinkingItemId,
+      field: 'text',
+      delta,
+    });
   } else if (ev.kind === 'tool') {
-    const p = ev.payload as { toolCallId: string; name: string; input?: unknown; output?: string; isError?: boolean; is_error?: boolean };
+    const p = ev.payload as {
+      toolCallId: string;
+      name: string;
+      input?: unknown;
+      output?: string;
+      structuredOutput?: unknown;
+      isError?: boolean;
+      is_error?: boolean;
+      agentId?: string;
+      agent_id?: string;
+      receiverThreadIds?: string[];
+    };
+    const normalized = normalizeKimiWebTool(p.name || 'tool', p.input ?? {});
+    const directAgentId = ev.agentId ?? p.agentId ?? p.agent_id ?? p.receiverThreadIds?.[0];
     if (ev.status === 'started') {
       ensureStep();
-      turn.runningTools.set(p.toolCallId, { name: p.name, args: p.input });
-      turn.transcript?.toolStarted(p.toolCallId, p.name, p.input ?? {});
-      emit('tool.call.started', { turnId: 0, toolCallId: p.toolCallId, name: p.name, args: p.input ?? {} });
+      closeV262Thinking(hub, sid, turn);
+      closeV262Assistant(hub, sid, turn);
+      turn.runningTools.set(p.toolCallId, { name: normalized.name, args: normalized.input });
+      const inputSubagentId = normalized.name === 'Agent' ? extractSubagentIdFromOutput(normalized.input) : undefined;
+      const linked = hub.transcript.getLinkedSubagents(sid, p.toolCallId);
+      const agentRefs = mergeAgentRefs(undefined, [directAgentId, inputSubagentId, ...linked]);
+      if (agentRefs && (normalized.name === 'Agent' || directAgentId)) {
+        for (const ref of agentRefs) {
+          hub.transcript.linkSubagentToToolCall(sid, p.toolCallId, ref.agent_id);
+        }
+      }
+      turn.transcript?.toolStarted(p.toolCallId, p.name, p.input ?? {}, {
+        ...(ev.phase ? { phase: ev.phase } : {}),
+        ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+        ...(directAgentId ? { agentId: directAgentId } : {}),
+        ...(agentRefs ? { agentRefs: agentRefs.map((r) => ({ agentId: r.agent_id, role: r.role })) } : {}),
+      });
+      emit('tool.call.started', { turnId: 0, toolCallId: p.toolCallId, name: normalized.name, args: normalized.input ?? {} });
+
+      const toolItem: Record<string, unknown> = {
+        item_id: p.toolCallId,
+        type: 'tool_call',
+        name: normalized.name,
+        input: normalized.input ?? {},
+        status: 'running',
+        started_at: new Date().toISOString(),
+        step_index: turn.v262StepIndex,
+        ...(agentRefs ? { agent_refs: agentRefs } : {}),
+      };
+      turn.v262Items.push(toolItem);
+      turn.v262ItemMap.set(p.toolCallId, toolItem);
+      hub.broadcastV262(sid, {
+        type: 'item.started',
+        session_id: sid,
+        agent_id: 'main',
+        turn_id: turn.v262TurnId,
+        item: toolItem,
+      });
     } else if (ev.status === 'delta') {
       const delta = p.output ?? '';
       if (!delta) return;
       emit('tool.progress', { turnId: 0, toolCallId: p.toolCallId, output: delta });
+      const existingTool = turn.v262ItemMap.get(p.toolCallId);
+      if (existingTool) {
+        existingTool.output = `${String(existingTool.output ?? '')}${delta}`;
+        hub.broadcastV262(sid, {
+          type: 'item.delta',
+          session_id: sid,
+          agent_id: 'main',
+          turn_id: turn.v262TurnId,
+          item_id: p.toolCallId,
+          field: 'output',
+          delta,
+        });
+      }
     } else {
       turn.runningTools.delete(p.toolCallId);
-      const isError = p.isError ?? p.is_error ?? false;
-      turn.transcript?.toolResult(p.toolCallId, p.output ?? '', isError);
-      // 适配器层统一用 snake_case(审查发现 camel 读取落空,失败被投影为成功)。
-      emit('tool.result', { turnId: 0, toolCallId: p.toolCallId, output: p.output ?? '', isError });
-      // 前端在 tool.result 后重置 assistant 跟踪 —— 一个 step 到此为止。
+      const isError = p.isError ?? p.is_error ?? (ev.status === 'failed');
+      const resolvedOut = (p.output === undefined || p.output === '') && p.structuredOutput !== undefined
+        ? (typeof p.structuredOutput === 'string' ? p.structuredOutput : JSON.stringify(p.structuredOutput))
+        : (p.output ?? '');
+      const existingTool = turn.v262ItemMap.get(p.toolCallId);
+      const extractedOutId = extractSubagentIdFromOutput(resolvedOut) ?? extractSubagentIdFromOutput(p.structuredOutput);
+      const linked = hub.transcript.getLinkedSubagents(sid, p.toolCallId);
+      const agentRefs = mergeAgentRefs(existingTool?.agent_refs, [directAgentId, extractedOutId, ...linked]);
+      if (agentRefs) {
+        for (const ref of agentRefs) {
+          hub.transcript.linkSubagentToToolCall(sid, p.toolCallId, ref.agent_id);
+        }
+      }
+      turn.transcript?.toolResult(p.toolCallId, p.output ?? '', isError, {
+        ...(p.structuredOutput !== undefined ? { structuredOutput: p.structuredOutput } : {}),
+        ...(ev.phase ? { phase: ev.phase } : {}),
+        ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
+        ...(directAgentId ? { agentId: directAgentId } : {}),
+        ...(agentRefs ? { agentRefs: agentRefs.map((r) => ({ agentId: r.agent_id, role: r.role })) } : {}),
+      });
+      emit('tool.result', { turnId: 0, toolCallId: p.toolCallId, output: resolvedOut, isError });
+
+      const endedTool: Record<string, unknown> = existingTool ?? {
+        item_id: p.toolCallId,
+        type: 'tool_call',
+        name: normalized.name,
+        input: normalized.input ?? {},
+        started_at: new Date().toISOString(),
+        step_index: turn.v262StepIndex,
+      };
+      endedTool.status = 'ended';
+      endedTool.outcome = isError ? 'failed' : 'completed';
+      endedTool.output = resolvedOut;
+      if (isError && resolvedOut) endedTool.error = resolvedOut;
+      endedTool.ended_at = new Date().toISOString();
+      if (agentRefs) endedTool.agent_refs = agentRefs;
+      if (!existingTool) {
+        turn.v262Items.push(endedTool);
+        turn.v262ItemMap.set(p.toolCallId, endedTool);
+      }
+      hub.broadcastV262(sid, {
+        type: 'item.ended',
+        session_id: sid,
+        agent_id: 'main',
+        turn_id: turn.v262TurnId,
+        item: endedTool,
+      });
       completeStep();
+    }
+  } else if (ev.kind === 'subagent') {
+    const p = (ev.payload ?? {}) as {
+      agentId?: string;
+      agent_id?: string;
+      parentToolUseId?: string;
+      parent_tool_use_id?: string;
+      name?: string;
+      status?: string;
+      summary?: string;
+    };
+    const agentId = ev.agentId ?? p.agentId ?? p.agent_id;
+    const parentToolUseId = ev.parentToolUseId ?? p.parentToolUseId ?? p.parent_tool_use_id;
+    if (agentId) {
+      if (parentToolUseId) {
+        hub.transcript.linkSubagentToToolCall(sid, parentToolUseId, agentId);
+        const parentItem = turn.v262ItemMap.get(parentToolUseId);
+        if (parentItem) {
+          const nextRefs = mergeAgentRefs(parentItem.agent_refs, [agentId]);
+          if (nextRefs) {
+            parentItem.agent_refs = nextRefs;
+            hub.broadcastV262(sid, {
+              type: 'item.updated',
+              session_id: sid,
+              agent_id: 'main',
+              turn_id: turn.v262TurnId,
+              item_id: parentToolUseId,
+              set: { agent_refs: nextRefs },
+            });
+          }
+        }
+      }
+      const existing = hub.transcript.currentTasks(sid).find((t) => t.taskId === agentId || t.agentId === agentId);
+      const taskState: TranscriptTask['state'] = ev.status === 'failed'
+        ? 'failed'
+        : ev.status === 'cancelled'
+          ? 'killed'
+          : ev.status === 'completed'
+            ? 'completed'
+            : 'running';
+      const nextTask: TranscriptTask = {
+        taskId: existing?.taskId ?? agentId,
+        kind: 'subagent',
+        state: taskState,
+        detached: existing?.detached ?? false,
+        description: p.summary ?? existing?.description ?? p.name ?? `Subagent ${agentId.slice(0, 8)}`,
+        agentId,
+        ...(parentToolUseId ?? existing?.parentToolUseId ? { parentToolUseId: parentToolUseId ?? existing?.parentToolUseId } : {}),
+        outputTail: p.summary ?? existing?.outputTail ?? '',
+        startedAt: existing?.startedAt ?? new Date(ev.timestamp || Date.now()).toISOString(),
+        ...(taskState !== 'running' ? { endedAt: new Date(ev.timestamp || Date.now()).toISOString() } : {}),
+        ...(taskState === 'completed' && p.summary ? { resultSummary: p.summary } : existing?.resultSummary ? { resultSummary: existing.resultSummary } : {}),
+        ...(taskState === 'failed' && p.summary ? { error: p.summary } : {}),
+      };
+      hub.transcript.upsertTask(sid, nextTask);
+      hub.broadcastV262(sid, {
+        type: 'task',
+        session_id: sid,
+        agent_id: 'main',
+        ...toWireTask(nextTask),
+      });
+    }
+  } else if (ev.kind === 'task') {
+    const p = (ev.payload ?? {}) as {
+      taskId?: string;
+      task_id?: string;
+      description?: string;
+      toolUseId?: string;
+      subagentType?: string;
+      taskType?: string;
+      isBackgrounded?: boolean;
+      summary?: string;
+      lastToolName?: string;
+      patch?: Record<string, unknown>;
+    };
+    const taskId = p.taskId ?? p.task_id;
+    if (taskId) {
+      const existing = hub.transcript.currentTasks(sid).find((t) => t.taskId === taskId);
+      const patchDesc = typeof p.patch?.description === 'string' ? p.patch.description : undefined;
+      const isSubagent = Boolean(p.subagentType || p.taskType === 'subagent' || existing?.kind === 'subagent');
+      const parentToolUseId = p.toolUseId ?? ev.parentToolUseId ?? existing?.parentToolUseId;
+      const taskState: TranscriptTask['state'] = ev.status === 'failed'
+        ? 'failed'
+        : ev.status === 'cancelled'
+          ? 'killed'
+          : ev.status === 'completed'
+            ? 'completed'
+            : 'running';
+      const nextTask: TranscriptTask = {
+        taskId,
+        kind: isSubagent ? 'subagent' : existing?.kind ?? 'tool',
+        state: taskState,
+        detached: p.isBackgrounded ?? existing?.detached ?? false,
+        ...(p.description ?? patchDesc ?? existing?.description ? { description: p.description ?? patchDesc ?? existing?.description } : {}),
+        ...(isSubagent ? { agentId: existing?.agentId ?? taskId } : existing?.agentId ? { agentId: existing.agentId } : {}),
+        ...(parentToolUseId ? { parentToolUseId } : {}),
+        outputTail: p.summary ?? p.lastToolName ?? existing?.outputTail ?? '',
+        startedAt: existing?.startedAt ?? new Date(ev.timestamp || Date.now()).toISOString(),
+        ...(taskState !== 'running' ? { endedAt: new Date(ev.timestamp || Date.now()).toISOString() } : {}),
+        ...(taskState === 'completed' && p.summary ? { resultSummary: p.summary } : existing?.resultSummary ? { resultSummary: existing.resultSummary } : {}),
+        ...(taskState === 'failed' && p.summary ? { error: p.summary } : {}),
+      };
+      hub.transcript.upsertTask(sid, nextTask);
+      hub.broadcastV262(sid, {
+        type: 'task',
+        session_id: sid,
+        agent_id: 'main',
+        ...toWireTask(nextTask),
+      });
     }
   } else if (ev.kind === 'approval') {
     const p = ev.payload as { approvalId: string; tool: string; input?: unknown; itemId?: string };
     turn.pendingApprovals.set(p.approvalId, { tool: p.tool, input: p.input, itemId: p.itemId });
+    const dto = approvalDto(sid, p.approvalId, turn);
     hub.transcript.requestInteraction(sid, {
       interactionId: p.approvalId,
       interactionKind: 'approval',
       ...(p.itemId ? { toolCallId: p.itemId } : {}),
       state: 'pending',
-      request: approvalDto(sid, p.approvalId, turn),
+      request: dto,
     });
-    emit('event.approval.requested', approvalDto(sid, p.approvalId, turn));
+    emit('event.approval.requested', dto);
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'approval' });
+    hub.broadcastV262(sid, v262PendingApprovalFrame(sid, p.approvalId, turn));
   } else if (ev.kind === 'question') {
     const p = ev.payload as { questionId: string; prompt: string; rawQuestions?: unknown[]; itemId?: string };
     turn.pendingQuestions.set(p.questionId, { prompt: p.prompt, rawQuestions: p.rawQuestions });
@@ -2642,8 +4590,31 @@ function consumeEvent(
     });
     emit('event.question.requested', request);
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'question' });
+    hub.broadcastV262(sid, v262PendingQuestionFrame(sid, p.questionId, p.itemId, { prompt: p.prompt, rawQuestions: p.rawQuestions }));
+  } else if (ev.kind === 'notice') {
+    const p = ev.payload as { level?: string; message?: string; title?: string } | undefined;
+    const rawMsg = typeof p?.message === 'string' ? p.message.trim() : '';
+    if (rawMsg) {
+      const prefix = p?.level === 'error' ? '✗ ' : p?.level === 'warning' ? '⚠ ' : '';
+      const title = typeof p?.title === 'string' && p.title.trim() ? `**${p.title.trim()}**\n` : '';
+      const sep = turn.assistantText ? '\n\n' : '';
+      emitAssistantDeltaText(`${sep}${prefix}${title}${rawMsg}`, turn, emit, ensureStep, sid, hub);
+    }
+  } else if (ev.kind === 'usage') {
+    const u = ev.payload as Partial<SessionUsage> | undefined;
+    if (u) {
+      let limit = u.context_limit ?? 0;
+      if (limit <= 0 && provider === 'grok') limit = grokStatusContextFallback();
+      hub.broadcastV262(sid, {
+        type: 'usage',
+        session_id: sid,
+        agent_id: 'main',
+        context_tokens: u.context_unavailable ? 0 : (u.context_tokens ?? 0),
+        max_context_tokens: limit,
+      });
+    }
   } else if (ev.kind === 'turn') {
-    // 终态由 submitPrompt 的 finally 统一广播。
+    // 终态由 driveTurn 的 finally 统一广播。
   }
 }
 
@@ -2652,29 +4623,91 @@ function consumeEvent(
  * 回 aborted:false,而不是谎称成功。帧序:turn.ended → prompt.aborted →
  * work_changed(前端投影器按 promptId 清 in-flight 状态,顺序敏感)。
  */
-async function abortTurn(adapter: ProviderAdapter, provider: ProviderName, nativeId: string, hub: SessionHub, demoActive: boolean = false): Promise<boolean> {
+async function abortTurn(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  hub: SessionHub,
+  demoActive: boolean = false,
+  uploadStore?: UploadStore,
+): Promise<boolean> {
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
   if (!active) return false;
-  // 先置位:若 turnId 还没拿到(acquire 窗口),driveTurn 会补 interrupt。
   active.cancelled = true;
   await adapter.interrupt(nativeId, active.turnId || undefined);
   hub.busy.delete(sid);
+  closeV262Thinking(hub, sid, active);
+  closeV262Assistant(hub, sid, active);
   active.transcript?.end('cancelled', 0);
   hub.transcript.finishPrompt(sid, active.promptId, 'aborted');
-  // 事件流循环发现占位消失后会静默退出(见 driveTurn 的 break),终态在
-  // 此广播,前端才能从 busy 恢复。
   hub.broadcast(sid, frame(sid, hub, 'turn.ended', { turnId: 0, reason: 'cancelled', durationMs: 0 }));
   hub.broadcast(sid, frame(sid, hub, 'prompt.aborted', { promptId: active.promptId, abortedAt: new Date().toISOString() }));
   hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: 'cancelled' }));
-  // 被取消 turn 后面可能还有排队 prompt,接力。
-  drainQueue(adapter, provider, nativeId, hub, demoActive);
+  hub.broadcastV262(sid, {
+    type: 'turn.ended',
+    session_id: sid,
+    agent_id: 'main',
+    turn: {
+      turn_id: active.v262TurnId,
+      ordinal: active.v262Ordinal,
+      turn_number: active.v262Ordinal + 1,
+      kind: 'agent',
+      status: 'ended',
+      outcome: 'interrupted',
+      duration_ms: 0,
+      started_at: active.v262StartedAt,
+      ended_at: new Date().toISOString(),
+      steps: [{ index: 0 }],
+      items: [],
+    },
+  });
+  emitV262AgentState(hub, adapter, provider, nativeId, sid, 'idle');
+  drainQueue(adapter, provider, nativeId, hub, demoActive, uploadStore);
   return true;
 }
 
 // ---------------------------------------------------------------------------
 // approvals / questions
 // ---------------------------------------------------------------------------
+
+function v262PendingApprovalFrame(sid: string, approvalId: string, turn: ActiveTurn): Record<string, unknown> {
+  const a = turn.pendingApprovals.get(approvalId);
+  return {
+    type: 'interaction',
+    session_id: sid,
+    agent_id: 'main',
+    interaction_id: approvalId,
+    kind: 'approval',
+    status: 'pending',
+    tool_call_id: a?.itemId ?? approvalId,
+    request: {
+      tool_name: a?.tool ?? 'commandExecution',
+      action: a?.tool ?? 'commandExecution',
+      tool_input_display: a?.input ?? null,
+    },
+  };
+}
+
+function v262PendingQuestionFrame(
+  sid: string,
+  questionId: string,
+  toolCallId: string | undefined,
+  q: { prompt: string; rawQuestions?: unknown[] },
+): Record<string, unknown> {
+  return {
+    type: 'interaction',
+    session_id: sid,
+    agent_id: 'main',
+    interaction_id: questionId,
+    kind: 'question',
+    status: 'pending',
+    ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+    request: {
+      questions: structuredQuestionItems(q.rawQuestions) ?? [{ id: 'q_0', question: q.prompt, options: [] }],
+    },
+  };
+}
 
 function pendingApprovals(sid: string, hub: SessionHub): unknown[] {
   const active = hub.busy.get(sid);
@@ -2746,14 +4779,40 @@ async function resolveApproval(
   provider: ProviderName,
   nativeId: string,
   approvalId: string,
-  body: { decision: string; scope?: string },
+  body: Record<string, unknown> & { decision: string; scope?: string },
   hub: SessionHub,
 ): Promise<void> {
-  // 前端"允许本次会话"带 scope:'session'(ApprovalCard.vue),映射 approve_always
-  // → codex acceptForSession;此前网关只读 decision,该按钮实际只放行单次(审查发现)。
+  // 前端"允许本次会话"带 scope:'session',映射 approve_always → codex/claude 持久放行。
   const base = body.decision === 'approved' ? 'approve' : 'reject';
-  const decision = base === 'approve' && body.scope === 'session' ? 'approve_always' : base;
-  await adapter.resolveApproval(nativeId, approvalId, decision);
+  const decision = base === 'approve' && (body.scope === 'session' || body.scope === 'always')
+    ? 'approve_always'
+    : base;
+  const details: GranularApprovalDetails = {};
+  let hasDetails = false;
+  if (typeof body.scope === 'string') { details.scope = body.scope; hasDetails = true; }
+  if (typeof body.feedback === 'string') { details.message = body.feedback; hasDetails = true; }
+  if (typeof body.message === 'string') { details.message = body.message; hasDetails = true; }
+  if (Array.isArray(body.updatedPermissions)) { details.updatedPermissions = body.updatedPermissions; hasDetails = true; }
+  if (body.updatedInput !== undefined) { details.updatedInput = body.updatedInput; hasDetails = true; }
+  if (Array.isArray(body.execpolicyAmendment)) { details.execpolicyAmendment = body.execpolicyAmendment as string[]; hasDetails = true; }
+  if (body.networkPolicyAmendment && typeof body.networkPolicyAmendment === 'object') {
+    details.networkPolicyAmendment = body.networkPolicyAmendment as GranularApprovalDetails['networkPolicyAmendment'];
+    hasDetails = true;
+  }
+  if (body.permissions && typeof body.permissions === 'object') {
+    details.permissions = body.permissions as Record<string, unknown>;
+    hasDetails = true;
+  }
+  if (body.elicitation && typeof body.elicitation === 'object') {
+    details.elicitation = body.elicitation as GranularApprovalDetails['elicitation'];
+    hasDetails = true;
+  }
+  if (body.nativeDecision !== undefined) { details.nativeDecision = body.nativeDecision; hasDetails = true; }
+  if (hasDetails) {
+    await adapter.resolveApproval(nativeId, approvalId, decision, details);
+  } else {
+    await adapter.resolveApproval(nativeId, approvalId, decision);
+  }
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
   active?.pendingApprovals.delete(approvalId);
@@ -2769,6 +4828,19 @@ async function resolveApproval(
     resolved_by: 'user',
     resolved_at: new Date().toISOString(),
   }));
+  hub.broadcastV262(sid, {
+    type: 'interaction',
+    session_id: sid,
+    agent_id: 'main',
+    interaction_id: approvalId,
+    kind: 'approval',
+    status: 'ended',
+    outcome: body.decision === 'approved' ? 'approved' : 'rejected',
+    response: {
+      ...(typeof body.feedback === 'string' ? { feedback: body.feedback } : {}),
+      ...(typeof body.selected_label === 'string' ? { selected_label: body.selected_label } : {}),
+    },
+  });
   const pending = (active?.pendingApprovals.size ?? 0) > 0 ? 'approval' : (active?.pendingQuestions.size ?? 0) > 0 ? 'question' : 'none';
   hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', { busy: active !== undefined, main_turn_active: active !== undefined, pending_interaction: pending }));
 }
@@ -2781,8 +4853,6 @@ async function resolveQuestion(
   body: { answers?: Record<string, unknown>; text?: string },
   hub: SessionHub,
 ): Promise<void> {
-  // 结构化答案(WireQuestionAnswer 按 question id 键控)→ codex 的
-  // {questionId: string[]};纯文本退回字符串(adapter 包装成 q_0)。
   let payload: string | Record<string, string[]>;
   if (body.answers && Object.keys(body.answers).length > 0) {
     const out: Record<string, string[]> = {};
@@ -2796,16 +4866,57 @@ async function resolveQuestion(
   const active = hub.busy.get(sid);
   active?.pendingQuestions.delete(questionId);
   hub.transcript.resolveInteraction(sid, questionId, 'answered', payload);
-  // 帧名对齐 kap-server:前端 projector 只认 event.question.answered/dismissed,
-  // 发 resolved 会落进 "Unhandled event"(审查实测)。
   hub.broadcast(sid, frame(sid, hub, 'event.question.answered', {
     question_id: questionId,
     answers: body.answers ?? {},
     resolved_by: 'user',
     resolved_at: new Date().toISOString(),
   }));
+  hub.broadcastV262(sid, {
+    type: 'interaction',
+    session_id: sid,
+    agent_id: 'main',
+    interaction_id: questionId,
+    kind: 'question',
+    status: 'ended',
+    outcome: 'answered',
+  });
   const pending = (active?.pendingApprovals.size ?? 0) > 0 ? 'approval' : (active?.pendingQuestions.size ?? 0) > 0 ? 'question' : 'none';
   hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', { busy: active !== undefined, main_turn_active: active !== undefined, pending_interaction: pending }));
+}
+
+async function dismissQuestion(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  questionId: string,
+  hub: SessionHub,
+): Promise<void> {
+  await adapter.resolveQuestion(nativeId, questionId, {}).catch(() => undefined);
+  const sid = prefixedId(provider, nativeId);
+  hub.busy.get(sid)?.pendingQuestions.delete(questionId);
+  hub.transcript.resolveInteraction(sid, questionId, 'dismissed', null);
+  hub.broadcast(sid, frame(sid, hub, 'event.question.dismissed', {
+    question_id: questionId, dismissed_at: new Date().toISOString(),
+  }));
+  hub.broadcastV262(sid, {
+    type: 'interaction',
+    session_id: sid,
+    agent_id: 'main',
+    interaction_id: questionId,
+    kind: 'question',
+    status: 'ended',
+    outcome: 'dismissed',
+  });
+  const activeAfterDismiss = hub.busy.get(sid);
+  const pendingAfterDismiss = (activeAfterDismiss?.pendingApprovals.size ?? 0) > 0
+    ? 'approval'
+    : (activeAfterDismiss?.pendingQuestions.size ?? 0) > 0 ? 'question' : 'none';
+  hub.broadcast(sid, frame(sid, hub, 'event.session.work_changed', {
+    busy: activeAfterDismiss !== undefined,
+    main_turn_active: activeAfterDismiss !== undefined,
+    pending_interaction: pendingAfterDismiss,
+  }));
 }
 
 /** WireQuestionAnswer → codex 答案字符串数组(option id / 自由文本)。 */
@@ -2917,12 +5028,13 @@ function attachGatewayWebSocket(
   server: ReturnType<typeof createServer>,
   token: string,
   hub: SessionHub,
-  adapters: Record<Exclude<ProviderName, 'kimi' | 'pi'>, ProviderAdapter>,
+  adapters: Record<LocalProviderName, ProviderAdapter>,
   resolveKimiWs: () => Promise<ReturnType<typeof createKimiWsUpgrader> | null>,
   gatewaySockets: Set<Duplex>,
   kimiSockets: Set<Duplex>,
   /** kimi=off: 官方启动屏等 WS open。没有上游时走本地事件通道,不能 503。 */
   stubKimiEvents: boolean,
+  demoActive: boolean = false,
 ): void {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -2985,9 +5097,16 @@ function attachGatewayWebSocket(
     if (chosenProto) headers.push(`Sec-WebSocket-Protocol: ${chosenProto}`);
     socket.write(headers.concat('\r\n').join('\r\n'));
     gatewaySockets.add(socket);
-    // TCP keepalive + WS ping:手机/隧道静默断连时尽快回收 socket/订阅。
+    // TCP keepalive + WS ping + 2.6.2 JSON ping(每 10s,匹配前端 stale 25s 与 20s 心跳指示)。
     try { (socket as import('node:net').Socket).setKeepAlive?.(true, 30_000); } catch { /* ignore */ }
     let lastPongAt = Date.now();
+    const sendObj = (obj: Record<string, unknown>): void => {
+      if (socket.destroyed) return;
+      wsSendText(socket, JSON.stringify(obj));
+      // 背压熔断:慢客户端(手机/隧道)消费不过来时写缓冲会无界增长拖垮
+      // 进程。超阈值直接断开,客户端重连后走 snapshot+resync 恢复。
+      if (socket.writableLength > 8 * 1024 * 1024) socket.destroy();
+    };
     const pingTimer = setInterval(() => {
       if (socket.destroyed) {
         clearInterval(pingTimer);
@@ -2997,17 +5116,15 @@ function attachGatewayWebSocket(
         socket.destroy();
         return;
       }
-      try { wsSendFrame(socket, 0x9, Buffer.alloc(0)); } catch { socket.destroy(); }
-    }, 30_000);
+      try {
+        wsSendFrame(socket, 0x9, Buffer.alloc(0));
+        sendObj({ type: 'ping' });
+      } catch {
+        socket.destroy();
+      }
+    }, 10_000);
     pingTimer.unref?.();
 
-    const sendObj = (obj: Record<string, unknown>): void => {
-      if (socket.destroyed) return;
-      wsSendText(socket, JSON.stringify(obj));
-      // 背压熔断:慢客户端(手机/隧道)消费不过来时写缓冲会无界增长拖垮
-      // 进程。超阈值直接断开,客户端重连后走 snapshot+resync 恢复。
-      if (socket.writableLength > 8 * 1024 * 1024) socket.destroy();
-    };
     sendObj({
       type: 'server_hello',
       timestamp: new Date().toISOString(),
@@ -3020,22 +5137,28 @@ function attachGatewayWebSocket(
 
     const transcriptSpecs = new Map<string, Record<string, unknown>>();
     const transcriptOffs = new Map<string, () => void>();
+    const v262Offs = new Map<string, () => void>();
     const sendFrame = (event: Record<string, unknown>): void => {
       const sid = typeof event.session_id === 'string' ? event.session_id : '';
       if (sid && providerFromSessionId(sid).provider !== socketProvider) return;
+      const type = typeof event.type === 'string' ? event.type : '';
+      if (v262Offs.has(sid) && !globalSessionEvent(type)) return;
       if (!transcriptSuppressesLegacy(event, transcriptSpecs.get(sid))) sendObj(event);
     };
-    // kimi=off 启动屏只要通道 open + server_hello,不能把 Claude/Codex/Grok
+    // kimi=off 启动屏只要通道 open + server_hello,不能把 Claude/Codex/Grok/Pi
     // 的 session.meta / work_changed 灌进去。
     const offGlobal = socketProvider === 'kimi'
       ? () => undefined
       : hub.subscribeGlobal(sendFrame);
 
-    // ---- 客户端帧处理:legacy 事件与 transcript v2 是两条独立订阅 ----
+    // ---- 客户端帧处理:2.6.2 turns/items、legacy 事件与 transcript v2 ----
     const localOffs = new Map<string, () => void>();
     const handleFrame = async (msg: {
       type?: string;
       id?: string;
+      request_id?: string;
+      session_id?: string;
+      agent_ids?: string[];
       payload?: {
         client_id?: string;
         subscriptions?: string[];
@@ -3047,6 +5170,94 @@ function attachGatewayWebSocket(
         transcript_since?: Record<string, unknown>;
       };
     }): Promise<void> => {
+      if (msg.type === 'pong') {
+        lastPongAt = Date.now();
+        return;
+      }
+      if (msg.type === 'ping') {
+        lastPongAt = Date.now();
+        sendObj({ type: 'pong' });
+        return;
+      }
+      if (msg.type === 'subscribe' && typeof msg.session_id === 'string') {
+        const sid = msg.session_id;
+        const split = providerFromSessionId(sid);
+        if (split.provider !== socketProvider) {
+          sendObj({ type: 'response', request_id: msg.request_id, code: 40001, msg: 'provider mismatch' });
+          return;
+        }
+        const adapter = isLocalProvider(socketProvider) ? adapters[socketProvider] : null;
+        let history: Message[] | null = null;
+        if (adapter) {
+          try {
+            history = await tryHistoryStrictWithDemo(adapter, socketProvider, split.nativeId, demoActive);
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isKnownDraft = Boolean(adapter.getCwd?.(split.nativeId)) && /not found/i.test(errMsg);
+            if (isKnownDraft) {
+              history = [];
+            } else {
+              sendObj({ type: 'response', request_id: msg.request_id, code: 40401, msg: errMsg || 'session not found' });
+              sendObj({ type: 'turns.failed', session_id: sid, agent_id: 'main', code: 40401, msg: errMsg || 'session not found' });
+              return;
+            }
+          }
+        }
+        v262Offs.get(sid)?.();
+        v262Offs.set(sid, hub.subscribeV262(sid, sendObj));
+        sendObj({ type: 'response', request_id: msg.request_id, code: 0, msg: 'success' });
+
+        if (history && !hub.transcript.hasObservedHistory(sid)) {
+          hub.transcript.observeHistory(sid, history);
+        }
+        const active = hub.busy.get(sid);
+        const allTurns = turnsFromHistory(history ?? [], active);
+        const page = sliceV262Turns(allTurns, undefined, 20);
+        sendObj({
+          type: 'turns',
+          session_id: sid,
+          agent_id: 'main',
+          turns: page.turns,
+          has_more: page.has_more,
+        });
+        if (adapter) {
+          emitV262AgentState(hub, adapter, socketProvider, split.nativeId, sid, active ? 'running' : 'idle');
+          emitV262Usage(hub, adapter, socketProvider, split.nativeId, sid);
+          const wireTasks = await collectSessionWireTasks(adapter, split.nativeId, sid, hub);
+          sendObj({
+            type: 'task.list',
+            session_id: sid,
+            agent_id: 'main',
+            tasks: wireTasks,
+          });
+          const caps = adapter.capabilities();
+          if (caps.goals !== false && adapter.getGoal) {
+            const goal = await adapter.getGoal(split.nativeId).catch(() => null);
+            sendObj({
+              type: 'goal',
+              session_id: sid,
+              agent_id: 'main',
+              goal: localGoalToWire(goal, split.nativeId),
+            });
+          }
+        }
+        if (active) {
+          for (const approvalId of active.pendingApprovals.keys()) {
+            sendObj(v262PendingApprovalFrame(sid, approvalId, active));
+          }
+          for (const [questionId, q] of active.pendingQuestions.entries()) {
+            sendObj(v262PendingQuestionFrame(sid, questionId, undefined, q));
+          }
+        }
+        return;
+      }
+      if (msg.type === 'unsubscribe' && typeof msg.session_id === 'string') {
+        const sid = msg.session_id;
+        v262Offs.get(sid)?.();
+        v262Offs.delete(sid);
+        sendObj({ type: 'response', request_id: msg.request_id, code: 0, msg: 'success' });
+        return;
+      }
       if (msg.type === 'subscribe_v2') {
         const sid = msg.payload?.session_id;
         const split = sid ? providerFromSessionId(sid) : null;
@@ -3063,7 +5274,9 @@ function attachGatewayWebSocket(
           return;
         }
 
-        transcriptOffs.get(sid)?.();
+        const prevOff = transcriptOffs.get(sid);
+        const prevSpec = transcriptSpecs.get(sid);
+        prevOff?.();
         transcriptSpecs.set(sid, spec);
         const grade = transcriptGrade(spec);
         const subscription = hub.transcript.subscribe(sid, (emission) => {
@@ -3072,7 +5285,31 @@ function attachGatewayWebSocket(
         });
         transcriptOffs.set(sid, subscription.close);
         const adapter = isLocalProvider(socketProvider) ? adapters[socketProvider] : null;
-        const history = adapter ? await adapter.getHistory(split.nativeId).catch(() => null) : null;
+        let history: Message[] | null = null;
+        if (adapter) {
+          try {
+            history = await tryHistoryStrictWithDemo(adapter, socketProvider, split.nativeId, demoActive);
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err);
+            const isKnownDraft = Boolean(adapter.getCwd?.(split.nativeId)) && /not found/i.test(errMsg);
+            if (isKnownDraft) {
+              history = [];
+            } else {
+              subscription.close();
+              transcriptOffs.delete(sid);
+              if (prevSpec === undefined) transcriptSpecs.delete(sid);
+              else transcriptSpecs.set(sid, prevSpec);
+              sendObj({
+                type: 'ack',
+                id: msg.id,
+                code: 1,
+                msg: errMsg || 'failed to load transcript',
+                payload: { accepted: [], not_found: [], resync_required: [sid], cursors: {} },
+              });
+              return;
+            }
+          }
+        }
         if (history) subscription.seed(history, hub.busy.has(sid) ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
         sendObj({
           type: 'ack', id: msg.id, code: 0, msg: 'success',
@@ -3139,6 +5376,8 @@ function attachGatewayWebSocket(
         for (const sid of ids) {
           localOffs.get(sid)?.();
           localOffs.delete(sid);
+          v262Offs.get(sid)?.();
+          v262Offs.delete(sid);
           transcriptOffs.get(sid)?.();
           transcriptOffs.delete(sid);
           transcriptSpecs.delete(sid);
@@ -3146,7 +5385,7 @@ function attachGatewayWebSocket(
         sendObj({ type: 'ack', id: msg.id, code: 0, msg: 'success', payload: {} });
         return;
       }
-      // pong / abort(上游 WS abort 是死路,中止走 REST):忽略。
+      // abort(上游 WS abort 是死路,中止走 REST):忽略。
     };
 
     const parser = new WsFrameParser();
@@ -3210,6 +5449,8 @@ function attachGatewayWebSocket(
       offGlobal();
       for (const off of localOffs.values()) off();
       localOffs.clear();
+      for (const off of v262Offs.values()) off();
+      v262Offs.clear();
       for (const off of transcriptOffs.values()) off();
       transcriptOffs.clear();
       transcriptSpecs.clear();
@@ -3359,31 +5600,36 @@ function ulid(): string {
 }
 
 // ---------------------------------------------------------------------------
-// codex goal / terminal → kimi wire 映射
+// goal / terminal / 2.6.2 turns / model → kimi wire 映射
 // ---------------------------------------------------------------------------
 
-/**
- * codex ThreadGoal(schema 实测:createdAt/objective/status/timeUsedSeconds/
- * tokenBudget/tokensUsed/updatedAt)→ WireGoalSnapshot。codex 无 goalId /
- * turn 预算,goalId 用 threadId 占位,没有的字段回 null/false。
- */
-function codexGoalToWire(goal: Record<string, unknown> | null): Record<string, unknown> | null {
+function localGoalToWire(goal: Record<string, unknown> | null, fallbackId = 'goal'): Record<string, unknown> | null {
   if (!goal) return null;
   const status = String(goal.status ?? 'active');
   const mapped = status === 'usageLimited' || status === 'budgetLimited' ? 'blocked' : status;
   const numOrNull = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const tokensUsed = numOrNull(goal.tokensUsed ?? goal.tokens_used) ?? 0;
+  const tokenBudget = numOrNull(goal.tokenBudget ?? goal.token_budget);
+  const wallClockMs = typeof goal.elapsed_ms === 'number' && Number.isFinite(goal.elapsed_ms)
+    ? goal.elapsed_ms
+    : (numOrNull(goal.timeUsedSeconds) ?? 0) * 1000;
   return {
-    goalId: String(goal.threadId ?? 'goal'),
+    goalId: String(goal.goalId ?? goal.goal_id ?? goal.threadId ?? fallbackId),
     objective: String(goal.objective ?? ''),
+    ...(typeof goal.completionCriterion === 'string'
+      ? { completionCriterion: goal.completionCriterion }
+      : typeof goal.completion_criterion === 'string'
+        ? { completionCriterion: goal.completion_criterion }
+        : {}),
     status: mapped,
-    turnsUsed: 0,
-    tokensUsed: numOrNull(goal.tokensUsed) ?? 0,
-    wallClockMs: (numOrNull(goal.timeUsedSeconds) ?? 0) * 1000,
+    turnsUsed: numOrNull(goal.turnsUsed ?? goal.turns_used) ?? 0,
+    tokensUsed,
+    wallClockMs,
     budget: {
-      tokenBudget: numOrNull(goal.tokenBudget),
-      turnBudget: null,
-      wallClockBudgetMs: null,
-      remainingTokens: null,
+      tokenBudget,
+      turnBudget: numOrNull(goal.turnBudget ?? goal.turn_budget),
+      wallClockBudgetMs: numOrNull(goal.wallClockBudgetMs ?? goal.wall_clock_budget_ms),
+      remainingTokens: tokenBudget !== null ? Math.max(0, tokenBudget - tokensUsed) : null,
       remainingTurns: null,
       remainingWallClockMs: null,
       tokenBudgetReached: status === 'budgetLimited',
@@ -3391,6 +5637,322 @@ function codexGoalToWire(goal: Record<string, unknown> | null): Record<string, u
       wallClockBudgetReached: false,
       overBudget: status === 'budgetLimited' || status === 'usageLimited',
     },
+  };
+}
+
+function wireModelDto(m: NativeModel): Record<string, unknown> {
+  const raw = m as NativeModel & Record<string, unknown>;
+  const rawCaps = Array.isArray(m.capabilities) ? [...m.capabilities] : [];
+  const rawEfforts = Array.isArray(m.support_efforts) ? m.support_efforts : undefined;
+  const filteredEfforts = rawEfforts
+    ? rawEfforts.filter((effort, idx, arr) => effort !== 'off' && arr.indexOf(effort) === idx)
+    : undefined;
+  if (
+    m.supportsThinkingOff === false
+    && rawCaps.includes('thinking')
+    && !rawCaps.includes('always_thinking')
+  ) {
+    rawCaps.push('always_thinking');
+  }
+  const out: Record<string, unknown> = {
+    ...raw,
+    ...(rawCaps.length > 0 || m.capabilities !== undefined ? { capabilities: rawCaps } : {}),
+    ...(m.max_output_tokens !== undefined && raw.max_output_size === undefined
+      ? { max_output_size: m.max_output_tokens }
+      : {}),
+    ...(m.supportsAdaptiveThinking !== undefined && raw.adaptive_thinking === undefined
+      ? { adaptive_thinking: m.supportsAdaptiveThinking }
+      : {}),
+  };
+  if (filteredEfforts !== undefined) {
+    if (filteredEfforts.length > 0) out.support_efforts = filteredEfforts;
+    else delete out.support_efforts;
+  }
+  return out;
+}
+
+function tryHistoryStrictWithDemo(
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  demoActive: boolean,
+): Promise<Message[]> {
+  if (demoActive) {
+    const demo = getDemoHistory(provider, nativeId);
+    if (demo) return Promise.resolve(demo);
+  }
+  return adapter.getHistory(nativeId);
+}
+
+function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record<string, unknown>> {
+  const turns: Array<Record<string, unknown>> = [];
+  let current: {
+    turn_id: string;
+    ordinal: number;
+    turn_number: number;
+    kind: 'agent';
+    status: 'ended' | 'running';
+    outcome?: string;
+    started_at?: string;
+    ended_at?: string;
+    steps: Array<{ index: number }>;
+    items: Array<Record<string, unknown>>;
+  } | null = null;
+  const toolMap = new Map<string, Record<string, unknown>>();
+  const ensureTurn = (seedId: string, createdAt: string) => {
+    if (!current) {
+      const ordinal = turns.length;
+      current = {
+        turn_id: `hist_${seedId}`,
+        ordinal,
+        turn_number: ordinal + 1,
+        kind: 'agent',
+        status: 'ended',
+        outcome: 'completed',
+        started_at: createdAt,
+        ended_at: createdAt,
+        steps: [{ index: 0 }],
+        items: [],
+      };
+      turns.push(current);
+    }
+    return current;
+  };
+
+  for (const msg of history) {
+    const msgAgentId = typeof msg.metadata?.agent_id === 'string'
+      ? msg.metadata.agent_id
+      : typeof msg.metadata?.agentId === 'string'
+        ? msg.metadata.agentId
+        : undefined;
+    const msgReceiverId = Array.isArray(msg.metadata?.receiverThreadIds) && typeof msg.metadata.receiverThreadIds[0] === 'string'
+      ? msg.metadata.receiverThreadIds[0]
+      : undefined;
+    const isBashCard = Boolean(msg.metadata?.bash_card);
+
+    if (msg.role === 'user' && !isBashCard) {
+      const text = msg.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+      const attachments = msg.content
+        .filter((p): p is Extract<Message['content'][number], { type: 'image' | 'file' | 'document' }> =>
+          p.type === 'image' || p.type === 'file' || p.type === 'document')
+        .map((p) => ({
+          kind: p.type === 'image' ? 'image' : 'file',
+          ...(p.name ? { name: p.name } : {}),
+          ...((p.mimeType ?? p.mime_type) ? { media_type: p.mimeType ?? p.mime_type } : {}),
+          ...(p.url ? { url: p.url } : {}),
+        }));
+      const isToolOnlyUser = !text.trim()
+        && attachments.length === 0
+        && msg.content.some((p) => p.type === 'tool_result' || p.type === 'tool_use' || p.type === 'tool_call');
+      if (!isToolOnlyUser) {
+        const ordinal = turns.length;
+        const promptIds = Array.isArray(msg.metadata?.prompt_ids)
+          ? msg.metadata.prompt_ids.filter((x): x is string => typeof x === 'string')
+          : typeof msg.metadata?.prompt_id === 'string'
+            ? [msg.metadata.prompt_id]
+            : [msg.id];
+        current = {
+          turn_id: `hist_${msg.id}`,
+          ordinal,
+          turn_number: ordinal + 1,
+          kind: 'agent',
+          status: 'ended',
+          outcome: 'completed',
+          started_at: msg.created_at,
+          ended_at: msg.created_at,
+          steps: [{ index: 0 }],
+          items: [{
+            item_id: `${msg.id}_opener`,
+            type: 'user_message',
+            placement: 'opener',
+            origin: { kind: 'user' },
+            text,
+            prompt_ids: promptIds,
+            attachments,
+            skills: [],
+            created_at: msg.created_at,
+          }],
+        };
+        turns.push(current);
+        continue;
+      }
+    }
+
+    if (msg.role === 'system' && msg.metadata?.notice_source === 'compact') {
+      const summary = msg.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+      const target = ensureTurn(msg.id, msg.created_at);
+      target.items.push({
+        item_id: msg.id,
+        type: 'system',
+        kind: 'compaction',
+        summary,
+        trigger: 'manual',
+        created_at: msg.created_at,
+      });
+      target.ended_at = msg.created_at;
+      continue;
+    }
+
+    const target = ensureTurn(msg.id, msg.created_at);
+    target.ended_at = msg.created_at;
+
+    if (isBashCard) {
+      const card = (typeof msg.metadata?.bash_card === 'object' && msg.metadata.bash_card !== null
+        ? msg.metadata.bash_card
+        : {}) as Record<string, unknown>;
+      const command = typeof card.command === 'string'
+        ? card.command
+        : typeof card.cmd === 'string'
+          ? card.cmd
+          : '';
+      const output = typeof card.output === 'string'
+        ? card.output
+        : typeof card.stdout === 'string'
+          ? card.stdout
+          : '';
+      const isError = card.is_error === true || card.isError === true || msg.metadata?.is_error === true;
+      const callId = (typeof card.tool_call_id === 'string' && card.tool_call_id) || `${msg.id}_bash`;
+      const norm = normalizeKimiWebTool('Bash', {
+        command,
+        ...(card.cwd ? { cwd: card.cwd } : {}),
+        ...(card.workdir ? { workdir: card.workdir } : {}),
+      });
+      target.items.push({
+        item_id: callId,
+        type: 'tool_call',
+        name: norm.name,
+        input: norm.input,
+        status: 'ended',
+        outcome: isError ? 'failed' : 'completed',
+        output,
+        ...(isError && output ? { error: output } : {}),
+        started_at: msg.created_at,
+        ended_at: msg.created_at,
+        step_index: 0,
+      });
+      continue;
+    }
+
+    let idx = 0;
+    for (const part of msg.content) {
+      if (part.type === 'thinking') {
+        const text = part.thinking ?? part.text ?? '';
+        if (!text) continue;
+        target.items.push({
+          item_id: `${msg.id}_think_${idx++}`,
+          type: 'reasoning',
+          status: 'ended',
+          text,
+          started_at: msg.created_at,
+          created_at: msg.created_at,
+          step_index: 0,
+        });
+      } else if (part.type === 'text') {
+        if (!part.text) continue;
+        target.items.push({
+          item_id: `${msg.id}_text_${idx++}`,
+          type: 'assistant_message',
+          status: 'ended',
+          text: part.text,
+          created_at: msg.created_at,
+          step_index: 0,
+        });
+      } else if (part.type === 'tool_call' || part.type === 'tool_use') {
+        const callId = part.type === 'tool_call' ? part.id : part.tool_call_id;
+        const rawName = part.type === 'tool_call' ? part.name : part.tool_name;
+        const normalized = normalizeKimiWebTool(rawName || 'tool', part.input ?? {});
+        const inputSubagentId = normalized.name === 'Agent' ? extractSubagentIdFromOutput(normalized.input) : undefined;
+        const agentRefs = mergeAgentRefs(
+          msg.metadata?.agent_refs ?? msg.metadata?.agentRefs,
+          [msgAgentId, msgReceiverId, inputSubagentId],
+        );
+        const item: Record<string, unknown> = {
+          item_id: callId,
+          type: 'tool_call',
+          name: normalized.name,
+          input: normalized.input ?? {},
+          status: 'ended',
+          outcome: 'completed',
+          started_at: msg.created_at,
+          ended_at: msg.created_at,
+          step_index: 0,
+          ...(agentRefs ? { agent_refs: agentRefs } : {}),
+        };
+        toolMap.set(callId, item);
+        target.items.push(item);
+      } else if (part.type === 'tool_result') {
+        const existing = toolMap.get(part.tool_call_id);
+        const structured = part.structured_output ?? part.structuredOutput;
+        const rawOut = part.output ?? part.content ?? '';
+        const output = (rawOut === '' || rawOut === undefined) && structured !== undefined
+          ? (typeof structured === 'string' ? structured : JSON.stringify(structured))
+          : rawOut;
+        const isError = part.is_error === true;
+        const outSubagentId = extractSubagentIdFromOutput(output) ?? extractSubagentIdFromOutput(structured);
+        if (existing) {
+          existing.status = 'ended';
+          existing.outcome = isError ? 'failed' : 'completed';
+          existing.output = output;
+          if (isError && typeof output === 'string') existing.error = output;
+          existing.ended_at = msg.created_at;
+          const mergedRefs = mergeAgentRefs(existing.agent_refs, [msgAgentId, msgReceiverId, outSubagentId]);
+          if (mergedRefs) existing.agent_refs = mergedRefs;
+        } else {
+          const agentRefs = mergeAgentRefs(
+            msg.metadata?.agent_refs ?? msg.metadata?.agentRefs,
+            [msgAgentId, msgReceiverId, outSubagentId],
+          );
+          target.items.push({
+            item_id: `${part.tool_call_id}_result_${idx++}`,
+            type: 'tool_call',
+            name: 'tool',
+            input: {},
+            status: 'ended',
+            outcome: isError ? 'failed' : 'completed',
+            output,
+            started_at: msg.created_at,
+            ended_at: msg.created_at,
+            step_index: 0,
+            ...(agentRefs ? { agent_refs: agentRefs } : {}),
+          });
+        }
+      }
+    }
+  }
+
+  if (active) {
+    turns.push({
+      turn_id: active.v262TurnId,
+      ordinal: turns.length,
+      turn_number: turns.length + 1,
+      kind: 'agent',
+      status: 'running',
+      started_at: active.v262StartedAt,
+      steps: Array.from({ length: Math.max(1, active.v262StepIndex + 1) }, (_, idx) => ({ index: idx })),
+      items: active.v262Items.map((item) => ({ ...item })),
+    });
+  }
+  return turns;
+}
+
+function sliceV262Turns(
+  allTurns: Array<Record<string, unknown>>,
+  beforeOrdinal: number | undefined,
+  pageSize: number,
+): { turns: Array<Record<string, unknown>>; has_more: boolean } {
+  const filtered = beforeOrdinal === undefined
+    ? allTurns
+    : allTurns.filter((t) => Number(t.ordinal) < beforeOrdinal);
+  const start = Math.max(0, filtered.length - pageSize);
+  return {
+    turns: filtered.slice(start),
+    has_more: start > 0,
   };
 }
 
@@ -3409,6 +5971,23 @@ function codexTerminalToWire(t: Record<string, unknown>, sid: string): Record<st
     status: 'running',
     created_at: new Date().toISOString(),
   };
+}
+
+function readManifestCompatVersion(explicitPath?: string): string {
+  const candidates: string[] = [];
+  if (explicitPath) candidates.push(explicitPath);
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  candidates.push(path.resolve(here, '..', 'web-origin-manifest.json'));
+  candidates.push(path.resolve(here, '..', '..', 'web-origin-manifest.json'));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(readFileSync(candidate, 'utf8')) as { version?: unknown };
+      if (typeof parsed.version === 'string' && parsed.version.trim()) return parsed.version.trim();
+    } catch {
+      // try next candidate
+    }
+  }
+  return '2.6.2';
 }
 
 // ---------------------------------------------------------------------------
@@ -3502,15 +6081,21 @@ function buildStoreZip(files: Array<{ name: string; data: Buffer }>): Buffer {
 }
 
 // ---------------------------------------------------------------------------
-// 文件上传(multipart 解析 + 本地存储)
+// 文件上传(multipart 解析 + 每实例 UploadStore)
 // ---------------------------------------------------------------------------
 
-const UPLOAD_DIR = path.join(
-  process.env.GATEWAY_SETTINGS_DIR
-    ?? path.join(os.homedir(), '.config', 'multi-agent-gateway'),
-  'uploads',
-);
 const UPLOAD_TTL_MS = 2 * 60 * 60 * 1000;
+const SAFE_RASTER_IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const ACTIVE_WEB_MIMES = new Set([
+  'image/svg+xml',
+  'text/html',
+  'application/xhtml+xml',
+  'text/xml',
+  'application/xml',
+  'text/javascript',
+  'application/javascript',
+  'application/ecmascript',
+]);
 
 interface UploadMeta {
   id: string;
@@ -3520,55 +6105,168 @@ interface UploadMeta {
   created_at: string;
 }
 
-/** 上传元数据(内存态;文件本体在 UPLOAD_DIR)。启动时扫盘重建,TTL 清扫孤儿。 */
-const uploads = new Map<string, UploadMeta>();
-
-async function ensureUploadDir(): Promise<void> {
-  await fsp.mkdir(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+interface UploadStore {
+  has: (id: string) => boolean;
+  get: (id: string) => UploadMeta | undefined;
+  filePath: (id: string) => string;
+  hydrate: () => Promise<void>;
+  store: (name: string, mediaType: string, data: Buffer) => Promise<UploadMeta>;
+  read: (id: string) => Promise<{ data: Buffer; media_type: string } | null>;
+  close: () => void;
 }
 
-async function hydrateUploadsFromDisk(): Promise<void> {
-  try {
-    await ensureUploadDir();
-    const names = await fsp.readdir(UPLOAD_DIR);
+function sniffRasterImageMime(data: Buffer): string | null {
+  if (data.byteLength >= 8 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 && data[4] === 0x0d && data[5] === 0x0a && data[6] === 0x1a && data[7] === 0x0a) {
+    return 'image/png';
+  }
+  if (data.byteLength >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (data.byteLength >= 6) {
+    const hdr = data.subarray(0, 6).toString('ascii');
+    if (hdr === 'GIF87a' || hdr === 'GIF89a') return 'image/gif';
+  }
+  if (data.byteLength >= 12 && data.subarray(0, 4).toString('ascii') === 'RIFF' && data.subarray(8, 12).toString('ascii') === 'WEBP') {
+    return 'image/webp';
+  }
+  return null;
+}
+
+function sanitizeUploadMediaType(rawMime: string, data: Buffer): string {
+  const base = rawMime.split(';')[0]?.trim().toLowerCase() || 'application/octet-stream';
+  const normalized = base === 'image/jpg' ? 'image/jpeg' : base;
+  if (ACTIVE_WEB_MIMES.has(normalized)) return 'application/octet-stream';
+  if (normalized.startsWith('image/')) {
+    return sniffRasterImageMime(data) ?? 'application/octet-stream';
+  }
+  return normalized;
+}
+
+function safeServedMediaType(mediaType: string): string {
+  const base = mediaType.split(';')[0]?.trim().toLowerCase() || 'application/octet-stream';
+  if (ACTIVE_WEB_MIMES.has(base)) return 'application/octet-stream';
+  if (base.startsWith('image/') && !SAFE_RASTER_IMAGE_MIMES.has(base)) return 'application/octet-stream';
+  return base;
+}
+
+function createUploadStore(settingsDir: string): UploadStore {
+  const uploadDir = path.join(settingsDir, 'uploads');
+  const uploads = new Map<string, UploadMeta>();
+
+  const ensureDir = async (): Promise<void> => {
+    await fsp.mkdir(uploadDir, { recursive: true, mode: 0o700 });
+  };
+
+  const forget = (id: string): void => {
+    uploads.delete(id);
+    if (!/^[\w-]+$/.test(id)) return;
+    void fsp.unlink(path.join(uploadDir, id)).catch(() => undefined);
+    void fsp.unlink(path.join(uploadDir, `${id}.meta.json`)).catch(() => undefined);
+  };
+
+  const ttlTimer = setInterval(() => {
     const now = Date.now();
-    for (const name of names) {
-      if (!/^[\w-]+$/.test(name)) continue;
-      const full = path.join(UPLOAD_DIR, name);
-      const st = await fsp.stat(full).catch(() => null);
-      if (!st || !st.isFile()) continue;
-      if (now - st.mtimeMs > UPLOAD_TTL_MS) {
-        await fsp.unlink(full).catch(() => undefined);
-        continue;
-      }
-      if (!uploads.has(name)) {
-        uploads.set(name, {
-          id: name,
-          name,
-          media_type: 'application/octet-stream',
-          size: st.size,
-          created_at: new Date(st.mtimeMs).toISOString(),
-        });
-      }
+    for (const [id, meta] of uploads) {
+      const created = Date.parse(meta.created_at);
+      if (!Number.isFinite(created) || now - created > UPLOAD_TTL_MS) forget(id);
     }
-  } catch {
-    // 上传目录不可用时不阻塞启动。
-  }
-}
+  }, 15 * 60 * 1000);
+  ttlTimer.unref?.();
 
-function forgetUpload(id: string): void {
-  uploads.delete(id);
-  if (!/^[\w-]+$/.test(id)) return;
-  void fsp.unlink(path.join(UPLOAD_DIR, id)).catch(() => undefined);
+  return {
+    has: (id) => uploads.has(id),
+    get: (id) => uploads.get(id),
+    filePath: (id) => path.join(uploadDir, id),
+    async hydrate(): Promise<void> {
+      try {
+        await ensureDir();
+        const names = await fsp.readdir(uploadDir);
+        const now = Date.now();
+        const dataFiles = new Set<string>();
+        for (const name of names) {
+          if (!/^[\w-]+$/.test(name)) continue;
+          const full = path.join(uploadDir, name);
+          const lst = await fsp.lstat(full).catch(() => null);
+          if (!lst || lst.isSymbolicLink() || !lst.isFile()) continue;
+          if (now - lst.mtimeMs > UPLOAD_TTL_MS) {
+            await fsp.unlink(full).catch(() => undefined);
+            await fsp.unlink(path.join(uploadDir, `${name}.meta.json`)).catch(() => undefined);
+            continue;
+          }
+          dataFiles.add(name);
+          if (uploads.has(name)) continue;
+          let meta: UploadMeta | null = null;
+          const metaPath = path.join(uploadDir, `${name}.meta.json`);
+          const metaLst = await fsp.lstat(metaPath).catch(() => null);
+          if (metaLst && !metaLst.isSymbolicLink() && metaLst.isFile()) {
+            try {
+              const raw = JSON.parse(await fsp.readFile(metaPath, 'utf8')) as Partial<UploadMeta>;
+              if (typeof raw.name === 'string' && typeof raw.media_type === 'string' && typeof raw.created_at === 'string') {
+                meta = {
+                  id: name,
+                  name: raw.name,
+                  media_type: safeServedMediaType(raw.media_type),
+                  size: typeof raw.size === 'number' && Number.isFinite(raw.size) ? raw.size : lst.size,
+                  created_at: raw.created_at,
+                };
+              }
+            } catch {
+              // ignore corrupt sidecar
+            }
+          }
+          uploads.set(name, meta ?? {
+            id: name,
+            name,
+            media_type: 'application/octet-stream',
+            size: lst.size,
+            created_at: new Date(lst.mtimeMs).toISOString(),
+          });
+        }
+        for (const name of names) {
+          if (!name.endsWith('.meta.json')) continue;
+          const id = name.slice(0, -'.meta.json'.length);
+          if (!dataFiles.has(id)) {
+            await fsp.unlink(path.join(uploadDir, name)).catch(() => undefined);
+          }
+        }
+      } catch {
+        // 上传目录不可用时不阻塞启动。
+      }
+    },
+    async store(name: string, mediaType: string, data: Buffer): Promise<UploadMeta> {
+      const id = randomUUID();
+      await ensureDir();
+      const safeName = path.basename(name.replace(/\\/g, '/')).replace(/[\u0000-\u001f\u007f]/g, '') || 'upload';
+      const safeMime = sanitizeUploadMediaType(mediaType, data);
+      const meta: UploadMeta = {
+        id,
+        name: safeName,
+        media_type: safeMime,
+        size: data.byteLength,
+        created_at: new Date().toISOString(),
+      };
+      await fsp.writeFile(path.join(uploadDir, id), data, { mode: 0o600 });
+      await fsp.writeFile(path.join(uploadDir, `${id}.meta.json`), JSON.stringify(meta), { mode: 0o600 });
+      uploads.set(id, meta);
+      return meta;
+    },
+    async read(id: string): Promise<{ data: Buffer; media_type: string } | null> {
+      const meta = uploads.get(id);
+      if (!meta || !/^[\w-]+$/.test(id)) return null;
+      const full = path.join(uploadDir, id);
+      try {
+        const lst = await fsp.lstat(full);
+        if (lst.isSymbolicLink() || !lst.isFile()) return null;
+        return { data: await fsp.readFile(full), media_type: safeServedMediaType(meta.media_type) };
+      } catch {
+        return null;
+      }
+    },
+    close(): void {
+      clearInterval(ttlTimer);
+    },
+  };
 }
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, meta] of uploads) {
-    const created = Date.parse(meta.created_at);
-    if (!Number.isFinite(created) || now - created > UPLOAD_TTL_MS) forgetUpload(id);
-  }
-}, 15 * 60 * 1000).unref?.();
 
 /** 极简 multipart/form-data 解析:只取第一个带 filename 的段(前端 postForm 单文件)。 */
 async function readMultipart(req: IncomingMessage): Promise<{ filename: string; contentType: string; data: Buffer } | null> {
@@ -3607,24 +6305,4 @@ async function readMultipart(req: IncomingMessage): Promise<{ filename: string; 
     data = data.subarray(0, data.byteLength - 2);
   }
   return { filename, contentType, data };
-}
-
-async function storeUpload(name: string, mediaType: string, data: Buffer): Promise<UploadMeta> {
-  const id = randomUUID();
-  await ensureUploadDir();
-  await fsp.writeFile(path.join(UPLOAD_DIR, id), data, { mode: 0o600 });
-  const meta: UploadMeta = { id, name, media_type: mediaType, size: data.byteLength, created_at: new Date().toISOString() };
-  uploads.set(id, meta);
-  return meta;
-}
-
-async function readUpload(id: string): Promise<{ data: Buffer; media_type: string } | null> {
-  const meta = uploads.get(id);
-  // id 只允许 UUID 字符,防目录穿越。
-  if (!meta || !/^[\w-]+$/.test(id)) return null;
-  try {
-    return { data: await fsp.readFile(path.join(UPLOAD_DIR, id)), media_type: meta.media_type };
-  } catch {
-    return null;
-  }
 }
