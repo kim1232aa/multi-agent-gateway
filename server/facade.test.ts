@@ -1142,7 +1142,8 @@ test('GrokProviderAdapter and PiProviderAdapter satisfy facade contracts cleanly
   assert.equal(grok.name, 'grok');
   assert.equal(pi.name, 'pi');
   assert.equal(grok.capabilities().goals, true);
-  assert.equal(pi.capabilities().approvals, false);
+  assert.equal(pi.capabilities().approvals, true);
+  assert.equal(pi.capabilities().manualApproval, true);
   assert.equal(pi.capabilities().clone, true);
 });
 

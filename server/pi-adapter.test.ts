@@ -935,8 +935,8 @@ test('validates base64 image size/MIME and converts non-image files to safe path
 test('honest capabilities and unsupported approval/rollback/goal contracts', async () => {
   const adapter = new PiProviderAdapter();
   const caps = adapter.capabilities();
-  assert.equal(caps.approvals, false);
-  assert.equal(caps.manualApproval, false);
+  assert.equal(caps.approvals, true);
+  assert.equal(caps.manualApproval, true);
   assert.equal(caps.planMode, false);
   assert.equal(caps.rollback, false);
   assert.equal(caps.swarm, false);
@@ -958,7 +958,7 @@ test('honest capabilities and unsupported approval/rollback/goal contracts', asy
 
   await assert.rejects(
     adapter.resolveApproval('s1', 'a1', 'approve'),
-    (e: unknown) => e instanceof ProviderError && e.code === 'unsupported',
+    (e: unknown) => e instanceof ProviderError && e.code === 'not_found',
   );
   await assert.rejects(
     adapter.rollback('s1', 1),

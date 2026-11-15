@@ -14,6 +14,26 @@
 
 ---
 
+## 界面预览 (Screenshots)
+
+### 1. 统一多 Agent 调度外壳（Kimi / Claude / Grok / Codex / Pi）
+在保持官方 Kimi Web 2.6.2 原生视觉体系与思考折叠的同时，通过底部一体化分段控制器无缝切换底层 Agent 引擎：
+![统一多 Agent 调度界面](docs/images/01-agent-overview.png)
+
+### 2. Grok 历史会话清洗（无空 session 污染）
+后端智能嗅探历史会话有效性，过滤无实质对话的系统/工作流种子目录，并提取首条真实用户提示词作为会话标题：
+![Grok 清爽侧边栏](docs/images/02-grok-clean-sidebar.png)
+
+### 3. Pi 49 项辅助模型选择弹窗（带实时搜索与滚动容器）
+当执行 `/advisor` 时在 Web 端弹出两步结构化 QuestionCard，超过 6 个选项自动注入实时筛选输入框与可滚动容器，支持快速搜索定位：
+![Pi Advisor 模型选择与筛选](docs/images/03-pi-advisor-dialog.png)
+
+### 4. Pi Plan Mode 结构化操作菜单
+输入 `/plan` 自动唤醒 6 项 Plan Mode 交互动作（只读规划/查看/收敛/实施/保存/退出）及自定义任务直接输入框，并转译为原生斜杠子命令执行：
+![Pi Plan Mode 动作选择菜单](docs/images/04-pi-plan-menu.png)
+
+---
+
 ## Agent 协议适配矩阵
 
 | Agent | 目标版本与底层运行时 | 核心能力支持 | Web UI 交互与资源优化 |

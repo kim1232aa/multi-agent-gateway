@@ -23,7 +23,12 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const serverRoot = path.basename(here) === 'dist' ? path.dirname(here) : here;
+const DEFAULT_APPROVAL_EXTENSION_PATH = path.resolve(serverRoot, 'extensions', 'pi-gateway-approval.ts');
 import { listPiCommands, type PiNativeCommandInput } from './native-commands.js';
 import { SettingsStore } from './settings-store.js';
 import {
@@ -213,6 +218,8 @@ export interface PiAdapterOptions {
   maxLiveProcesses?: number;
   /** Maximum session file size in bytes before refusing to spawn. Default 192 MiB; 0 disables. */
   maxSessionFileBytes?: number;
+  /** Optional approval extension path override. */
+  approvalExtensionPath?: string;
 }
 
 export type PiProviderAdapterOptions = PiAdapterOptions;
@@ -828,6 +835,15 @@ interface ParkedQuestion {
   turnId: string;
 }
 
+interface ParkedApproval {
+  id: string;
+  sessionId: string;
+  tool: string;
+  timer: ReturnType<typeof setTimeout> | null;
+  stream: EventStream<GatewayEvent>;
+  turnId: string;
+}
+
 interface PiExtensionUiState {
   statuses: Map<string, string>;
   widgets: Map<string, { lines: string[]; placement?: string }>;
@@ -892,6 +908,9 @@ export class PiAdapter {
   private readonly clientToSession = new WeakMap<PiRpcClient, string>();
   private readonly activeTurns = new Map<string, ActiveTurnState>();
   private readonly parkedQuestions = new Map<string, ParkedQuestion>();
+  private readonly parkedApprovals = new Map<string, ParkedApproval>();
+  private readonly settingsPath?: string;
+  private readonly approvalExtensionPath?: string;
   private readonly sessionCwd = new Map<string, string>();
   private readonly sessionFiles = new Map<string, string>();
   private readonly sessionNames = new Map<string, string>();
@@ -932,6 +951,8 @@ export class PiAdapter {
     this.recycleGraceMs = options.recycleGraceMs !== undefined ? Math.max(0, options.recycleGraceMs) : DEFAULT_RECYCLE_GRACE_MS;
     this.maxLiveProcesses = options.maxLiveProcesses !== undefined ? Math.max(0, options.maxLiveProcesses) : DEFAULT_MAX_LIVE_PROCESSES;
     this.maxSessionFileBytes = options.maxSessionFileBytes !== undefined ? Math.max(0, options.maxSessionFileBytes) : DEFAULT_MAX_SESSION_FILE_BYTES;
+    this.settingsPath = options.settingsPath;
+    this.approvalExtensionPath = options.approvalExtensionPath ?? DEFAULT_APPROVAL_EXTENSION_PATH;
   }
 
   getPiBin(): string {
@@ -1850,7 +1871,43 @@ export class PiAdapter {
     }
   }
 
-  // -- Extension UI question bridging ---------------------------------------
+  // -- Extension UI question & approval bridging ---------------------------
+
+  async resolveApproval(
+    sessionId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
+  ): Promise<void> {
+    this.touchActivity(sessionId);
+    const parked = this.parkedApprovals.get(approvalId);
+    if (!parked || parked.sessionId !== sessionId) {
+      throw new ProviderError('not_found', `pi-adapter: no pending approval ${approvalId} for session ${sessionId}`, 404);
+    }
+    this.parkedApprovals.delete(approvalId);
+    if (parked.timer) clearTimeout(parked.timer);
+
+    const client = this.processes.get(sessionId);
+    const confirmed = decision === 'approve' || decision === 'approve_always';
+    if (client?.canWriteStdin) {
+      await client.sendExtensionUiResponse({
+        type: 'extension_ui_response',
+        id: approvalId,
+        confirmed,
+      }).catch(() => undefined);
+    }
+    parked.stream.push({
+      kind: 'interaction_resolved',
+      status: confirmed ? 'completed' : 'cancelled',
+      sessionId,
+      turnId: parked.turnId,
+      timestamp: Date.now(),
+      payload: {
+        interactionId: approvalId,
+        interactionKind: 'approval',
+        resolution: confirmed ? 'approved' : 'rejected',
+      },
+    });
+  }
 
   async resolveQuestion(
     sessionId: string,
@@ -1927,6 +1984,7 @@ export class PiAdapter {
     this.extensionUiStates.delete(sessionId);
     const turn = this.activeTurns.get(sessionId);
     this.failCloseSessionQuestions(sessionId);
+    this.failCloseSessionApprovals(sessionId);
     const client = this.processes.get(sessionId);
     this.processes.delete(sessionId);
     if (client) {
@@ -1963,6 +2021,10 @@ export class PiAdapter {
       if (q.timer) clearTimeout(q.timer);
     }
     this.parkedQuestions.clear();
+    for (const [, a] of this.parkedApprovals) {
+      if (a.timer) clearTimeout(a.timer);
+    }
+    this.parkedApprovals.clear();
   }
 
   // -- Internals ------------------------------------------------------------
@@ -2059,11 +2121,18 @@ export class PiAdapter {
   }
 
   private createClient(cwd: string, args: string[]): PiRpcClient {
+    const hasExplicitNoExt = this.extraArgs.includes('--no-extensions') || this.extraArgs.includes('-ne');
+    const extArgs = !hasExplicitNoExt && this.approvalExtensionPath && fs.existsSync(this.approvalExtensionPath)
+      ? ['--extension', this.approvalExtensionPath]
+      : [];
     const client = new PiRpcClient({
       piBin: this.getPiBin(),
       cwd,
-      env: this.env,
-      args: [...args, ...this.extraArgs],
+      env: {
+        ...this.env,
+        ...(this.settingsPath ? { PI_GATEWAY_SETTINGS: this.settingsPath } : {}),
+      },
+      args: [...args, ...extArgs, ...this.extraArgs],
       requestTimeoutMs: this.requestTimeoutMs,
       shutdownGraceMs: this.shutdownGraceMs,
       killGraceMs: this.killGraceMs,
@@ -3452,7 +3521,11 @@ export class PiAdapter {
     const id = typeof req.id === 'string' ? req.id : '';
     if (!id || FIRE_AND_FORGET_UI_METHODS.has(method)) return;
     if (client.canWriteStdin) {
-      void client.sendExtensionUiResponse({ type: 'extension_ui_response', id, cancelled: true }).catch(() => undefined);
+      const isApproval = method === 'confirm' && typeof req.title === 'string' && req.title.startsWith('tool_approval:');
+      const payload = isApproval
+        ? { type: 'extension_ui_response', id, confirmed: false }
+        : { type: 'extension_ui_response', id, cancelled: true };
+      void client.sendExtensionUiResponse(payload).catch(() => undefined);
     }
   }
 
@@ -3504,6 +3577,13 @@ export class PiAdapter {
     }
 
     const title = typeof req.title === 'string' ? req.title : '';
+    const reqTimeout = typeof req.timeout === 'number' && Number.isFinite(req.timeout) && req.timeout > 0
+      ? req.timeout
+      : 0;
+    const effectiveTimeout = reqTimeout > 0
+      ? (this.dialogTimeoutMs > 0 ? Math.min(reqTimeout, this.dialogTimeoutMs) : reqTimeout)
+      : this.dialogTimeoutMs;
+
     let promptText = title;
     let options: string[] | undefined;
     let optionById: Map<string, string> | undefined;
@@ -3533,6 +3613,61 @@ export class PiAdapter {
         },
       ];
     } else if (method === 'confirm') {
+      const isToolApproval = title.startsWith('tool_approval:');
+      if (isToolApproval) {
+        const toolName = title.slice('tool_approval:'.length).trim() || 'tool';
+        const rawMsg = typeof req.message === 'string' ? req.message : '';
+        let toolInput: unknown = rawMsg;
+        try { toolInput = JSON.parse(rawMsg); } catch {}
+
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        if (effectiveTimeout > 0) {
+          timer = setTimeout(() => {
+            const entry = this.parkedApprovals.get(id);
+            if (!entry) return;
+            this.parkedApprovals.delete(id);
+            if (turn.client.canWriteStdin) {
+              void turn.client.sendExtensionUiResponse({ type: 'extension_ui_response', id, confirmed: false }).catch(() => undefined);
+            }
+            if (!turn.settled) {
+              turn.stream.push({
+                kind: 'interaction_resolved',
+                status: 'cancelled',
+                sessionId: turn.sessionId,
+                turnId: turn.turnId,
+                timestamp: Date.now(),
+                payload: { interactionId: id, interactionKind: 'approval', resolution: 'cancelled' },
+              });
+            }
+          }, effectiveTimeout);
+          timer.unref?.();
+        }
+
+        this.parkedApprovals.set(id, {
+          id,
+          sessionId: turn.sessionId,
+          tool: toolName,
+          timer,
+          stream: turn.stream,
+          turnId: turn.turnId,
+        });
+
+        turn.stream.push({
+          kind: 'approval',
+          status: 'started',
+          sessionId: turn.sessionId,
+          turnId: turn.turnId,
+          timestamp: Date.now(),
+          payload: {
+            approvalId: id,
+            tool: toolName,
+            input: toolInput,
+          },
+        });
+        turn.onPromptProgress?.();
+        return;
+      }
+
       const msgBody = typeof req.message === 'string' ? req.message : '';
       promptText = msgBody ? (title ? `${title}\n${msgBody}` : msgBody) : title || 'Confirm';
       options = ['Yes', 'No'];
@@ -3575,13 +3710,6 @@ export class PiAdapter {
         },
       ];
     }
-
-    const reqTimeout = typeof req.timeout === 'number' && Number.isFinite(req.timeout) && req.timeout > 0
-      ? req.timeout
-      : 0;
-    const effectiveTimeout = reqTimeout > 0
-      ? (this.dialogTimeoutMs > 0 ? Math.min(reqTimeout, this.dialogTimeoutMs) : reqTimeout)
-      : this.dialogTimeoutMs;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
     if (effectiveTimeout > 0) {
@@ -3650,6 +3778,26 @@ export class PiAdapter {
         turnId: parked.turnId,
         timestamp: Date.now(),
         payload: { interactionId: qid, interactionKind: 'question', resolution: 'cancelled' },
+      });
+    }
+  }
+
+  private failCloseSessionApprovals(sessionId: string): void {
+    const client = this.processes.get(sessionId);
+    for (const [id, parked] of [...this.parkedApprovals.entries()]) {
+      if (parked.sessionId !== sessionId) continue;
+      this.parkedApprovals.delete(id);
+      if (parked.timer) clearTimeout(parked.timer);
+      if (client?.canWriteStdin) {
+        void client.sendExtensionUiResponse({ type: 'extension_ui_response', id, confirmed: false }).catch(() => undefined);
+      }
+      parked.stream.push({
+        kind: 'interaction_resolved',
+        status: 'cancelled',
+        sessionId,
+        turnId: parked.turnId,
+        timestamp: Date.now(),
+        payload: { interactionId: id, interactionKind: 'approval', resolution: 'cancelled' },
       });
     }
   }
@@ -3736,6 +3884,7 @@ export class PiAdapter {
       this.activeTurns.delete(turn.sessionId);
     }
     this.failCloseSessionQuestions(turn.sessionId);
+    this.failCloseSessionApprovals(turn.sessionId);
   }
 }
 
@@ -3783,7 +3932,7 @@ export class PiProviderAdapter implements ProviderAdapter {
       streaming: true,
       thinking: true,
       tools: true,
-      approvals: false,
+      approvals: true,
       questions: true,
       interrupt: true,
       history: true,
@@ -3799,7 +3948,8 @@ export class PiProviderAdapter implements ProviderAdapter {
       nativeArchive: false,
       delete: true,
       planMode: false,
-      manualApproval: false,
+      permissionModes: ['default', 'auto', 'bypassPermissions', 'manual'],
+      manualApproval: true,
       goals: false,
       swarm: false,
       tower: false,
@@ -3878,12 +4028,21 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   async resolveApproval(
-    _sessionId: string,
-    _approvalId: string,
-    _decision: ApprovalDecision,
+    sessionId: string,
+    approvalId: string,
+    decision: ApprovalDecision,
     _details?: GranularApprovalDetails,
   ): Promise<void> {
-    throw new ProviderError('unsupported', 'Pi RPC mode does not support manual tool approvals', 400);
+    return this.inner.resolveApproval(sessionId, approvalId, decision);
+  }
+
+  async setPermission(sessionId: string, mode: string): Promise<void> {
+    this.settings.set('permission', sessionId, mode);
+  }
+
+  getPermission(sessionId: string): string | undefined {
+    return this.settings.getString('permission', sessionId)
+      ?? this.settings.getString('permission', '__default__');
   }
 
   async resolveQuestion(

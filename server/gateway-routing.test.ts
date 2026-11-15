@@ -26,12 +26,13 @@ function fakeAdapter(name: 'claude' | 'codex' | 'grok' | 'pi'): ProviderAdapter 
   const adapterCaps: ProviderCapabilities = name === 'pi'
     ? {
         ...capabilities,
+        approvals: true,
+        manualApproval: true,
         questions: true,
         compact: true,
         fork: true,
         clone: true,
         rollback: false,
-        manualApproval: false,
         planMode: false,
         goals: false,
       }
@@ -3350,15 +3351,15 @@ test('Pi routing, wireModelDto, capability gating, and Pi slash commands work en
     assert.equal((await reqJson('/sessions/pi_pi-native:compact', 'POST', { instruction: 'trim' })).status, 200);
 
     assert.equal((await reqJson('/sessions/pi_pi-native:undo', 'POST', {})).status, 400);
-    assert.equal((await reqJson('/sessions?provider=pi', 'POST', { cwd: '/tmp', agent_config: { permission_mode: 'manual' } })).status, 400);
+    assert.equal((await reqJson('/sessions?provider=pi', 'POST', { cwd: '/tmp', agent_config: { permission_mode: 'manual' } })).status, 200);
     assert.equal((await reqJson('/sessions?provider=pi', 'POST', { cwd: '/tmp', agent_config: { plan_mode: true } })).status, 400);
-    assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: 'hi' }], permission_mode: 'manual' })).status, 400);
+    assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: 'hi' }], permission_mode: 'manual' })).status, 200);
     assert.equal((await reqJson('/sessions/pi_pi-native/prompts', 'POST', { content: [{ type: 'text', text: 'hi' }], plan_mode: true })).status, 400);
     const approvalsRes = await reqJson('/sessions/pi_pi-native/approvals');
     assert.equal(approvalsRes.status, 200);
     assert.deepEqual((await approvalsRes.json() as any).data.items, []);
-    assert.equal((await reqJson('/sessions/pi_pi-native/approvals/ap-1', 'POST', { decision: 'approved' })).status, 400);
-    assert.equal((await reqJson('/sessions/pi_pi-native/interactions/ap-1', 'POST', { kind: 'approval', decision: 'approved' })).status, 400);
+    assert.equal((await reqJson('/sessions/pi_pi-native/approvals/ap-1', 'POST', { decision: 'approved' })).status, 200);
+    assert.equal((await reqJson('/sessions/pi_pi-native/interactions/ap-1', 'POST', { kind: 'approval', decision: 'approved' })).status, 200);
 
     const qRes = await reqJson('/sessions/pi_pi-native/interactions/q-1', 'POST', {
       kind: 'question',
