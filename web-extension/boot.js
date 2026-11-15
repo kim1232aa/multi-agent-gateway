@@ -3,6 +3,77 @@
 
   var PROVIDERS = ['kimi', 'claude', 'codex', 'grok', 'pi'];
   var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok', pi: 'Pi' };
+  var DEFAULT_CAPABILITIES = {
+    kimi: {
+      tower: true,
+      swarm: true,
+      goals: true,
+      planMode: true,
+      btw: true,
+      rollback: true,
+      compact: true,
+      fork: true,
+    },
+    claude: {
+      tower: false,
+      swarm: false,
+      goals: false,
+      planMode: true,
+      btw: false,
+      rollback: false,
+      compact: true,
+      fork: true,
+    },
+    codex: {
+      tower: false,
+      swarm: false,
+      goals: true,
+      planMode: true,
+      btw: false,
+      rollback: true,
+      compact: true,
+      fork: true,
+    },
+    grok: {
+      tower: false,
+      swarm: false,
+      goals: true,
+      planMode: true,
+      btw: false,
+      rollback: true,
+      compact: true,
+      fork: true,
+    },
+    pi: {
+      tower: false,
+      swarm: false,
+      goals: false,
+      planMode: false,
+      btw: false,
+      rollback: false,
+      compact: true,
+      fork: true,
+    },
+  };
+  var providerCapabilities = Object.create(null);
+
+  function getCapabilities(provider) {
+    var dynamic = providerCapabilities && providerCapabilities[provider];
+    var fallback = DEFAULT_CAPABILITIES[provider] || {
+      tower: false,
+      swarm: false,
+      goals: false,
+      planMode: false,
+      btw: false,
+      rollback: false,
+      compact: true,
+      fork: true,
+    };
+    if (dynamic && typeof dynamic === 'object') {
+      return Object.assign({}, fallback, dynamic);
+    }
+    return fallback;
+  }
   var STORAGE_KEY = 'multi-agent-gateway.provider.v1';
   var EXPLICIT_KEY = 'multi-agent-gateway.explicitProvider.v1';
   var WS_STALE_WAKE_MS = 45000;
@@ -85,7 +156,7 @@
   function needsProvider(pathname) {
     // /api/v1/auth 与 /api/v2/mcp/* 永不带 provider:登录和官方 MCP 认证是 Kimi 全局状态。
     if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta' || pathname === '/api/v1/providers') return true;
-    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/fs:suggest' || pathname === '/api/v1/workspace/fs:list' || pathname === '/api/v1/workspace/fs:search' || pathname === '/api/v1/workspace/fs:suggest' || /^\/api\/v1\/files\//.test(pathname)) return true;
+    if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/fs:suggest' || pathname === '/api/v1/workspace/fs:list' || pathname === '/api/v1/workspace/fs:search' || pathname === '/api/v1/workspace/fs:suggest' || /^\/api\/v1\/files\//.test(pathname) || /^\/api\/v1\/sessions\/[^/]+\/status$/.test(pathname)) return true;
     // 2.6.2 / 0.39 全局能力不跟 Agent 切换走:
     // /v1/remote*、/capabilities、/plugins、/remote-control*、/api/v2/mcp/*、/providers、/catalog/providers、/fs:content。
     // /workspaces/* (project-config-dirs、/:id、/:id/trust、/:id/primary、/:id/skills) 必须带 provider,
@@ -190,7 +261,15 @@
     return url;
   }
 
+  function skillHintLookupName(label) {
+    var raw = String(label || '').trim().split(/\s+/)[0];
+    if (raw.charAt(0) === '/') raw = raw.slice(1);
+    if (raw.slice(0, 6).toLowerCase() === 'skill:') raw = raw.slice(6);
+    return raw;
+  }
+
   var skillHintsByProvider = Object.create(null);
+  var extUiBySession = Object.create(null);
 
   function rememberSkillHints(provider, skills) {
     if (!isProvider(provider) || !Array.isArray(skills)) return;
@@ -203,8 +282,15 @@
         : typeof item.argumentHint === 'string'
           ? item.argumentHint.trim()
           : '';
-      if (hint) bucket[item.name] = hint;
-      else delete bucket[item.name];
+      var rawName = item.name.trim();
+      var cleanName = skillHintLookupName(rawName);
+      if (hint) {
+        bucket[rawName] = hint;
+        if (cleanName) bucket[cleanName] = hint;
+      } else {
+        delete bucket[rawName];
+        if (cleanName) delete bucket[cleanName];
+      }
     }
   }
 
@@ -315,6 +401,44 @@
         }).catch(function () {});
       }).catch(function () {});
     }
+    if ((url.pathname === '/api/v1/meta' || url.pathname === '/meta') && reqPromise && typeof reqPromise.then === 'function') {
+      reqPromise.then(function (res) {
+        if (!res || !res.ok || typeof res.clone !== 'function') return;
+        res.clone().json().then(function (body) {
+          var capsMap = (body && body.data && body.data.provider_capabilities)
+            || (body && body.provider_capabilities);
+          if (capsMap && typeof capsMap === 'object') {
+            for (var p in capsMap) {
+              if (Object.prototype.hasOwnProperty.call(capsMap, p) && capsMap[p] && typeof capsMap[p] === 'object') {
+                providerCapabilities[p] = capsMap[p];
+              }
+            }
+            if (window.__multiAgent) window.__multiAgent.providerCapabilities = providerCapabilities;
+            scheduleSyncUi();
+          }
+        }).catch(function () {});
+      }).catch(function () {});
+    }
+    var statusMatch = /^\/api\/v1\/sessions\/([^/]+)\/status$/.exec(url.pathname);
+    if (statusMatch && reqPromise && typeof reqPromise.then === 'function') {
+      var statusSid = decodeURIComponent(statusMatch[1]);
+      reqPromise.then(function (res) {
+        if (!res || !res.ok || typeof res.clone !== 'function') return;
+        res.clone().json().then(function (body) {
+          var ext = body && body.data && body.data.extension_ui;
+          if (ext && typeof ext === 'object') {
+            extUiBySession[statusSid] = {
+              statuses: ext.statuses || {},
+              widgets: ext.widgets || {},
+              title: ext.title || '',
+            };
+          } else {
+            delete extUiBySession[statusSid];
+          }
+          scheduleSyncUi();
+        }).catch(function () {});
+      }).catch(function () {});
+    }
     return reqPromise;
   };
 
@@ -395,9 +519,22 @@
             ws._maLastActivityAt = Date.now();
             clearWakeProbe(ws);
           });
-          ws.addEventListener('message', function () {
+          ws.addEventListener('message', function (ev) {
             ws._maLastActivityAt = Date.now();
             clearWakeProbe(ws);
+            if (ev && typeof ev.data === 'string' && ev.data.charAt(0) === '{') {
+              try {
+                var parsedMsg = JSON.parse(ev.data);
+                if (parsedMsg && parsedMsg.type === 'extension_ui' && parsedMsg.session_id) {
+                  extUiBySession[parsedMsg.session_id] = {
+                    statuses: parsedMsg.statuses || {},
+                    widgets: parsedMsg.widgets || {},
+                    title: parsedMsg.title || '',
+                  };
+                  scheduleSyncUi();
+                }
+              } catch (_) {}
+            }
           });
           ws.addEventListener('close', function () {
             clearWakeProbe(ws);
@@ -532,18 +669,34 @@
       .call(window, '/api/v1/meta', token ? { headers: { authorization: 'Bearer ' + token } } : undefined)
       .then(function (res) { return res && res.ok ? res.json() : null; })
       .then(function (body) {
+        var capsMap = (body && body.data && body.data.provider_capabilities)
+          || (body && body.provider_capabilities);
+        if (capsMap && typeof capsMap === 'object') {
+          for (var p in capsMap) {
+            if (Object.prototype.hasOwnProperty.call(capsMap, p) && capsMap[p] && typeof capsMap[p] === 'object') {
+              providerCapabilities[p] = capsMap[p];
+            }
+          }
+          if (window.__multiAgent) window.__multiAgent.providerCapabilities = providerCapabilities;
+        }
         var list = body && body.data && body.data.providers;
-        if (!Array.isArray(list)) return;
+        if (!Array.isArray(list)) {
+          if (capsMap) syncUi();
+          return;
+        }
         var filtered = list.filter(isProvider);
-        if (filtered.length === 0 || filtered.indexOf('kimi') === -1) return;
+        if (filtered.length === 0 || filtered.indexOf('kimi') === -1) {
+          if (capsMap) syncUi();
+          return;
+        }
         var changed = filtered.length !== PROVIDERS.length;
         PROVIDERS.length = 0;
         Array.prototype.push.apply(PROVIDERS, filtered);
         if (window.__multiAgent) window.__multiAgent.providers = PROVIDERS;
         if (PROVIDERS.indexOf(selectedProvider()) === -1) setProvider('kimi');
-        if (changed) {
+        if (changed || capsMap) {
           var stale = document.querySelector && document.querySelector('.multi-agent-provider-wrap');
-          if (stale) stale.remove();
+          if (stale && changed) stale.remove();
           syncUi();
         }
       })
@@ -764,6 +917,7 @@
     var sessionsStore = getPiniaStore(pinia, 'kimi.sessions');
     var workspacesStore = getPiniaStore(pinia, 'kimi.workspaces');
     var modelsStore = getPiniaStore(pinia, 'kimi.models');
+    var modeStore = getPiniaStore(pinia, 'kimi.mode');
     if (sessionsStore && typeof sessionsStore.setActiveSessionId === 'function') {
       sessionsStore.setActiveSessionId(undefined);
     }
@@ -784,6 +938,94 @@
     }
     if (modelsStore && typeof modelsStore.setDefaultModel === 'function') {
       modelsStore.setDefaultModel(null);
+    }
+    if (modelsStore) {
+      var wsSkillsMap = unwrapRef(modelsStore.skillsByWorkspace);
+      var wsFetchedMap = unwrapRef(modelsStore.skillsFetchedByWorkspace);
+      var wsKeys = Object.keys(Object.assign({}, wsSkillsMap && typeof wsSkillsMap === 'object' ? wsSkillsMap : null, wsFetchedMap && typeof wsFetchedMap === 'object' ? wsFetchedMap : null));
+      if (typeof modelsStore.invalidateSkillsForWorkspace === 'function') {
+        for (var wi = 0; wi < wsKeys.length; wi += 1) {
+          try { modelsStore.invalidateSkillsForWorkspace(wsKeys[wi]); } catch (_) {}
+        }
+      } else {
+        if (modelsStore.skillsByWorkspace && typeof modelsStore.skillsByWorkspace === 'object' && 'value' in modelsStore.skillsByWorkspace) {
+          modelsStore.skillsByWorkspace.value = {};
+        } else if (modelsStore.skillsByWorkspace !== undefined) {
+          modelsStore.skillsByWorkspace = {};
+        }
+        if (modelsStore.skillsFetchedByWorkspace && typeof modelsStore.skillsFetchedByWorkspace === 'object' && 'value' in modelsStore.skillsFetchedByWorkspace) {
+          modelsStore.skillsFetchedByWorkspace.value = {};
+        } else if (modelsStore.skillsFetchedByWorkspace !== undefined) {
+          modelsStore.skillsFetchedByWorkspace = {};
+        }
+      }
+      var sessSkillsMap = unwrapRef(modelsStore.skillsBySession);
+      var sessFetchedMap = unwrapRef(modelsStore.skillsFetchedBySession);
+      var sessKeys = Object.keys(Object.assign({}, sessSkillsMap && typeof sessSkillsMap === 'object' ? sessSkillsMap : null, sessFetchedMap && typeof sessFetchedMap === 'object' ? sessFetchedMap : null));
+      if (typeof modelsStore.invalidateSkillsForSession === 'function') {
+        for (var si = 0; si < sessKeys.length; si += 1) {
+          try { modelsStore.invalidateSkillsForSession(sessKeys[si]); } catch (_) {}
+        }
+      } else {
+        if (modelsStore.skillsBySession && typeof modelsStore.skillsBySession === 'object' && 'value' in modelsStore.skillsBySession) {
+          modelsStore.skillsBySession.value = {};
+        } else if (modelsStore.skillsBySession !== undefined) {
+          modelsStore.skillsBySession = {};
+        }
+        if (modelsStore.skillsFetchedBySession && typeof modelsStore.skillsFetchedBySession === 'object' && 'value' in modelsStore.skillsFetchedBySession) {
+          modelsStore.skillsFetchedBySession.value = {};
+        } else if (modelsStore.skillsFetchedBySession !== undefined) {
+          modelsStore.skillsFetchedBySession = {};
+        }
+      }
+    }
+    if (modeStore) {
+      if (typeof modeStore.resetMode === 'function') {
+        try { modeStore.resetMode(); } catch (_) {}
+      }
+      var resetProps = [
+        'thinking', 'draftThinkingExplicit',
+        'thinkingBySession', 'pendingThinkingBySession',
+        'planModeBySession', 'planArmedBySession', 'pendingPlanBySession',
+        'swarmModeBySession', 'pendingSwarmBySession',
+        'towerModeBySession', 'pendingTowerBySession',
+        'goalModeBySession',
+      ];
+      for (var m = 0; m < resetProps.length; m += 1) {
+        var prop = resetProps[m];
+        if (modeStore[prop] !== undefined) {
+          var isMap = prop.indexOf('BySession') !== -1;
+          var emptyVal = isMap ? {} : (prop === 'draftThinkingExplicit' ? false : undefined);
+          if (modeStore[prop] && typeof modeStore[prop] === 'object' && 'value' in modeStore[prop]) {
+            modeStore[prop].value = emptyVal;
+          } else {
+            modeStore[prop] = emptyVal;
+          }
+        }
+      }
+      if (modeStore.draftModes) {
+        var cleanDraftModes = { planMode: false, swarmMode: false, towerMode: false, towerBase: undefined, goalMode: false };
+        if (typeof modeStore.draftModes === 'object' && 'value' in modeStore.draftModes) {
+          modeStore.draftModes.value = cleanDraftModes;
+        } else if (typeof modeStore.draftModes === 'object') {
+          modeStore.draftModes.planMode = false;
+          modeStore.draftModes.swarmMode = false;
+          modeStore.draftModes.towerMode = false;
+          modeStore.draftModes.towerBase = undefined;
+          modeStore.draftModes.goalMode = false;
+        }
+      }
+      var modeRefs = ['planMode', 'planArmed', 'swarmMode', 'towerMode', 'goalMode'];
+      for (var r = 0; r < modeRefs.length; r += 1) {
+        var ref = modeRefs[r];
+        if (modeStore[ref] !== undefined) {
+          if (modeStore[ref] && typeof modeStore[ref] === 'object' && 'value' in modeStore[ref]) {
+            modeStore[ref].value = false;
+          } else if (typeof modeStore[ref] === 'boolean') {
+            modeStore[ref] = false;
+          }
+        }
+      }
     }
   }
 
@@ -836,6 +1078,10 @@
         return wsPromise.then(function () {
           if (provider !== selectedProvider()) return null;
           reconcileWorkspaceSelection(workspacesStore);
+          var activeWsId = unwrapRef(workspacesStore && workspacesStore.activeWorkspaceId);
+          if (activeWsId && modelsStore && typeof modelsStore.loadSkillsForWorkspace === 'function') {
+            Promise.resolve(modelsStore.loadSkillsForWorkspace(activeWsId)).catch(function () {});
+          }
           return Promise.resolve(sessionListStore.loadInitialSessionsByWorkspace({
             firstPage: first && first.firstPage,
             input: first && first.input,
@@ -855,6 +1101,10 @@
       return wsFallback.then(function () {
         if (provider !== selectedProvider()) return;
         reconcileWorkspaceSelection(workspacesStore);
+        var activeWsId = unwrapRef(workspacesStore && workspacesStore.activeWorkspaceId);
+        if (activeWsId && modelsStore && typeof modelsStore.loadSkillsForWorkspace === 'function') {
+          Promise.resolve(modelsStore.loadSkillsForWorkspace(activeWsId)).catch(function () {});
+        }
         if (sessionListStore && typeof sessionListStore.ensureFlatSessions === 'function') {
           return Promise.resolve(sessionListStore.ensureFlatSessions()).catch(function () {});
         }
@@ -1049,6 +1299,7 @@
   function gateModes() {
     if (!document.querySelectorAll) return;
     var provider = selectedProvider();
+    var caps = getCapabilities(provider);
     document.querySelectorAll('.am-row').forEach(function (row) {
       var id = row.getAttribute ? String(row.getAttribute('data-mode-id') || '') : '';
       if (!id && row.querySelector) {
@@ -1066,13 +1317,10 @@
       var isSwarm = id === 'swarm' || id.indexOf('swarm') !== -1;
       var isGoal = id === 'goal' || id.indexOf('goal') !== -1 || id.indexOf('目标') !== -1;
       var isPlan = id === 'plan' || id.indexOf('plan') !== -1 || id.indexOf('计划') !== -1;
-      var hide = provider === 'pi'
-        ? (isTower || isSwarm || isGoal || isPlan)
-        : provider === 'claude'
-          ? (isTower || isSwarm || isGoal)
-          : (provider === 'codex' || provider === 'grok')
-            ? (isTower || isSwarm)
-            : false;
+      var hide = (isTower && !caps.tower)
+        || (isSwarm && !caps.swarm)
+        || (isGoal && !caps.goals)
+        || (isPlan && !caps.planMode);
       if (hide) {
         row.hidden = true;
         row.style.display = 'none';
@@ -1086,22 +1334,19 @@
   }
 
   // 官方 2.6.2 SlashMenu 内置 /swarm /tower /goal /btw /compact /undo /fork 等。移动端走 .slash-menu.is-sheet。
-  // Kimi 全部保留。Claude compact 是真 /compact prompt,但无 rewind,藏 /undo /goal /swarm /tower /btw。
-  // Grok 1.0.77 支持 goal/compact/undo/fork,只藏 /swarm /tower /btw。
-  // Codex 支持 goal/compact/undo/fork,藏 /swarm /tower /btw。
-  // Pi 1.5.2 支持 compact/fork/clone/status/usage,无 goal/plan/undo/swarm/tower/btw,藏 /swarm /tower /goal /plan /btw /undo。
+  // 基于 providerCapabilities 动态门控 Tier-1 命令，未就绪时回退安全默认值。
   function blockedSlashNames(provider) {
-    if (provider === 'grok' || provider === 'codex') return ['/swarm', '/tower', '/btw'];
-    if (provider === 'claude') return ['/swarm', '/tower', '/goal', '/btw', '/undo'];
-    if (provider === 'pi') return ['/swarm', '/tower', '/goal', '/btw', '/undo', '/plan'];
-    return [];
-  }
-
-  function skillHintLookupName(label) {
-    var raw = String(label || '').trim().split(/\s+/)[0];
-    if (raw.charAt(0) === '/') raw = raw.slice(1);
-    if (raw.indexOf('skill:') === 0) raw = raw.slice(6);
-    return raw;
+    var caps = getCapabilities(provider);
+    var blocked = [];
+    if (!caps.tower) blocked.push('/tower');
+    if (!caps.swarm) blocked.push('/swarm');
+    if (!caps.goals) blocked.push('/goal');
+    if (!caps.planMode) blocked.push('/plan');
+    if (!caps.btw) blocked.push('/btw');
+    if (!caps.rollback) blocked.push('/undo');
+    if (!caps.compact) blocked.push('/compact');
+    if (!caps.fork) blocked.push('/fork');
+    return blocked;
   }
 
   var synthesizingSlashKey = false;
@@ -1133,9 +1378,10 @@
     document.querySelectorAll('.slash-menu .slash-name').forEach(function (nameEl) {
       var token = String(nameEl.textContent || '').trim().split(/\s+/)[0];
       var label = token.toLowerCase();
-      var hide = blocked.indexOf(label) !== -1;
-      var row = nameEl.parentElement;
+      var row = (typeof nameEl.closest === 'function' && nameEl.closest('.slash-item')) || nameEl.parentElement;
       if (!row || !row.style) return;
+      var isSkill = Boolean(row.classList && typeof row.classList.contains === 'function' && row.classList.contains('is-skill'));
+      var hide = blocked.indexOf(label) !== -1 && !isSkill;
       if (hide) {
         row.hidden = true;
         row.style.display = 'none';
@@ -1147,7 +1393,8 @@
       }
       if (!hide && typeof row.querySelector === 'function' && typeof document.createElement === 'function') {
         var existingHint = row.querySelector('.multi-agent-slash-hint');
-        var hintText = provider !== 'kimi' && hints ? hints[skillHintLookupName(token)] : '';
+        var hintKey = skillHintLookupName(token);
+        var hintText = provider !== 'kimi' && hints ? (hints[hintKey] || hints[token] || '') : '';
         if (hintText) {
           if (!existingHint) {
             existingHint = document.createElement('span');
@@ -1162,7 +1409,7 @@
       }
     });
     var menu = document.querySelector && document.querySelector('.slash-menu');
-    if (menu && typeof menu.querySelectorAll === 'function' && document.activeElement) {
+    if (menu && typeof menu.querySelectorAll === 'function') {
       var rows = Array.prototype.slice.call(menu.querySelectorAll('.slash-item'));
       var activeIdx = -1;
       for (var i = 0; i < rows.length; i += 1) {
@@ -1173,12 +1420,30 @@
       }
       if (activeIdx >= 0 && !isSlashRowVisible(rows[activeIdx])) {
         var steps = 1;
+        var nextVisibleIdx = -1;
         while (steps < rows.length) {
-          if (isSlashRowVisible(rows[(activeIdx + steps) % rows.length])) {
-            dispatchSlashArrow(document.activeElement, 'ArrowDown', steps);
+          var candIdx = (activeIdx + steps) % rows.length;
+          if (isSlashRowVisible(rows[candIdx])) {
+            nextVisibleIdx = candIdx;
             break;
           }
           steps += 1;
+        }
+        if (nextVisibleIdx >= 0) {
+          var targetEl = document.activeElement || (document.querySelector && document.querySelector('.composer textarea, textarea, [contenteditable="true"]'));
+          if (targetEl) dispatchSlashArrow(targetEl, 'ArrowDown', steps);
+          if (rows[activeIdx].classList && typeof rows[activeIdx].classList.remove === 'function') {
+            rows[activeIdx].classList.remove('active');
+          }
+          if (rows[nextVisibleIdx].classList && typeof rows[nextVisibleIdx].classList.add === 'function') {
+            rows[nextVisibleIdx].classList.add('active');
+          }
+          if (typeof rows[activeIdx].setAttribute === 'function') {
+            rows[activeIdx].setAttribute('aria-selected', 'false');
+          }
+          if (typeof rows[nextVisibleIdx].setAttribute === 'function') {
+            rows[nextVisibleIdx].setAttribute('aria-selected', 'true');
+          }
         }
       }
     }
@@ -1218,15 +1483,216 @@
       if (isSlashRowVisible(rows[candidate])) break;
       steps += 1;
     }
-    if (steps > 1 && steps <= rows.length) {
+    if ((steps > 1 || !isSlashRowVisible(rows[cur])) && steps <= rows.length) {
       if (typeof e.preventDefault === 'function') e.preventDefault();
       if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
       dispatchSlashArrow(e.target || document.activeElement, key, steps);
     }
   }
 
+  function getBarePlanComposerEditor() {
+    if (!document.querySelector) return null;
+    var ed = document.querySelector('.composer .ProseMirror, .composer [contenteditable="true"], .empty-composer .ProseMirror, .empty-composer [contenteditable="true"]');
+    if (!ed) return null;
+    var raw = String(ed.innerText !== undefined ? ed.innerText : (ed.textContent || '')).trim();
+    return raw === '/plan' ? ed : null;
+  }
+
+  function isSlashMenuVisiblyOpen() {
+    if (!document.querySelector) return false;
+    var menu = document.querySelector('.slash-menu');
+    if (!menu) return false;
+    if (typeof window.getComputedStyle === 'function') {
+      var st = window.getComputedStyle(menu);
+      if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) return false;
+    }
+    if (typeof menu.getBoundingClientRect === 'function') {
+      var rect = menu.getBoundingClientRect();
+      if (rect && rect.height === 0 && rect.width === 0) return false;
+    }
+    return true;
+  }
+
+  function tryBypassPiBarePlan(e, allowWhenMenuOpen) {
+    if (selectedProvider() !== 'pi' || getCapabilities('pi').planMode) return false;
+    var ed = getBarePlanComposerEditor();
+    var sid = currentSessionIdForExtUi();
+    if (!ed || !sid) return false;
+    if (!allowWhenMenuOpen && isSlashMenuVisiblyOpen()) {
+      var hasToken = typeof ed.querySelector === 'function' && Boolean(ed.querySelector('.composer-command-token'));
+      if (!hasToken) return false;
+    }
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    if (e && typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    try {
+      if (typeof ed.focus === 'function') ed.focus();
+      if (typeof document.execCommand === 'function') {
+        document.execCommand('selectAll', false);
+        document.execCommand('delete', false);
+      } else {
+        ed.textContent = '';
+      }
+    } catch (_) {
+      ed.textContent = '';
+    }
+    var headers = Object.assign({ 'content-type': 'application/json' }, authHeaders() || {});
+    window.fetch('/api/v1/sessions/' + encodeURIComponent(sid) + '/prompts?provider=pi', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({ content: [{ type: 'text', text: '/plan' }] }),
+    }).catch(function () {});
+    return true;
+  }
+
+  function onComposerPlanSubmitKeydown(e) {
+    if (!e || e.isComposing || e.key !== 'Enter' || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+    var target = e.target;
+    var inEditor = target && typeof target.closest === 'function'
+      ? Boolean(target.closest('.composer, .empty-composer'))
+      : Boolean(document.activeElement && typeof document.activeElement.closest === 'function' && document.activeElement.closest('.composer, .empty-composer'));
+    if (!inEditor && target && target.className && String(target.className).indexOf('ProseMirror') === -1) return;
+    tryBypassPiBarePlan(e, false);
+  }
+
+  function onComposerPlanSendClick(e) {
+    var target = e && e.target;
+    if (!target || typeof target.closest !== 'function') return;
+    var btn = target.closest('.composer button, .empty-composer button');
+    if (!btn) return;
+    var aria = typeof btn.getAttribute === 'function' ? String(btn.getAttribute('aria-label') || '') : '';
+    var cls = String(btn.className || '');
+    var isSend = /\bsend\b/i.test(cls) || /发送|send/i.test(aria) || btn.type === 'submit';
+    if (!isSend) return;
+    tryBypassPiBarePlan(e, true);
+  }
+
   if (document.addEventListener) {
     document.addEventListener('keydown', onSlashKeydown, true);
+    document.addEventListener('keydown', onComposerPlanSubmitKeydown, true);
+    document.addEventListener('click', onComposerPlanSendClick, true);
+  }
+
+  function enhanceQuestionCards() {
+    if (!document.querySelectorAll || typeof document.createElement !== 'function') return;
+    document.querySelectorAll('.qcard .qpane .qopts').forEach(function (qopts) {
+      if (!qopts || !qopts.querySelectorAll || !qopts.parentElement) return;
+      var opts = Array.prototype.slice.call(qopts.querySelectorAll('.qopt')).filter(function (el) {
+        return !(el.classList && el.classList.contains('qopt-other'));
+      });
+      var existingSearch = qopts.parentElement.querySelector ? qopts.parentElement.querySelector('.multi-agent-qsearch') : null;
+      if (opts.length <= 6) {
+        if (qopts.classList) qopts.classList.remove('multi-agent-qopts-scroll');
+        if (existingSearch && typeof existingSearch.remove === 'function') existingSearch.remove();
+        return;
+      }
+      if (qopts.classList) qopts.classList.add('multi-agent-qopts-scroll');
+      if (existingSearch) return;
+      var box = document.createElement('div');
+      box.className = 'multi-agent-qsearch';
+      var input = document.createElement('input');
+      input.type = 'search';
+      input.className = 'multi-agent-qsearch__input';
+      input.placeholder = '搜索选项 / Type to filter…';
+      input.autocomplete = 'off';
+      var count = document.createElement('span');
+      count.className = 'multi-agent-qsearch__count';
+      count.textContent = opts.length + ' / ' + opts.length;
+      function applyFilter() {
+        var q = String(input.value || '').trim().toLowerCase();
+        var shown = 0;
+        var currentOpts = Array.prototype.slice.call(qopts.querySelectorAll('.qopt')).filter(function (el) {
+          return !(el.classList && el.classList.contains('qopt-other'));
+        });
+        for (var i = 0; i < currentOpts.length; i += 1) {
+          var opt = currentOpts[i];
+          var txt = String(opt.textContent || '').toLowerCase();
+          var hit = !q || txt.indexOf(q) !== -1;
+          if (hit) {
+            shown += 1;
+            opt.hidden = false;
+            if (typeof opt.removeAttribute === 'function') opt.removeAttribute('data-multi-agent-qhidden');
+          } else {
+            opt.hidden = true;
+            if (typeof opt.setAttribute === 'function') opt.setAttribute('data-multi-agent-qhidden', '');
+          }
+        }
+        count.textContent = shown + ' / ' + currentOpts.length;
+      }
+      if (typeof input.addEventListener === 'function') {
+        input.addEventListener('input', applyFilter);
+        input.addEventListener('keydown', function (e) {
+          if (e.key === 'Escape' && input.value) {
+            input.value = '';
+            applyFilter();
+            if (typeof e.stopPropagation === 'function') e.stopPropagation();
+            if (typeof e.preventDefault === 'function') e.preventDefault();
+          } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter') {
+            if (typeof e.stopPropagation === 'function') e.stopPropagation();
+          }
+        });
+      }
+      box.appendChild(input);
+      box.appendChild(count);
+      qopts.parentElement.insertBefore(box, qopts);
+    });
+  }
+
+  function currentSessionIdForExtUi() {
+    var m = /^\/sessions\/([^/]+)/.exec(window.location.pathname || '');
+    if (m && m[1]) {
+      try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
+    }
+    var pinia = findPinia();
+    var sessionsStore = getPiniaStore(pinia, 'kimi.sessions');
+    var active = sessionsStore && unwrapRef(sessionsStore.activeSessionId);
+    return typeof active === 'string' && active ? active : null;
+  }
+
+  function syncExtBar() {
+    if (!document.querySelector || typeof document.createElement !== 'function') return;
+    var existingBars = document.querySelectorAll ? Array.prototype.slice.call(document.querySelectorAll('.multi-agent-ext-bar')) : [];
+    var provider = selectedProvider();
+    var sid = currentSessionIdForExtUi();
+    var ext = provider === 'pi' && sid ? extUiBySession[sid] : null;
+    var statusKeys = ext && ext.statuses ? Object.keys(ext.statuses).filter(function (k) { return ext.statuses[k]; }) : [];
+    var widgetKeys = ext && ext.widgets ? Object.keys(ext.widgets).filter(function (k) { return ext.widgets[k] && Array.isArray(ext.widgets[k].lines) && ext.widgets[k].lines.length > 0; }) : [];
+    if (statusKeys.length === 0 && widgetKeys.length === 0) {
+      for (var r = 0; r < existingBars.length; r += 1) {
+        if (typeof existingBars[r].remove === 'function') existingBars[r].remove();
+      }
+      return;
+    }
+    var composer = document.querySelector('.composer, .empty-composer');
+    if (!composer || !composer.parentElement) return;
+    var bar = existingBars[0];
+    if (!bar || bar.parentElement !== composer.parentElement) {
+      for (var d = 0; d < existingBars.length; d += 1) {
+        if (typeof existingBars[d].remove === 'function') existingBars[d].remove();
+      }
+      bar = document.createElement('div');
+      bar.className = 'multi-agent-ext-bar';
+      composer.parentElement.insertBefore(bar, composer);
+    }
+    bar.textContent = '';
+    if (statusKeys.length > 0) {
+      var stRow = document.createElement('div');
+      stRow.className = 'multi-agent-ext-statuses';
+      for (var i = 0; i < statusKeys.length; i += 1) {
+        var key = statusKeys[i];
+        var pill = document.createElement('span');
+        pill.className = 'multi-agent-ext-pill';
+        pill.textContent = key + ': ' + ext.statuses[key];
+        stRow.appendChild(pill);
+      }
+      bar.appendChild(stRow);
+    }
+    for (var j = 0; j < widgetKeys.length; j += 1) {
+      var wKey = widgetKeys[j];
+      var wBox = document.createElement('div');
+      wBox.className = 'multi-agent-ext-widgets';
+      wBox.textContent = ext.widgets[wKey].lines.join('\n');
+      bar.appendChild(wBox);
+    }
   }
 
   function syncUi() {
@@ -1245,6 +1711,8 @@
     }
     gateModes();
     gateSlashMenu();
+    enhanceQuestionCards();
+    syncExtBar();
     if (pendingProviderRefresh) refreshProviderData();
   }
 
@@ -1273,7 +1741,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.side-footer, .user-menu-trigger, .view-tabs, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard';
+  var uiMutationSelector = '.side-footer, .user-menu-trigger, .view-tabs, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard, .qcard, .qpane, .qopts, .composer, .empty-composer';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {
@@ -1311,5 +1779,7 @@
     setProvider: setProvider,
     switchProvider: switchProvider,
     rewriteApiUrl: rewriteApiUrl,
+    providerCapabilities: providerCapabilities,
+    getCapabilities: getCapabilities,
   };
 })();

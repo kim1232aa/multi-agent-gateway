@@ -750,6 +750,13 @@ export interface CodexAdapterOptions {
    */
   recycleGraceMs?: number;
   /**
+   * Timeout for parked reverse server requests (approvals, user input questions)
+   * in ms. An abandoned approval or question from a closed browser tab will
+   * fail-close cleanly (cancel/decline) after this duration so idle recycling
+   * can reclaim the process. Default 30 * 60_000 (30 minutes); 0 disables.
+   */
+  parkedServerTimeoutMs?: number;
+  /**
    * When true, approval requests are answered immediately with 'accept' and
    * user-input questions with empty answers instead of being parked until
    * resolveApproval/resolveQuestion is called. Default false (park + emit).
@@ -867,6 +874,8 @@ interface PendingServerRequest {
   itemId?: string;
   approvalId?: string;
   interactionKind?: 'approval' | 'question' | 'elicitation' | 'permissions';
+  createdAt: number;
+  timer?: NodeJS.Timeout;
 }
 
 class TurnEventQueue implements AsyncIterable<CodexEvent> {
@@ -938,8 +947,10 @@ export class CodexAdapter {
   readonly provider = 'codex' as const;
   /** 未落盘线程的回收保护期:覆盖"新建会话→想一下→发首条消息"的正常间隔。 */
   private static readonly UNPERSISTED_PROTECT_MS = 15 * 60_000;
+  /** 废弃 parked 反向请求(审批/提问)的过期时间:防止关闭标签页后永久钉死回收。 */
+  private static readonly DEFAULT_PARKED_SERVER_TIMEOUT_MS = 30 * 60_000;
 
-  private opts: Required<Pick<CodexAdapterOptions, 'requestTimeoutMs' | 'recycleGraceMs'>> & CodexAdapterOptions;
+  private opts: Required<Pick<CodexAdapterOptions, 'requestTimeoutMs' | 'recycleGraceMs' | 'parkedServerTimeoutMs'>> & CodexAdapterOptions;
   private child: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
   private nextId = 1;
@@ -981,7 +992,18 @@ export class CodexAdapter {
   private unpersistedThreads = new Map<string, number>();
 
   constructor(options: CodexAdapterOptions = {}) {
-    this.opts = { requestTimeoutMs: 120_000, recycleGraceMs: 60_000, ...options };
+    this.opts = {
+      requestTimeoutMs: 120_000,
+      recycleGraceMs: 60_000,
+      parkedServerTimeoutMs:
+        options.parkedServerTimeoutMs !== undefined
+          ? options.parkedServerTimeoutMs
+          : CodexAdapter.DEFAULT_PARKED_SERVER_TIMEOUT_MS,
+      ...options,
+    };
+    if (this.opts.parkedServerTimeoutMs === undefined) {
+      this.opts.parkedServerTimeoutMs = CodexAdapter.DEFAULT_PARKED_SERVER_TIMEOUT_MS;
+    }
   }
 
   // -- lifecycle ------------------------------------------------------------
@@ -1243,6 +1265,103 @@ export class CodexAdapter {
     return undefined;
   }
 
+  private parkServerRequest(
+    key: string,
+    entry: Omit<PendingServerRequest, 'createdAt' | 'timer'>,
+  ): void {
+    const existing = this.pendingServer.get(key);
+    if (existing?.timer) clearTimeout(existing.timer);
+
+    const createdAt = Date.now();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = this.opts.parkedServerTimeoutMs;
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        if (this.expireParkedRequest(key)) {
+          this.scheduleRecycleWhenIdle();
+        }
+      }, timeout);
+      timer.unref?.();
+    }
+
+    this.pendingServer.set(key, {
+      ...entry,
+      createdAt,
+      timer,
+    });
+    this.scheduleRecycleWhenIdle();
+  }
+
+  private deletePendingServer(key: string): PendingServerRequest | undefined {
+    const entry = this.pendingServer.get(key);
+    if (entry) {
+      if (entry.timer) clearTimeout(entry.timer);
+      this.pendingServer.delete(key);
+    }
+    return entry;
+  }
+
+  private failCloseParkedRequest(parked: PendingServerRequest): void {
+    try {
+      if (
+        parked.method === 'item/commandExecution/requestApproval' ||
+        parked.method === 'item/fileChange/requestApproval' ||
+        parked.method === 'applyPatchApproval' ||
+        parked.method === 'execCommandApproval'
+      ) {
+        const wireDecision = this.normalizeWireApprovalDecision(parked.method, 'cancel');
+        this.safeRespond(parked.id, { decision: wireDecision });
+      } else if (parked.method === 'item/permissions/requestApproval') {
+        this.safeRespond(parked.id, { permissions: {}, scope: 'turn' });
+      } else if (parked.method === 'mcpServer/elicitation/request') {
+        this.safeRespond(parked.id, { action: 'cancel', content: null, _meta: null });
+      } else if (parked.method === 'item/tool/requestUserInput') {
+        this.safeRespond(parked.id, { answers: {} });
+      } else {
+        this.safeRespondError(parked.id, -32000, 'Server request expired');
+      }
+    } catch {
+      // safeRespond already catches "not running"
+    }
+
+    const threadId = parked.threadId ?? '';
+    const turnId = parked.turnId ?? this.findActiveTurnId(threadId);
+    this.emit({
+      type: 'server-request-resolved',
+      threadId,
+      turnId,
+      requestId: parked.id,
+      interactionKind: parked.interactionKind,
+    });
+    this.emit({
+      type: 'log',
+      line: `codex parked server request ${String(parked.id)} (${parked.method}) expired after ${Date.now() - parked.createdAt}ms, fail-closing with cancel`,
+    });
+  }
+
+  private expireParkedRequest(key: string): boolean {
+    const parked = this.pendingServer.get(key);
+    if (!parked) return false;
+    this.deletePendingServer(key);
+    this.failCloseParkedRequest(parked);
+    return true;
+  }
+
+  /** 检查并 fail-close 超时的 parked 请求(审批/提问等)，防止废弃标签页永久钉死进程回收。 */
+  private expireStaleParkedRequests(now = Date.now()): number {
+    const timeout = this.opts.parkedServerTimeoutMs;
+    if (!timeout || timeout <= 0) return 0;
+    let expiredCount = 0;
+    for (const [key, parked] of this.pendingServer.entries()) {
+      if (now - parked.createdAt >= timeout) {
+        if (this.expireParkedRequest(key)) {
+          expiredCount++;
+        }
+      }
+    }
+    return expiredCount;
+  }
+
   private handleServerRequest(id: CodexRequestId, method: string, params: unknown): void {
     const key = String(id);
     const rawParams = (params && typeof params === 'object' ? params : {}) as Record<string, unknown>;
@@ -1257,13 +1376,13 @@ export class CodexAdapter {
     if (approvalMethod) {
       const parsed = ApprovalRequestParamsSchema.safeParse(params);
       if (!parsed.success) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespondError(id, -32602, `invalid ${method} params: ${parsed.error.message}`);
         return;
       }
       const p = parsed.data;
       if (this.opts.autoApprove) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespond(id, { decision: 'accept' });
         return;
       }
@@ -1274,7 +1393,7 @@ export class CodexAdapter {
         : approvalMethod === 'fileChange'
           ? ['accept', 'acceptForSession', 'decline', 'cancel']
           : undefined;
-      this.pendingServer.set(key, {
+      this.parkServerRequest(key, {
         id,
         method,
         params: p,
@@ -1314,7 +1433,7 @@ export class CodexAdapter {
     if (method === 'item/permissions/requestApproval') {
       const parsed = PermissionsApprovalRequestParamsSchema.safeParse(params);
       if (!parsed.success) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespondError(id, -32602, `invalid ${method} params: ${parsed.error.message}`);
         return;
       }
@@ -1324,11 +1443,11 @@ export class CodexAdapter {
           ? (p.permissions as Record<string, unknown>)
           : {};
       if (this.opts.autoApprove) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespond(id, { permissions: requestedPermissions, scope: 'turn' });
         return;
       }
-      this.pendingServer.set(key, {
+      this.parkServerRequest(key, {
         id,
         method,
         params: p,
@@ -1360,7 +1479,7 @@ export class CodexAdapter {
     if (method === 'mcpServer/elicitation/request') {
       const parsed = McpElicitationRequestParamsSchema.safeParse(params);
       if (!parsed.success) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespondError(id, -32602, `invalid ${method} params: ${parsed.error.message}`);
         return;
       }
@@ -1368,13 +1487,13 @@ export class CodexAdapter {
       const resolvedTurnId =
         (typeof p.turnId === 'string' && p.turnId) || this.findActiveTurnId(p.threadId) || '';
       if (this.opts.autoApprove) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespond(id, { action: 'accept', content: {}, _meta: p._meta ?? null });
         return;
       }
       const approvalId =
         typeof p.elicitationId === 'string' && p.elicitationId ? p.elicitationId : String(id);
-      this.pendingServer.set(key, {
+      this.parkServerRequest(key, {
         id,
         method,
         params: p,
@@ -1429,7 +1548,7 @@ export class CodexAdapter {
         (typeof p.threadId === 'string' && p.threadId) ||
         '';
       if (!threadId) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespondError(id, -32602, `invalid ${method} params: missing conversationId/threadId`);
         return;
       }
@@ -1440,7 +1559,7 @@ export class CodexAdapter {
         (typeof p.itemId === 'string' && p.itemId) ||
         '';
       if (this.opts.autoApprove) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespond(id, { decision: 'approved' });
         return;
       }
@@ -1455,7 +1574,7 @@ export class CodexAdapter {
         : typeof cmdRaw === 'string'
           ? cmdRaw
           : undefined;
-      this.pendingServer.set(key, {
+      this.parkServerRequest(key, {
         id,
         method,
         params: p,
@@ -1490,17 +1609,17 @@ export class CodexAdapter {
     if (method === 'item/tool/requestUserInput') {
       const parsed = UserInputRequestParamsSchema.safeParse(params);
       if (!parsed.success) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespondError(id, -32602, `invalid ${method} params: ${parsed.error.message}`);
         return;
       }
       const p = parsed.data;
       if (this.opts.autoApprove) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespond(id, { answers: {} });
         return;
       }
-      this.pendingServer.set(key, {
+      this.parkServerRequest(key, {
         id,
         method,
         params: p,
@@ -1546,7 +1665,7 @@ export class CodexAdapter {
     if (method === 'item/tool/call') {
       const parsed = DynamicToolCallParamsSchema.safeParse(params);
       if (!parsed.success) {
-        this.pendingServer.delete(key);
+        this.deletePendingServer(key);
         this.safeRespondError(id, -32602, `invalid ${method} params: ${parsed.error.message}`);
         return;
       }
@@ -1561,7 +1680,7 @@ export class CodexAdapter {
       params,
       handled: false,
     };
-    this.pendingServer.set(key, {
+    this.parkServerRequest(key, {
       id,
       method,
       params,
@@ -1570,7 +1689,7 @@ export class CodexAdapter {
     });
     this.emit(serverReqEvent);
     if (this.pendingServer.has(key) && serverReqEvent.handled !== true) {
-      this.pendingServer.delete(key);
+      this.deletePendingServer(key);
       this.safeRespondError(id, -32601, `unsupported server request '${method}'`);
     }
   }
@@ -1646,7 +1765,7 @@ export class CodexAdapter {
       throw new Error(`pending request ${key} is '${parked.method}', not an approval`);
     }
 
-    this.pendingServer.delete(key);
+    this.deletePendingServer(key);
 
     if (parked.method === 'item/permissions/requestApproval') {
       const requestedPerms =
@@ -1886,7 +2005,7 @@ export class CodexAdapter {
     if (parked.method !== 'item/tool/requestUserInput') {
       throw new Error(`pending request ${key} is '${parked.method}', not a user-input request`);
     }
-    this.pendingServer.delete(key);
+    this.deletePendingServer(key);
 
     const rawQuestions = Array.isArray((parked.params as { questions?: unknown })?.questions)
       ? ((parked.params as { questions: Array<Record<string, unknown>> }).questions)
@@ -1916,7 +2035,7 @@ export class CodexAdapter {
     const key = this.findPendingServerKey(requestId);
     if (!key) throw new Error(`no pending server request with id ${String(requestId)}`);
     const parked = this.pendingServer.get(key)!;
-    this.pendingServer.delete(key);
+    this.deletePendingServer(key);
     this.respond(parked.id, result);
   }
 
@@ -1930,7 +2049,7 @@ export class CodexAdapter {
     const key = this.findPendingServerKey(requestId);
     if (!key) return;
     const parked = this.pendingServer.get(key)!;
-    this.pendingServer.delete(key);
+    this.deletePendingServer(key);
     this.safeRespondError(parked.id, code, message);
   }
 
@@ -1977,7 +2096,7 @@ export class CodexAdapter {
         if (reqId !== undefined) {
           const key = this.findPendingServerKey(reqId) ?? String(reqId);
           const parked = this.pendingServer.get(key);
-          this.pendingServer.delete(key);
+          this.deletePendingServer(key);
           const turnId = parked?.turnId ?? this.findActiveTurnId(threadId || parked?.threadId);
           this.emit({
             type: 'server-request-resolved',
@@ -2204,6 +2323,9 @@ export class CodexAdapter {
       pending.reject(reason);
     }
     this.pendingClient.clear();
+    for (const [, parked] of this.pendingServer) {
+      if (parked.timer) clearTimeout(parked.timer);
+    }
     this.pendingServer.clear();
     for (const q of this.turnQueues.values()) q.fail(reason);
     this.turnQueues.clear();
@@ -2248,13 +2370,13 @@ export class CodexAdapter {
 
   private recycleIfIdle(): void {
     if (this.closed || !this.child || this.child.exitCode !== null) return;
+    this.expireStaleParkedRequests();
     // pendingServer(parked 审批/提问)也算 busy:审批是 turn 中段的反向请求,
     // 用户在斟酌的 60s 里进程被回收,审批会静默蒸发。
     const busy =
       this.pendingClient.size > 0 ||
       this.pendingServer.size > 0 ||
-      this.turnQueues.size > 0 ||
-      this.pendingTurnEvents.size > 0;
+      this.turnQueues.size > 0;
     if (busy) {
       // turn 流长期静默:可能 app-server  wedge(实测:rollout 已写
       // task_complete,但 turn/completed 始终不上线,写者锁被一直占着,
@@ -2357,14 +2479,14 @@ export class CodexAdapter {
         this.unpersistedThreads.delete(id); // 首个 turn 已落盘
       }
     }
+    this.expireStaleParkedRequests(now);
     if (this.closed || !this.child || this.child.exitCode !== null) return;
     // await 窗口内可能来了新请求:杀之前按与 recycleIfIdle 相同的口径重检,
     // 否则在飞请求会被无谓杀掉(虽能 reject 兜底,但用户看到的是偶发失败)。
     const busy =
       this.pendingClient.size > 0 ||
       this.pendingServer.size > 0 ||
-      this.turnQueues.size > 0 ||
-      this.pendingTurnEvents.size > 0;
+      this.turnQueues.size > 0;
     if (busy) {
       this.scheduleRecycleWhenIdle();
       return;
@@ -3264,15 +3386,17 @@ export class CodexAdapter {
   /** 后台终端(thread/backgroundTerminals/list)，支持 `nextCursor` 翻页。 */
   async backgroundTerminals(threadId: string): Promise<Array<Record<string, unknown>>> {
     await this.connect();
-    return this.collectCursorPages(
-      'thread/backgroundTerminals/list',
-      (cursor) => ({ threadId, cursor, limit: null }),
-      (raw) => {
-        const data = (raw as { data?: unknown })?.data;
-        return Array.isArray(data)
-          ? data.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
-          : [];
-      },
+    return this.withThreadRetry(threadId, () =>
+      this.collectCursorPages(
+        'thread/backgroundTerminals/list',
+        (cursor) => ({ threadId, cursor, limit: null }),
+        (raw) => {
+          const data = (raw as { data?: unknown })?.data;
+          return Array.isArray(data)
+            ? data.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+            : [];
+        },
+      ),
     );
   }
 
@@ -3351,6 +3475,11 @@ export class CodexAdapter {
         },
       }),
     );
+    if (options?.model) this.threadModels.set(threadId, options.model);
+    if (options?.reasoningEffort !== undefined) {
+      if (options.reasoningEffort) this.threadEfforts.set(threadId, options.reasoningEffort);
+      else this.threadEfforts.delete(threadId);
+    }
   }
 
   /**

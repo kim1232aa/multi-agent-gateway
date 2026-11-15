@@ -119,3 +119,95 @@
   padding: 1px 5px;
   margin-left: 6px;
 }
+
+[data-multi-agent-hidden],
+[data-multi-agent-slash-hidden],
+[data-multi-agent-qhidden] {
+  display: none !important;
+}
+
+.multi-agent-qsearch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: var(--color-surface-sunken, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--color-line, rgba(255, 255, 255, 0.12));
+  border-radius: var(--radius-md, 8px);
+}
+
+.multi-agent-qsearch__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--color-text, inherit);
+  font-family: var(--font-ui, inherit);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.multi-agent-qsearch__input::placeholder {
+  color: var(--color-text-muted, #888);
+}
+
+.multi-agent-qsearch__count {
+  flex: none;
+  font-size: 11px;
+  color: var(--color-text-muted, #888);
+  font-variant-numeric: tabular-nums;
+}
+
+.qopts.multi-agent-qopts-scroll {
+  max-height: min(44vh, 280px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.multi-agent-ext-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 10px 2px;
+  font-family: var(--font-ui, inherit);
+  font-size: 12px;
+  color: var(--color-text-muted, #9aa0a6);
+}
+
+.multi-agent-ext-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.multi-agent-ext-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--color-surface-sunken, rgba(255, 255, 255, 0.06));
+  border: 0.5px solid var(--color-line, rgba(255, 255, 255, 0.12));
+  color: var(--color-text, inherit);
+  font-size: 11px;
+  line-height: 1.4;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.multi-agent-ext-widgets {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm, 6px);
+  background: var(--color-surface-sunken, rgba(255, 255, 255, 0.04));
+  border-left: 2px solid var(--color-accent, #1783ff);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}

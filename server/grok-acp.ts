@@ -303,15 +303,21 @@ export class GrokAcpClient {
     sessionId: string;
     cwd: string;
     mcpServers?: unknown[];
+    autoMode?: boolean;
+    yoloMode?: boolean;
   }): Promise<{
     models?: GrokAcpModelState;
     configOptions?: GrokAcpConfigOption[];
   }> {
     await this.connect();
+    const meta: Record<string, unknown> = {};
+    if (params.yoloMode) meta.yoloMode = true;
+    if (params.autoMode) meta.autoMode = true;
     const result = await this.request('session/load', {
       sessionId: params.sessionId,
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
+      ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
     });
     const rec = (result ?? {}) as Record<string, unknown>;
     const models = parseModelState(rec.models);
@@ -335,6 +341,11 @@ export class GrokAcpClient {
       sessionId: params.sessionId,
       cwd: params.cwd,
     });
+  }
+
+  async sessionClose(sessionId: string): Promise<void> {
+    if (!this.ready) return;
+    await this.request('session/close', { sessionId });
   }
 
   async sessionFork(params: {

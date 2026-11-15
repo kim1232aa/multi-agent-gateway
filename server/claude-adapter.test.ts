@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import {
   ClaudeAdapter,
+  LruCache,
   encodeAskUserQuestionAnswers,
   followClaudeBranch,
   mapControlPermissionMode,
@@ -1100,7 +1101,7 @@ rl.on('close', () => process.exit(0));
       assert.deepEqual(models.map((m) => m.value), ['claude-opus-5-5']);
       assert.equal(models[0]?.supportsAdaptiveThinking, true);
       assert.equal(models[0]?.supportsThinkingOff, false);
-      assert.equal(models[0]?.fastMode, true);
+      assert.equal(models[0]?.fastMode, false);
       assert.equal(models[0]?.supportsAutoMode, true);
       assert.equal(models[0]?.fastModeState, 'off');
       assert.equal(models[0]?.fastModeDisabledReason, 'sdk_opt_in_required');
@@ -1930,5 +1931,347 @@ test('ClaudeAdapter.listSubagentDetails reads sidecar metadata fields', async ()
   } finally {
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test('LruCache enforces maxEntries cap, LRU eviction, and close() clears caches', async () => {
+  const cache = new LruCache<string, number>(3);
+  cache.set('a', 1);
+  cache.set('b', 2);
+  cache.set('c', 3);
+  assert.equal(cache.size, 3);
+
+  // Access 'a' to make it most recently used
+  assert.equal(cache.get('a'), 1);
+
+  // Inserting 'd' should evict 'b' (least recently used)
+  cache.set('d', 4);
+  assert.equal(cache.size, 3);
+  assert.equal(cache.get('b'), undefined);
+  assert.equal(cache.get('a'), 1);
+  assert.equal(cache.get('c'), 3);
+  assert.equal(cache.get('d'), 4);
+
+  // Test close() clearing historyCache and summarizeCache
+  const adapter = new ClaudeAdapter();
+  (adapter as any).historyCache.set('sess1:main', { key: '1:100', messages: [] });
+  (adapter as any).summarizeCache.set('/path/to/sess1.jsonl', { mtimeMs: 1, size: 100, summary: { sessionId: 'sess1' } });
+  assert.equal((adapter as any).historyCache.size, 1);
+  assert.equal((adapter as any).summarizeCache.size, 1);
+
+  await adapter.close();
+  assert.equal((adapter as any).historyCache.size, 0);
+  assert.equal((adapter as any).summarizeCache.size, 0);
+});
+
+test('startTurn rejects if adapter is closed', async () => {
+  const adapter = new ClaudeAdapter();
+  await adapter.close();
+  await assert.rejects(
+    adapter.startTurn({
+      sessionId: '123e4567-e89b-12d3-a456-426614174000',
+      prompt: 'hello',
+      onEvent: () => {},
+    }),
+    /claude-adapter: adapter closed/,
+  );
+});
+
+test('listSlashCommands preserves terminalOnly, allowedTools, and model from catalog', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-commands-'));
+  try {
+    const bin = join(base, 'claude-mock');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === 'control_request' && msg.request?.subtype === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: {
+        request_id: msg.request_id,
+        subtype: 'success',
+        response: {
+          commands: [
+            {
+              name: 'deploy',
+              description: 'Deploy project',
+              argumentHint: '<target>',
+              aliases: ['dp'],
+              terminalOnly: true,
+              allowedTools: ['Bash', 'Read'],
+              model: 'claude-3-opus',
+            },
+            {
+              name: 'help',
+              description: 'Get help',
+            },
+          ],
+        },
+      },
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const commands = await adapter.listSlashCommands();
+      const deploy = commands.find((c) => c.name === 'deploy');
+      assert.ok(deploy);
+      assert.equal(deploy.terminalOnly, true);
+      assert.deepEqual(deploy.allowedTools, ['Bash', 'Read']);
+      assert.equal(deploy.model, 'claude-3-opus');
+
+      const help = commands.find((c) => c.name === 'help');
+      assert.ok(help);
+      assert.equal(help.terminalOnly, undefined);
+      assert.equal(help.allowedTools, undefined);
+      assert.equal(help.model, undefined);
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('listBuiltinModels sets fastMode: false when fast_mode_state is off or sdk_opt_in_required', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-fastmode-'));
+  try {
+    const bin = join(base, 'claude-mock');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === 'control_request' && msg.request?.subtype === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: {
+        request_id: msg.request_id,
+        subtype: 'success',
+        response: {
+          fast_mode_state: 'off',
+          fast_mode_disabled_reason: 'sdk_opt_in_required',
+          models: [
+            {
+              value: 'claude-sonnet-4',
+              supportsFastMode: true,
+              fastMode: true,
+            },
+          ],
+        },
+      },
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const models = await adapter.listBuiltinModels();
+      assert.equal(models.length, 1);
+      assert.equal(models[0]?.fastMode, false);
+      assert.equal(models[0]?.supportsFastMode, true);
+      assert.equal(models[0]?.fastModeState, 'off');
+      assert.equal(models[0]?.fastModeDisabledReason, 'sdk_opt_in_required');
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('startTurn omits --effort when effort is auto or on, but passes explicit levels', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-effort-'));
+  const log = join(base, 'args.log');
+  try {
+    const bin = join(base, 'claude-mock');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === 'user') {
+    process.stdout.write(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'ok',
+      session_id: '123e4567-e89b-12d3-a456-426614174000',
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      // 1. effort = 'auto'
+      await adapter.startTurn({
+        sessionId: '123e4567-e89b-12d3-a456-426614174000',
+        prompt: 'test auto',
+        effort: 'auto',
+        onEvent: () => {},
+      });
+
+      // 2. effort = 'on'
+      await adapter.startTurn({
+        sessionId: '123e4567-e89b-12d3-a456-426614174000',
+        prompt: 'test on',
+        effort: 'on',
+        onEvent: () => {},
+      });
+
+      // 3. effort = 'high'
+      await adapter.startTurn({
+        sessionId: '123e4567-e89b-12d3-a456-426614174000',
+        prompt: 'test high',
+        effort: 'high',
+        onEvent: () => {},
+      });
+
+      const lines = (await readFile(log, 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+      assert.equal(lines.length, 3);
+
+      const autoArgs: string[] = lines[0];
+      assert.ok(!autoArgs.includes('--effort'), `expected no --effort, got: ${autoArgs.join(' ')}`);
+
+      const onArgs: string[] = lines[1];
+      assert.ok(!onArgs.includes('--effort'), `expected no --effort, got: ${onArgs.join(' ')}`);
+
+      const highArgs: string[] = lines[2];
+      const effortIdx = highArgs.indexOf('--effort');
+      assert.ok(effortIdx >= 0, `expected --effort in: ${highArgs.join(' ')}`);
+      assert.equal(highArgs[effortIdx + 1], 'high');
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('clearHandshakeCache clears cached handshake response and inflight map', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-handshake-'));
+  try {
+    const countFile = join(base, 'count.txt');
+    await writeFile(countFile, '0');
+
+    const bin = join(base, 'claude-mock');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const countFile = ${JSON.stringify(countFile)};
+const cur = parseInt(fs.readFileSync(countFile, 'utf8') || '0', 10);
+fs.writeFileSync(countFile, String(cur + 1));
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const msg = JSON.parse(line);
+  if (msg.type === 'control_request' && msg.request?.subtype === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: {
+        request_id: msg.request_id,
+        subtype: 'success',
+        response: {
+          commands: [{ name: 'cmd1', description: 'test', argumentHint: '', aliases: [] }],
+          models: [{ value: 'model1' }],
+        },
+      },
+    }) + '\\n');
+  }
+});
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      const cmds1 = await adapter.listSlashCommands(base);
+      assert.equal(cmds1.length, 1);
+      assert.equal(await readFile(countFile, 'utf8'), '1');
+
+      // Second call should hit handshakeCache without spawning another process
+      const cmds2 = await adapter.listSlashCommands(base);
+      assert.equal(cmds2.length, 1);
+      assert.equal(await readFile(countFile, 'utf8'), '1');
+
+      // Clear cache and call again; should spawn a second process
+      adapter.clearHandshakeCache();
+      assert.equal((adapter as any).handshakeCache.size, 0);
+      assert.equal((adapter as any).handshakeInflight.size, 0);
+
+      const cmds3 = await adapter.listSlashCommands(base);
+      assert.equal(cmds3.length, 1);
+      assert.equal(await readFile(countFile, 'utf8'), '2');
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('clearHandshakeCache prevents stale in-flight handshake from polluting cache and close during waitForExit aborts startTurn', async () => {
+  const adapter = new ClaudeAdapter({ claudeBin: '/nonexistent/claude' });
+  let releaseProbe!: (value: Record<string, unknown> | null) => void;
+  let spawnCalls = 0;
+  (adapter as any).spawnHandshake = () => {
+    spawnCalls += 1;
+    if (spawnCalls === 1) {
+      return new Promise<Record<string, unknown> | null>((resolve) => {
+        releaseProbe = resolve;
+      });
+    }
+    return Promise.resolve({ commands: [{ name: 'fresh', description: 'fresh' }], models: [{ value: 'sonnet' }] });
+  };
+
+  const p1 = adapter.listSlashCommands('/tmp/p1');
+  adapter.clearHandshakeCache();
+  const p2 = adapter.listSlashCommands('/tmp/p1');
+  releaseProbe({ commands: [{ name: 'stale', description: 'stale' }], models: [{ value: 'haiku' }] });
+
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.equal(r1[0]?.name, 'stale');
+  assert.equal(r2[0]?.name, 'fresh');
+  // Cache must retain the fresh result, not the stale one that settled afterward
+  const r3 = await adapter.listSlashCommands('/tmp/p1');
+  assert.equal(r3[0]?.name, 'fresh');
+  assert.equal(spawnCalls, 2);
+
+  // If close() happens while waitForExit is waiting, startTurn must abort instead of spawning
+  (adapter as any).running.set('sess-wait', { exitCode: null, signalCode: null, kill: () => true });
+  (adapter as any).waitForExit = async () => {
+    (adapter as any).closed = true;
+    (adapter as any).running.delete('sess-wait');
+  };
+  await assert.rejects(
+    adapter.startTurn({ sessionId: 'sess-wait', prompt: 'hi', onEvent: () => undefined }),
+    /adapter closed/,
+  );
+  await adapter.close();
 });
 

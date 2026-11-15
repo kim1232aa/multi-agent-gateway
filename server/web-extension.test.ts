@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -136,8 +137,11 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   assert.equal(api.rewriteApiUrl('/api/v2/sessions').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v2/sessions:archive').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v2/sessions:restore').searchParams.get('provider'), 'claude');
-  // 设置页供应商目录、官方 MCP 认证为 Kimi 全局态;工作区项目配置目录/信任/主目录均按当前 provider 分流。
-  assert.equal(api.rewriteApiUrl('/api/v1/providers').searchParams.has('provider'), false);
+  // 设置页供应商目录为全局，网关 /providers、/commands、/meta、/sessions/:id/status 与工作区按当前 provider 分流。
+  assert.equal(api.rewriteApiUrl('/api/v1/providers').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v1/commands').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v1/meta').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v1/sessions/claude_abc/status').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v1/catalog/providers').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v2/mcp/auth-statuses').searchParams.has('provider'), false);
   assert.equal(api.rewriteApiUrl('/api/v1/workspaces/project-config-dirs').searchParams.get('provider'), 'claude');
@@ -393,15 +397,17 @@ function fakeElement(tag: string): any {
     if (el.parentElement) el.parentElement.children = el.parentElement.children.filter((c: any) => c !== el);
   };
   const matchesClass = (node: any, selector: string): boolean =>
-    String(node.className ?? '').split(/\s+/).includes(selector.replace(/^\./, ''));
-  el.matches = (selector: string) =>
     selector.split(',').some((part) => {
       const trimmed = part.trim();
-      return trimmed.startsWith('.') && String(el.className).split(/\s+/).includes(trimmed.slice(1));
+      if (!trimmed.startsWith('.')) return false;
+      const cls = trimmed.slice(1).split('.');
+      const nodeClasses = String(node.className ?? '').split(/\s+/);
+      return cls.every((c) => nodeClasses.includes(c));
     });
+  el.matches = (selector: string) => matchesClass(el, selector);
   const walk = (node: any, selector: string, out: any[]): void => {
     for (const child of node.children) {
-      if (selector.startsWith('.') && matchesClass(child, selector)) out.push(child);
+      if (matchesClass(child, selector)) out.push(child);
       walk(child, selector, out);
     }
   };
@@ -417,6 +423,7 @@ async function loadDomShim(options: {
   withFacade?: boolean;
   vueSetupState?: boolean;
   metaProviders?: string[];
+  metaCapabilities?: Record<string, any>;
   metaFails?: boolean;
   storedProvider?: string;
   hash?: string;
@@ -524,7 +531,10 @@ async function loadDomShim(options: {
         metaAuth = init?.headers?.authorization;
         return new Response(JSON.stringify({
           code: 0,
-          data: { providers: options.metaProviders ?? ['kimi', 'claude', 'codex'] },
+          data: {
+            providers: options.metaProviders ?? ['kimi', 'claude', 'codex'],
+            provider_capabilities: options.metaCapabilities,
+          },
         }));
       }
       return new Response('{}');
@@ -1836,3 +1846,829 @@ test('sends active ping probe on wakeup after 10s idle and closes at 3s if pong 
   assert.deepEqual(healthyWs.closedWith, []);
   assert.deepEqual(deadWs.closedWith, [{ code: 4008, reason: 'stale-wakeup' }]);
 });
+
+test('dynamically updates gateModes and gateSlashMenu when /api/v1/meta returns provider_capabilities', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+
+  const makeModeRow = (id: string) => {
+    const attributes = new Map<string, string>([['data-mode-id', id]]);
+    return {
+      hidden: false,
+      style: { display: '' },
+      textContent: id,
+      getAttribute: (name: string) => attributes.get(name) ?? null,
+      setAttribute: (name: string, value: string) => attributes.set(name, value),
+      hasAttribute: (name: string) => attributes.has(name),
+      removeAttribute: (name: string) => attributes.delete(name),
+      querySelector: () => ({ textContent: id, getAttribute: () => null }),
+    };
+  };
+  const modeRows = ['plan', 'swarm', 'goal', 'tower'].map(makeModeRow);
+
+  const makeSlashItem = (name: string) => {
+    const attributes = new Map<string, string>();
+    const classes = new Set(['slash-item']);
+    const nameEl = { textContent: name };
+    const row = {
+      hidden: false,
+      style: { display: '' },
+      children: [nameEl],
+      classList: {
+        contains: (c: string) => classes.has(c),
+        add: (c: string) => classes.add(c),
+        remove: (c: string) => classes.delete(c),
+      },
+      getAttribute: (k: string) => attributes.get(k) ?? null,
+      setAttribute: (k: string, v: string) => attributes.set(k, v),
+      hasAttribute: (k: string) => attributes.has(k),
+      removeAttribute: (k: string) => attributes.delete(k),
+    };
+    (nameEl as any).parentElement = row;
+    return { nameEl, row };
+  };
+  const slashItems = ['/tower', '/swarm', '/goal', '/plan', '/btw', '/undo', '/compact', '/fork'].map(makeSlashItem);
+
+  let metaResponse = {
+    code: 0,
+    data: {
+      providers: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+      provider_capabilities: {
+        claude: {
+          tower: true,
+          goals: true,
+          planMode: true,
+          swarm: false,
+          btw: false,
+          rollback: false,
+          compact: true,
+          fork: true,
+        },
+        pi: {
+          planMode: true,
+          tower: false,
+          swarm: false,
+          goals: false,
+          btw: false,
+          rollback: false,
+          compact: true,
+          fork: true,
+        },
+      },
+    },
+  };
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: (selector: string) => {
+      if (selector === '.am-row') return modeRows;
+      if (selector === '.slash-menu .slash-name') return slashItems.map((i) => i.nameEl);
+      return [];
+    },
+    addEventListener: () => {},
+    createElement: () => ({}),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async (input: unknown) => {
+      const url = String((input as any)?.url ?? input);
+      if (url.includes('/api/v1/meta')) {
+        return new Response(JSON.stringify(metaResponse));
+      }
+      return new Response('{}');
+    },
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const api = windowObject.__multiAgent;
+  // Wait for initial loadAvailableProviders to settle
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Claude dynamically gained tower: true and goals: true from /api/v1/meta
+  api.setProvider('claude');
+  assert.equal(modeRows[0].style.display, ''); // plan
+  assert.equal(modeRows[1].style.display, 'none'); // swarm
+  assert.equal(modeRows[2].style.display, ''); // goal (unlocked!)
+  assert.equal(modeRows[3].style.display, ''); // tower (unlocked!)
+
+  // In slash menu, /tower and /goal are now unlocked for Claude
+  assert.equal(slashItems[0].row.style.display, ''); // /tower unlocked
+  assert.equal(slashItems[1].row.style.display, 'none'); // /swarm still blocked
+  assert.equal(slashItems[2].row.style.display, ''); // /goal unlocked
+  assert.equal(slashItems[3].row.style.display, ''); // /plan
+  assert.equal(slashItems[4].row.style.display, 'none'); // /btw still blocked
+  assert.equal(slashItems[5].row.style.display, 'none'); // /undo still blocked
+  assert.equal(slashItems[6].row.style.display, ''); // /compact
+  assert.equal(slashItems[7].row.style.display, ''); // /fork
+
+  // Pi dynamically gained planMode: true
+  api.setProvider('pi');
+  assert.equal(modeRows[0].style.display, ''); // plan (unlocked!)
+  assert.equal(modeRows[1].style.display, 'none'); // swarm
+  assert.equal(modeRows[2].style.display, 'none'); // goal
+  assert.equal(modeRows[3].style.display, 'none'); // tower
+  assert.equal(slashItems[3].row.style.display, ''); // /plan unlocked
+});
+
+test('distinguishes Tier-1 (.slash-item) vs Tier-2 (.slash-item.is-skill) when gating /plan and /goal', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+
+  const makeRow = (name: string, isSkill: boolean) => {
+    const classes = new Set(['slash-item']);
+    if (isSkill) classes.add('is-skill');
+    const attributes = new Map<string, string>();
+    const nameEl = { textContent: name };
+    const row = {
+      hidden: false,
+      style: { display: '' },
+      children: [nameEl],
+      classList: {
+        contains: (c: string) => classes.has(c),
+        add: (c: string) => classes.add(c),
+        remove: (c: string) => classes.delete(c),
+      },
+      getAttribute: (k: string) => attributes.get(k) ?? null,
+      setAttribute: (k: string, v: string) => attributes.set(k, v),
+      hasAttribute: (k: string) => attributes.has(k),
+      removeAttribute: (k: string) => attributes.delete(k),
+    };
+    (nameEl as any).parentElement = row;
+    return { nameEl, row };
+  };
+
+  const menuRows = [
+    makeRow('/plan', false), // Tier-1 Kimi mode command
+    makeRow('/plan', true),  // Tier-2 provider skill command
+    makeRow('/goal', false), // Tier-1 Kimi mode command
+    makeRow('/goal', true),  // Tier-2 provider skill command
+    makeRow('/status', false),
+  ];
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: (selector: string) => {
+      if (selector === '.slash-menu .slash-name') return menuRows.map((m) => m.nameEl);
+      return [];
+    },
+    addEventListener: () => {},
+    createElement: () => ({}),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response('{}'),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const api = windowObject.__multiAgent;
+
+  // On Pi: caps.planMode === false, caps.goals === false.
+  // Tier-1 /plan and /goal must be hidden, but Tier-2 (.is-skill) /plan and /goal must stay visible!
+  api.setProvider('pi');
+  assert.equal(menuRows[0].row.style.display, 'none'); // Tier-1 /plan hidden
+  assert.equal(menuRows[1].row.style.display, '');     // Tier-2 /plan VISIBLE
+  assert.equal(menuRows[2].row.style.display, 'none'); // Tier-1 /goal hidden
+  assert.equal(menuRows[3].row.style.display, '');     // Tier-2 /goal VISIBLE
+  assert.equal(menuRows[4].row.style.display, '');     // Tier-1 /status visible
+
+  // On Claude: caps.planMode === true, caps.goals === false.
+  // Tier-1 /plan is visible. Tier-1 /goal is hidden, but Tier-2 (.is-skill) /goal stays visible!
+  api.setProvider('claude');
+  assert.equal(menuRows[0].row.style.display, '');     // Tier-1 /plan visible
+  assert.equal(menuRows[1].row.style.display, '');     // Tier-2 /plan visible
+  assert.equal(menuRows[2].row.style.display, 'none'); // Tier-1 /goal hidden
+  assert.equal(menuRows[3].row.style.display, '');     // Tier-2 /goal VISIBLE
+  assert.equal(menuRows[4].row.style.display, '');     // Tier-1 /status visible
+});
+
+test('slash menu active selection advances past invisible rows and protects enter key', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+
+  const docListeners = new Map<string, Array<(e: any) => void>>();
+  const dispatched: string[] = [];
+  const activeTarget: any = {
+    dispatchEvent: (ev: { key: string }) => {
+      dispatched.push(ev.key);
+      return true;
+    },
+  };
+
+  const makeRow = (name: string, isSkill: boolean, isActive = false) => {
+    const classes = new Set(['slash-item']);
+    if (isSkill) classes.add('is-skill');
+    if (isActive) classes.add('active');
+    const attributes = new Map<string, string>();
+    const nameEl = { textContent: name };
+    const row = {
+      hidden: false,
+      style: { display: '' },
+      children: [nameEl],
+      classList: {
+        contains: (c: string) => classes.has(c),
+        add: (c: string) => classes.add(c),
+        remove: (c: string) => classes.delete(c),
+      },
+      getAttribute: (k: string) => attributes.get(k) ?? null,
+      setAttribute: (k: string, v: string) => attributes.set(k, v),
+      hasAttribute: (k: string) => attributes.has(k),
+      removeAttribute: (k: string) => attributes.delete(k),
+    };
+    (nameEl as any).parentElement = row;
+    return { nameEl, row, classes };
+  };
+
+  const items = [
+    makeRow('/plan', false, true), // Tier-1 /plan (initially active, will be hidden on Pi)
+    makeRow('/plan', true, false), // Tier-2 /plan (.is-skill, stays visible on Pi)
+    makeRow('/status', false, false),
+  ];
+
+  const menuEl = {
+    querySelectorAll: (sel: string) => (sel === '.slash-item' ? items.map((i) => i.row) : []),
+    querySelector: () => activeTarget,
+  };
+
+  class FakeKeyboardEvent {
+    key: string;
+    code: string;
+    constructor(_type: string, init: any) {
+      this.key = init.key;
+      this.code = init.code;
+    }
+  }
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    activeElement: activeTarget,
+    querySelector: (sel: string) => (sel === '.slash-menu' ? menuEl : null),
+    querySelectorAll: (sel: string) => (sel === '.slash-menu .slash-name' ? items.map((i) => i.nameEl) : []),
+    addEventListener: (type: string, fn: (e: any) => void) => {
+      const list = docListeners.get(type) ?? [];
+      list.push(fn);
+      docListeners.set(type, list);
+    },
+    createElement: () => ({ className: '', textContent: '' }),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    KeyboardEvent: FakeKeyboardEvent,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response('{}'),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  // Switching to Pi hides Tier-1 /plan (items[0])
+  windowObject.__multiAgent.setProvider('pi');
+  assert.equal(items[0].row.style.display, 'none');
+  assert.equal(items[1].row.style.display, '');
+
+  // gateSlashMenu advanced active selection from invisible items[0] to visible items[1]
+  assert.equal(items[0].classes.has('active'), false);
+  assert.equal(items[1].classes.has('active'), true);
+  assert.deepEqual(dispatched, ['ArrowDown']);
+
+  // Enter when visible Tier-2 skill is active must NOT be blocked
+  let enterPrevented = false;
+  for (const fn of docListeners.get('keydown') ?? []) {
+    fn({
+      key: 'Enter',
+      code: 'Enter',
+      target: activeTarget,
+      preventDefault: () => { enterPrevented = true; },
+      stopImmediatePropagation: () => {},
+    });
+  }
+  assert.equal(enterPrevented, false);
+});
+
+test('resets kimi.mode state on provider switch so stale plan/goal/thinking does not bleed', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+
+  let resetModeCalled = false;
+  const modeStore: any = {
+    thinking: { value: 'high' },
+    draftThinkingExplicit: { value: true },
+    thinkingBySession: { s1: 'high' },
+    planModeBySession: { s1: true },
+    goalModeBySession: { s1: true },
+    draftModes: {
+      planMode: true,
+      swarmMode: true,
+      towerMode: false,
+      towerBase: undefined,
+      goalMode: true,
+    },
+    planMode: { value: true },
+    goalMode: { value: true },
+    resetMode: () => {
+      resetModeCalled = true;
+    },
+  };
+  const sessionsStore: any = {
+    activeSessionId: 's1',
+    sessions: [{ id: 's1' }],
+    setActiveSessionId: (id: any) => { sessionsStore.activeSessionId = id; },
+    setSessions: (items: any[]) => { sessionsStore.sessions = items; },
+  };
+  const workspacesStore: any = {
+    workspaces: [{ id: 'w1' }],
+    selectWorkspace: () => {},
+  };
+  const invalidatedWorkspaces: string[] = [];
+  const invalidatedSessions: string[] = [];
+  const modelsStore: any = {
+    models: [{ id: 'm1' }],
+    draftModel: 'm1',
+    defaultModel: 'm1',
+    skillsByWorkspace: { wd_shared: [{ name: 'pi-only' }] },
+    skillsFetchedByWorkspace: { wd_shared: true },
+    skillsBySession: { s1: [{ name: 'pi-only' }] },
+    skillsFetchedBySession: { s1: true },
+    invalidateSkillsForWorkspace: (id: string) => {
+      invalidatedWorkspaces.push(id);
+      delete modelsStore.skillsByWorkspace[id];
+      delete modelsStore.skillsFetchedByWorkspace[id];
+    },
+    invalidateSkillsForSession: (id: string) => {
+      invalidatedSessions.push(id);
+      delete modelsStore.skillsBySession[id];
+      delete modelsStore.skillsFetchedBySession[id];
+    },
+    setModels: (items: any[]) => { modelsStore.models = items; },
+    setDraftModel: (m: any) => { modelsStore.draftModel = m; },
+    setDefaultModel: (m: any) => { modelsStore.defaultModel = m; },
+  };
+  const storeMap = new Map<string, any>([
+    ['kimi.mode', modeStore],
+    ['kimi.sessions', sessionsStore],
+    ['kimi.workspaces', workspacesStore],
+    ['kimi.models', modelsStore],
+  ]);
+
+  const appRoot = {
+    __vue_app__: {
+      _context: { provides: {} },
+      _instance: { setupState: {} },
+      config: { globalProperties: { $pinia: { _s: storeMap } } },
+    },
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    dispatchEvent: () => true,
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: {
+      readyState: 'complete',
+      documentElement: fakeElement('html'),
+      addEventListener: () => {},
+      createElement: (tag: string) => fakeElement(tag),
+      querySelector: (sel: string) => (sel === '#app' ? appRoot : null),
+      querySelectorAll: () => [],
+    },
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    Event: class { type: string; constructor(t: string) { this.type = t; } },
+    PopStateEvent: class { type: string; constructor(t: string) { this.type = t; } },
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response('{}'),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  windowObject.__multiAgent.setProvider('kimi');
+  windowObject.__multiAgent.switchProvider('pi');
+
+  // Verify resetMode was invoked and refs/properties were cleanly cleared
+  assert.equal(resetModeCalled, true);
+  assert.equal(modeStore.thinking.value, undefined);
+  assert.equal(modeStore.draftThinkingExplicit.value, false);
+  assert.deepEqual(Object.keys(modeStore.thinkingBySession), []);
+  assert.deepEqual(Object.keys(modeStore.planModeBySession), []);
+  assert.deepEqual(Object.keys(modeStore.goalModeBySession), []);
+  assert.equal(modeStore.draftModes.planMode, false);
+  assert.equal(modeStore.draftModes.goalMode, false);
+  assert.equal(modeStore.planMode.value, false);
+  assert.equal(modeStore.goalMode.value, false);
+  assert.deepEqual(invalidatedWorkspaces, ['wd_shared']);
+  assert.deepEqual(invalidatedSessions, ['s1']);
+});
+
+test('handles argument_hint and argumentHint cleanly for both /cmd and /skill:cmd rows', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+
+  const makeRow = (name: string) => {
+    const classes = new Set(['slash-item', 'is-skill']);
+    const nameEl: any = { textContent: name, nextSibling: null };
+    const children: any[] = [nameEl];
+    const row = {
+      hidden: false,
+      style: { display: '' },
+      children,
+      classList: { contains: (c: string) => classes.has(c) },
+      hasAttribute: () => false,
+      querySelector: (sel: string) => children.find((c) => c.className === sel.replace(/^\./, '')) ?? null,
+      insertBefore: (node: any, ref: any) => {
+        const idx = children.indexOf(ref);
+        if (idx === -1) children.push(node);
+        else children.splice(idx, 0, node);
+        return node;
+      },
+      appendChild: (node: any) => { children.push(node); return node; },
+    };
+    nameEl.parentElement = row;
+    return { nameEl, row };
+  };
+
+  const rows = [
+    makeRow('/review'),
+    makeRow('/skill:review'),
+    makeRow('/deploy'),
+    makeRow('/skill:deploy'),
+  ];
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: (selector: string) => {
+      if (selector === '.slash-menu .slash-name') return rows.map((r) => r.nameEl);
+      return [];
+    },
+    addEventListener: () => {},
+    createElement: (tag: string) => fakeElement(tag),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  const skillsPayload = JSON.stringify({
+    code: 0,
+    data: {
+      skills: [
+        { name: 'review', argument_hint: '<pr-or-branch>' },
+        { name: 'skill:deploy', argumentHint: '<env>' },
+      ],
+    },
+  });
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async (input: unknown) => {
+      const url = String((input as any)?.url ?? input);
+      if (url.includes('/skills')) {
+        return new Response(skillsPayload, { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('{}');
+    },
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  windowObject.__multiAgent.setProvider('pi');
+  await windowObject.fetch('http://localhost:58630/api/v1/sessions/pi_1/skills?provider=pi');
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Both /review and /skill:review receive the hint
+  const hintReviewBare = rows[0].row.querySelector('.multi-agent-slash-hint');
+  const hintReviewPrefixed = rows[1].row.querySelector('.multi-agent-slash-hint');
+  assert.equal(hintReviewBare?.textContent, '<pr-or-branch>');
+  assert.equal(hintReviewPrefixed?.textContent, '<pr-or-branch>');
+
+  // Both /deploy and /skill:deploy receive the hint
+  const hintDeployBare = rows[2].row.querySelector('.multi-agent-slash-hint');
+  const hintDeployPrefixed = rows[3].row.querySelector('.multi-agent-slash-hint');
+  assert.equal(hintDeployBare?.textContent, '<env>');
+  assert.equal(hintDeployPrefixed?.textContent, '<env>');
+});
+
+test('enhanceQuestionCards adds live filter bar for >6 options and syncExtBar renders Pi extension statuses/widgets', async () => {
+  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const qopts = fakeElement('div');
+  qopts.className = 'qopts';
+  for (let i = 0; i < 8; i += 1) {
+    const opt = fakeElement('label');
+    opt.className = 'qopt';
+    opt.textContent = i === 3 ? 'cx/gpt-6.1-sol (alibb9)' : `model-${i}`;
+    qopts.appendChild(opt);
+  }
+  const qpane = fakeElement('div');
+  qpane.className = 'qpane';
+  qpane.appendChild(qopts);
+  const qcard = fakeElement('div');
+  qcard.className = 'qcard';
+  qcard.appendChild(qpane);
+
+  const composer = fakeElement('div');
+  composer.className = 'composer';
+  const mainPane = fakeElement('div');
+  mainPane.className = 'main-pane';
+  mainPane.appendChild(qcard);
+  mainPane.appendChild(composer);
+
+  const wsCreated: any[] = [];
+  class MockWebSocket {
+    listeners = new Map<string, Array<(ev: any) => void>>();
+    readyState = 1;
+    constructor(public url: string) {
+      wsCreated.push(this);
+    }
+    addEventListener(type: string, fn: (ev: any) => void) {
+      const list = this.listeners.get(type) ?? [];
+      list.push(fn);
+      this.listeners.set(type, list);
+    }
+    emit(type: string, ev: any) {
+      for (const fn of this.listeners.get(type) ?? []) fn(ev);
+    }
+    send() {}
+    close() {}
+  }
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: mainPane,
+    querySelector: (sel: string) => mainPane.querySelector(sel),
+    querySelectorAll: (sel: string) => {
+      if (sel === '.qcard .qpane .qopts') return [qopts];
+      return mainPane.querySelectorAll(sel);
+    },
+    addEventListener: () => {},
+    createElement: (tag: string) => fakeElement(tag),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/sessions/pi_s1', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+    WebSocket: MockWebSocket,
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    WebSocket: MockWebSocket,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response('{}'),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  // 1. Search bar injected for 8 options and filters live
+  const searchBox = qpane.querySelector('.multi-agent-qsearch');
+  assert.ok(searchBox, 'expected search bar when options > 6');
+  const searchInput = searchBox.querySelector('.multi-agent-qsearch__input');
+  const countEl = searchBox.querySelector('.multi-agent-qsearch__count');
+  assert.equal(countEl.textContent, '8 / 8');
+
+  searchInput.value = 'gpt-6.1';
+  searchInput._listeners.get('input')?.();
+  assert.equal(countEl.textContent, '1 / 8');
+  const optEls = qopts.querySelectorAll('.qopt');
+  assert.equal(optEls[3].hidden, false);
+  assert.equal(optEls[0].hidden, true);
+  assert.equal(optEls[0].getAttribute('data-multi-agent-qhidden'), '');
+
+  // Escape with query clears filter
+  let stopped = false;
+  searchInput._listeners.get('keydown')?.({
+    key: 'Escape',
+    stopPropagation: () => { stopped = true; },
+    preventDefault: () => {},
+  });
+  assert.equal(stopped, true);
+  assert.equal(searchInput.value, '');
+  assert.equal(countEl.textContent, '8 / 8');
+  assert.equal(optEls[0].hidden, false);
+
+  // 2. WS extension_ui message renders status pills and widgets for Pi session
+  windowObject.__multiAgent.setProvider('pi');
+  const ws = new windowObject.WebSocket('ws://localhost:58630/api/v1/ws');
+  ws.emit('message', {
+    data: JSON.stringify({
+      type: 'extension_ui',
+      session_id: 'pi_s1',
+      statuses: { 'plan-mode': 'Plan active' },
+      widgets: { plan: { lines: ['A', 'B'] } },
+      title: 'Planning',
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  const extBar = mainPane.querySelector('.multi-agent-ext-bar');
+  assert.ok(extBar, 'expected Pi extension UI bar above composer');
+  assert.equal(extBar.querySelector('.multi-agent-ext-pill')?.textContent, 'plan-mode: Plan active');
+  assert.equal(extBar.querySelector('.multi-agent-ext-widgets')?.textContent, 'A\nB');
+
+  // Switching away from Pi hides the Pi extension bar
+  windowObject.location.pathname = '/sessions/claude_c1';
+  windowObject.__multiAgent.setProvider('claude');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(mainPane.querySelector('.multi-agent-ext-bar'), null);
+});
+
+test('Pi bare /plan bypasses Kimi mode hijack and dispatches POST /prompts on Enter and Send click', async () => {
+  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const editor = fakeElement('div');
+  editor.className = 'ProseMirror';
+  editor.textContent = '/plan';
+  editor.closest = (sel: string) => (sel.includes('.composer') ? composer : null);
+
+  const sendBtn = fakeElement('button');
+  sendBtn.className = 'send';
+  sendBtn.setAttribute('aria-label', '发送 ↵');
+  sendBtn.closest = (sel: string) => (sel.includes('button') ? sendBtn : null);
+
+  const composer = fakeElement('div');
+  composer.className = 'composer';
+  composer.appendChild(editor);
+  composer.appendChild(sendBtn);
+
+  const docListeners = new Map<string, Array<(e: any) => void>>();
+  const posted: Array<{ url: string; body: string }> = [];
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: composer,
+    activeElement: editor,
+    querySelector: (sel: string) => {
+      if (sel.includes('ProseMirror')) return editor;
+      if (sel === '.slash-menu') return null;
+      return composer.querySelector(sel);
+    },
+    querySelectorAll: (sel: string) => composer.querySelectorAll(sel),
+    addEventListener: (ev: string, fn: (e: any) => void) => {
+      const list = docListeners.get(ev) ?? [];
+      list.push(fn);
+      docListeners.set(ev, list);
+    },
+    createElement: (tag: string) => fakeElement(tag),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/sessions/pi_p1', search: '', hash: '#token=t1' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async (input: unknown, init?: any) => {
+      if (init?.method === 'POST') {
+        posted.push({ url: String((input as any)?.url ?? input), body: String(init?.body ?? '') });
+      }
+      return new Response('{}');
+    },
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  windowObject.__multiAgent.setProvider('pi');
+
+  // 1. Enter keydown bypasses client hijack and posts /plan
+  let prevented = false;
+  let stopped = false;
+  for (const fn of docListeners.get('keydown') ?? []) {
+    fn({
+      key: 'Enter',
+      target: editor,
+      preventDefault: () => { prevented = true; },
+      stopImmediatePropagation: () => { stopped = true; },
+    });
+  }
+  assert.equal(prevented, true);
+  assert.equal(stopped, true);
+  assert.equal(editor.textContent, '');
+  assert.equal(posted.length, 1);
+  assert.match(posted[0]!.url, /\/api\/v1\/sessions\/pi_p1\/prompts\?provider=pi$/);
+  assert.deepEqual(JSON.parse(posted[0]!.body), { content: [{ type: 'text', text: '/plan' }] });
+
+  // 2. Send button click also bypasses client hijack when editor has /plan
+  editor.textContent = '/plan';
+  let clickPrevented = false;
+  for (const fn of docListeners.get('click') ?? []) {
+    fn({
+      target: sendBtn,
+      preventDefault: () => { clickPrevented = true; },
+      stopImmediatePropagation: () => {},
+    });
+  }
+  assert.equal(clickPrevented, true);
+  assert.equal(posted.length, 2);
+});
+
+

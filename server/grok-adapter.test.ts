@@ -5,7 +5,18 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { GrokAdapter, GrokProviderAdapter, grokContextWindow, grokEffort, resolveGrokBin, GROK_EFFORTS, acpPrompt, materializePromptFile } from './grok-adapter.js';
+import {
+  GrokAdapter,
+  GrokProviderAdapter,
+  grokContextWindow,
+  grokEffort,
+  resolveGrokBin,
+  GROK_EFFORTS,
+  acpPrompt,
+  materializePromptFile,
+  discoverGrokDiskSkills,
+  isKnownGrokReasoningModel,
+} from './grok-adapter.js';
 import { ProviderError } from './types.js';
 
 async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: string; stdinLog: string }> {
@@ -1376,6 +1387,527 @@ test('materializePromptFile decodes base64 images into temp files and writes pla
   assert.equal(existsSync(promptFile.path), false);
   assert.equal(existsSync(imgPath), false);
 });
+
+test('commandsCache caches discovered ACP commands and clearCommandsCache invalidates it', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-cache-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const spawnLog = join(base, 'spawn.log');
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_FAKE_ACP: '1', GROK_SPAWN_LOG: spawnLog },
+    });
+    const cmds1 = await adapter.listCommands();
+    assert.ok(cmds1.some((c) => c.name === 'doctor'));
+    assert.equal(await readFile(spawnLog, 'utf8'), 'x');
+
+    const cmds2 = await adapter.listCommands();
+    assert.ok(cmds2.some((c) => c.name === 'doctor'));
+    assert.equal(await readFile(spawnLog, 'utf8'), 'x');
+
+    adapter.clearCommandsCache();
+    await (adapter as any).recycleAcpClients();
+    assert.equal(adapter.client, null);
+
+    const cmds3 = await adapter.listCommands();
+    assert.ok(cmds3.some((c) => c.name === 'doctor'));
+    assert.equal(await readFile(spawnLog, 'utf8'), 'xx');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('recycles idle ACP child process after recycleGraceMs when not busy', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-idle-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_FAKE_ACP: '1' },
+      recycleGraceMs: 30,
+    });
+    const cmds = await adapter.listCommands();
+    assert.ok(cmds.some((c) => c.name === 'doctor'));
+    assert.ok(adapter.client?.ready);
+
+    await new Promise((r) => setTimeout(r, 70));
+    assert.equal(adapter.client, null);
+
+    const cmds2 = await adapter.listCommands();
+    assert.ok(cmds2.some((c) => c.name === 'doctor'));
+    assert.equal(adapter.client, null);
+
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'hi' }));
+
+    await new Promise((r) => setTimeout(r, 70));
+    assert.equal(adapter.client, null);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('does not recycle ACP child process while question or turn is active', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-q-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_FAKE_ACP: '1', GROK_FAKE_QUESTION: '1' },
+      recycleGraceMs: 25,
+    });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'ask me' });
+    let qId = '';
+    for await (const ev of handle.events) {
+      if ((ev as any).kind === 'question') {
+        qId = (ev as any).payload.questionId;
+        break;
+      }
+    }
+    assert.ok(qId);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(adapter.client?.ready);
+
+    await adapter.resolveQuestion(session.id, qId, 'Alpha');
+    await drain(handle);
+
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(adapter.client, null);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('listModels merges acp modelState when ready and protects non-Grok models offline', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-models-parity-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin });
+
+    // 1. Offline fallback: inner.listModels returns a Grok model and a non-Grok model (gemini-3.8-flash)
+    (adapter as any).inner.listModels = async () => ({
+      defaultModel: 'grok-4.5',
+      models: ['grok-4.5', 'gemini-3.8-flash'],
+    });
+
+    const offlineModels = await adapter.listModels();
+    const grokModel = offlineModels.find((m) => m.model === 'grok-4.5');
+    const geminiModel = offlineModels.find((m) => m.model === 'gemini-3.8-flash');
+
+    assert.ok(grokModel);
+    assert.deepEqual(grokModel.capabilities, ['thinking']);
+    assert.equal(grokModel.default_effort, 'high');
+    assert.deepEqual(grokModel.support_efforts, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+    assert.ok(geminiModel);
+    assert.deepEqual(geminiModel.capabilities, []);
+    assert.equal(geminiModel.default_effort, undefined);
+    assert.equal(geminiModel.support_efforts, undefined);
+
+    // 2. ACP client ready: merges modelState with reasoningEfforts & custom totalContextTokens
+    const fakeClient = {
+      ready: true,
+      modelState: {
+        currentModelId: 'gemini-3.8-flash',
+        availableModels: [
+          {
+            modelId: 'gemini-3.8-flash',
+            name: 'Gemini 3.8 Flash',
+            description: 'Fast multimodal model',
+            totalContextTokens: 1_048_576,
+            supportsReasoningEffort: true,
+            reasoningEffort: 'low',
+            reasoningEfforts: [{ id: '1', value: 'low' }, { id: '2', value: 'high' }],
+          },
+        ],
+      },
+    };
+    (adapter as any).acpClients.set(false, fakeClient);
+
+    const mergedModels = await adapter.listModels();
+    const mergedGemini = mergedModels.find((m) => m.model === 'gemini-3.8-flash');
+    assert.ok(mergedGemini);
+    assert.equal(mergedGemini.display_name, 'Gemini 3.8 Flash');
+    assert.equal(mergedGemini.description, 'Fast multimodal model');
+    assert.equal(mergedGemini.max_context_size, 1_048_576);
+    assert.deepEqual(mergedGemini.capabilities, ['thinking']);
+    assert.deepEqual(mergedGemini.support_efforts, ['low', 'high']);
+    assert.equal(mergedGemini.default_effort, 'low');
+
+    // 3. ACP client reports supportsReasoningEffort: false
+    fakeClient.modelState.availableModels[0]!.supportsReasoningEffort = false;
+    const noEffortModels = await adapter.listModels();
+    const noEffortGemini = noEffortModels.find((m) => m.model === 'gemini-3.8-flash');
+    assert.ok(noEffortGemini);
+    assert.deepEqual(noEffortGemini.capabilities, []);
+    assert.equal(noEffortGemini.support_efforts, undefined);
+    assert.equal(noEffortGemini.default_effort, undefined);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('auto permission mode forwards autoMode: true to ACP session/new', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-auto-'));
+  const rpcLog = join(base, 'rpc.log');
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_FAKE_ACP: '1', GROK_RPC_LOG: rpcLog },
+    });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await adapter.setPermission(session.id, 'auto');
+    assert.equal(adapter.getPermission(session.id), 'auto');
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'hello' });
+    await drain(handle);
+
+    const logContent = await readFile(rpcLog, 'utf8');
+    const calls = logContent.trim().split('\n').map((l) => JSON.parse(l));
+    const sessionNewCall = calls.find((c) => c.method === 'session/new');
+    assert.ok(sessionNewCall);
+    assert.equal(sessionNewCall.params?._meta?.autoMode, true);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('setThinking normalizes on to high and auto to undefined/deleted', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-thinking-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+
+    await adapter.setThinking(session.id, 'on');
+    assert.equal(adapter.getThinking(session.id), 'high');
+    assert.equal(grokEffort(adapter.getThinking(session.id)), 'high');
+
+    await adapter.setThinking(session.id, 'auto');
+    assert.equal(adapter.getThinking(session.id), undefined);
+    assert.equal(grokEffort(adapter.getThinking(session.id)), undefined);
+
+    await adapter.setThinking('__default__', 'on');
+    assert.equal(adapter.getThinking(session.id), 'high');
+
+    await adapter.setThinking('__default__', 'auto');
+    assert.equal(adapter.getThinking(session.id), undefined);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('tool_call_update emits status: delta on in_progress and terminal on completed/failed', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-tool-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin });
+    const sessionId = 'test-session';
+    const turnId = 'test-turn';
+    const events: any[] = [];
+    const stream = {
+      push: (ev: any) => events.push(ev),
+    };
+
+    // in_progress should emit status: 'delta'
+    (adapter as any).mapAcpEvent(sessionId, turnId, stream, {
+      type: 'tool_call_update',
+      sessionId,
+      toolCallId: 'call-1',
+      title: 'Bash',
+      status: 'in_progress',
+      rawOutput: 'running command...',
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].kind, 'tool');
+    assert.equal(events[0].status, 'delta');
+    assert.equal(events[0].payload.is_error, false);
+
+    // pending should emit status: 'delta'
+    (adapter as any).mapAcpEvent(sessionId, turnId, stream, {
+      type: 'tool_call_update',
+      sessionId,
+      toolCallId: 'call-1',
+      title: 'Bash',
+      status: 'pending',
+      rawOutput: '',
+    });
+    assert.equal(events.length, 2);
+    assert.equal(events[1].status, 'delta');
+
+    // completed should emit status: 'completed'
+    (adapter as any).mapAcpEvent(sessionId, turnId, stream, {
+      type: 'tool_call_update',
+      sessionId,
+      toolCallId: 'call-1',
+      title: 'Bash',
+      status: 'completed',
+      rawOutput: 'done',
+    });
+    assert.equal(events.length, 3);
+    assert.equal(events[2].status, 'completed');
+    assert.equal(events[2].payload.is_error, false);
+
+    // failed should emit status: 'failed'
+    (adapter as any).mapAcpEvent(sessionId, turnId, stream, {
+      type: 'tool_call_update',
+      sessionId,
+      toolCallId: 'call-1',
+      title: 'Bash',
+      status: 'failed',
+      rawOutput: 'command failed',
+    });
+    assert.equal(events.length, 4);
+    assert.equal(events[3].status, 'failed');
+    assert.equal(events[3].payload.is_error, true);
+
+    // missing rawOutput must NOT serialize as '""'
+    (adapter as any).mapAcpEvent(sessionId, turnId, stream, {
+      type: 'tool_call_update',
+      sessionId,
+      toolCallId: 'call-1',
+      title: 'Bash',
+      status: 'in_progress',
+    });
+    assert.equal(events.length, 5);
+    assert.equal(events[4].payload.output, undefined);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('non-grok ACP model with empty reasoningEfforts does not inherit GROK_EFFORTS and setThinking auto resets live reasoning_effort', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-efforts-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin });
+
+    const setConfigCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
+    const fakeClient = {
+      ready: true,
+      alwaysApproveEnabled: false,
+      modelState: {
+        currentModelId: 'grok-4.6',
+        availableModels: [
+          {
+            modelId: 'grok-4.6',
+            supportsReasoningEffort: true,
+            reasoningEffort: 'high',
+            reasoningEfforts: [{ id: 'low', value: 'low' }, { id: 'high', value: 'high', default: true }],
+          },
+          {
+            modelId: 'gemini-3.8-flash',
+            supportsReasoningEffort: true,
+            reasoningEfforts: [],
+          },
+        ],
+      },
+      getConfigOptions: () => [{ id: 'reasoning_effort', currentValue: 'low' }],
+      sessionSetModel: async () => undefined,
+      sessionSetConfigOption: async (sessionId: string, configId: string, value: string) => {
+        setConfigCalls.push({ sessionId, configId, value });
+        return [];
+      },
+    };
+    (adapter as any).acpClients.set(false, fakeClient);
+    (adapter as any).sessionClient.set('sess-1', fakeClient);
+    (adapter as any).acpSessionIds.set('sess-1', 'acp-1');
+    await adapter.setModel('sess-1', 'grok-4.6');
+
+    const models = await adapter.listModels();
+    const geminiFromFallback = models.find((m) => m.model === 'gemini-3.8-flash');
+    // Fake models CLI only returns grok-4.5/4.6/grok; force catch branch for gemini-3.8-flash
+    (adapter as any).inner.listModels = async () => { throw new Error('offline'); };
+    const acpOnlyModels = await adapter.listModels();
+    const geminiModel = acpOnlyModels.find((m) => m.model === 'gemini-3.8-flash');
+    assert.ok(geminiModel);
+    assert.equal(geminiModel.support_efforts, undefined);
+    assert.equal(geminiModel.default_effort, undefined);
+    assert.equal(geminiFromFallback, undefined);
+
+    await adapter.setThinking('sess-1', 'low');
+    await adapter.setThinking('sess-1', 'auto');
+    assert.deepEqual(setConfigCalls, [
+      { sessionId: 'acp-1', configId: 'reasoning_effort', value: 'low' },
+      { sessionId: 'acp-1', configId: 'reasoning_effort', value: 'high' },
+    ]);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('recycleIfIdle recycles both standard client and alwaysApproveClient', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-recycle-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({
+      grokBin: bin,
+      env: { GROK_FAKE_ACP: '1' },
+      recycleGraceMs: 0,
+    });
+    const client1 = await (adapter as any).ensureAcp(false);
+    const client2 = await (adapter as any).ensureAcp(true);
+    assert.ok(client1);
+    assert.ok(client2);
+    assert.equal(adapter.client, client1);
+    assert.equal(adapter.alwaysApproveClient, client2);
+
+    await adapter.recycleIfIdle();
+
+    assert.equal(adapter.client, null);
+    assert.equal(adapter.alwaysApproveClient, null);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('bounds skillCache and commandsCache and clears state on close, delete, and dispose', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-bounds-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin });
+
+    // Test commandsCache bounding
+    for (let i = 0; i < 70; i++) {
+      (adapter as any).setCommandsCache(`key-${i}`, [{ name: `cmd-${i}` }]);
+    }
+    assert.ok((adapter as any).commandsCache.size <= 64);
+
+    // Test skillCache bounding
+    for (let i = 0; i < 70; i++) {
+      (adapter as any).setSkillCache(`dir-${i}`, [{ name: `skill-${i}`, description: 'd' }]);
+    }
+    assert.ok((adapter as any).skillCache.size <= 64);
+
+    // Set per-session state
+    const sId = 'sess-123';
+    (adapter as any).sessionCwd.set(sId, '/tmp');
+    (adapter as any).acpSessionIds.set(sId, 'acp-123');
+    (adapter as any).sessionUsage.set(sId, { input_tokens: 10, output_tokens: 20 });
+    (adapter as any).renames.set(sId, 'Renamed');
+    (adapter as any).commandsCache.set(sId, [{ name: 'test' }]);
+
+    // Close session should clear per-session state
+    await adapter.close(sId);
+    assert.equal((adapter as any).sessionCwd.has(sId), false);
+    assert.equal((adapter as any).acpSessionIds.has(sId), false);
+    assert.equal((adapter as any).sessionUsage.has(sId), false);
+    assert.equal((adapter as any).renames.has(sId), false);
+    assert.equal((adapter as any).commandsCache.has(sId), false);
+
+    // Dispose should clear all caches
+    await adapter.dispose();
+    assert.equal((adapter as any).commandsCache.size, 0);
+    assert.equal((adapter as any).skillCache.size, 0);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('discoverGrokDiskSkills adheres to maxEntries bound', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-disk-'));
+  try {
+    const skillsDir = join(base, '.grok', 'skills');
+    await mkdir(skillsDir, { recursive: true });
+    for (let i = 0; i < 20; i++) {
+      await writeFile(join(skillsDir, `skill-${i}.md`), `# Skill ${i}\nDescription`);
+    }
+    const skills = await discoverGrokDiskSkills(base, { maxEntries: 5 });
+    assert.ok(skills.length <= 5);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('GrokProviderAdapter hides zero-turn seed-only (session) directories and extracts firstPrompt title when summary is empty', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-empty-filter-'));
+  const sessionsDir = join(base, 'sessions');
+  const cwdKey = encodeURIComponent('/tmp/grok-proj');
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+
+    // 1. Seed-only 0-message session with "(session)" placeholder -> must be filtered out
+    const emptyId = '11111111-1111-4111-8111-111111111111';
+    const emptyDir = join(sessionsDir, cwdKey, emptyId);
+    await mkdir(emptyDir, { recursive: true });
+    await writeFile(
+      join(emptyDir, 'summary.json'),
+      JSON.stringify({
+        info: { id: emptyId, cwd: '/tmp/grok-proj' },
+        num_messages: 0,
+        session_summary: '(session)',
+        updated_at: '2026-11-15T10:00:00.000Z',
+      }),
+    );
+    await writeFile(
+      join(emptyDir, 'chat_history.jsonl'),
+      `${JSON.stringify({ type: 'user', content: '<system-reminder>workflow seed</system-reminder>' })}\n`,
+    );
+
+    // 2. Real conversation session with empty summary -> must be shown with first user prompt title
+    const realId = '22222222-2222-4222-8222-222222222222';
+    const realDir = join(sessionsDir, cwdKey, realId);
+    await mkdir(realDir, { recursive: true });
+    await writeFile(
+      join(realDir, 'summary.json'),
+      JSON.stringify({
+        info: { id: realId, cwd: '/tmp/grok-proj' },
+        num_messages: 2,
+        session_summary: '',
+        updated_at: '2026-11-15T10:01:00.000Z',
+      }),
+    );
+    await writeFile(
+      join(realDir, 'chat_history.jsonl'),
+      [
+        JSON.stringify({ type: 'user', content: '<system-reminder>seed</system-reminder>' }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\n\n</user_query>' }] }),
+        JSON.stringify({ type: 'user', content: '<user_query>\nExplain Grok session filtering\n</user_query>' }),
+        JSON.stringify({ type: 'assistant', content: 'Sure!' }),
+      ].join('\n') + '\n',
+    );
+
+    adapter = new GrokProviderAdapter({ grokBin: bin, sessionsDir });
+    const page = await adapter.list();
+    assert.deepEqual(page.items.map((s) => s.id), [realId]);
+    assert.equal(page.items[0]?.title, 'Explain Grok session filtering');
+    assert.equal(page.items[0]?.extras?.last_prompt, 'Explain Grok session filtering');
+
+    // Empty session remains visible only while actively running a turn
+    (adapter as any).acpTurns.set(emptyId, {});
+    const livePage = await adapter.list();
+    assert.deepEqual(livePage.items.map((s) => s.id), [realId, emptyId]);
+    assert.notEqual(livePage.items[1]?.title, '(session)');
+    assert.equal(livePage.items[1]?.extras?.last_prompt, '');
+    (adapter as any).acpTurns.delete(emptyId);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 
 
 

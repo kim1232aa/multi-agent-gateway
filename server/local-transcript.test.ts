@@ -807,3 +807,94 @@ test('merges Claude and Pi bash execution messages in historyTurns ONLY when met
   assert.equal(pagePlain.items[0]?.prompt, 'check directory');
   assert.equal(pagePlain.items[1]?.prompt, '$ pwd\n/home/user');
 });
+
+test('normalizes subAgentActivity tool to Agent', () => {
+  const normObj = normalizeKimiWebTool('subAgentActivity', {
+    description: 'Investigate bug',
+    prompt: 'Look into the issue',
+  });
+  assert.equal(normObj.name, 'Agent');
+  assert.equal((normObj.input as Record<string, unknown>).description, 'Investigate bug');
+  assert.equal((normObj.input as Record<string, unknown>).prompt, 'Look into the issue');
+
+  const normStr = normalizeKimiWebTool('subAgentActivity', 'Check logs and analyze');
+  assert.equal(normStr.name, 'Agent');
+  assert.equal((normStr.input as Record<string, unknown>).description, 'Check logs and analyze');
+  assert.equal((normStr.input as Record<string, unknown>).prompt, 'Check logs and analyze');
+});
+
+test('evicts oldest inactive sessions when exceeding MAX_SESSIONS', () => {
+  const hub = new LocalTranscriptHub();
+  // Create 64 inactive sessions
+  for (let i = 1; i <= 64; i++) {
+    hub.submitPrompt(`s${i}`, `p${i}`, 'running', `prompt ${i}`);
+    hub.finishPrompt(`s${i}`, `p${i}`, 'completed');
+  }
+  assert.equal(hub.sessionCount(), 64);
+
+  // Accessing a 65th session should evict s1 (oldest inactive)
+  hub.submitPrompt('s65', 'p65', 'running', 'prompt 65');
+  hub.finishPrompt('s65', 'p65', 'completed');
+  assert.equal(hub.sessionCount(), 64);
+  assert.equal(hub.currentSeq('s1'), 0); // s1 was evicted, newly accessed state starts at seq 0
+
+  // An active session with running turn is protected from eviction
+  const activeTurn = hub.beginTurn('s2', 'live turn');
+  for (let i = 66; i <= 80; i++) {
+    hub.submitPrompt(`s${i}`, `p${i}`, 'running', `prompt ${i}`);
+    hub.finishPrompt(`s${i}`, `p${i}`, 'completed');
+  }
+  assert.equal(hub.activeItems('s2').length, 1);
+  activeTurn.end('completed');
+});
+
+test('caps prompts, tasks, interactions, and toolSubagentLinks per session cleanly', () => {
+  const hub = new LocalTranscriptHub();
+  const sid = 's-bounded';
+
+  // Active running tasks are protected from eviction; terminal tasks are capped at 100
+  hub.upsertTask(sid, { taskId: 'task-running', kind: 'shell', state: 'running', detached: false, outputTail: '' });
+  for (let i = 1; i <= 120; i++) {
+    hub.upsertTask(sid, { taskId: `task-${i}`, kind: 'shell', state: 'completed', detached: false, outputTail: '' });
+  }
+  const tasks = hub.currentTasks(sid);
+  assert.equal(tasks.length, 100);
+  assert.equal(tasks.some((t) => t.taskId === 'task-running'), true);
+
+  // Active prompts are protected; completed prompts are capped at 100
+  hub.submitPrompt(sid, 'prompt-running', 'running', 'running prompt');
+  for (let i = 1; i <= 120; i++) {
+    hub.submitPrompt(sid, `prompt-${i}`, 'running', `prompt ${i}`);
+    hub.finishPrompt(sid, `prompt-${i}`, 'completed');
+  }
+  const prompts = hub.currentPrompts(sid);
+  assert.equal(prompts.length, 100);
+  assert.equal(prompts.some((p) => p.promptId === 'prompt-running'), true);
+
+  // Pending interactions are protected; settled interactions are capped at 100
+  hub.requestInteraction(sid, {
+    interactionId: 'inter-pending',
+    interactionKind: 'approval',
+    state: 'pending',
+    createdAt: new Date().toISOString(),
+  } as any);
+  for (let i = 1; i <= 120; i++) {
+    hub.requestInteraction(sid, {
+      interactionId: `inter-${i}`,
+      interactionKind: 'approval',
+      state: 'approved',
+      createdAt: new Date().toISOString(),
+    } as any);
+  }
+  const interactions = hub.currentInteractions(sid);
+  assert.equal(interactions.length, 100);
+  assert.equal(interactions.some((item) => item.interactionId === 'inter-pending'), true);
+
+  // toolSubagentLinks capped at 200
+  for (let i = 1; i <= 220; i++) {
+    hub.linkSubagentToToolCall(sid, `call-${i}`, `agent-${i}`);
+  }
+  // Earliest links should be evicted
+  assert.deepEqual(hub.getLinkedSubagents(sid, 'call-1'), []);
+  assert.deepEqual(hub.getLinkedSubagents(sid, 'call-220'), ['agent-220']);
+});

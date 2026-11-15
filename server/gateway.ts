@@ -21,6 +21,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadWebShell, type WebShell } from './web-assets.js';
 import { createKimiHttpProxy, createKimiWsUpgrader, isKimiApiPath } from './kimi-proxy.js';
+import { bridgeKimiV25Ws, fetchKimiV25Turns, isKimiV25Version } from './kimi-v25-bridge.js';
+import { WS_MAX_MESSAGE_BYTES, WsFrameParser, wsAccept, wsSendFrame, wsSendText, type ParsedWsFrame } from './ws-framing.js';
 import { followKimiServer, spawnKimiServer, type KimiChild } from './kimi-child.js';
 import { createStaticServer } from './static.js';
 import { CodexProviderAdapter, ClaudeProviderAdapter, claudeContextWindow } from './facade.js';
@@ -64,6 +66,7 @@ import {
   type NativeCommand,
   type NativeModel,
   type ProviderAdapter,
+  type ProviderCapabilities,
   type ProviderName,
   type Session,
   type SessionPage,
@@ -279,10 +282,31 @@ function providerFromSessionId(id: string): { provider: ProviderName; nativeId: 
 }
 
 /** archive/restore/delete 后清掉该会话当过页尾时留下的翻页游标,避免 Open/Done 串页。 */
+const MAX_SESSION_PAGE_CURSORS = 500;
+
 function clearSessionPageCursors(pageCursors: Map<string, string>, sessionId: string): void {
   for (const key of pageCursors.keys()) {
     if (key.endsWith(`\u0000${sessionId}`)) pageCursors.delete(key);
   }
+}
+
+function setSessionPageCursor(pageCursors: Map<string, string>, key: string, cursor: string): void {
+  if (pageCursors.has(key)) {
+    pageCursors.delete(key);
+  } else if (pageCursors.size >= MAX_SESSION_PAGE_CURSORS) {
+    const oldest = pageCursors.keys().next().value;
+    if (oldest !== undefined) pageCursors.delete(oldest);
+  }
+  pageCursors.set(key, cursor);
+}
+
+function getSessionPageCursor(pageCursors: Map<string, string>, key: string): string | undefined {
+  const cursor = pageCursors.get(key);
+  if (cursor !== undefined) {
+    pageCursors.delete(key);
+    pageCursors.set(key, cursor);
+  }
+  return cursor;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +368,7 @@ interface ActiveTurn {
   runningTools: Map<string, { name: string; args?: unknown }>;
   pendingApprovals: Map<string, { tool: string; input?: unknown; itemId?: string }>;
   pendingQuestions: Map<string, { prompt: string; rawQuestions?: unknown[] }>;
+  localQuestionResolvers?: Map<string, (payload: string | Record<string, string[]> | null) => void>;
   transcript?: LocalTranscriptTurn;
   v262TurnId: string;
   v262Ordinal: number;
@@ -365,7 +390,7 @@ interface QueuedPrompt {
   createdAt: string;
 }
 
-class SessionHub {
+export class SessionHub {
   readonly busy = new Map<string, ActiveTurn>();
   readonly queued = new Map<string, QueuedPrompt[]>();
   readonly transcript = new LocalTranscriptHub();
@@ -392,6 +417,18 @@ class SessionHub {
     return this.seq;
   }
 
+  listenerCount(sessionId: string): number {
+    return this.listeners.get(sessionId)?.size ?? 0;
+  }
+
+  hasListeners(sessionId: string): boolean {
+    return this.listeners.has(sessionId);
+  }
+
+  hasV262Listeners(sessionId: string): boolean {
+    return this.v262Listeners.has(sessionId);
+  }
+
   subscribe(sessionId: string, fn: (ev: Record<string, unknown>) => void): () => void {
     let set = this.listeners.get(sessionId);
     if (!set) {
@@ -401,6 +438,9 @@ class SessionHub {
     set.add(fn);
     return () => {
       set.delete(fn);
+      if (set.size === 0) {
+        this.listeners.delete(sessionId);
+      }
     };
   }
 
@@ -413,6 +453,9 @@ class SessionHub {
     set.add(fn);
     return () => {
       set.delete(fn);
+      if (set.size === 0) {
+        this.v262Listeners.delete(sessionId);
+      }
     };
   }
 
@@ -460,6 +503,8 @@ class SessionHub {
     this.queued.delete(sessionId);
     this.replay.delete(sessionId);
     this.evictedSeq.delete(sessionId);
+    this.listeners.delete(sessionId);
+    this.v262Listeners.delete(sessionId);
     this.transcript.drop(sessionId);
   }
 }
@@ -485,8 +530,17 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       ? path.join(settingsDir, 'workspaces.json')
       : undefined,
   );
+  const grokRecycleGraceMs = process.env.GATEWAY_GROK_IDLE_TIMEOUT_MS !== undefined
+    ? Number(process.env.GATEWAY_GROK_IDLE_TIMEOUT_MS)
+    : 3 * 60_000;
+  const codexRecycleGraceMs = process.env.GATEWAY_CODEX_IDLE_TIMEOUT_MS !== undefined
+    ? Number(process.env.GATEWAY_CODEX_IDLE_TIMEOUT_MS)
+    : undefined;
   const adapters: Record<LocalProviderName, ProviderAdapter> = {
-    codex: options.codex ?? new CodexProviderAdapter({ settingsPath: path.join(settingsDir, 'session-settings.codex.json') }),
+    codex: options.codex ?? new CodexProviderAdapter({
+      settingsPath: path.join(settingsDir, 'session-settings.codex.json'),
+      ...(codexRecycleGraceMs !== undefined && Number.isFinite(codexRecycleGraceMs) ? { recycleGraceMs: codexRecycleGraceMs } : {}),
+    }),
     claude: options.claude ?? new ClaudeProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.claude.json'),
       claudeBin: process.env.CLAUDE_BIN,
@@ -494,11 +548,30 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     grok: options.grok ?? new GrokProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.grok.json'),
       grokBin: process.env.GROK_BIN,
+      ...(Number.isFinite(grokRecycleGraceMs) ? { recycleGraceMs: grokRecycleGraceMs } : {}),
     }),
-    pi: options.pi ?? new PiProviderAdapter({
-      settingsPath: path.join(settingsDir, 'session-settings.pi.json'),
-      piBin: process.env.PI_BIN,
-    }),
+    pi: options.pi ?? (() => {
+      const piRecycleGraceMs = process.env.GATEWAY_PI_IDLE_TIMEOUT_MS !== undefined
+        ? Number(process.env.GATEWAY_PI_IDLE_TIMEOUT_MS)
+        : undefined;
+      const piMaxLiveProcesses = process.env.GATEWAY_PI_MAX_PROCESSES !== undefined
+        ? Number(process.env.GATEWAY_PI_MAX_PROCESSES)
+        : undefined;
+      const piMaxSessionFileBytes = process.env.GATEWAY_PI_MAX_SESSION_BYTES !== undefined
+        ? Number(process.env.GATEWAY_PI_MAX_SESSION_BYTES)
+        : undefined;
+      const piExtraArgs = process.env.GATEWAY_PI_EXTRA_ARGS
+        ? process.env.GATEWAY_PI_EXTRA_ARGS.trim().split(/\s+/).filter(Boolean)
+        : undefined;
+      return new PiProviderAdapter({
+        settingsPath: path.join(settingsDir, 'session-settings.pi.json'),
+        piBin: process.env.PI_BIN,
+        ...(piRecycleGraceMs !== undefined && Number.isFinite(piRecycleGraceMs) ? { recycleGraceMs: piRecycleGraceMs } : {}),
+        ...(piMaxLiveProcesses !== undefined && Number.isFinite(piMaxLiveProcesses) ? { maxLiveProcesses: piMaxLiveProcesses } : {}),
+        ...(piMaxSessionFileBytes !== undefined && Number.isFinite(piMaxSessionFileBytes) ? { maxSessionFileBytes: piMaxSessionFileBytes } : {}),
+        ...(piExtraArgs && piExtraArgs.length > 0 ? { extraArgs: piExtraArgs } : {}),
+      });
+    })(),
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
@@ -520,8 +593,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     const child = await spawnKimiServer();
     if (child.owned) {
       kimiFallback = child;
-    } else if (!process.env.KIMI_UPSTREAM_URL && !process.env.KIMI_UPSTREAM_PORT && !process.env.KIMI_PORT) {
+    } else if (process.env.GATEWAY_KIMI_STANDBY === '1' && !process.env.KIMI_UPSTREAM_URL && !process.env.KIMI_UPSTREAM_PORT && !process.env.KIMI_PORT) {
       kimiFallback = await spawnKimiServer({ reuseRegistered: false });
+    } else {
+      kimiFallback = null;
     }
     kimi = { url: child.url, token: child.token, child };
   } else if (kimiOpt !== 'off') {
@@ -536,25 +611,65 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     kimiWs = proxyOptions ? createKimiWsUpgrader(proxyOptions) : null;
   };
   updateKimiProxy();
+  const kimiVersionCache = new Map<string, string>();
+  const isKimiV25Upstream = async (): Promise<boolean> => {
+    if (!kimi) return false;
+    const directVersion = kimi.child?.version;
+    if (directVersion) return isKimiV25Version(directVersion);
+    const cached = kimiVersionCache.get(kimi.url);
+    if (cached !== undefined) return isKimiV25Version(cached);
+    try {
+      const res = await fetch(`${kimi.url}${API}/meta`, {
+        headers: { authorization: `Bearer ${kimi.token}` },
+        signal: AbortSignal.timeout(1_000),
+      });
+      if (!res.ok) return false;
+      const parsed = (await res.json()) as { data?: { server_version?: unknown } };
+      const ver = typeof parsed?.data?.server_version === 'string' ? parsed.data.server_version : '';
+      if (ver) {
+        kimiVersionCache.set(kimi.url, ver);
+        return isKimiV25Version(ver);
+      }
+    } catch {
+      // ignore probe failure; keep lossless passthrough
+    }
+    return false;
+  };
   const kimiSockets = new Set<Duplex>();
+  const kimiNeedsFollow = (): boolean => Boolean(kimiFallback || (kimi && !kimi.child?.owned));
   let refreshKimiInflight: Promise<void> | null = null;
   const refreshKimi = (): Promise<void> => {
-    const standby = kimiFallback;
-    if (kimiOpt !== 'spawn' || !standby) return Promise.resolve();
+    if (kimiOpt !== 'spawn') return Promise.resolve();
     refreshKimiInflight ??= (async () => {
-      let next = await followKimiServer(standby);
-      if (next === standby && !(await kimiAlive(next))) {
-        // 官方候选经 connectExisting 探活过;只有"无候选→沿用 standby"这条
-        // 没探。standby 崩溃/被杀时旧实现永远卡在死人身上(kimi WS 502、
-        // /auth 掉线、前端弹 WebSocket error),探死就重走 spawn:注册表有
-        // 活实例则复用;没有、或注册表卡住(多实例/残留误报)则强制新起。
-        try {
-          next = await spawnKimiServer();
-        } catch {
-          next = await spawnKimiServer({ reuseRegistered: false });
+      let next: KimiChild | null = null;
+      if (kimiFallback) {
+        if (kimi && !kimi.child?.owned && await kimiAlive(kimi)) {
+          return;
         }
-        if (next.owned) kimiFallback = next;
+        next = await followKimiServer(kimiFallback);
+        if (next === kimiFallback && !(await kimiAlive(next))) {
+          // 官方候选经 connectExisting 探活过;只有"无候选→沿用 standby"这条
+          // 没探。standby 崩溃/被杀时旧实现永远卡在死人身上(kimi WS 502、
+          // /auth 掉线、前端弹 WebSocket error),探死就重走 spawn:注册表有
+          // 活实例则复用;没有、或注册表卡住(多实例/残留误报)则强制新起。
+          try {
+            next = await spawnKimiServer();
+          } catch {
+            next = await spawnKimiServer({ reuseRegistered: false });
+          }
+          if (next.owned) kimiFallback = next;
+        }
+      } else if (kimi) {
+        if (!(await kimiAlive(kimi))) {
+          try {
+            next = await spawnKimiServer();
+          } catch {
+            next = await spawnKimiServer({ reuseRegistered: false });
+          }
+          if (next.owned) kimiFallback = next;
+        }
       }
+      if (!next) return;
       if (kimi?.url === next.url && kimi.token === next.token) return;
       kimi = { url: next.url, token: next.token, child: next };
       updateKimiProxy();
@@ -567,7 +682,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     return refreshKimiInflight;
   };
   const kimiFollowTimer = kimiOpt === 'spawn'
-    ? setInterval(() => { void refreshKimi().catch(() => undefined); }, 1_000)
+    ? setInterval(() => { if (kimiNeedsFollow()) void refreshKimi().catch(() => undefined); }, 1_000)
     : null;
   kimiFollowTimer?.unref();
 
@@ -613,9 +728,26 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         fail(res, 401, 40101, 'Unauthorized', ulid());
         return;
       }
-      // Kimi 会话(id 无前缀)的 REST → 无损代理到原版 kap-server。
+      // Kimi 会话(id 无前缀)的 REST → 无损代理到原版 kap-server;2.5.x 上游补齐 2.6.2 翻页。
       if (shouldProxyToKimi(req, (id) => uploadStore.has(id))) {
         await refreshKimi();
+        if (req.method === 'GET' && kimi) {
+          const reqUrl = new URL(req.url ?? '/', 'http://localhost');
+          const turnsMatch = /^\/api\/v1\/sessions\/([^/:]+)\/agents\/([^/:]+)\/turns$/.exec(reqUrl.pathname);
+          if (turnsMatch && await isKimiV25Upstream()) {
+            const sessionId = decodeURIComponent(turnsMatch[1]);
+            const agentId = decodeURIComponent(turnsMatch[2]);
+            const beforeRaw = reqUrl.searchParams.get('before_ordinal');
+            const beforeOrdinal = beforeRaw !== null && beforeRaw !== '' ? Number(beforeRaw) : undefined;
+            const pageSize = Number(reqUrl.searchParams.get('page_size') ?? 20) || 20;
+            const page = await fetchKimiV25Turns(kimi, sessionId, agentId, {
+              beforeOrdinal: Number.isFinite(beforeOrdinal) ? beforeOrdinal : undefined,
+              pageSize,
+            });
+            ok(res, page, ulid());
+            return;
+          }
+        }
         if (kimiHttp) {
           const handled = await kimiHttp(req, res);
           if (handled) return;
@@ -739,6 +871,30 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (sub === '/healthz') return ok(res, { ok: true }, requestId);
     if (sub === '/meta') {
       const upstream = (await kimiFetch?.('/meta').catch(() => null)) as Record<string, unknown> | null;
+      const localInAvailable = LOCAL_PROVIDERS.filter((p) => availableProviders.includes(p));
+      const targetProviders = localInAvailable.length > 0 ? localInAvailable : LOCAL_PROVIDERS;
+      const providerCapabilities: Record<string, ProviderCapabilities> = {};
+      for (const p of targetProviders) {
+        if (adapters[p]) {
+          providerCapabilities[p] = adapters[p].capabilities();
+        }
+      }
+
+      const localCaps = isLocalProvider(provider) ? adapters[provider]?.capabilities() : undefined;
+      const experimentalFlags = localCaps
+        ? {
+            ...((upstream?.experimental_flags as Record<string, unknown> | undefined) ?? {}),
+            tower: localCaps.tower === true,
+            swarm: localCaps.swarm === true,
+            subagent_fork: false,
+            notify_user: false,
+            wait_for: false,
+            'tool-select': false,
+            plan: localCaps.planMode === true,
+            goal: localCaps.goals === true,
+          }
+        : (upstream?.experimental_flags as Record<string, unknown> | undefined);
+
       return ok(res, {
         server_version: `multi-agent-gateway/0.1 (Kimi ${kimiCompatVersion} compatible)`,
         capabilities: { websocket: true, file_upload: true, fs_query: true, mcp: false, tasks: true, terminal: true },
@@ -749,6 +905,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         backend: 'v2',
         ...(upstream ?? {}),
         providers: availableProviders,
+        provider_capabilities: providerCapabilities,
+        ...(experimentalFlags !== undefined ? { experimental_flags: experimentalFlags } : {}),
       }, requestId);
     }
     if (sub === '/auth') {
@@ -1151,11 +1309,50 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (tail === ':undo' && req.method === 'POST') {
         // 撤销最近 count 轮。codex:thread/rollback;claude:stream-json 下无 /rewind;pi:不支持 undo。
         if (caps.rollback === false || !adapter.rollback) throw new ProviderError('unsupported', `${sp} 不支持撤销`, 400);
-        const body = (await readBody(req).catch(() => ({}))) as { count?: number };
-        const count = Math.max(1, Math.min(50, Number(body.count ?? 1) || 1));
+        const body = (await readBody(req).catch(() => ({}))) as {
+          count?: number;
+          turn_id?: string;
+          agent_id?: string;
+        };
+        if (body.agent_id !== undefined && body.agent_id !== 'main') {
+          throw new ProviderError('unsupported', '仅支持撤销主会话轮次', 400);
+        }
         const sid = prefixedId(sp, nativeId);
         const beforeHistory = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
         const beforeTurns = beforeHistory ? turnsFromHistory(beforeHistory) : [];
+
+        let count: number;
+        if (typeof body.count === 'number' && Number.isFinite(body.count)) {
+          count = Math.max(1, Math.min(50, Math.trunc(body.count)));
+        } else if (typeof body.turn_id === 'string' && body.turn_id) {
+          const targetTurnId = body.turn_id;
+          const idx = beforeTurns.findIndex((t) => {
+            const tid = String(t.turn_id ?? '');
+            if (tid === targetTurnId) return true;
+            if (tid === `hist_${targetTurnId}` || `hist_${tid}` === targetTurnId) return true;
+            if (Array.isArray(t.items)) {
+              for (const it of t.items as Array<Record<string, unknown>>) {
+                if (it?.id === targetTurnId || it?.turn_id === targetTurnId) return true;
+                if (Array.isArray(it?.prompt_ids)) {
+                  for (const pid of it.prompt_ids) {
+                    if (typeof pid === 'string' && (pid === targetTurnId || `turn_${pid}` === targetTurnId)) {
+                      return true;
+                    }
+                  }
+                }
+              }
+            }
+            return false;
+          });
+          if (idx >= 0) {
+            count = Math.max(1, Math.min(50, beforeTurns.length - idx));
+          } else {
+            count = 1;
+          }
+        } else {
+          count = 1;
+        }
+
         await adapter.rollback(nativeId, count);
         hub.transcript.invalidateHistory(sid);
         const removedTurnIds = beforeTurns.slice(-count).map((t) => String(t.turn_id));
@@ -1202,7 +1399,15 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
       if (tail === ':fork' && req.method === 'POST') {
         if (caps.fork === false || !adapter.fork) throw new ProviderError('unsupported', `${sp} 不支持分叉`, 400);
+        const body = (await readBody(req).catch(() => ({}))) as { title?: string; turn_index?: number };
         const forked = await adapter.fork(nativeId);
+        if (typeof body.title === 'string' && body.title.trim()) {
+          const newTitle = body.title.trim();
+          if (adapter.rename) {
+            await adapter.rename(forked.id, newTitle).catch(() => {});
+          }
+          forked.title = newTitle;
+        }
         const sid = prefixedId(sp, forked.id);
         hub.broadcast(sid, frame(sid, hub, 'event.session.created', { session: sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)) }));
         return ok(res, sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)), requestId);
@@ -1239,22 +1444,52 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // Kimi 2.6.2 前端会带入 [name](kimi-code://skill/name) 芯片标记，先剥离避免误当参数。
         const body = (await readBody(req).catch(() => ({}))) as {
           args?: string;
+          path?: string;
           prompt_id?: string;
           attachments?: Array<Record<string, unknown>>;
+          metadata?: { display_text?: unknown };
         };
         const name = decodeURIComponent(skillActivate[1]);
-        const metadataText = typeof (body as { metadata?: { display_text?: unknown } }).metadata?.display_text === 'string'
-          ? sanitizePromptSkillChips((body as { metadata?: { display_text?: string } }).metadata!.display_text!)
+        const bareSkillName = name.startsWith('skill:') ? name.slice(6) : name;
+        const metadataText = typeof body.metadata?.display_text === 'string'
+          ? sanitizePromptSkillChips(body.metadata.display_text)
           : '';
-        const rawArgs = typeof body.args === 'string' && body.args.trim() && body.args.trim() !== `/${name}`
-          ? body.args
+        const hasBodyArgs = typeof body.args === 'string' && body.args.trim().length > 0;
+        const rawArgs = hasBodyArgs && body.args!.trim() !== `/${name}`
+          ? body.args!
           : metadataText;
-        const cleanArgs = sanitizeSkillActivateArgs(name, rawArgs)
+        let cleanArgs = sanitizeSkillActivateArgs(name, rawArgs)
           .replace(new RegExp(`^/${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'i'), '')
           .trim();
+        if (!hasBodyArgs && cleanArgs) {
+          const nameEsc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const bareEsc = bareSkillName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const chipPrefix = new RegExp(`^(?:${nameEsc}|${bareEsc})(?:\\s+([\\s\\S]*))?$`, 'i').exec(cleanArgs);
+          if (chipPrefix) {
+            cleanArgs = (chipPrefix[1] ?? '').trim();
+          }
+        }
         const effort = nativeEffortFromCommand(name, cleanArgs);
         if (effort && adapter.setThinking) await adapter.setThinking(nativeId, effort);
-        const text = `/${name}${cleanArgs ? ` ${cleanArgs}` : ''}`;
+
+        let commandPrefix = `/${name}`;
+        if (sp === 'pi') {
+          const bareName = name.startsWith('skill:') ? name.slice(6) : name;
+          const [skills, commands] = await Promise.all([
+            adapter.listSkills ? adapter.listSkills(nativeId).catch(() => []) : Promise.resolve([]),
+            adapter.listCommands ? adapter.listCommands(nativeId).catch(() => []) : Promise.resolve([]),
+          ]);
+          const matchingSkill = skills.find((s) => s && (s.name === name || s.name === `skill:${bareName}`));
+          const nonSkillCmd = commands.find(
+            (c) => c && (c.name === name || c.name === bareName) && c.source && c.source !== 'skill',
+          );
+          const requestedSkillByPath = typeof body.path === 'string' && body.path.length > 0 && matchingSkill?.path === body.path;
+          if (matchingSkill && (requestedSkillByPath || !nonSkillCmd)) {
+            commandPrefix = `/skill:${bareName}`;
+          }
+        }
+
+        const text = `${commandPrefix}${cleanArgs ? ` ${cleanArgs}` : ''}`;
         const content: Array<Record<string, unknown>> = [{ type: 'text', text }];
         if (Array.isArray(body.attachments)) {
           for (const att of body.attachments) {
@@ -1364,6 +1599,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           contextLimit = grokStatusContextFallback();
         }
         const contextUnavailable = usage?.context_unavailable === true;
+        const extUi = (adapter as { getExtensionUiState?: (id: string) => unknown }).getExtensionUiState?.(nativeId);
         return ok(res, {
           model,
           thinking_level: adapter.getThinking?.(nativeId) ?? '',
@@ -1378,6 +1614,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
               ? Math.min(1, usage.context_tokens / contextLimit)
               : 0,
           ...(contextUnavailable ? { context_unavailable: true } : {}),
+          ...(extUi ? { extension_ui: extUi } : {}),
         }, requestId);
       }
       if (tail === '/commands' && req.method === 'GET') {
@@ -1410,11 +1647,16 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (!agentId) throw new ProviderError('invalid_request', 'agent_id is required', 400);
         const pageSize = Number(url.searchParams.get('page_size') ?? 20);
         const sid = prefixedId(sp, nativeId);
-        const history = agentId !== 'main' && adapter.getSubagentMessages
-          ? await adapter.getSubagentMessages(nativeId, agentId).catch(() => [])
-          : await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
-        // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
-        if (history !== null && history.length > 0) hub.transcript.observeHistory(sid, history);
+        let history: Message[] | null = null;
+        if (agentId === 'main') {
+          history = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
+          // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
+          if (history !== null && history.length > 0) hub.transcript.observeHistory(sid, history);
+        } else if (adapter.getSubagentMessages) {
+          history = await adapter.getSubagentMessages(nativeId, agentId).catch(() => []);
+        } else {
+          history = [];
+        }
         return ok(res, buildLocalTranscriptPage(history ?? [], {
           agentId,
           beforeTurn: url.searchParams.get('before_turn') ?? undefined,
@@ -1686,6 +1928,14 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     kimiSockets,
     kimiOpt === 'off',
     demoActive,
+    async (req, socket, head) => {
+      await refreshKimi();
+      if (kimi && await isKimiV25Upstream()) {
+        bridgeKimiV25Ws(req, socket, head, kimi, gatewaySockets, kimiSockets);
+        return true;
+      }
+      return false;
+    },
   );
 
   await new Promise<void>((resolveListen, rejectListen) => {
@@ -1702,11 +1952,14 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     warmNames.push(name);
     warm.push(task);
   };
+  const fullWarmup = process.env.GATEWAY_WARMUP === 'full';
   for (const p of LOCAL_PROVIDERS) {
     if (!availableProviders.includes(p)) continue;
     enqueueWarm(`${p}.list`, adapters[p].list({ limit: 100 }));
-    enqueueWarm(`${p}.models`, adapters[p].listModels?.() ?? Promise.resolve(null));
-    enqueueWarm(`${p}.cmds`, adapters[p].listCommands?.() ?? Promise.resolve(null));
+    if (fullWarmup) {
+      enqueueWarm(`${p}.models`, adapters[p].listModels?.() ?? Promise.resolve(null));
+      enqueueWarm(`${p}.cmds`, adapters[p].listCommands?.() ?? Promise.resolve(null));
+    }
   }
   if (warm.length > 0) {
     void Promise.allSettled(warm).then((rs) => {
@@ -1890,15 +2143,48 @@ function nativeEffortFromCommand(name: string, args: string): string | undefined
   return token && NATIVE_EFFORTS.has(token) ? token : undefined;
 }
 
-function parseWireThinkingPatch(raw: unknown): string | undefined {
-  if (typeof raw === 'string' && raw.trim()) return raw.trim();
-  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+export function parseWireThinkingPatch(
+  raw: unknown,
+  sp?: string,
+  model?: NativeModel | null,
+): string | undefined {
+  let parsed: string | undefined;
+  if (typeof raw === 'string' && raw.trim()) {
+    parsed = raw.trim();
+  } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const rec = raw as { enabled?: unknown; effort?: unknown };
     if (rec.enabled === false) return 'off';
-    if (typeof rec.effort === 'string' && rec.effort.trim()) return rec.effort.trim();
-    if (rec.enabled === true) return 'on';
+    if (typeof rec.effort === 'string' && rec.effort.trim()) parsed = rec.effort.trim();
+    else if (rec.enabled === true) parsed = 'on';
   }
-  return undefined;
+  if (!parsed) return undefined;
+  if (parsed === 'off') return 'off';
+
+  // Check if model explicitly lacks thinking capability
+  if (model) {
+    const hasThinkingCap = model.capabilities ? model.capabilities.includes('thinking') : true;
+    const hasEfforts = model.support_efforts ? model.support_efforts.length > 0 : true;
+    if (!hasThinkingCap || !hasEfforts) {
+      return undefined;
+    }
+  }
+
+  const defaultEffort = model?.default_effort
+    ?? (sp === 'grok' ? 'high' : 'medium');
+
+  if (parsed === 'on') {
+    return defaultEffort;
+  }
+
+  if (parsed === 'auto') {
+    // Pi and Codex do not support 'auto'
+    if (sp === 'pi' || sp === 'codex' || sp === 'grok') {
+      return defaultEffort;
+    }
+    return 'auto';
+  }
+
+  return parsed;
 }
 
 function toWireThinkingConfig(thinking: string | undefined): Record<string, unknown> | undefined {
@@ -2025,12 +2311,19 @@ async function applySessionProfilePatch(
   if (cfg.tower_mode === true) {
     throw new ProviderError('unsupported', `${sp} 不支持 tower_mode`, 400);
   }
+  const selectedModelId = typeof cfg.model === 'string' && cfg.model ? cfg.model : adapter.getModel?.(nativeId);
   if (typeof cfg.model === 'string' && cfg.model && adapter.setModel) {
     await adapter.setModel(nativeId, cfg.model);
   }
-  const parsedThinking = parseWireThinkingPatch(cfg.thinking);
-  if (parsedThinking !== undefined && adapter.setThinking) {
-    await adapter.setThinking(nativeId, parsedThinking);
+  if (cfg.thinking !== undefined && adapter.setThinking) {
+    const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
+    const selectedModel = (selectedModelId
+      ? models.find((m) => m.model === selectedModelId)
+      : models.find((m) => m.isDefault) ?? models[0]) ?? null;
+    const parsedThinking = parseWireThinkingPatch(cfg.thinking, sp, selectedModel);
+    if (parsedThinking !== undefined) {
+      await adapter.setThinking(nativeId, parsedThinking);
+    }
   }
   if (typeof cfg.permission_mode === 'string') {
     if (cfg.permission_mode === 'manual' && (caps.manualApproval === false || caps.approvals === false)) {
@@ -2069,9 +2362,10 @@ async function providerConfigView(
   const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
   const requestedModel = typeof patch.default_model === 'string' ? patch.default_model : undefined;
   if (requestedModel && adapter.setModel) await adapter.setModel('__default__', requestedModel);
-  const requestedThinking = patch.thinking !== undefined ? parseWireThinkingPatch(patch.thinking) : undefined;
-  if (requestedThinking && adapter.setThinking) await adapter.setThinking('__default__', requestedThinking);
   const defaultModel = requestedModel ?? adapter.getModel?.('__default__') ?? models[0]?.model ?? '';
+  const selectedModel = models.find((m) => m.model === defaultModel) ?? null;
+  const requestedThinking = patch.thinking !== undefined ? parseWireThinkingPatch(patch.thinking, provider, selectedModel) : undefined;
+  if (requestedThinking && adapter.setThinking) await adapter.setThinking('__default__', requestedThinking);
   const wireThinking = toWireThinkingConfig(adapter.getThinking?.('__default__'));
   const modelMap: Record<string, Record<string, unknown>> = {};
   for (const model of models) {
@@ -2106,19 +2400,39 @@ async function providerConfigView(
   };
 }
 
-/** Kimi Web 2.6.2 前端 `xM` 已内置的斜杠命令名，避免在 SlashMenu 中与 `/skills` 重复渲染。 */
-const KIMI_BUILTIN_SLASH_NAMES = new Set([
-  'new', 'clear', 'login', 'plan', 'swarm', 'tower', 'goal', 'btw',
-  'compact', 'undo', 'fork', 'reload', 'export', 'status',
-]);
+/**
+ * 根据 provider capabilities 动态计算 Kimi Web 2.6.2 前端 `xM` Tier-1 命令集合。
+ * Tier-1 命令由前端直接拦截/内置处理，需在 `/skills` 列表中过滤以避免重复渲染。
+ */
+export function activeKimiTier1Names(caps?: ProviderCapabilities): Set<string> {
+  const names = new Set<string>(['new', 'clear', 'login', 'reload', 'export', 'status']);
+  if (!caps) return names;
+  if (caps.planMode !== false) names.add('plan');
+  if (caps.goals !== false) names.add('goal');
+  if (caps.swarm === true) names.add('swarm');
+  if (caps.tower === true) names.add('tower');
+  if (caps.btw === true) names.add('btw');
+  if (caps.compact !== false) names.add('compact');
+  if (caps.rollback !== false) names.add('undo');
+  if (caps.fork !== false) names.add('fork');
+  return names;
+}
 
-function skillDto(command: NativeCommand, cwd?: string): Record<string, unknown> {
-  const isDiskEntry = Boolean(command.path) && command.builtin !== true;
-  const source = isDiskEntry
-    ? (command.scope === 'project' ? 'project' : 'user')
-    : 'builtin';
+export function skillDto(command: NativeCommand, cwd?: string): Record<string, unknown> {
+  const rawName = command.name;
+  const bareName = rawName.startsWith('skill:') ? rawName.slice(6) : rawName;
+  const isBuiltinLike = command.builtin === true || command.source === 'extension' || command.source === 'prompt';
+  const isDiskEntry = Boolean(command.path) && !isBuiltinLike;
+  const source = isBuiltinLike
+    ? 'builtin'
+    : isDiskEntry
+      ? (command.scope === 'project' ? 'project' : 'user')
+      : (command.scope === 'project' ? 'project' : 'builtin');
+  const aliases = command.aliases
+    ? command.aliases.map((a) => (a.startsWith('skill:') ? a.slice(6) : a))
+    : undefined;
   return {
-    name: command.name,
+    name: bareName,
     description: command.description,
     path: command.path ?? '',
     source,
@@ -2126,18 +2440,21 @@ function skillDto(command: NativeCommand, cwd?: string): Record<string, unknown>
     type: 'prompt',
     accepts_input: command.acceptsInput !== false,
     ...(command.argumentHint ? { argument_hint: command.argumentHint } : {}),
-    ...(command.aliases && command.aliases.length > 0 ? { aliases: command.aliases } : {}),
+    ...(aliases && aliases.length > 0 ? { aliases } : {}),
     disable_model_invocation: false,
   };
 }
 
-async function adapterSkills(
+export async function adapterSkills(
   adapter: ProviderAdapter,
   sessionId?: string,
   cwdOverride?: string,
 ): Promise<Record<string, unknown>[]> {
   const byName = new Map<string, Record<string, unknown>>();
   const cwd = cwdOverride ?? (sessionId ? adapter.getCwd?.(sessionId) : undefined);
+  const caps = adapter.capabilities?.() ?? ({} as ProviderCapabilities);
+  const tier1Names = activeKimiTier1Names(caps);
+
   if (adapter.listSkills) {
     const skills = await adapter.listSkills(sessionId, cwd).catch(() => []);
     for (const skill of skills) {
@@ -2145,13 +2462,24 @@ async function adapterSkills(
         !skill
         || typeof skill.name !== 'string'
         || skill.enabled === false
-        || KIMI_BUILTIN_SLASH_NAMES.has(skill.name)
       ) {
         continue;
       }
-      const source = skill.scope === 'project' ? 'project' : 'user';
-      byName.set(skill.name, {
-        name: skill.name,
+      const rawName = skill.name;
+      const bareName = rawName.startsWith('skill:') ? rawName.slice(6) : rawName;
+      if (tier1Names.has(bareName) || tier1Names.has(rawName)) {
+        continue;
+      }
+      const isBuiltinLike = (skill as any).builtin === true || (skill as any).source === 'extension' || (skill as any).source === 'prompt';
+      const isDiskEntry = Boolean(skill.path) && !isBuiltinLike;
+      const source = isBuiltinLike
+        ? 'builtin'
+        : isDiskEntry
+          ? (skill.scope === 'project' ? 'project' : 'user')
+          : (skill.scope === 'project' ? 'project' : 'user');
+      const dedupeKey = `${source === 'builtin' ? 'cmd' : 'skill'}:${bareName}`;
+      byName.set(dedupeKey, {
+        name: bareName,
         description: skill.description ?? '',
         path: skill.path ?? '',
         source,
@@ -2168,12 +2496,21 @@ async function adapterSkills(
       if (
         command.kind !== 'prompt'
         || command.terminalOnly === true
-        || KIMI_BUILTIN_SLASH_NAMES.has(command.name)
-        || byName.has(command.name)
       ) {
         continue;
       }
-      byName.set(command.name, skillDto(command, cwd));
+      const rawName = command.name;
+      const bareName = rawName.startsWith('skill:') ? rawName.slice(6) : rawName;
+      const dto = skillDto(command, cwd);
+      const dedupeKey = `${dto.source === 'builtin' ? 'cmd' : 'skill'}:${bareName}`;
+      if (
+        tier1Names.has(bareName)
+        || tier1Names.has(rawName)
+        || byName.has(dedupeKey)
+      ) {
+        continue;
+      }
+      byName.set(dedupeKey, dto);
     }
   }
   return [...byName.values()];
@@ -2385,6 +2722,13 @@ function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boo
   };
 }
 
+function isEmptyPlaceholderSession(item: Record<string, unknown>, busy: boolean): boolean {
+  if (busy) return false;
+  const title = typeof item.title === 'string' ? item.title.trim() : '';
+  const lastPrompt = typeof item.last_prompt === 'string' ? item.last_prompt.trim() : '';
+  return lastPrompt.length === 0 && (title.length === 0 || title === '(session)');
+}
+
 /**
  * 0.38+ 侧栏 load 调 listSessionGroupsV2: GET /api/v2/sessions?view=by_workspace,
  * 解包 `groups` 再 `[...Ie.groups]`。Kimi 无 provider 仍走 shouldProxyToKimi,本函数服务本地 provider。
@@ -2395,8 +2739,8 @@ function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<str
   const buckets = new Map<string, { workspace: { id: string; cwd: string }; sessions: Record<string, unknown>[] }>();
   for (const item of items) {
     const meta = item.meta && typeof item.meta === 'object' ? item.meta as Record<string, unknown> : {};
-    const lastPrompt = typeof meta.last_prompt === 'string' ? meta.last_prompt : '';
-    if (hasPrompt && lastPrompt.length === 0) continue;
+    const lastPrompt = typeof meta.last_prompt === 'string' ? meta.last_prompt.trim() : '';
+    if (hasPrompt && (lastPrompt.length === 0 || lastPrompt === '(session)')) continue;
     const workspace = item.workspace && typeof item.workspace === 'object'
       ? item.workspace as Record<string, unknown>
       : {};
@@ -2492,12 +2836,14 @@ async function listSessions(
       allItems = archivedOnly
         ? allItems.filter((session) => session.archived === true)
         : allItems.filter((session) => session.archived !== true);
-      const localItems = allItems.map((session) => sessionDto(
-        session,
-        adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
-        adapter.getUsage?.(session.id),
-        busyOf(prefixedId(provider, session.id)),
-      ));
+      const localItems = allItems
+        .map((session) => sessionDto(
+          session,
+          adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
+          adapter.getUsage?.(session.id),
+          busyOf(prefixedId(provider, session.id)),
+        ))
+        .filter((dto) => !excludeEmpty || !isEmptyPlaceholderSession(dto, Boolean(dto.busy)));
       return { items: localItems, has_more: false };
     }
     // Open/Done 翻页游标必须带 archived 维度,否则两边页尾 id 相同时会串用。
@@ -2505,7 +2851,7 @@ async function listSessions(
     const cursorKey = (id: string): string => `${provider}\u0000${workspaceId ?? ''}\u0000${archiveLane}\u0000${id}`;
     let cursor: string | undefined;
     if (beforeId) {
-      cursor = pageCursors.get(cursorKey(beforeId));
+      cursor = getSessionPageCursor(pageCursors, cursorKey(beforeId));
       if (!cursor) {
         const prefix = ID_PREFIX[provider];
         if (prefix && beforeId.startsWith(prefix)) cursor = beforeId.slice(prefix.length);
@@ -2539,14 +2885,16 @@ async function listSessions(
     } else {
       page = { ...page, items: page.items.filter((session) => session.archived !== true) };
     }
-    const localItems = page.items.map((session) => sessionDto(
-      session,
-      adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
-      adapter.getUsage?.(session.id),
-      busyOf(prefixedId(provider, session.id)),
-    ));
-    if (page.next_cursor && localItems.length > 0) {
-      pageCursors.set(cursorKey(String(localItems[localItems.length - 1].id)), page.next_cursor);
+    const localItems = page.items
+      .map((session) => sessionDto(
+        session,
+        adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
+        adapter.getUsage?.(session.id),
+        busyOf(prefixedId(provider, session.id)),
+      ))
+      .filter((dto) => !excludeEmpty || !isEmptyPlaceholderSession(dto, Boolean(dto.busy)));
+    if (page.next_cursor && page.items.length > 0) {
+      setSessionPageCursor(pageCursors, cursorKey(prefixedId(provider, page.items[page.items.length - 1]!.id)), page.next_cursor);
     }
     return { items: localItems, has_more: Boolean(page.next_cursor) };
   }
@@ -2976,6 +3324,17 @@ async function submitPrompt(
     if (cmd[1] === 'undo') {
       throw new ProviderError('unsupported', 'pi 不支持 /undo', 400);
     }
+    if (cmd[1] === 'advisor') {
+      if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+      return runInteractivePiAdvisor(adapter, nativeId, (cmd[2] ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
+    }
+    if (cmd[1] === 'plan' && !(cmd[2] ?? '').trim()) {
+      const piCmds = adapter.listCommands ? await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[]) : [];
+      if (piCmds.some((c) => c.name === 'plan')) {
+        if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+        return runInteractivePiPlanMenu(adapter, nativeId, hub, requestedPromptId, demoActive, uploadStore);
+      }
+    }
     if (piGatewayCommandNames().has(cmd[1]) || piUnsupportedTuiCommandNames().has(cmd[1])) {
       if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
       const [, name, rawArgs] = cmd;
@@ -3278,6 +3637,16 @@ async function driveTurn(
       completeStep(reason === 'failed' ? 'failed' : 'completed');
       closeV262Thinking(hub, sid, turn);
       closeV262Assistant(hub, sid, turn);
+      // Never leave a completed slash-command turn (e.g. a Pi extension command that
+      // produced no text/tool/notice items) as a silent blank user bubble.
+      if (reason === 'completed' && step === 0 && turn.v262Items.length <= 1) {
+        const trimmedCmd = text.trim();
+        const fallbackMsg = trimmedCmd.startsWith('/')
+          ? `ℹ 命令 \`${trimmedCmd.split(/\s+/)[0]}\` 已处理（无输出内容；若该命令在本地终端使用自定义 TUI 面板 \`ctx.ui.custom()\`，Web 协议模式下可能无界面输出，可尝试带子命令参数运行或输入 \`/help\` 查看网页可用命令）。`
+          : '✓ 已完成（无额外文本输出）。';
+        emitAssistantDeltaText(fallbackMsg, turn, emit, ensureStep, sid, hub);
+        completeStep('completed');
+      }
       if (hub.busy.get(sid) === turn) {
         hub.busy.delete(sid);
         const durationMs = Date.now() - startedAt;
@@ -3501,6 +3870,467 @@ async function runLocalGatewayCommand(
   }
 }
 
+function resolveRpivAdvisorConfigPath(): { primary: string; legacy: string } {
+  const home = os.homedir();
+  const defaultDir = path.join(home, '.config');
+  const rawXdg = process.env.XDG_CONFIG_HOME?.trim() ?? '';
+  let configDir = defaultDir;
+  if (rawXdg) {
+    const expanded = rawXdg === '~' ? home : rawXdg.startsWith('~/') ? path.join(home, rawXdg.slice(2)) : rawXdg;
+    if (path.isAbsolute(expanded)) configDir = expanded;
+  }
+  return {
+    primary: path.join(configDir, 'rpiv-advisor', 'advisor.json'),
+    legacy: path.join(defaultDir, 'rpiv-advisor', 'advisor.json'),
+  };
+}
+
+async function readRpivAdvisorConfig(): Promise<{ path: string; data: Record<string, unknown> }> {
+  const paths = resolveRpivAdvisorConfigPath();
+  for (const candidate of [paths.primary, paths.legacy]) {
+    try {
+      const raw = await fsp.readFile(candidate, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { path: paths.primary, data: parsed as Record<string, unknown> };
+      }
+    } catch {
+      // try next
+    }
+  }
+  return { path: paths.primary, data: {} };
+}
+
+async function writeRpivAdvisorConfig(targetPath: string, data: Record<string, unknown>): Promise<void> {
+  const dir = path.dirname(targetPath);
+  await fsp.mkdir(dir, { recursive: true });
+  const tmpPath = path.join(dir, `.advisor.${process.pid}.${Date.now()}.tmp`);
+  await fsp.writeFile(tmpPath, `${JSON.stringify(data, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await fsp.rename(tmpPath, targetPath);
+}
+
+function extractFirstQuestionAnswer(payload: string | Record<string, string[]> | null, qId: string): string | null {
+  if (payload === null) return null;
+  if (typeof payload === 'string') return payload.trim() || null;
+  const direct = payload[qId];
+  if (Array.isArray(direct) && direct.length > 0 && typeof direct[0] === 'string' && direct[0].trim()) {
+    return direct[0].trim();
+  }
+  for (const vals of Object.values(payload)) {
+    if (Array.isArray(vals) && vals.length > 0 && typeof vals[0] === 'string' && vals[0].trim()) {
+      return vals[0].trim();
+    }
+  }
+  return null;
+}
+
+async function askLocalTurnQuestion(
+  hub: SessionHub,
+  sid: string,
+  turn: ActiveTurn,
+  emit: Emit,
+  promptText: string,
+  rawQuestions: unknown[],
+): Promise<string | Record<string, string[]> | null> {
+  const questionId = `local_q_${randomUUID()}`;
+  turn.pendingQuestions.set(questionId, { prompt: promptText, rawQuestions });
+  if (!turn.localQuestionResolvers) turn.localQuestionResolvers = new Map();
+  const wait = new Promise<string | Record<string, string[]> | null>((resolve) => {
+    turn.localQuestionResolvers!.set(questionId, resolve);
+  });
+  const request = questionDto(sid, questionId, { prompt: promptText, rawQuestions });
+  hub.transcript.requestInteraction(sid, {
+    interactionId: questionId,
+    interactionKind: 'question',
+    state: 'pending',
+    request,
+  });
+  emit('event.question.requested', request);
+  emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'question' });
+  hub.broadcastV262(sid, v262PendingQuestionFrame(sid, questionId, undefined, { prompt: promptText, rawQuestions }));
+  return wait;
+}
+
+async function beginLocalInteractiveTurn(
+  adapter: ProviderAdapter,
+  provider: LocalProviderName,
+  nativeId: string,
+  promptText: string,
+  hub: SessionHub,
+  requestedPromptId: string | undefined,
+  demoActive: boolean,
+): Promise<{
+  sid: string;
+  promptId: string;
+  startedAt: number;
+  createdAt: string;
+  turn: ActiveTurn;
+  emit: Emit;
+  finishWithText: (output: string, reason?: 'completed' | 'failed') => void;
+}> {
+  const sid = prefixedId(provider, nativeId);
+  const promptId = requestedPromptId ?? randomUUID();
+  const emit: Emit = (type, payload, volatile = false, offset) =>
+    hub.broadcast(sid, frame(sid, hub, type, payload, volatile, offset));
+  const turn = newActiveTurn(nativeId, promptId);
+  hub.busy.set(sid, turn);
+  const startedAt = Date.now();
+  const createdAt = new Date(startedAt).toISOString();
+  turn.v262StartedAt = createdAt;
+  const history = await tryHistoryWithDemo(adapter, provider, nativeId, demoActive);
+  if (history !== null && !hub.transcript.hasObservedHistory(sid) && history.length > 0) {
+    hub.transcript.observeHistory(sid, history);
+  }
+  turn.transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
+  turn.v262Ordinal = Math.max(0, turn.transcript.ordinal - 1);
+  hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text: promptText }], createdAt);
+  emit('session.meta.updated', { patch: { lastPrompt: promptText } });
+  emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
+  emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: promptText });
+  const openerItem: Record<string, unknown> = {
+    item_id: `${promptId}_user`,
+    type: 'user_message',
+    placement: 'opener',
+    origin: { kind: 'user' },
+    text: promptText,
+    prompt_ids: [promptId],
+    attachments: [],
+    skills: [],
+    created_at: createdAt,
+  };
+  turn.v262Items.push(openerItem);
+  turn.v262ItemMap.set(String(openerItem.item_id), openerItem);
+  hub.broadcastV262(sid, {
+    type: 'turn.started',
+    session_id: sid,
+    agent_id: 'main',
+    turn: {
+      turn_id: turn.v262TurnId,
+      ordinal: turn.v262Ordinal,
+      turn_number: turn.v262Ordinal + 1,
+      kind: 'agent',
+      status: 'running',
+      started_at: createdAt,
+      steps: [{ index: 0 }],
+      items: [],
+    },
+  });
+  hub.broadcastV262(sid, { type: 'item.started', session_id: sid, agent_id: 'main', turn_id: turn.v262TurnId, item: openerItem });
+  hub.broadcastV262(sid, { type: 'item.ended', session_id: sid, agent_id: 'main', turn_id: turn.v262TurnId, item: openerItem });
+  emitV262AgentState(hub, adapter, provider, nativeId, sid, 'running');
+
+  const finishWithText = (output: string, reason: 'completed' | 'failed' = 'completed'): void => {
+    if (hub.busy.get(sid) !== turn) return;
+    emit('turn.step.started', { turnId: 0, step: 0 });
+    emitAssistantDeltaText(output, turn, emit, () => undefined, sid, hub);
+    closeV262Thinking(hub, sid, turn);
+    closeV262Assistant(hub, sid, turn);
+    turn.transcript?.completeStep(reason === 'completed' ? 'completed' : 'failed');
+    emit('turn.step.completed', { turnId: 0, step: 0, usage: {} });
+    hub.busy.delete(sid);
+    const durationMs = Date.now() - startedAt;
+    turn.transcript?.end(reason, durationMs);
+    hub.transcript.finishPrompt(sid, promptId, reason);
+    emit('turn.ended', { turnId: 0, reason, durationMs });
+    emit('prompt.completed', { promptId, reason });
+    emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: reason });
+    hub.broadcastV262(sid, {
+      type: 'turn.ended',
+      session_id: sid,
+      agent_id: 'main',
+      turn: {
+        turn_id: turn.v262TurnId,
+        ordinal: turn.v262Ordinal,
+        turn_number: turn.v262Ordinal + 1,
+        kind: 'agent',
+        status: 'ended',
+        outcome: reason === 'failed' ? 'failed' : 'completed',
+        duration_ms: durationMs,
+        started_at: createdAt,
+        ended_at: new Date().toISOString(),
+        steps: [{ index: 0 }],
+        items: [],
+      },
+    });
+    emitV262AgentState(hub, adapter, provider, nativeId, sid, 'idle');
+  };
+
+  return { sid, promptId, startedAt, createdAt, turn, emit, finishWithText };
+}
+
+async function runInteractivePiAdvisor(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  argsText: string,
+  hub: SessionHub,
+  requestedPromptId: string | undefined,
+  demoActive: boolean,
+  uploadStore: UploadStore,
+): Promise<Record<string, unknown>> {
+  const promptText = argsText ? `/advisor ${argsText}` : '/advisor';
+  const ctx = await beginLocalInteractiveTurn(adapter, 'pi', nativeId, promptText, hub, requestedPromptId, demoActive);
+  const { sid, promptId, createdAt, turn, emit, finishWithText } = ctx;
+
+  void (async () => {
+    try {
+      const sub = argsText.trim().toLowerCase();
+      const { path: cfgPath, data: cfgData } = await readRpivAdvisorConfig();
+      const curModel = typeof cfgData.modelKey === 'string' ? cfgData.modelKey : undefined;
+      const curEffort = typeof cfgData.effort === 'string' ? cfgData.effort : undefined;
+
+      if (sub === 'status') {
+        const msg = curModel
+          ? `当前 Pi Advisor 模型：\`${curModel}\`${curEffort ? ` (effort: \`${curEffort}\`)` : ''}\n配置文件：\`${cfgPath}\``
+          : `当前未启用 Pi Advisor（可在 Web UI 直接发送 \`/advisor\` 弹窗选择）。`;
+        finishWithText(msg, 'completed');
+        return;
+      }
+
+      if (sub === 'off' || sub === 'disable' || sub === 'none') {
+        const next = { ...cfgData };
+        delete next.modelKey;
+        delete next.effort;
+        await writeRpivAdvisorConfig(cfgPath, next);
+        await adapter.close(nativeId).catch(() => undefined);
+        finishWithText(`✓ 已关闭 Pi Advisor（已更新 \`${cfgPath}\`）。`, 'completed');
+        return;
+      }
+
+      const models = adapter.listModels ? await adapter.listModels().catch(() => [] as NativeModel[]) : [];
+      if (models.length === 0) {
+        finishWithText('⚠ 未获取到可用 Pi 模型列表，请检查 Pi 模型配置后再试。', 'failed');
+        return;
+      }
+
+      const modelOptions = [
+        ...models.map((m) => ({
+          id: m.model,
+          label: `${m.display_name || m.model}${m.model === curModel ? ' ✓' : ''}`,
+          description: m.model,
+        })),
+        {
+          id: '__disable__',
+          label: `No advisor (关闭 Advisor)${!curModel ? ' ✓' : ''}`,
+          description: '禁用 advisor 工具',
+        },
+      ];
+
+      const modelAns = await askLocalTurnQuestion(hub, sid, turn, emit, '选择 Advisor 辅助模型', [
+        {
+          id: 'advisor_model',
+          header: 'Advisor Tool',
+          question: '选择 Advisor 辅助模型（当主模型卡住或面对复杂决策时升级求助）：',
+          body: curModel
+            ? `当前配置：\`${curModel}\`${curEffort ? ` · effort: \`${curEffort}\`` : ''}`
+            : '当前未启用 Advisor',
+          options: modelOptions,
+        },
+      ]);
+      if (turn.cancelled || hub.busy.get(sid) !== turn) return;
+
+      const pickedId = extractFirstQuestionAnswer(modelAns, 'advisor_model');
+      if (!pickedId) {
+        finishWithText('已取消 Advisor 配置（当前配置未修改）。', 'completed');
+        return;
+      }
+
+      if (pickedId === '__disable__') {
+        const next = { ...cfgData };
+        delete next.modelKey;
+        delete next.effort;
+        await writeRpivAdvisorConfig(cfgPath, next);
+        await adapter.close(nativeId).catch(() => undefined);
+        finishWithText(`✓ 已关闭 Pi Advisor（已写入 \`${cfgPath}\`）。`, 'completed');
+        return;
+      }
+
+      const pickedModel = models.find((m) => m.model === pickedId);
+      if (!pickedModel) {
+        finishWithText(`✗ 未找到所选模型 \`${pickedId}\`。`, 'failed');
+        return;
+      }
+
+      let chosenEffort: string | undefined;
+      const efforts = (pickedModel.support_efforts ?? ['minimal', 'low', 'medium', 'high', 'xhigh'])
+        .filter((e) => e !== 'off' && e !== 'auto');
+      if (pickedModel.capabilities?.includes('thinking') || efforts.length > 0) {
+        const effortOptions = [
+          { id: '__off__', label: 'off (no reasoning sent)', description: '不附加推理强度参数' },
+          ...efforts.map((lvl) => ({
+            id: lvl,
+            label: lvl === 'medium' ? `${lvl} (Recommended)` : lvl,
+            ...(lvl === curEffort ? { description: '当前已启用' } : {}),
+          })),
+        ];
+        const effortAns = await askLocalTurnQuestion(hub, sid, turn, emit, '选择 Advisor 思考强度', [
+          {
+            id: 'advisor_effort',
+            header: 'Reasoning Level',
+            question: `为 ${pickedModel.display_name || pickedModel.model} 选择 Advisor 思考强度：`,
+            options: effortOptions,
+          },
+        ]);
+        if (turn.cancelled || hub.busy.get(sid) !== turn) return;
+        const pickedEffort = extractFirstQuestionAnswer(effortAns, 'advisor_effort');
+        if (pickedEffort && pickedEffort !== '__off__') {
+          chosenEffort = pickedEffort;
+        }
+      }
+
+      const next: Record<string, unknown> = { ...cfgData, modelKey: pickedModel.model };
+      if (chosenEffort) next.effort = chosenEffort;
+      else delete next.effort;
+      await writeRpivAdvisorConfig(cfgPath, next);
+      await adapter.close(nativeId).catch(() => undefined);
+      finishWithText(
+        `✓ 已启用 Pi Advisor：\`${pickedModel.model}\`${chosenEffort ? ` (effort: \`${chosenEffort}\`)` : ''}\n已保存至 \`${cfgPath}\`，下一轮对话自动生效。`,
+        'completed',
+      );
+    } catch (err) {
+      finishWithText(`✗ /advisor 配置失败：${err instanceof Error ? err.message : String(err)}`, 'failed');
+    } finally {
+      drainQueue(adapter, 'pi', nativeId, hub, demoActive, uploadStore);
+    }
+  })();
+
+  return {
+    prompt_id: promptId,
+    user_message_id: promptId,
+    origin: { kind: 'user' },
+    status: 'running',
+    content: [{ type: 'text', text: promptText }],
+    created_at: createdAt,
+  };
+}
+
+async function runInteractivePiPlanMenu(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  hub: SessionHub,
+  requestedPromptId: string | undefined,
+  demoActive: boolean,
+  uploadStore: UploadStore,
+): Promise<Record<string, unknown>> {
+  const ctx = await beginLocalInteractiveTurn(adapter, 'pi', nativeId, '/plan', hub, requestedPromptId, demoActive);
+  const { sid, promptId, startedAt, createdAt, turn, emit, finishWithText } = ctx;
+
+  void (async () => {
+    try {
+      const planAns = await askLocalTurnQuestion(hub, sid, turn, emit, '选择 Plan Mode 操作', [
+        {
+          id: 'plan_action',
+          header: 'Plan Mode',
+          question: '选择 Plan Mode 操作，或在下方直接输入要规划的任务：',
+          options: [
+            { id: 'start', label: '开启 Plan Mode (/plan start)', description: '只读探索与规划，禁止修改文件' },
+            { id: 'show', label: '查看当前计划 (/plan show)', description: '展示已生成或保存的计划内容' },
+            { id: 'finalize', label: '生成最终计划 (/plan finalize)', description: '要求助手收敛并输出最终计划' },
+            { id: 'implement', label: '开始实施计划 (/plan implement)', description: '退出只读规划并执行当前计划' },
+            { id: 'save', label: '保存计划供稍后使用 (/plan save)', description: '将当前计划保存留待后续实施' },
+            { id: 'exit', label: '退出 Plan Mode (/plan exit)', description: '关闭 Plan Mode 恢复正常对话' },
+          ],
+          isOther: true,
+          otherLabel: '直接输入计划任务并开启',
+          otherPlaceholder: '描述你想规划的任务…',
+        },
+      ]);
+      if (turn.cancelled || hub.busy.get(sid) !== turn) return;
+
+      const choice = extractFirstQuestionAnswer(planAns, 'plan_action');
+      if (!choice) {
+        finishWithText('已取消 Plan Mode 操作。', 'completed');
+        return;
+      }
+
+      const nextCmd = `/plan ${choice}`;
+      const handle = await adapter.startTurn({ sessionId: nativeId, input: nextCmd });
+      turn.turnId = handle.turnId;
+      let stepActive = false;
+      let step = 0;
+      const ensureStep = (): void => {
+        if (!stepActive) {
+          turn.assistantText = '';
+          turn.thinkingText = '';
+          emit('turn.step.started', { turnId: 0, step });
+          stepActive = true;
+          turn.v262StepIndex = step;
+        }
+      };
+      const completeStep = (state: 'completed' | 'failed' = 'completed'): void => {
+        if (stepActive) {
+          closeV262Thinking(hub, sid, turn);
+          closeV262Assistant(hub, sid, turn);
+          turn.transcript?.completeStep(state);
+          emit('turn.step.completed', { turnId: 0, step, usage: {} });
+          stepActive = false;
+          step += 1;
+          turn.v262StepIndex = step;
+        }
+      };
+      let reason: 'completed' | 'failed' = 'completed';
+      let turnError: string | undefined;
+      for await (const ev of handle.events) {
+        if (hub.busy.get(sid) !== turn) break;
+        if (ev.kind === 'turn' && (ev.status === 'failed' || ev.status === 'cancelled')) {
+          reason = 'failed';
+          const errText = (ev.payload as { error?: string } | undefined)?.error;
+          if (typeof errText === 'string' && errText) turnError = errText;
+        }
+        consumeEvent(ev, turn, emit, ensureStep, completeStep, sid, hub, 'pi');
+      }
+      completeStep(reason === 'failed' ? 'failed' : 'completed');
+      closeV262Thinking(hub, sid, turn);
+      closeV262Assistant(hub, sid, turn);
+      if (reason === 'completed' && step === 0 && turn.v262Items.length <= 1) {
+        emitAssistantDeltaText(`✓ 已执行 \`${nextCmd}\`。`, turn, emit, ensureStep, sid, hub);
+        completeStep('completed');
+      }
+      if (hub.busy.get(sid) === turn) {
+        hub.busy.delete(sid);
+        const durationMs = Date.now() - startedAt;
+        turn.transcript?.end(reason, durationMs);
+        hub.transcript.finishPrompt(sid, promptId, reason);
+        emit('turn.ended', { turnId: 0, reason, durationMs });
+        emit('prompt.completed', { promptId, reason });
+        emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: 'none', last_turn_reason: reason });
+        hub.broadcastV262(sid, {
+          type: 'turn.ended',
+          session_id: sid,
+          agent_id: 'main',
+          turn: {
+            turn_id: turn.v262TurnId,
+            ordinal: turn.v262Ordinal,
+            turn_number: turn.v262Ordinal + 1,
+            kind: 'agent',
+            status: 'ended',
+            outcome: reason === 'failed' ? 'failed' : 'completed',
+            duration_ms: durationMs,
+            started_at: createdAt,
+            ended_at: new Date().toISOString(),
+            ...(reason === 'failed' && turnError ? { error: { message: turnError } } : {}),
+            steps: Array.from({ length: Math.max(1, step) }, (_, idx) => ({ index: idx })),
+            items: [],
+          },
+        });
+        emitV262AgentState(hub, adapter, 'pi', nativeId, sid, 'idle');
+      }
+    } catch (err) {
+      finishWithText(`✗ /plan 执行失败：${err instanceof Error ? err.message : String(err)}`, 'failed');
+    } finally {
+      drainQueue(adapter, 'pi', nativeId, hub, demoActive, uploadStore);
+    }
+  })();
+
+  return {
+    prompt_id: promptId,
+    user_message_id: promptId,
+    origin: { kind: 'user' },
+    status: 'running',
+    content: [{ type: 'text', text: '/plan' }],
+    created_at: createdAt,
+  };
+}
+
 function parseCodexReviewOptions(argsText: string): Parameters<NonNullable<ProviderAdapter['review']>>[1] {
   const trimmed = argsText.trim();
   if (!trimmed) return undefined;
@@ -3522,7 +4352,7 @@ function parseCodexReviewOptions(argsText: string): Parameters<NonNullable<Provi
 }
 
 /** codex 代执行命令 → RPC 映射,返回给用户的输出文本。 */
-async function executeCodexCommand(
+export async function executeCodexCommand(
   adapter: ProviderAdapter,
   nativeId: string,
   name: string,
@@ -3536,7 +4366,7 @@ async function executeCodexCommand(
     case 'undo':
       if (!adapter.rollback) throw new ProviderError('unsupported', 'codex undo 不可用', 400);
       await adapter.rollback(nativeId, 1);
-      return '✓ 已回滚最近 1 个 turn(thread/rollback)。';
+      return '✓ 已回滚最近 1 个 turn(thread/revert)。';
     case 'fork': {
       if (!adapter.fork) throw new ProviderError('unsupported', 'codex fork 不可用', 400);
       const s = await adapter.fork(nativeId);
@@ -3826,12 +4656,17 @@ async function renderCodexStatus(adapter: ProviderAdapter, nativeId: string): Pr
   return lines.join('\n');
 }
 
-async function renderCodexUsage(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+export async function renderCodexUsage(adapter: ProviderAdapter, nativeId: string): Promise<string> {
   const u = adapter.getUsage?.(nativeId);
   const limits = adapter.getRateLimits ? await adapter.getRateLimits().catch(() => null) : null;
   const limitSummary = formatCodexRateLimits(limits);
+  const accountUsage = (adapter as { getAccountUsage?: (sid?: string) => Promise<Record<string, unknown> | null> }).getAccountUsage
+    ? await (adapter as { getAccountUsage?: (sid?: string) => Promise<Record<string, unknown> | null> }).getAccountUsage!(nativeId).catch(() => null)
+    : null;
+  const accountSummary = formatCodexAccountUsage(accountUsage);
   if (!u || (u.input_tokens === 0 && u.output_tokens === 0)) {
-    return limitSummary ? `∑ 暂无本会话累计用量。\n${limitSummary}` : '∑ 暂无用量数据(完成一轮对话后可见)。';
+    const extraParts = [accountSummary, limitSummary].filter(Boolean);
+    return extraParts.length > 0 ? `∑ 暂无本会话累计用量。\n${extraParts.join('\n')}` : '∑ 暂无用量数据(完成一轮对话后可见)。';
   }
   const lines = [
     '∑ 用量统计(本会话累计)',
@@ -3839,8 +4674,28 @@ async function renderCodexUsage(adapter: ProviderAdapter, nativeId: string): Pro
     `· 输出 tokens:${u.output_tokens.toLocaleString()}`,
     `· 缓存读:${u.cache_read_tokens.toLocaleString()} · 缓存写:${u.cache_creation_tokens.toLocaleString()}`,
   ];
+  if (accountSummary) lines.push(accountSummary);
   if (limitSummary) lines.push(limitSummary);
   return lines.join('\n');
+}
+
+export function formatCodexAccountUsage(raw: Record<string, unknown> | null): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const data = (raw.usage && typeof raw.usage === 'object') ? (raw.usage as Record<string, unknown>) : raw;
+  const parts: string[] = [];
+  const num = (v: unknown): number | undefined => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  const total = num(data.totalTokens ?? data.total_tokens ?? data.tokensUsed ?? data.tokens_used);
+  const input = num(data.inputTokens ?? data.input_tokens);
+  const output = num(data.outputTokens ?? data.output_tokens);
+  if (total !== undefined) parts.push(`总 tokens:${total.toLocaleString()}`);
+  if (input !== undefined) parts.push(`输入:${input.toLocaleString()}`);
+  if (output !== undefined) parts.push(`输出:${output.toLocaleString()}`);
+  if (parts.length > 0) return `· 账号用量:${parts.join(' · ')}`;
+  const textEntries = Object.entries(data)
+    .filter(([_, v]) => typeof v === 'number' || typeof v === 'string')
+    .slice(0, 3)
+    .map(([k, v]) => `${k}:${typeof v === 'number' ? v.toLocaleString() : v}`);
+  return textEntries.length > 0 ? `· 账号用量:${textEntries.join(' · ')}` : null;
 }
 
 function formatCodexRateLimits(raw: Record<string, unknown> | null): string | null {
@@ -4613,6 +5468,16 @@ function consumeEvent(
         max_context_tokens: limit,
       });
     }
+  } else if (ev.kind === 'passthrough') {
+    const p = ev.payload as { method?: string; data?: unknown } | undefined;
+    if (p?.method === 'extension_ui' && p.data && typeof p.data === 'object') {
+      hub.broadcastV262(sid, {
+        type: 'extension_ui',
+        session_id: sid,
+        agent_id: 'main',
+        ...(p.data as Record<string, unknown>),
+      });
+    }
   } else if (ev.kind === 'turn') {
     // 终态由 driveTurn 的 finally 统一广播。
   }
@@ -4635,6 +5500,12 @@ async function abortTurn(
   const active = hub.busy.get(sid);
   if (!active) return false;
   active.cancelled = true;
+  if (active.localQuestionResolvers && active.localQuestionResolvers.size > 0) {
+    for (const [qid, resolver] of [...active.localQuestionResolvers.entries()]) {
+      active.localQuestionResolvers.delete(qid);
+      try { resolver(null); } catch { /* ignore */ }
+    }
+  }
   await adapter.interrupt(nativeId, active.turnId || undefined);
   hub.busy.delete(sid);
   closeV262Thinking(hub, sid, active);
@@ -4763,13 +5634,20 @@ function structuredQuestionItems(raw: unknown[] | undefined): Array<Record<strin
           ...(typeof o?.description === 'string' ? { description: o.description } : {}),
         }))
       : [];
+    const otherLabel = typeof q.otherLabel === 'string' ? q.otherLabel : typeof q.other_label === 'string' ? q.other_label : undefined;
+    const otherDesc = typeof q.otherDescription === 'string' ? q.otherDescription : typeof q.other_description === 'string' ? q.other_description : undefined;
+    const otherPh = typeof q.otherPlaceholder === 'string' ? q.otherPlaceholder : typeof q.other_placeholder === 'string' ? q.other_placeholder : undefined;
     return {
       id: String(q.id ?? `q_${i}`),
       question: String(q.question ?? q.header ?? ''),
       ...(typeof q.header === 'string' ? { header: q.header } : {}),
+      ...(typeof q.body === 'string' && q.body ? { body: q.body } : {}),
       options,
       ...(q.multiSelect === true || q.multi_select === true ? { multi_select: true } : {}),
       ...(q.isOther === true || q.allow_other === true ? { allow_other: true } : {}),
+      ...(otherLabel ? { other_label: otherLabel } : {}),
+      ...(otherDesc ? { other_description: otherDesc } : {}),
+      ...(otherPh ? { other_placeholder: otherPh } : {}),
     };
   });
 }
@@ -4861,9 +5739,15 @@ async function resolveQuestion(
   } else {
     payload = body.text ?? '';
   }
-  await adapter.resolveQuestion(nativeId, questionId, payload);
   const sid = prefixedId(provider, nativeId);
   const active = hub.busy.get(sid);
+  const localResolver = active?.localQuestionResolvers?.get(questionId);
+  if (localResolver) {
+    active!.localQuestionResolvers!.delete(questionId);
+    localResolver(payload);
+  } else {
+    await adapter.resolveQuestion(nativeId, questionId, payload);
+  }
   active?.pendingQuestions.delete(questionId);
   hub.transcript.resolveInteraction(sid, questionId, 'answered', payload);
   hub.broadcast(sid, frame(sid, hub, 'event.question.answered', {
@@ -4892,9 +5776,16 @@ async function dismissQuestion(
   questionId: string,
   hub: SessionHub,
 ): Promise<void> {
-  await adapter.resolveQuestion(nativeId, questionId, {}).catch(() => undefined);
   const sid = prefixedId(provider, nativeId);
-  hub.busy.get(sid)?.pendingQuestions.delete(questionId);
+  const active = hub.busy.get(sid);
+  const localResolver = active?.localQuestionResolvers?.get(questionId);
+  if (localResolver) {
+    active!.localQuestionResolvers!.delete(questionId);
+    localResolver(null);
+  } else {
+    await adapter.resolveQuestion(nativeId, questionId, {}).catch(() => undefined);
+  }
+  active?.pendingQuestions.delete(questionId);
   hub.transcript.resolveInteraction(sid, questionId, 'dismissed', null);
   hub.broadcast(sid, frame(sid, hub, 'event.question.dismissed', {
     question_id: questionId, dismissed_at: new Date().toISOString(),
@@ -5035,6 +5926,7 @@ function attachGatewayWebSocket(
   /** kimi=off: 官方启动屏等 WS open。没有上游时走本地事件通道,不能 503。 */
   stubKimiEvents: boolean,
   demoActive: boolean = false,
+  onKimiV25Upgrade?: (req: IncomingMessage, socket: Duplex, head: Buffer) => Promise<boolean>,
 ): void {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -5050,7 +5942,11 @@ function attachGatewayWebSocket(
     const provider = url.searchParams.get('provider');
     if (!isLocalProvider(provider) && !stubKimiEvents) {
       socket.pause();
-      void resolveKimiWs().then((kimiWs) => {
+      void (async () => {
+        if (onKimiV25Upgrade && await onKimiV25Upgrade(req, socket, head)) {
+          return;
+        }
+        const kimiWs = await resolveKimiWs();
         if (socket.destroyed) return;
         if (!kimiWs) {
           socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
@@ -5065,7 +5961,7 @@ function attachGatewayWebSocket(
         });
         if (!kimiWs(req, socket, head)) socket.destroy();
         else socket.resume();
-      }, () => {
+      })().catch(() => {
         if (!socket.destroyed) {
           socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
           socket.destroy();
@@ -5223,6 +6119,15 @@ function attachGatewayWebSocket(
         if (adapter) {
           emitV262AgentState(hub, adapter, socketProvider, split.nativeId, sid, active ? 'running' : 'idle');
           emitV262Usage(hub, adapter, socketProvider, split.nativeId, sid);
+          const extUi = (adapter as { getExtensionUiState?: (id: string) => Record<string, unknown> | undefined }).getExtensionUiState?.(split.nativeId);
+          if (extUi) {
+            sendObj({
+              type: 'extension_ui',
+              session_id: sid,
+              agent_id: 'main',
+              ...extUi,
+            });
+          }
           const wireTasks = await collectSessionWireTasks(adapter, split.nativeId, sid, hub);
           sendObj({
             type: 'task.list',
@@ -5458,89 +6363,6 @@ function attachGatewayWebSocket(
     socket.on('close', cleanup);
     socket.on('error', cleanup);
   });
-}
-
-function wsAccept(key: string): string {
-  return createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
-}
-
-function wsSendFrame(socket: NodeJS.WritableStream, opcode: number, payload: Buffer): void {
-  const len = payload.byteLength;
-  let header: Buffer;
-  if (len < 126) {
-    header = Buffer.from([0x80 | opcode, len]);
-  } else if (len < 65536) {
-    header = Buffer.alloc(4);
-    header[0] = 0x80 | opcode; header[1] = 126; header.writeUInt16BE(len, 2);
-  } else {
-    header = Buffer.alloc(10);
-    header[0] = 0x80 | opcode; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
-  }
-  socket.write(Buffer.concat([header, payload]));
-}
-
-/** 发送一个 text WS 帧(服务端→客户端,不掩码)。 */
-function wsSendText(socket: NodeJS.WritableStream, text: string): void {
-  wsSendFrame(socket, 0x1, Buffer.from(text));
-}
-
-interface ParsedWsFrame {
-  fin: boolean;
-  opcode: number;
-  payload: Buffer;
-}
-
-const WS_MAX_MESSAGE_BYTES = 1 * 1024 * 1024;
-
-/** 带跨 chunk 缓冲的 WS 帧解析器。 */
-class WsFrameParser {
-  private buf: Buffer = Buffer.alloc(0);
-
-  push(chunk: Buffer): ParsedWsFrame[] {
-    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
-    if (this.buf.byteLength > WS_MAX_MESSAGE_BYTES * 2) {
-      throw new Error('websocket buffer too large');
-    }
-    const out: ParsedWsFrame[] = [];
-    for (;;) {
-      const frame = this.tryParse();
-      if (!frame) break;
-      out.push(frame);
-    }
-    return out;
-  }
-
-  private tryParse(): ParsedWsFrame | null {
-    const b = this.buf;
-    if (b.byteLength < 2) return null;
-    const fin = (b[0] & 0x80) !== 0;
-    const opcode = b[0] & 0x0f;
-    const masked = (b[1] & 0x80) !== 0;
-    let len = b[1] & 0x7f;
-    let offset = 2;
-    if (len === 126) {
-      if (b.byteLength < 4) return null;
-      len = b.readUInt16BE(2);
-      offset = 4;
-    } else if (len === 127) {
-      if (b.byteLength < 10) return null;
-      const n = b.readBigUInt64BE(2);
-      if (n > BigInt(WS_MAX_MESSAGE_BYTES)) throw new Error('websocket frame too large');
-      len = Number(n);
-      offset = 10;
-    }
-    if (len > WS_MAX_MESSAGE_BYTES) throw new Error('websocket frame too large');
-    const maskOffset = offset;
-    if (masked) offset += 4;
-    if (b.byteLength < offset + len) return null;
-    let payload = b.subarray(offset, offset + len);
-    if (masked) {
-      const mask = b.subarray(maskOffset, maskOffset + 4);
-      payload = Buffer.from(payload.map((v, i) => v ^ mask[i % 4]));
-    }
-    this.buf = b.subarray(offset + len);
-    return { fin, opcode, payload };
-  }
 }
 
 // ---------------------------------------------------------------------------

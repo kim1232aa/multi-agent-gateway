@@ -61,6 +61,9 @@ const DEFAULT_COMPACT_TIMEOUT_MS = 120_000;
 const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const DEFAULT_HANDLED_GRACE_MS = 200;
+const DEFAULT_RECYCLE_GRACE_MS = 3 * 60_000;
+const DEFAULT_MAX_LIVE_PROCESSES = 2;
+const DEFAULT_MAX_SESSION_FILE_BYTES = 192 * 1024 * 1024;
 const MODELS_TTL_MS = 5 * 60_000;
 const COMMANDS_TTL_MS = 5 * 60_000;
 const SUMMARY_HEAD_BYTES = 64 * 1024;
@@ -204,7 +207,15 @@ export interface PiAdapterOptions {
   onStderr?: (line: string) => void;
   /** Optional preference resolver (used by PiProviderAdapter to sync SettingsStore). */
   resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
+  /** Idle process recycle grace period in ms. Default 180_000 (3 min); 0 disables. */
+  recycleGraceMs?: number;
+  /** Maximum concurrent live session processes. Default 2; 0 disables. */
+  maxLiveProcesses?: number;
+  /** Maximum session file size in bytes before refusing to spawn. Default 192 MiB; 0 disables. */
+  maxSessionFileBytes?: number;
 }
+
+export type PiProviderAdapterOptions = PiAdapterOptions;
 
 export interface PiStartTurnResult {
   turnId: string;
@@ -487,6 +498,7 @@ export interface PiRpcClientOptions {
   shutdownGraceMs?: number;
   killGraceMs?: number;
   onStderr?: (line: string) => void;
+  onActivity?: () => void;
 }
 
 export class PiRpcClient {
@@ -498,6 +510,7 @@ export class PiRpcClient {
   private readonly shutdownGraceMs: number;
   private readonly killGraceMs: number;
   private readonly onStderr?: (line: string) => void;
+  private readonly onActivity?: () => void;
 
   private child: ChildProcess | null = null;
   private writer: StdinLineWriter | null = null;
@@ -522,6 +535,11 @@ export class PiRpcClient {
     this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
     this.killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
     this.onStderr = options.onStderr;
+    this.onActivity = options.onActivity;
+  }
+
+  hasPendingRequests(): boolean {
+    return this.pending.size > 0;
   }
 
   get isAlive(): boolean {
@@ -609,21 +627,41 @@ export class PiRpcClient {
     });
   }
 
-  async request<T = unknown>(command: Record<string, unknown>, timeoutMs = this.requestTimeoutMs): Promise<T> {
+  requestWithController<T = unknown>(
+    command: Record<string, unknown>,
+    timeoutMs = this.requestTimeoutMs,
+  ): { promise: Promise<T>; cancelTimeout: () => void } {
+    this.onActivity?.();
     if (!this.started) this.start();
     if (this.exited || this.closing || !this.writer) {
-      throw this.exitError ?? new ProviderError('upstream_error', 'Pi RPC process is not running', 502);
+      return {
+        promise: Promise.reject(this.exitError ?? new ProviderError('upstream_error', 'Pi RPC process is not running', 502)),
+        cancelTimeout: () => undefined,
+      };
     }
     const id = `pi_req_${++this.reqSeq}`;
     const cmdName = String(command.type ?? 'unknown');
     const payload = { ...command, id };
     const line = `${JSON.stringify(payload)}\n`;
 
-    return new Promise<T>((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cancelTimeout = (): void => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      const entry = this.pending.get(id);
+      if (entry && entry.timer) {
+        clearTimeout(entry.timer);
+        entry.timer = null;
+      }
+    };
+
+    const promise = new Promise<T>((resolve, reject) => {
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           this.pending.delete(id);
+          this.onActivity?.();
           reject(new ProviderError('upstream_error', `Pi RPC '${cmdName}' timed out after ${timeoutMs}ms`, 504));
         }, timeoutMs);
         timer.unref?.();
@@ -639,14 +677,22 @@ export class PiRpcClient {
         const entry = this.pending.get(id);
         if (!entry) return;
         this.pending.delete(id);
+        this.onActivity?.();
         if (entry.timer) clearTimeout(entry.timer);
         const message = err instanceof Error ? err.message : String(err);
         reject(new ProviderError('upstream_error', `Pi RPC '${cmdName}' write failed: ${message}`, 502, err));
       });
     });
+
+    return { promise, cancelTimeout };
+  }
+
+  async request<T = unknown>(command: Record<string, unknown>, timeoutMs = this.requestTimeoutMs): Promise<T> {
+    return this.requestWithController<T>(command, timeoutMs).promise;
   }
 
   async sendExtensionUiResponse(response: Record<string, unknown>): Promise<void> {
+    this.onActivity?.();
     if (!this.canWriteStdin || !this.writer) return;
     await this.writer.writeLine(`${JSON.stringify(response)}\n`);
   }
@@ -704,6 +750,7 @@ export class PiRpcClient {
     if (!isRecord(msg)) return;
 
     if (msg.type === 'response') {
+      this.onActivity?.();
       const id = typeof msg.id === 'string' ? msg.id : undefined;
       if (id && this.pending.has(id)) {
         const pending = this.pending.get(id)!;
@@ -722,10 +769,12 @@ export class PiRpcClient {
     }
 
     if (msg.type === 'extension_ui_request') {
+      this.onActivity?.();
       this.emit({ kind: 'ui_request', request: msg });
       return;
     }
 
+    this.onActivity?.();
     this.emit({ kind: 'rpc_event', event: msg });
   }
 
@@ -771,11 +820,26 @@ export class PiRpcClient {
 interface ParkedQuestion {
   id: string;
   sessionId: string;
-  method: 'select' | 'confirm' | 'input';
+  method: 'select' | 'confirm' | 'input' | 'editor';
   options?: string[];
+  optionById?: Map<string, string>;
   timer: ReturnType<typeof setTimeout> | null;
   stream: EventStream<GatewayEvent>;
   turnId: string;
+}
+
+interface PiExtensionUiState {
+  statuses: Map<string, string>;
+  widgets: Map<string, { lines: string[]; placement?: string }>;
+  title?: string;
+}
+
+interface PiDiscoveredSubagent {
+  agentId: string;
+  parentToolUseId?: string;
+  description?: string;
+  subagentType?: string;
+  transcriptPath?: string;
 }
 
 interface ActiveTurnState {
@@ -787,6 +851,11 @@ interface ActiveTurnState {
   abortRequested: boolean;
   inAgentRun: boolean;
   sawAgentStart: boolean;
+  promptSettled: boolean;
+  promptDisposition?: 'started' | 'queued' | 'handled';
+  onPromptProgress?: () => void;
+  sawCustomEntryIds: Set<string>;
+  startedSubagents: Set<string>;
   streamedTextIndices: Set<number>;
   streamedThinkingIndices: Set<number>;
   startedTools: Set<string>;
@@ -813,6 +882,9 @@ export class PiAdapter {
   private readonly handledGraceMs: number;
   private readonly onStderr?: (line: string) => void;
   private readonly resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
+  private readonly recycleGraceMs: number;
+  private readonly maxLiveProcesses: number;
+  private readonly maxSessionFileBytes: number;
 
   private readonly processes = new Map<string, PiRpcClient>();
   private readonly ephemeralClients = new Set<PiRpcClient>();
@@ -828,9 +900,17 @@ export class PiAdapter {
   private readonly sessionModels = new Map<string, string>();
   private readonly sessionThinkings = new Map<string, string>();
   private readonly appliedPreferences = new Map<string, { model?: string; thinking?: string }>();
+  private readonly extensionUiStates = new Map<string, PiExtensionUiState>();
+  private readonly discoveredSubagents = new Map<string, Map<string, PiDiscoveredSubagent>>();
+  private readonly lastActivityAt = new Map<string, number>();
+  private readonly recycleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly ensureInflight = new Map<string, Promise<PiRpcClient>>();
+  private readonly startingSessions = new Set<string>();
+  private capacityLock: Promise<void> = Promise.resolve();
 
   private modelsCache: { ts: number; models: PiModelInfo[] } | null = null;
   private modelsInflight: Promise<PiModelInfo[]> | null = null;
+  private readonly thinkingLevelsCache = new Map<string, { ts: number; levels: string[] }>();
   private readonly commandsCache = new Map<string, { ts: number; commands: PiNativeCommandInput[] }>();
   private readonly commandsInflight = new Map<string, Promise<PiNativeCommandInput[]>>();
 
@@ -849,6 +929,9 @@ export class PiAdapter {
     this.handledGraceMs = Math.max(0, options.handledGraceMs ?? DEFAULT_HANDLED_GRACE_MS);
     this.onStderr = options.onStderr;
     this.resolveSessionPreferences = options.resolveSessionPreferences;
+    this.recycleGraceMs = options.recycleGraceMs !== undefined ? Math.max(0, options.recycleGraceMs) : DEFAULT_RECYCLE_GRACE_MS;
+    this.maxLiveProcesses = options.maxLiveProcesses !== undefined ? Math.max(0, options.maxLiveProcesses) : DEFAULT_MAX_LIVE_PROCESSES;
+    this.maxSessionFileBytes = options.maxSessionFileBytes !== undefined ? Math.max(0, options.maxSessionFileBytes) : DEFAULT_MAX_SESSION_FILE_BYTES;
   }
 
   getPiBin(): string {
@@ -1012,41 +1095,195 @@ export class PiAdapter {
   }
 
   async getState(sessionId: string): Promise<PiSessionState> {
-    const client = await this.ensureSessionProcess(sessionId);
-    const state = await client.request<PiSessionState>({ type: 'get_state' });
-    this.recordState(sessionId, state);
-    return state;
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const state = await existing.request<PiSessionState>({ type: 'get_state' });
+      this.touchActivity(sessionId);
+      this.recordState(sessionId, state);
+      return state;
+    }
+    return this.readSessionStateFromDisk(sessionId);
+  }
+
+  getExtensionUiState(sessionId: string): {
+    statuses: Record<string, string>;
+    widgets: Record<string, { lines: string[]; placement?: string }>;
+    title?: string;
+  } | undefined {
+    const st = this.extensionUiStates.get(sessionId);
+    if (!st) return undefined;
+    const statuses: Record<string, string> = {};
+    for (const [k, v] of st.statuses) statuses[k] = v;
+    const widgets: Record<string, { lines: string[]; placement?: string }> = {};
+    for (const [k, v] of st.widgets) widgets[k] = v;
+    if (Object.keys(statuses).length === 0 && Object.keys(widgets).length === 0 && !st.title) {
+      return undefined;
+    }
+    return {
+      statuses,
+      widgets,
+      ...(st.title ? { title: st.title } : {}),
+    };
+  }
+
+  getPlanMode(sessionId: string): boolean {
+    const statusText = this.extensionUiStates.get(sessionId)?.statuses.get('plan-mode');
+    if (!statusText) return false;
+    return /^plan\s+(active|ready|discussion)\b/i.test(statusText);
+  }
+
+  private updateExtensionUiState(sessionId: string, req: Record<string, unknown>): boolean {
+    const method = typeof req.method === 'string' ? req.method : '';
+    let st = this.extensionUiStates.get(sessionId);
+    const ensure = (): PiExtensionUiState => {
+      if (!st) {
+        st = { statuses: new Map(), widgets: new Map() };
+        this.extensionUiStates.set(sessionId, st);
+      }
+      return st;
+    };
+    if (method === 'setStatus') {
+      const key = typeof req.statusKey === 'string' ? req.statusKey : '';
+      if (!key) return false;
+      const text = typeof req.statusText === 'string' ? req.statusText.trim() : '';
+      if (!text) {
+        return st ? st.statuses.delete(key) : false;
+      }
+      ensure().statuses.set(key, text);
+      return true;
+    }
+    if (method === 'setWidget') {
+      const key = typeof req.widgetKey === 'string' ? req.widgetKey : '';
+      if (!key) return false;
+      const lines = Array.isArray(req.widgetLines)
+        ? req.widgetLines.filter((l): l is string => typeof l === 'string')
+        : null;
+      if (!lines || lines.length === 0) {
+        return st ? st.widgets.delete(key) : false;
+      }
+      const placement = typeof req.widgetPlacement === 'string' ? req.widgetPlacement : undefined;
+      ensure().widgets.set(key, { lines, ...(placement ? { placement } : {}) });
+      return true;
+    }
+    if (method === 'setTitle') {
+      const title = typeof req.title === 'string' ? req.title.trim() : '';
+      if (!title) {
+        if (st && st.title !== undefined) {
+          delete st.title;
+          return true;
+        }
+        return false;
+      }
+      ensure().title = title;
+      return true;
+    }
+    return false;
   }
 
   async getAvailableThinkingLevels(sessionId: string): Promise<string[]> {
-    const client = await this.ensureSessionProcess(sessionId);
-    const data = await client.request<{ levels?: string[] }>({ type: 'get_available_thinking_levels' });
-    const raw = Array.isArray(data?.levels) ? data.levels.filter((l): l is string => typeof l === 'string') : [];
-    return Array.from(new Set(raw));
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      const data = await existing.request<{ levels?: string[] }>({ type: 'get_available_thinking_levels' });
+      const raw = Array.isArray(data?.levels) ? data.levels.filter((l): l is string => typeof l === 'string') : [];
+      return Array.from(new Set(raw));
+    }
+    // Never spawn a heavy --session <file> process just to list thinking levels for an idle session.
+    const modelId = this.sessionModels.get(sessionId) ?? this.resolveSessionPreferences?.(sessionId)?.model;
+    const known = this.modelsCache?.models;
+    if (modelId && known) {
+      const parsed = decodePiModelId(modelId, known);
+      const hit = parsed
+        ? known.find((m) => m.provider === parsed.provider && m.id === parsed.modelId)
+        : known.find((m) => m.id === modelId);
+      if (hit) return piModelSupportedThinkingLevels(hit);
+    }
+    const cacheKey = modelId ?? '__default__';
+    const cached = this.thinkingLevelsCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < MODELS_TTL_MS) {
+      return [...cached.levels];
+    }
+    try {
+      const cwd = await this.resolveSessionCwd(sessionId);
+      const levels = await this.runEphemeralRpc(async (client) => {
+        if (modelId) {
+          const parsed = decodePiModelId(modelId, this.modelsCache?.models);
+          if (parsed) {
+            await client.request({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId }).catch(() => undefined);
+          }
+        }
+        const data = await client.request<{ levels?: string[] }>({ type: 'get_available_thinking_levels' });
+        const raw = Array.isArray(data?.levels) ? data.levels.filter((l): l is string => typeof l === 'string') : [];
+        return Array.from(new Set(raw));
+      }, cwd);
+      if (levels.length > 0) {
+        this.thinkingLevelsCache.set(cacheKey, { ts: Date.now(), levels });
+        return [...levels];
+      }
+    } catch {
+      // fall through to safe static fallback
+    }
+    return [...EXTENDED_THINKING_LEVELS];
   }
 
   async setModel(sessionId: string, encodedModel: string): Promise<PiModelInfo> {
-    const known = this.modelsCache?.models;
-    const parsed = decodePiModelId(encodedModel, known);
+    let known = this.modelsCache?.models;
+    let parsed = decodePiModelId(encodedModel, known);
+    if (!parsed && !this.modelsCache) {
+      known = await this.getAvailableModels();
+      parsed = decodePiModelId(encodedModel, known);
+    }
     if (!parsed) {
       throw new ProviderError('invalid_request', `Invalid Pi model identifier: ${encodedModel}`, 400);
     }
-    const client = await this.ensureSessionProcess(sessionId, { skipModelSync: true });
-    const model = await client.request<PiModelInfo>({
-      type: 'set_model',
-      provider: parsed.provider,
-      modelId: parsed.modelId,
-    });
-    const state = await client.request<PiSessionState>({ type: 'get_state' });
-    this.recordState(sessionId, state);
-    const resolvedEncoded = encodePiModelId(model.provider || parsed.provider, model.id || parsed.modelId);
+
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const model = await existing.request<PiModelInfo>({
+        type: 'set_model',
+        provider: parsed.provider,
+        modelId: parsed.modelId,
+      });
+      const state = await existing.request<PiSessionState>({ type: 'get_state' });
+      this.touchActivity(sessionId);
+      this.recordState(sessionId, state);
+      const resolvedEncoded = encodePiModelId(model.provider || parsed.provider, model.id || parsed.modelId);
+      const prevApplied = this.appliedPreferences.get(sessionId);
+      this.appliedPreferences.set(sessionId, {
+        ...prevApplied,
+        model: resolvedEncoded,
+        ...(state.thinkingLevel ? { thinking: state.thinkingLevel } : {}),
+      });
+      return model;
+    }
+
+    if (!known) {
+      known = await this.getAvailableModels().catch(() => undefined);
+    }
+    if (known && known.length > 0) {
+      const match = known.find((m) => m.provider === parsed!.provider && m.id === parsed!.modelId);
+      if (!match) {
+        throw new ProviderError('invalid_request', `Unknown Pi model identifier: ${encodedModel}`, 400);
+      }
+    }
+
+    const resolvedEncoded = encodePiModelId(parsed.provider, parsed.modelId);
+    this.sessionModels.set(sessionId, resolvedEncoded);
     const prevApplied = this.appliedPreferences.get(sessionId);
-    this.appliedPreferences.set(sessionId, {
-      ...prevApplied,
-      model: resolvedEncoded,
-      ...(state.thinkingLevel ? { thinking: state.thinkingLevel } : {}),
-    });
-    return model;
+    if (prevApplied) {
+      const { model: _, ...rest } = prevApplied;
+      if (Object.keys(rest).length > 0) {
+        this.appliedPreferences.set(sessionId, rest);
+      } else {
+        this.appliedPreferences.delete(sessionId);
+      }
+    }
+    const matched = known?.find((m) => m.provider === parsed!.provider && m.id === parsed!.modelId);
+    return matched ?? {
+      provider: parsed.provider,
+      id: parsed.modelId,
+    };
   }
 
   async setThinkingLevel(sessionId: string, level: string): Promise<string> {
@@ -1054,22 +1291,44 @@ export class PiAdapter {
     if (!VALID_THINKING_LEVELS.has(normalized)) {
       throw new ProviderError('invalid_request', `Unsupported thinking level: ${level}`, 400);
     }
-    const client = await this.ensureSessionProcess(sessionId, { skipThinkingSync: true });
-    await client.request({ type: 'set_thinking_level', level: normalized });
-    const state = await client.request<PiSessionState>({ type: 'get_state' });
-    this.recordState(sessionId, state);
-    const effective = state.thinkingLevel ?? normalized;
+
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      await existing.request({ type: 'set_thinking_level', level: normalized });
+      const state = await existing.request<PiSessionState>({ type: 'get_state' });
+      this.touchActivity(sessionId);
+      this.recordState(sessionId, state);
+      const effective = state.thinkingLevel ?? normalized;
+      const prevApplied = this.appliedPreferences.get(sessionId);
+      this.appliedPreferences.set(sessionId, { ...prevApplied, thinking: effective });
+      return effective;
+    }
+
+    this.sessionThinkings.set(sessionId, normalized);
     const prevApplied = this.appliedPreferences.get(sessionId);
-    this.appliedPreferences.set(sessionId, { ...prevApplied, thinking: effective });
-    return effective;
+    if (prevApplied) {
+      const { thinking: _, ...rest } = prevApplied;
+      if (Object.keys(rest).length > 0) {
+        this.appliedPreferences.set(sessionId, rest);
+      } else {
+        this.appliedPreferences.delete(sessionId);
+      }
+    }
+    return normalized;
   }
 
   async getSessionStats(sessionId: string): Promise<PiSessionStats> {
-    const client = await this.ensureSessionProcess(sessionId);
-    const stats = await client.request<PiSessionStats>({ type: 'get_session_stats' });
-    const usage = mapPiStatsToUsage(stats, this.sessionModels.get(sessionId), this.modelsCache?.models);
-    this.sessionUsage.set(sessionId, usage);
-    return stats;
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const stats = await existing.request<PiSessionStats>({ type: 'get_session_stats' });
+      this.touchActivity(sessionId);
+      const usage = mapPiStatsToUsage(stats, this.sessionModels.get(sessionId), this.modelsCache?.models);
+      this.sessionUsage.set(sessionId, usage);
+      return stats;
+    }
+    return this.readSessionStatsFromDisk(sessionId);
   }
 
   async refreshUsage(sessionId: string): Promise<SessionUsage> {
@@ -1086,20 +1345,45 @@ export class PiAdapter {
   }
 
   async getAutoCompaction(sessionId: string): Promise<boolean | undefined> {
-    const state = await this.getState(sessionId);
-    return state.autoCompactionEnabled;
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const state = await existing.request<PiSessionState>({ type: 'get_state' });
+      this.touchActivity(sessionId);
+      this.recordState(sessionId, state);
+      return state.autoCompactionEnabled;
+    }
+    return this.readConfiguredCompactionEnabled();
   }
 
   async getLastAssistantText(sessionId: string): Promise<string | null> {
-    const client = await this.ensureSessionProcess(sessionId);
-    const data = await client.request<{ text?: string | null }>({ type: 'get_last_assistant_text' });
-    return typeof data?.text === 'string' ? data.text : null;
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const data = await existing.request<{ text?: string | null }>({ type: 'get_last_assistant_text' });
+      this.touchActivity(sessionId);
+      return typeof data?.text === 'string' ? data.text : null;
+    }
+    const history = await this.getHistory(sessionId);
+    for (let i = history.length - 1; i >= 0; i--) {
+      const msg = history[i]!;
+      if (msg.role === 'assistant') {
+        const text = extractMessageText(msg.content);
+        return text || null;
+      }
+    }
+    return null;
   }
 
   async getSessionTree(sessionId: string): Promise<Record<string, unknown> | null> {
-    const client = await this.ensureSessionProcess(sessionId);
-    const data = await client.request<Record<string, unknown>>({ type: 'get_tree' });
-    return data && typeof data === 'object' ? data : null;
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const data = await existing.request<Record<string, unknown>>({ type: 'get_tree' });
+      this.touchActivity(sessionId);
+      return data && typeof data === 'object' ? data : null;
+    }
+    return this.readSessionTreeFromDisk(sessionId);
   }
 
   clearCommandsCache(): void {
@@ -1160,11 +1444,36 @@ export class PiAdapter {
   // -- Clone & Fork (isolated processes) ------------------------------------
 
   async getForkMessages(sessionId: string): Promise<Array<{ entryId: string; text: string }>> {
-    const client = await this.ensureSessionProcess(sessionId);
-    const data = await client.request<{ messages?: Array<{ entryId: string; text: string }> }>({
-      type: 'get_fork_messages',
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      const data = await existing.request<{ messages?: Array<{ entryId: string; text: string }> }>({
+        type: 'get_fork_messages',
+      });
+      this.touchActivity(sessionId);
+      return Array.isArray(data?.messages) ? data.messages : [];
+    }
+    assertSafeSessionId(sessionId);
+    const filePath = await this.locateSessionFile(sessionId);
+    if (!filePath) {
+      if (this.draftSessions.has(sessionId)) return [];
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+    const realRoot = await safeRealpath(this.sessionsDir);
+    if (!realRoot) {
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+    const out: Array<{ entryId: string; text: string }> = [];
+    let legacySeq = 0;
+    await forEachJsonlEntryNoFollow(filePath, realRoot, (entry) => {
+      if (entry.type !== 'message' || !isRecord(entry.message)) return;
+      if (entry.message.role !== 'user') return;
+      const text = extractMessageText(entry.message.content);
+      if (!text) return;
+      const entryId = typeof entry.id === 'string' && entry.id ? entry.id : `legacy_${++legacySeq}`;
+      out.push({ entryId, text });
     });
-    return Array.isArray(data?.messages) ? data.messages : [];
+    return out;
   }
 
   async clone(sessionId: string): Promise<PiSessionSummary> {
@@ -1211,6 +1520,16 @@ export class PiAdapter {
 
     const sourceCwd = await this.resolveSessionCwd(sourceSessionId);
     const resolvedSourceFile = sourceFile ?? this.sessionFiles.get(sourceSessionId);
+    if (resolvedSourceFile && this.maxSessionFileBytes > 0) {
+      const st = await fsp.stat(resolvedSourceFile).catch(() => null);
+      if (st && st.size > this.maxSessionFileBytes) {
+        throw new ProviderError(
+          'invalid_request',
+          `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${resolvedSourceFile}`,
+          400,
+        );
+      }
+    }
     const launchArgs = resolvedSourceFile
       ? ['--session', resolvedSourceFile]
       : ['--session-id', sourceSessionId];
@@ -1293,6 +1612,7 @@ export class PiAdapter {
         throw new ProviderError('not_found', 'pi adapter disposed', 404);
       }
       this.ephemeralClients.delete(newClient);
+      await this.evictOldestIdleProcessIfNeeded(newSessionId, false);
       const displaced = this.processes.get(newSessionId);
       if (displaced && displaced !== newClient) {
         this.clientToSession.delete(displaced);
@@ -1300,6 +1620,7 @@ export class PiAdapter {
       }
       this.clientToSession.set(newClient, newSessionId);
       this.processes.set(newSessionId, newClient);
+      this.touchActivity(newSessionId);
       this.sessionCwd.set(newSessionId, sourceCwd);
       if ((newState.messageCount ?? 0) > 0) {
         if (newSessionFile) this.sessionFiles.set(newSessionId, newSessionFile);
@@ -1355,8 +1676,19 @@ export class PiAdapter {
     }
 
     const client = await this.ensureSessionProcess(sessionId);
+    this.touchActivity(sessionId);
     const turnId = randomUUID();
     const stream = new EventStream<GatewayEvent>();
+
+    let resolveProgress!: () => void;
+    let progressFired = false;
+    const progressPromise = new Promise<void>((resolve) => {
+      resolveProgress = () => {
+        if (progressFired) return;
+        progressFired = true;
+        resolve();
+      };
+    });
 
     const turn: ActiveTurnState = {
       sessionId,
@@ -1367,6 +1699,10 @@ export class PiAdapter {
       abortRequested: false,
       inAgentRun: false,
       sawAgentStart: false,
+      promptSettled: false,
+      onPromptProgress: resolveProgress,
+      sawCustomEntryIds: new Set(),
+      startedSubagents: new Set(),
       streamedTextIndices: new Set(),
       streamedThinkingIndices: new Set(),
       startedTools: new Set(),
@@ -1384,29 +1720,60 @@ export class PiAdapter {
       this.handleClientEvent(turn, ev);
     });
 
-    try {
-      const response = await client.request<{ disposition?: 'started' | 'queued' | 'handled' }>({
-        type: 'prompt',
-        message,
-        ...(images.length > 0 ? { images } : {}),
-      });
-      const disposition = response?.disposition ?? 'started';
+    const promptReq = client.requestWithController<{ disposition?: 'started' | 'queued' | 'handled' }>({
+      type: 'prompt',
+      message,
+      ...(images.length > 0 ? { images } : {}),
+    });
 
-      // `disposition: "handled"` only means no run started synchronously for the
-      // submitted prompt; an extension command/input handler can still trigger an
-      // asynchronous `agent_start` -> `agent_settled` run right after returning.
-      // Keep the listener open for a short grace window before completing.
-      if (disposition === 'handled' && !turn.inAgentRun && !turn.sawAgentStart && !turn.settled) {
-        this.scheduleHandledGraceSettle(turn);
-      }
+    let returned = false;
+    const promptOutcome = promptReq.promise.then(
+      (response) => {
+        promptReq.cancelTimeout();
+        turn.promptSettled = true;
+        const disposition = response?.disposition ?? 'started';
+        turn.promptDisposition = disposition;
 
-      return { turnId, disposition, events: stream };
-    } catch (err) {
+        // `disposition: "handled"` only means no run started synchronously for the
+        // submitted prompt; an extension command/input handler can still trigger an
+        // asynchronous `agent_start` -> `agent_settled` run right after returning.
+        // Keep the listener open for a short grace window before completing.
+        if (disposition === 'handled' && !turn.inAgentRun && !turn.sawAgentStart && !turn.settled) {
+          this.scheduleHandledGraceSettle(turn);
+        }
+        return { ok: true as const, disposition };
+      },
+      (err: unknown) => {
+        promptReq.cancelTimeout();
+        turn.promptSettled = true;
+        if (returned && !turn.settled) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.settleTurn(turn, turn.abortRequested ? 'cancelled' : 'failed', msg);
+        }
+        return { ok: false as const, err };
+      },
+    );
+
+    const winner = await Promise.race([
+      promptOutcome.then((res) => ({ kind: 'prompt' as const, res })),
+      progressPromise.then(() => ({ kind: 'progress' as const })),
+    ]);
+
+    if (winner.kind === 'prompt' && !winner.res.ok) {
       if (!turn.settled) {
         this.cleanupTurn(turn);
       }
-      throw err;
+      throw winner.res.err;
     }
+
+    returned = true;
+    if (winner.kind === 'progress') {
+      promptReq.cancelTimeout();
+    }
+    const disposition = winner.kind === 'prompt' && winner.res.ok
+      ? winner.res.disposition
+      : (turn.promptDisposition ?? 'started');
+    return { turnId, disposition, events: stream };
   }
 
   async steer(
@@ -1490,6 +1857,7 @@ export class PiAdapter {
     questionId: string,
     answer: string | Record<string, string[]>,
   ): Promise<void> {
+    this.touchActivity(sessionId);
     const parked = this.parkedQuestions.get(questionId);
     if (!parked || parked.sessionId !== sessionId) {
       throw new ProviderError('not_found', `pi-adapter: no pending question ${questionId} for session ${sessionId}`, 404);
@@ -1550,6 +1918,13 @@ export class PiAdapter {
   }
 
   async close(sessionId: string): Promise<void> {
+    const timer = this.recycleTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.recycleTimers.delete(sessionId);
+    }
+    this.lastActivityAt.delete(sessionId);
+    this.extensionUiStates.delete(sessionId);
     const turn = this.activeTurns.get(sessionId);
     this.failCloseSessionQuestions(sessionId);
     const client = this.processes.get(sessionId);
@@ -1565,7 +1940,15 @@ export class PiAdapter {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.ensureInflight.clear();
+    this.startingSessions.clear();
+    for (const [, timer] of this.recycleTimers) {
+      clearTimeout(timer);
+    }
+    this.recycleTimers.clear();
+    this.lastActivityAt.clear();
     this.modelsInflight = null;
+    this.thinkingLevelsCache.clear();
     this.commandsInflight.clear();
     const sessionIds = new Set([...this.processes.keys(), ...this.activeTurns.keys()]);
     const ephemeral = [...this.ephemeralClients];
@@ -1584,6 +1967,97 @@ export class PiAdapter {
 
   // -- Internals ------------------------------------------------------------
 
+  private withCapacityLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.capacityLock.then(fn, fn);
+    this.capacityLock = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private touchActivity(sessionId: string): void {
+    this.lastActivityAt.set(sessionId, Date.now());
+    if (this.processes.has(sessionId)) {
+      this.scheduleRecycle(sessionId);
+    }
+  }
+
+  private scheduleRecycle(sessionId: string): void {
+    if (this.recycleGraceMs <= 0) return;
+    const existingTimer = this.recycleTimers.get(sessionId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    const timer = setTimeout(() => {
+      void this.checkRecycle(sessionId);
+    }, this.recycleGraceMs);
+    timer.unref?.();
+    this.recycleTimers.set(sessionId, timer);
+  }
+
+  private async checkRecycle(sessionId: string): Promise<void> {
+    this.recycleTimers.delete(sessionId);
+    const client = this.processes.get(sessionId);
+    if (!client || !client.isAlive) {
+      this.lastActivityAt.delete(sessionId);
+      return;
+    }
+    const hasParked = this.hasParkedQuestions(sessionId);
+    const busy = this.activeTurns.has(sessionId) || hasParked || client.hasPendingRequests();
+    if (busy) {
+      this.scheduleRecycle(sessionId);
+      return;
+    }
+    const last = this.lastActivityAt.get(sessionId) ?? 0;
+    const elapsed = Date.now() - last;
+    if (elapsed < this.recycleGraceMs) {
+      const remaining = this.recycleGraceMs - elapsed;
+      const timer = setTimeout(() => {
+        void this.checkRecycle(sessionId);
+      }, remaining);
+      timer.unref?.();
+      this.recycleTimers.set(sessionId, timer);
+      return;
+    }
+    await this.close(sessionId).catch(() => undefined);
+  }
+
+  private hasParkedQuestions(sessionId: string): boolean {
+    for (const q of this.parkedQuestions.values()) {
+      if (q.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  private async evictOldestIdleProcessIfNeeded(excludeSid?: string, strict = true): Promise<void> {
+    if (this.maxLiveProcesses <= 0) return;
+    while (this.processes.size + this.startingSessions.size >= this.maxLiveProcesses) {
+      let oldestSid: string | null = null;
+      let oldestTime = Infinity;
+      for (const [sid, client] of this.processes) {
+        if (sid === excludeSid) continue;
+        if (this.activeTurns.has(sid)) continue;
+        if (this.hasParkedQuestions(sid)) continue;
+        if (this.ensureInflight.has(sid) || this.startingSessions.has(sid)) continue;
+        if (client.hasPendingRequests()) continue;
+        const t = this.lastActivityAt.get(sid) ?? 0;
+        if (t < oldestTime) {
+          oldestTime = t;
+          oldestSid = sid;
+        }
+      }
+      if (!oldestSid) {
+        if (strict) {
+          throw new ProviderError(
+            'busy',
+            `Too many active Pi processes (max ${this.maxLiveProcesses}); wait for an active session to finish`,
+            409,
+          );
+        }
+        break;
+      }
+      await this.close(oldestSid);
+    }
+  }
+
   private createClient(cwd: string, args: string[]): PiRpcClient {
     const client = new PiRpcClient({
       piBin: this.getPiBin(),
@@ -1594,6 +2068,12 @@ export class PiAdapter {
       shutdownGraceMs: this.shutdownGraceMs,
       killGraceMs: this.killGraceMs,
       onStderr: this.onStderr,
+      onActivity: () => {
+        const sid = this.clientToSession.get(client);
+        if (sid) {
+          this.touchActivity(sid);
+        }
+      },
     });
     // Persistent client-level fallback: any extension_ui_request outside an active
     // unsettled turn fails closed `{ cancelled: true }` (fire-and-forget stays a no-op).
@@ -1622,13 +2102,55 @@ export class PiAdapter {
     sessionId: string,
     opts?: { skipModelSync?: boolean; skipThinkingSync?: boolean },
   ): Promise<PiRpcClient> {
+    if (this.disposed) {
+      throw new ProviderError('not_found', 'pi adapter disposed', 404);
+    }
     const existing = this.processes.get(sessionId);
     if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      await this.syncSessionPreferencesToClient(existing, sessionId, undefined, opts);
+      return existing;
+    }
+
+    const inflight = this.ensureInflight.get(sessionId);
+    if (inflight) {
+      const client = await inflight;
+      if (this.disposed || !client.isAlive) {
+        throw new ProviderError('not_found', 'pi session closed while starting', 404);
+      }
+      this.touchActivity(sessionId);
+      await this.syncSessionPreferencesToClient(client, sessionId, undefined, opts);
+      return client;
+    }
+
+    const task = this.startSessionProcessLocked(sessionId, opts);
+    this.ensureInflight.set(sessionId, task);
+    try {
+      return await task;
+    } finally {
+      if (this.ensureInflight.get(sessionId) === task) {
+        this.ensureInflight.delete(sessionId);
+      }
+    }
+  }
+
+  private async startSessionProcessLocked(
+    sessionId: string,
+    opts?: { skipModelSync?: boolean; skipThinkingSync?: boolean },
+  ): Promise<PiRpcClient> {
+    if (this.disposed) {
+      throw new ProviderError('not_found', 'pi adapter disposed', 404);
+    }
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
       await this.syncSessionPreferencesToClient(existing, sessionId, undefined, opts);
       return existing;
     }
     if (existing) {
-      this.processes.delete(sessionId);
+      if (this.processes.get(sessionId) === existing) {
+        this.processes.delete(sessionId);
+      }
       this.clientToSession.delete(existing);
       await existing.close().catch(() => undefined);
     }
@@ -1636,31 +2158,467 @@ export class PiAdapter {
     assertSafeSessionId(sessionId);
     const cwd = await this.resolveSessionCwd(sessionId);
     const existingFile = await this.locateSessionFile(sessionId);
-    const args: string[] = existingFile
-      ? ['--session', existingFile]
-      : ['--session-id', sessionId];
 
-    const pendingName = this.sessionNames.get(sessionId);
-    if (!existingFile && pendingName) {
-      args.push('--name', pendingName);
+    if (existingFile && this.maxSessionFileBytes > 0) {
+      const st = await fsp.stat(existingFile).catch(() => null);
+      if (st && st.size > this.maxSessionFileBytes) {
+        throw new ProviderError(
+          'invalid_request',
+          `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${existingFile}`,
+          400,
+        );
+      }
     }
 
-    const client = this.createClient(cwd, args);
-    this.clientToSession.set(client, sessionId);
-    client.start();
-    this.processes.set(sessionId, client);
+    const existingAfterPrep = await this.withCapacityLock(async () => {
+      if (this.disposed) {
+        throw new ProviderError('not_found', 'pi adapter disposed', 404);
+      }
+      const liveNow = this.processes.get(sessionId);
+      if (liveNow?.isAlive) return liveNow;
+      await this.evictOldestIdleProcessIfNeeded(sessionId, true);
+      this.startingSessions.add(sessionId);
+      return null;
+    });
+    if (existingAfterPrep) {
+      this.touchActivity(sessionId);
+      await this.syncSessionPreferencesToClient(existingAfterPrep, sessionId, undefined, opts);
+      return existingAfterPrep;
+    }
 
+    let client: PiRpcClient | null = null;
     try {
+      if (this.disposed) {
+        throw new ProviderError('not_found', 'pi adapter disposed', 404);
+      }
+      const args: string[] = existingFile
+        ? ['--session', existingFile]
+        : ['--session-id', sessionId];
+
+      const pendingName = this.sessionNames.get(sessionId);
+      if (!existingFile && pendingName) {
+        args.push('--name', pendingName);
+      }
+
+      client = this.createClient(cwd, args);
+      this.clientToSession.set(client, sessionId);
+      client.start();
+      this.processes.set(sessionId, client);
+      this.touchActivity(sessionId);
+
       const initialState = await client.request<PiSessionState>({ type: 'get_state' });
+      if (this.disposed) {
+        throw new ProviderError('not_found', 'pi adapter disposed', 404);
+      }
       this.recordState(sessionId, initialState);
       await this.syncSessionPreferencesToClient(client, sessionId, initialState, opts);
       return client;
     } catch (err) {
-      this.processes.delete(sessionId);
-      this.clientToSession.delete(client);
-      await client.close().catch(() => undefined);
+      if (client) {
+        if (this.processes.get(sessionId) === client) {
+          this.processes.delete(sessionId);
+        }
+        this.clientToSession.delete(client);
+        await client.close().catch(() => undefined);
+      }
       throw err;
+    } finally {
+      this.startingSessions.delete(sessionId);
     }
+  }
+
+  private readConfiguredCompactionEnabled(): boolean {
+    const agentDir = resolvePiAgentDirForSettings(this.env, this.sessionsDir);
+    try {
+      const settingsPath = path.join(agentDir, 'settings.json');
+      const content = fs.readFileSync(settingsPath, 'utf8');
+      const parsed = JSON.parse(content) as { compaction?: { enabled?: unknown } };
+      if (parsed && typeof parsed === 'object' && parsed.compaction && typeof parsed.compaction.enabled === 'boolean') {
+        return parsed.compaction.enabled;
+      }
+    } catch {
+      // fallback default
+    }
+    return true;
+  }
+
+  private readConfiguredDefaultsFromSettings(): { model?: string; thinking?: string } {
+    const agentDir = resolvePiAgentDirForSettings(this.env, this.sessionsDir);
+    try {
+      const settingsPath = path.join(agentDir, 'settings.json');
+      const content = fs.readFileSync(settingsPath, 'utf8');
+      const parsed = JSON.parse(content) as {
+        defaultProvider?: unknown;
+        defaultModel?: unknown;
+        defaultThinkingLevel?: unknown;
+      };
+      const provider = typeof parsed.defaultProvider === 'string' ? parsed.defaultProvider.trim() : '';
+      const model = typeof parsed.defaultModel === 'string' ? parsed.defaultModel.trim() : '';
+      const thinking = typeof parsed.defaultThinkingLevel === 'string' ? parsed.defaultThinkingLevel.trim() : '';
+      const encodedModel = model ? (provider ? encodePiModelId(provider, model) : model) : undefined;
+      return {
+        model: encodedModel,
+        thinking: thinking || undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  private async readSessionStateFromDisk(sessionId: string): Promise<PiSessionState> {
+    assertSafeSessionId(sessionId);
+    const filePath = await this.locateSessionFile(sessionId);
+    const compactionEnabled = this.readConfiguredCompactionEnabled();
+    const cachedModel = this.sessionModels.get(sessionId) ?? this.resolveSessionPreferences?.(sessionId)?.model;
+    const cachedThinking = this.sessionThinkings.get(sessionId) ?? this.resolveSessionPreferences?.(sessionId)?.thinking;
+    const cachedName = this.sessionNames.get(sessionId);
+
+    if (!filePath) {
+      if (this.draftSessions.has(sessionId)) {
+        let modelInfo: PiModelInfo | undefined;
+        if (cachedModel) {
+          const parsed = decodePiModelId(cachedModel, this.modelsCache?.models);
+          if (parsed) {
+            modelInfo = this.modelsCache?.models?.find((m) => m.provider === parsed.provider && m.id === parsed.modelId) ?? {
+              provider: parsed.provider,
+              id: parsed.modelId,
+            };
+          }
+        }
+        return {
+          sessionId,
+          sessionName: cachedName,
+          model: modelInfo,
+          thinkingLevel: cachedThinking,
+          isStreaming: false,
+          isCompacting: false,
+          steeringMode: 'one-at-a-time',
+          followUpMode: 'one-at-a-time',
+          autoCompactionEnabled: compactionEnabled,
+          messageCount: 0,
+          pendingMessageCount: 0,
+        };
+      }
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    const realRoot = await safeRealpath(this.sessionsDir);
+    if (!realRoot) {
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    let sessionName: string | undefined = cachedName;
+    let modelFromDisk: { provider: string; modelId: string } | undefined;
+    let thinkingFromDisk: string | undefined;
+    let messageCount = 0;
+
+    await forEachJsonlEntryNoFollow(filePath, realRoot, (entry) => {
+      if (entry.type === 'session') return;
+      if (entry.type === 'session_info') {
+        const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+        if (name) sessionName = name;
+      } else if (entry.type === 'model_change') {
+        const provider = typeof entry.provider === 'string' ? entry.provider : '';
+        const modelId = typeof entry.modelId === 'string' ? entry.modelId : (typeof entry.model === 'string' ? entry.model : '');
+        if (provider || modelId) {
+          modelFromDisk = { provider, modelId };
+        }
+      } else if (entry.type === 'thinking_level_change') {
+        const level = typeof entry.thinkingLevel === 'string' ? entry.thinkingLevel : (typeof entry.level === 'string' ? entry.level : '');
+        if (level) thinkingFromDisk = level;
+      } else if (entry.type === 'message') {
+        messageCount++;
+      }
+    });
+
+    const settingsDefaults = this.readConfiguredDefaultsFromSettings();
+    const effectiveModelStr = cachedModel ?? (modelFromDisk ? encodePiModelId(modelFromDisk.provider, modelFromDisk.modelId) : settingsDefaults.model);
+    let modelInfo: PiModelInfo | undefined;
+    if (effectiveModelStr) {
+      const parsed = decodePiModelId(effectiveModelStr, this.modelsCache?.models);
+      if (parsed) {
+        modelInfo = this.modelsCache?.models?.find((m) => m.provider === parsed.provider && m.id === parsed.modelId) ?? {
+          provider: parsed.provider,
+          id: parsed.modelId,
+        };
+      }
+    } else if (modelFromDisk) {
+      modelInfo = {
+        provider: modelFromDisk.provider,
+        id: modelFromDisk.modelId,
+      };
+    }
+
+    const effectiveThinking = cachedThinking ?? thinkingFromDisk ?? settingsDefaults.thinking;
+
+    const state: PiSessionState = {
+      sessionId,
+      sessionFile: filePath,
+      sessionName,
+      model: modelInfo,
+      thinkingLevel: effectiveThinking,
+      isStreaming: false,
+      isCompacting: false,
+      steeringMode: 'one-at-a-time',
+      followUpMode: 'one-at-a-time',
+      autoCompactionEnabled: compactionEnabled,
+      messageCount,
+      pendingMessageCount: 0,
+    };
+    this.recordState(sessionId, state);
+    return state;
+  }
+
+  private async readSessionStatsFromDisk(sessionId: string): Promise<PiSessionStats> {
+    assertSafeSessionId(sessionId);
+    const filePath = await this.locateSessionFile(sessionId);
+    if (!filePath) {
+      if (this.draftSessions.has(sessionId)) {
+        const activeModelId = this.sessionModels.get(sessionId) ?? this.resolveSessionPreferences?.(sessionId)?.model;
+        const ctxLimit = lookupPiContextWindow(activeModelId, this.modelsCache?.models);
+        const emptyStats: PiSessionStats = {
+          sessionId,
+          userMessages: 0,
+          assistantMessages: 0,
+          toolCalls: 0,
+          toolResults: 0,
+          totalMessages: 0,
+          tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          cost: 0,
+          contextUsage: { tokens: null, contextWindow: ctxLimit, percent: null },
+        };
+        const usage = mapPiStatsToUsage(emptyStats, activeModelId, this.modelsCache?.models);
+        this.sessionUsage.set(sessionId, usage);
+        return emptyStats;
+      }
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    const realRoot = await safeRealpath(this.sessionsDir);
+    if (!realRoot) {
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    let userMessages = 0;
+    let assistantMessages = 0;
+    let toolCalls = 0;
+    let toolResults = 0;
+    let totalMessages = 0;
+    let totalCost = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheWriteTokens = 0;
+    let lastContextTokens: number | null = null;
+    let modelFromDisk: string | undefined;
+
+    const extractNum = (val: unknown): number => (typeof val === 'number' && Number.isFinite(val) ? val : 0);
+    const addUsage = (u: Record<string, unknown>): number => {
+      const inp = extractNum(u.input ?? u.inputTokens);
+      const out = extractNum(u.output ?? u.outputTokens);
+      const cr = extractNum(u.cacheRead ?? u.cacheReadTokens);
+      const cw = extractNum(u.cacheWrite ?? u.cacheWriteTokens);
+      inputTokens += inp;
+      outputTokens += out;
+      cacheReadTokens += cr;
+      cacheWriteTokens += cw;
+      if (isRecord(u.cost)) {
+        totalCost += extractNum(u.cost.total);
+      } else {
+        totalCost += extractNum(u.cost);
+      }
+      const total = extractNum(u.totalTokens);
+      return total > 0 ? total : (inp + out + cr + cw);
+    };
+
+    await forEachJsonlEntryNoFollow(filePath, realRoot, (entry) => {
+      if (entry.type === 'session') return;
+
+      if (entry.type === 'model_change') {
+        const provider = typeof entry.provider === 'string' ? entry.provider : '';
+        const modelId = typeof entry.modelId === 'string' ? entry.modelId : '';
+        if (provider && modelId) modelFromDisk = encodePiModelId(provider, modelId);
+        return;
+      }
+
+      if (entry.type === 'usage' && isRecord(entry.usage)) {
+        addUsage(entry.usage);
+        return;
+      }
+
+      if (entry.type === 'compaction') {
+        if (isRecord(entry.usage)) addUsage(entry.usage);
+        lastContextTokens = null;
+        return;
+      }
+
+      if (entry.type === 'branch_summary') {
+        if (isRecord(entry.usage)) addUsage(entry.usage);
+        return;
+      }
+
+      if (entry.type === 'message' && isRecord(entry.message)) {
+        totalMessages++;
+        const msg = entry.message;
+        const role = typeof msg.role === 'string' ? msg.role : '';
+        if (role === 'user') {
+          userMessages++;
+        } else if (role === 'assistant') {
+          assistantMessages++;
+          if (typeof msg.provider === 'string' && typeof msg.model === 'string' && msg.model !== 'unknown') {
+            modelFromDisk = encodePiModelId(msg.provider, msg.model);
+          }
+          if (Array.isArray(msg.content)) {
+            for (const part of msg.content) {
+              if (isRecord(part) && (part.type === 'tool_use' || part.type === 'toolCall')) {
+                toolCalls++;
+              }
+            }
+          }
+          const u = isRecord(msg.usage) ? msg.usage : (isRecord(entry.usage) ? entry.usage : undefined);
+          if (u) {
+            const ctxTokens = addUsage(u);
+            const stopReason = typeof msg.stopReason === 'string' ? msg.stopReason : '';
+            if (stopReason !== 'aborted' && stopReason !== 'error' && ctxTokens > 0) {
+              lastContextTokens = typeof u.contextTokens === 'number' && Number.isFinite(u.contextTokens)
+                ? u.contextTokens
+                : ctxTokens;
+            }
+          }
+          if (!isRecord(u?.cost)) {
+            totalCost += extractNum(msg.cost ?? entry.cost);
+          }
+        } else if (role === 'toolResult') {
+          toolResults++;
+          if (isRecord(msg.usage)) addUsage(msg.usage);
+        } else if (role === 'bashExecution') {
+          toolCalls++;
+          toolResults++;
+        }
+      } else if (entry.type === 'tool_call') {
+        toolCalls++;
+      } else if (entry.type === 'tool_result') {
+        toolResults++;
+      }
+    });
+
+    const activeModelId = this.sessionModels.get(sessionId)
+      ?? this.resolveSessionPreferences?.(sessionId)?.model
+      ?? modelFromDisk
+      ?? this.readConfiguredDefaultsFromSettings().model;
+    const contextWindow = lookupPiContextWindow(activeModelId, this.modelsCache?.models);
+    const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+    const percent = lastContextTokens !== null && contextWindow > 0
+      ? (lastContextTokens / contextWindow) * 100
+      : null;
+
+    const stats: PiSessionStats = {
+      sessionFile: filePath,
+      sessionId,
+      userMessages,
+      assistantMessages,
+      toolCalls,
+      toolResults,
+      totalMessages,
+      tokens: {
+        input: inputTokens,
+        output: outputTokens,
+        cacheRead: cacheReadTokens,
+        cacheWrite: cacheWriteTokens,
+        total: totalTokens,
+      },
+      cost: totalCost,
+      ...(contextWindow > 0
+        ? {
+            contextUsage: {
+              tokens: lastContextTokens,
+              contextWindow,
+              percent,
+            },
+          }
+        : {}),
+    };
+    const usage = mapPiStatsToUsage(stats, activeModelId, this.modelsCache?.models);
+    this.sessionUsage.set(sessionId, usage);
+    return stats;
+  }
+
+  private async readSessionTreeFromDisk(sessionId: string): Promise<Record<string, unknown> | null> {
+    assertSafeSessionId(sessionId);
+    const filePath = await this.locateSessionFile(sessionId);
+    if (!filePath) {
+      if (this.draftSessions.has(sessionId)) {
+        return { leafId: null, tree: [] };
+      }
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    const realRoot = await safeRealpath(this.sessionsDir);
+    if (!realRoot) {
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+
+    interface TreeBuilderNode {
+      entry: Record<string, unknown>;
+      children: TreeBuilderNode[];
+    }
+
+    const nodesById = new Map<string, TreeBuilderNode>();
+    const parentOf = new Map<string, string | null>();
+    const rootNodes: TreeBuilderNode[] = [];
+    let lastId: string | null = null;
+    let legacySeq = 0;
+
+    const wouldCreateCycle = (nodeId: string, candidateParentId: string): boolean => {
+      let cur: string | null = candidateParentId;
+      const seen = new Set<string>();
+      while (cur) {
+        if (cur === nodeId) return true;
+        if (seen.has(cur)) return true;
+        seen.add(cur);
+        cur = parentOf.get(cur) ?? null;
+      }
+      return false;
+    };
+
+    await forEachJsonlEntryNoFollow(filePath, realRoot, (parsed) => {
+      if (parsed.type === 'session') return;
+      let id = typeof parsed.id === 'string' && parsed.id ? parsed.id : '';
+      let rawParentId = typeof parsed.parentId === 'string' && parsed.parentId ? parsed.parentId : null;
+      if (!id) {
+        id = `legacy_${++legacySeq}`;
+        rawParentId = lastId;
+      }
+      if (nodesById.has(id)) return;
+
+      const role = isRecord(parsed.message) && typeof parsed.message.role === 'string'
+        ? parsed.message.role
+        : undefined;
+      const lightEntry: Record<string, unknown> = {
+        id,
+        parentId: rawParentId,
+        type: typeof parsed.type === 'string' ? parsed.type : 'unknown',
+        ...(typeof parsed.timestamp === 'string' ? { timestamp: parsed.timestamp } : {}),
+        ...(role ? { message: { role } } : {}),
+      };
+      const node: TreeBuilderNode = { entry: lightEntry, children: [] };
+      nodesById.set(id, node);
+      lastId = id;
+
+      if (rawParentId && rawParentId !== id && nodesById.has(rawParentId) && !wouldCreateCycle(id, rawParentId)) {
+        parentOf.set(id, rawParentId);
+        nodesById.get(rawParentId)!.children.push(node);
+      } else {
+        lightEntry.parentId = null;
+        parentOf.set(id, null);
+        rootNodes.push(node);
+      }
+    });
+
+    return {
+      tree: rootNodes,
+      leafId: lastId,
+    };
   }
 
   private async syncSessionPreferencesToClient(
@@ -1790,6 +2748,7 @@ export class PiAdapter {
     ts: number,
     input?: unknown,
     parentToolCallId?: string,
+    agentId?: string,
   ): void {
     if (!toolCallId || turn.startedTools.has(toolCallId)) return;
     turn.startedTools.add(toolCallId);
@@ -1804,8 +2763,204 @@ export class PiAdapter {
         name,
         ...(input !== undefined ? { input } : {}),
         ...(parentToolCallId ? { parentToolUseId: parentToolCallId } : {}),
+        ...(agentId ? { agentId } : {}),
       },
     });
+  }
+
+  private emitSubagentStartedIfNeeded(
+    turn: ActiveTurnState,
+    subMeta: PiDiscoveredSubagent | undefined,
+    toolCallId: string,
+    ts: number,
+  ): void {
+    if (!subMeta || turn.startedSubagents.has(subMeta.agentId)) return;
+    turn.startedSubagents.add(subMeta.agentId);
+    turn.stream.push({
+      kind: 'subagent',
+      status: 'started',
+      sessionId: turn.sessionId,
+      turnId: turn.turnId,
+      timestamp: ts,
+      agentId: subMeta.agentId,
+      parentToolUseId: toolCallId,
+      payload: {
+        agentId: subMeta.agentId,
+        parentToolUseId: toolCallId,
+        ...(subMeta.subagentType ? { name: subMeta.subagentType } : {}),
+        status: 'running',
+        ...(subMeta.description ? { summary: subMeta.description } : {}),
+      },
+    });
+  }
+
+  private recordDiscoveredSubagent(
+    sessionId: string,
+    toolCallId: string,
+    toolName: string,
+    args: unknown,
+    details: Record<string, unknown> | undefined,
+    allowFallback = true,
+  ): PiDiscoveredSubagent | undefined {
+    const lower = toolName.toLowerCase();
+    if (lower !== 'subagent' && lower !== 'acp_delegate' && lower !== 'agent') return undefined;
+    const argsRec = isRecord(args) ? args : undefined;
+    const det = details;
+    const rawAgentId = (typeof det?.runId === 'string' && det.runId.trim())
+      || (typeof det?.sessionId === 'string' && det.sessionId.trim())
+      || (typeof det?.agentId === 'string' && det.agentId.trim())
+      || (typeof det?.subagentId === 'string' && det.subagentId.trim())
+      || undefined;
+    const transcriptPath = (typeof det?.transcriptPath === 'string' && det.transcriptPath.trim())
+      || (typeof det?.sessionFile === 'string' && det.sessionFile.trim())
+      || (typeof det?.file === 'string' && det.file.trim())
+      || undefined;
+    const subagentType = (typeof det?.agent === 'string' && det.agent.trim())
+      || (typeof argsRec?.agent === 'string' && argsRec.agent.trim())
+      || (typeof argsRec?.subagent_type === 'string' && argsRec.subagent_type.trim())
+      || undefined;
+    const description = (typeof det?.task === 'string' && det.task.trim())
+      || (typeof argsRec?.description === 'string' && argsRec.description.trim())
+      || (typeof argsRec?.task === 'string' && argsRec.task.trim())
+      || (typeof argsRec?.prompt === 'string' && argsRec.prompt.trim())
+      || undefined;
+    const fallbackId = toolCallId ? `pi_sub_${toolCallId}` : '';
+    let bucket = this.discoveredSubagents.get(sessionId);
+    if (!bucket) {
+      bucket = new Map();
+      this.discoveredSubagents.set(sessionId, bucket);
+    }
+    const placeholder = fallbackId ? bucket.get(fallbackId) : undefined;
+    if (rawAgentId && placeholder && rawAgentId !== fallbackId) {
+      bucket.delete(fallbackId);
+    }
+    const agentId = rawAgentId || (allowFallback ? fallbackId : '');
+    if (!agentId) {
+      if (fallbackId) {
+        bucket.set(fallbackId, {
+          agentId: fallbackId,
+          parentToolUseId: toolCallId || placeholder?.parentToolUseId,
+          description: description ? description.slice(0, 120) : placeholder?.description,
+          subagentType: subagentType || placeholder?.subagentType,
+          transcriptPath: transcriptPath || placeholder?.transcriptPath,
+        });
+      }
+      return undefined;
+    }
+    const prev = bucket.get(agentId) ?? (agentId !== fallbackId ? placeholder : undefined);
+    const merged: PiDiscoveredSubagent = {
+      agentId,
+      parentToolUseId: toolCallId || prev?.parentToolUseId,
+      description: description ? description.slice(0, 120) : prev?.description,
+      subagentType: subagentType || prev?.subagentType,
+      transcriptPath: transcriptPath || prev?.transcriptPath,
+    };
+    bucket.set(agentId, merged);
+    return merged;
+  }
+
+  async listSubagents(
+    sessionId: string,
+  ): Promise<Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>> {
+    const out = new Map<string, PiDiscoveredSubagent>();
+    const live = this.discoveredSubagents.get(sessionId);
+    if (live) {
+      for (const [id, info] of live) out.set(id, info);
+    }
+    const filePath = await this.locateSessionFile(sessionId).catch(() => null);
+    const realRoot = await safeRealpath(this.sessionsDir).catch(() => null);
+    if (filePath && realRoot) {
+      const lines = await readTailWindowLinesNoFollow(filePath, 2 * 1024 * 1024, realRoot, this.sessionsDir).catch(() => []);
+      for (const line of lines) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(line); } catch { continue; }
+        if (!isRecord(parsed) || parsed.type !== 'message' || !isRecord(parsed.message)) continue;
+        const msg = parsed.message;
+        if (msg.role !== 'toolResult') continue;
+        const tName = typeof msg.toolName === 'string' ? msg.toolName : '';
+        const tId = typeof msg.toolCallId === 'string' ? msg.toolCallId : '';
+        const det = isRecord(msg.details) ? msg.details : undefined;
+        const meta = this.recordDiscoveredSubagent(sessionId, tId, tName, undefined, det);
+        if (meta) out.set(meta.agentId, meta);
+      }
+    }
+    return [...out.values()].map(({ transcriptPath: _tp, ...rest }) => rest);
+  }
+
+  async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {
+    if (!this.discoveredSubagents.get(sessionId)?.has(agentId)) {
+      await this.listSubagents(sessionId).catch(() => []);
+    }
+    const info = this.discoveredSubagents.get(sessionId)?.get(agentId);
+    const targetPath = info?.transcriptPath;
+    if (targetPath && path.isAbsolute(targetPath)) {
+      if (targetPath.endsWith('.jsonl')) {
+        const msgs = await readPiActiveBranchHistory(targetPath, {
+          sessionId: agentId,
+          maxTailBytes: Math.min(this.maxHistoryTailBytes, 4 * 1024 * 1024),
+        }).catch(() => null);
+        if (msgs && msgs.length > 0) return msgs;
+      } else {
+        try {
+          const { fh, stat } = await openFileNoFollowVerified(targetPath);
+          try {
+            const toRead = Math.min(stat.size, 256 * 1024);
+            if (toRead > 0) {
+              const buf = Buffer.allocUnsafe(toRead);
+              const { bytesRead } = await fh.read(buf, 0, toRead, 0);
+              const text = buf.subarray(0, bytesRead).toString('utf8').trim();
+              if (text) {
+                return [
+                  {
+                    id: `${agentId}_out`,
+                    session_id: agentId,
+                    role: 'assistant',
+                    content: [{ type: 'text', text }],
+                    created_at: nowIso(),
+                  },
+                ];
+              }
+            }
+          } finally {
+            await fh.close().catch(() => undefined);
+          }
+        } catch {
+          // fall through to parent toolResult fallback
+        }
+      }
+    }
+    // Fallback: inspect parent session JSONL for the toolResult text corresponding to this subagent.
+    const filePath = await this.locateSessionFile(sessionId).catch(() => null);
+    const realRoot = await safeRealpath(this.sessionsDir).catch(() => null);
+    if (filePath && realRoot) {
+      const lines = await readTailWindowLinesNoFollow(filePath, 2 * 1024 * 1024, realRoot, this.sessionsDir).catch(() => []);
+      for (const line of lines) {
+        let parsed: unknown;
+        try { parsed = JSON.parse(line); } catch { continue; }
+        if (!isRecord(parsed) || parsed.type !== 'message' || !isRecord(parsed.message)) continue;
+        const msg = parsed.message;
+        if (msg.role !== 'toolResult') continue;
+        const det = isRecord(msg.details) ? msg.details : undefined;
+        const detId = (typeof det?.runId === 'string' && det.runId)
+          || (typeof det?.sessionId === 'string' && det.sessionId)
+          || (typeof det?.agentId === 'string' && det.agentId)
+          || (typeof msg.toolCallId === 'string' ? `pi_sub_${msg.toolCallId}` : '');
+        if (detId !== agentId) continue;
+        const text = extractToolContentText(msg);
+        if (text) {
+          return [
+            {
+              id: `${agentId}_res`,
+              session_id: agentId,
+              role: 'assistant',
+              content: [{ type: 'text', text }],
+              created_at: typeof parsed.timestamp === 'string' ? parsed.timestamp : nowIso(),
+            },
+          ];
+        }
+      }
+    }
+    return [];
   }
 
   private handleClientEvent(turn: ActiveTurnState, ev: PiRpcClientEvent): void {
@@ -1847,6 +3002,7 @@ export class PiAdapter {
         }
         turn.inAgentRun = true;
         turn.sawAgentStart = true;
+        turn.onPromptProgress?.();
         break;
 
       case 'message_start':
@@ -1864,7 +3020,9 @@ export class PiAdapter {
         const toolCallId = String(msg.toolCallId ?? '');
         const name = String(msg.toolName ?? 'tool');
         const parentToolCallId = typeof msg.parentToolCallId === 'string' ? msg.parentToolCallId : undefined;
-        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, msg.args, parentToolCallId);
+        const subMeta = this.recordDiscoveredSubagent(turn.sessionId, toolCallId, name, msg.args, undefined, false);
+        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, msg.args, parentToolCallId, subMeta?.agentId);
+        this.emitSubagentStartedIfNeeded(turn, subMeta, toolCallId, ts);
         break;
       }
 
@@ -1873,7 +3031,10 @@ export class PiAdapter {
         const name = String(msg.toolName ?? 'tool');
         if (!toolCallId) break;
         const parentToolCallId = typeof msg.parentToolCallId === 'string' ? msg.parentToolCallId : undefined;
-        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, msg.args, parentToolCallId);
+        const partialDetails = isRecord(msg.partialResult) && isRecord(msg.partialResult.details) ? msg.partialResult.details : undefined;
+        const subMeta = this.recordDiscoveredSubagent(turn.sessionId, toolCallId, name, msg.args, partialDetails, false);
+        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, msg.args, parentToolCallId, subMeta?.agentId);
+        this.emitSubagentStartedIfNeeded(turn, subMeta, toolCallId, ts);
         const full = extractToolContentText(msg.partialResult);
         const prev = turn.lastToolPartial.get(toolCallId);
         const delta = prev !== undefined && full.startsWith(prev) ? full.slice(prev.length) : full;
@@ -1890,6 +3051,7 @@ export class PiAdapter {
               name,
               output: delta,
               ...(parentToolCallId ? { parentToolUseId: parentToolCallId } : {}),
+              ...(subMeta?.agentId ? { agentId: subMeta.agentId } : {}),
             },
           });
         }
@@ -1901,7 +3063,9 @@ export class PiAdapter {
         const name = String(msg.toolName ?? 'tool');
         if (!toolCallId) break;
         const parentToolCallId = typeof msg.parentToolCallId === 'string' ? msg.parentToolCallId : undefined;
-        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, undefined, parentToolCallId);
+        const details = isRecord(msg.result) && isRecord(msg.result.details) ? msg.result.details : undefined;
+        const subMeta = this.recordDiscoveredSubagent(turn.sessionId, toolCallId, name, undefined, details, true);
+        this.emitToolStartedIfNeeded(turn, toolCallId, name, ts, undefined, parentToolCallId, subMeta?.agentId);
         if (!turn.endedTools.has(toolCallId)) {
           turn.endedTools.add(toolCallId);
           const isError = msg.isError === true;
@@ -1920,8 +3084,28 @@ export class PiAdapter {
               ...(structured !== undefined ? { structuredOutput: structured } : {}),
               is_error: isError,
               ...(parentToolCallId ? { parentToolUseId: parentToolCallId } : {}),
+              ...(subMeta?.agentId ? { agentId: subMeta.agentId } : {}),
             },
           });
+          if (subMeta) {
+            this.emitSubagentStartedIfNeeded(turn, subMeta, toolCallId, ts);
+            turn.stream.push({
+              kind: 'subagent',
+              status: isError ? 'failed' : 'completed',
+              sessionId: turn.sessionId,
+              turnId: turn.turnId,
+              timestamp: ts,
+              agentId: subMeta.agentId,
+              parentToolUseId: toolCallId,
+              payload: {
+                agentId: subMeta.agentId,
+                parentToolUseId: toolCallId,
+                ...(subMeta.subagentType ? { name: subMeta.subagentType } : {}),
+                status: isError ? 'failed' : 'completed',
+                ...(output ? { summary: output.slice(0, 240) } : subMeta.description ? { summary: subMeta.description } : {}),
+              },
+            });
+          }
         }
         break;
       }
@@ -1929,6 +3113,29 @@ export class PiAdapter {
       case 'message_end':
         this.handleMessageEnd(turn, msg, ts);
         break;
+
+      case 'entry_appended': {
+        const entry = isRecord(msg.entry) ? msg.entry : null;
+        if (entry && entry.type === 'custom_message' && entry.display !== false) {
+          const entryId = typeof entry.id === 'string' && entry.id ? entry.id : '';
+          const text = extractCustomContentText(entry.content);
+          const customType = typeof entry.customType === 'string' ? entry.customType : '';
+          const contentKey = `${customType}:${text}`;
+          if (text && !turn.sawCustomEntryIds.has(contentKey) && (!entryId || !turn.sawCustomEntryIds.has(entryId))) {
+            turn.sawCustomEntryIds.add(contentKey);
+            if (entryId) turn.sawCustomEntryIds.add(entryId);
+            turn.stream.push({
+              kind: 'message',
+              status: 'delta',
+              sessionId: turn.sessionId,
+              turnId: turn.turnId,
+              timestamp: ts,
+              payload: { delta: text, message: emptyAssistantMessage(turn.sessionId) },
+            });
+          }
+        }
+        break;
+      }
 
       case 'compaction_end':
         if (msg.aborted !== true && isRecord(msg.result)) {
@@ -2137,6 +3344,25 @@ export class PiAdapter {
       return;
     }
 
+    if (role === 'custom') {
+      if (message.display === false) return;
+      const text = extractCustomContentText(message.content);
+      if (!text) return;
+      const customType = typeof message.customType === 'string' ? message.customType : '';
+      const dedupKey = `${customType}:${text}`;
+      if (turn.sawCustomEntryIds.has(dedupKey)) return;
+      turn.sawCustomEntryIds.add(dedupKey);
+      turn.stream.push({
+        kind: 'message',
+        status: 'delta',
+        sessionId: turn.sessionId,
+        turnId: turn.turnId,
+        timestamp: ts,
+        payload: { delta: text, message: emptyAssistantMessage(turn.sessionId) },
+      });
+      return;
+    }
+
     if (role === 'toolResult') {
       const toolCallId = String(message.toolCallId ?? '');
       if (!toolCallId || turn.endedTools.has(toolCallId)) return;
@@ -2245,15 +3471,31 @@ export class PiAdapter {
           timestamp: Date.now(),
           payload: { level, message: req.message, code: 'extension_notify' },
         });
+      } else if (method === 'setStatus' || method === 'setWidget' || method === 'setTitle') {
+        const changed = this.updateExtensionUiState(turn.sessionId, req);
+        if (changed) {
+          turn.stream.push({
+            kind: 'passthrough',
+            status: 'updated',
+            sessionId: turn.sessionId,
+            turnId: turn.turnId,
+            timestamp: Date.now(),
+            payload: {
+              method: 'extension_ui',
+              data: this.getExtensionUiState(turn.sessionId) ?? { statuses: {}, widgets: {} },
+              source: 'pi',
+            },
+          });
+        }
       }
       return;
     }
 
     if (!id) return;
 
-    // Unsupported UI dialogs (including `editor`) and aborted/unwritable turns fail closed.
+    // Unsupported UI dialogs and aborted/unwritable turns fail closed.
     if (
-      (method !== 'select' && method !== 'confirm' && method !== 'input') ||
+      (method !== 'select' && method !== 'confirm' && method !== 'input' && method !== 'editor') ||
       turn.abortRequested ||
       !turn.client.canWriteStdin
     ) {
@@ -2264,6 +3506,7 @@ export class PiAdapter {
     const title = typeof req.title === 'string' ? req.title : '';
     let promptText = title;
     let options: string[] | undefined;
+    let optionById: Map<string, string> | undefined;
     let rawQuestions: unknown[];
 
     if (method === 'select') {
@@ -2275,12 +3518,18 @@ export class PiAdapter {
         return;
       }
       options = validOptions;
+      optionById = new Map<string, string>();
+      const mappedOptions = validOptions.map((opt, idx) => {
+        const key = optionById!.has(opt) ? `${opt}__${idx}` : opt;
+        optionById!.set(key, opt);
+        return { id: key, label: opt };
+      });
       rawQuestions = [
         {
           id: 'q_0',
           question: title || 'Select an option',
           header: title || 'Select',
-          options: validOptions.map((opt) => ({ id: opt, label: opt })),
+          options: mappedOptions,
         },
       ];
     } else if (method === 'confirm') {
@@ -2298,6 +3547,20 @@ export class PiAdapter {
           ],
         },
       ];
+    } else if (method === 'editor') {
+      const prefill = typeof req.prefill === 'string' ? req.prefill : '';
+      promptText = title || 'Edit text';
+      rawQuestions = [
+        {
+          id: 'q_0',
+          question: promptText,
+          header: title || 'Editor',
+          ...(prefill ? { body: prefill } : {}),
+          options: [],
+          isOther: true,
+          otherPlaceholder: 'Enter text…',
+        },
+      ];
     } else {
       const placeholder = typeof req.placeholder === 'string' && req.placeholder ? req.placeholder : undefined;
       promptText = placeholder ? (title ? `${title} (${placeholder})` : placeholder) : title || 'Input';
@@ -2308,6 +3571,7 @@ export class PiAdapter {
           header: title || 'Input',
           options: [],
           isOther: true,
+          ...(placeholder ? { otherPlaceholder: placeholder } : {}),
         },
       ];
     }
@@ -2347,6 +3611,7 @@ export class PiAdapter {
       sessionId: turn.sessionId,
       method,
       options,
+      ...(optionById ? { optionById } : {}),
       timer,
       stream: turn.stream,
       turnId: turn.turnId,
@@ -2366,6 +3631,7 @@ export class PiAdapter {
         rawQuestions,
       },
     });
+    turn.onPromptProgress?.();
   }
 
   private failCloseSessionQuestions(sessionId: string): void {
@@ -2424,6 +3690,10 @@ export class PiAdapter {
         this.settleTurn(turn, 'cancelled');
         return;
       }
+      if (this.hasParkedQuestions(turn.sessionId)) {
+        this.scheduleHandledGraceSettle(turn);
+        return;
+      }
       if (turn.client.isAlive) {
         const probeMs = Math.min(100, this.requestTimeoutMs || 100);
         const state = await turn.client
@@ -2435,16 +3705,17 @@ export class PiAdapter {
           return;
         }
         if (
-          state &&
-          (state.isStreaming === true ||
-            state.isCompacting === true ||
-            (state.pendingMessageCount ?? 0) > 0)
+          this.hasParkedQuestions(turn.sessionId) ||
+          (state &&
+            (state.isStreaming === true ||
+              state.isCompacting === true ||
+              (state.pendingMessageCount ?? 0) > 0))
         ) {
           this.scheduleHandledGraceSettle(turn);
           return;
         }
       }
-      if (!turn.settled && !turn.inAgentRun && !turn.sawAgentStart) {
+      if (!turn.settled && !turn.inAgentRun && !turn.sawAgentStart && !this.hasParkedQuestions(turn.sessionId)) {
         this.settleTurn(turn, 'completed');
       }
     };
@@ -2480,7 +3751,7 @@ export class PiProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
   private readonly sessionCwd = new Map<string, string>();
 
-  constructor(options?: PiAdapterOptions) {
+  constructor(options?: PiProviderAdapterOptions) {
     this.settings = new SettingsStore(options?.settingsPath);
     this.agentDir = resolvePiAgentDirForSettings(options?.env ?? {}, options?.sessionsDir);
     this.inner = new PiAdapter({
@@ -2753,6 +4024,10 @@ export class PiProviderAdapter implements ProviderAdapter {
     return this.inner.getSessionStats(sessionId);
   }
 
+  async getForkMessages(sessionId: string): Promise<Array<{ entryId: string; text: string }>> {
+    return this.inner.getForkMessages(sessionId);
+  }
+
   clearCommandsCache(): void {
     this.inner.clearCommandsCache();
   }
@@ -2820,6 +4095,22 @@ export class PiProviderAdapter implements ProviderAdapter {
 
   getCwd(sessionId: string): string | undefined {
     return this.sessionCwd.get(sessionId) ?? this.inner.getCwd(sessionId);
+  }
+
+  getExtensionUiState(sessionId: string) {
+    return this.inner.getExtensionUiState(sessionId);
+  }
+
+  getPlanMode(sessionId: string): boolean {
+    return this.inner.getPlanMode(sessionId);
+  }
+
+  async listSubagents(sessionId: string) {
+    return this.inner.listSubagents(sessionId);
+  }
+
+  async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {
+    return this.inner.getSubagentMessages(sessionId, agentId);
   }
 
   async close(sessionId: string): Promise<void> {
@@ -3372,6 +4663,44 @@ async function readTailWindowLinesNoFollow(
   }
 }
 
+async function forEachJsonlEntryNoFollow(
+  filePath: string,
+  expectedRoot: string | undefined,
+  onEntry: (entry: Record<string, unknown>) => void,
+): Promise<void> {
+  const { fh, stat } = await openFileNoFollowVerified(filePath, expectedRoot);
+  try {
+    if (stat.size === 0) return;
+    const chunkSize = Math.min(stat.size, 1024 * 1024);
+    const buf = Buffer.allocUnsafe(chunkSize);
+    const framer = new JsonlLineFramer();
+    let pos = 0;
+
+    const handleLines = (lines: string[]): void => {
+      for (const line of lines) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (isRecord(parsed)) onEntry(parsed);
+      }
+    };
+
+    while (pos < stat.size) {
+      const toRead = Math.min(stat.size - pos, chunkSize);
+      const { bytesRead } = await fh.read(buf, 0, toRead, pos);
+      if (bytesRead === 0) break;
+      pos += bytesRead;
+      handleLines(framer.push(buf.subarray(0, bytesRead)));
+    }
+    handleLines(framer.flush());
+  } finally {
+    await fh.close().catch(() => undefined);
+  }
+}
+
 async function readHeadChunkNoFollow(
   filePath: string,
   maxBytes: number,
@@ -3809,11 +5138,19 @@ function buildExtensionUiResponse(
   }
 
   if (parked.method === 'select') {
+    const mappedById = parked.optionById?.get(extracted);
+    if (mappedById !== undefined) {
+      return { type: 'extension_ui_response', id: parked.id, value: mappedById };
+    }
     const options = parked.options ?? [];
     if (options.includes(extracted)) {
       return { type: 'extension_ui_response', id: parked.id, value: extracted };
     }
     const trimmed = extracted.trim();
+    const mappedByTrim = parked.optionById?.get(trimmed);
+    if (mappedByTrim !== undefined) {
+      return { type: 'extension_ui_response', id: parked.id, value: mappedByTrim };
+    }
     const matched = options.find((o) => o === trimmed);
     if (matched !== undefined) {
       return { type: 'extension_ui_response', id: parked.id, value: matched };
@@ -3821,7 +5158,7 @@ function buildExtensionUiResponse(
     return fail();
   }
 
-  // `input` dialog: reject empty/blank dismisses fail-closed.
+  // `input` / `editor` dialog: reject empty/blank dismisses fail-closed.
   if (extracted.length === 0) return fail();
   return { type: 'extension_ui_response', id: parked.id, value: extracted };
 }
@@ -4110,6 +5447,25 @@ function extractToolContentText(raw: unknown): string {
     } catch {
       return String(raw);
     }
+  }
+  return '';
+}
+
+function extractCustomContentText(content: unknown): string {
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (typeof block === 'string') {
+        if (block.trim()) parts.push(block);
+      } else if (isRecord(block) && block.type === 'text' && typeof block.text === 'string' && block.text) {
+        parts.push(block.text);
+      }
+    }
+    return parts.join('\n').trim();
+  }
+  if (isRecord(content) && typeof content.text === 'string') {
+    return content.text.trim();
   }
   return '';
 }

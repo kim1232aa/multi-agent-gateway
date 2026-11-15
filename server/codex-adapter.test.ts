@@ -1351,3 +1351,199 @@ test('normalizeCodexThreadItem normalizes collabAgentToolCall and subAgentActivi
   assert.equal(subActivityItem?.type, 'subAgentActivity');
   assert.equal((subActivityItem as any)?.agentId, 'thread-sub-1');
 });
+
+test('backgroundTerminals retries via thread/resume on thread not found after recycle', async () => {
+  const adapter = new CodexAdapter();
+  (adapter as any).connect = async () => undefined;
+  const requestedMethods: string[] = [];
+  let resumed = false;
+  let listCalls = 0;
+
+  (adapter as any).request = async (method: string, params: any) => {
+    requestedMethods.push(method);
+    if (method === 'thread/resume') {
+      resumed = true;
+      (adapter as any).liveThreads.add(params.threadId);
+      return {
+        thread: { id: params.threadId, status: 'active' },
+      };
+    }
+    if (method === 'thread/backgroundTerminals/list') {
+      listCalls++;
+      if (listCalls === 1) {
+        throw new Error("codex 'thread/backgroundTerminals/list' failed (-32600): thread not found");
+      }
+      return {
+        data: [{ terminalId: 'term-1', command: 'echo hello' }],
+        nextCursor: null,
+      };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+
+  // 1) When thread was previously live but app-server recycled (so call fails with 'thread not found')
+  (adapter as any).liveThreads.add('th-rec');
+  const terminals = await adapter.backgroundTerminals('th-rec');
+  assert.equal(terminals.length, 1);
+  assert.equal(terminals[0]?.terminalId, 'term-1');
+  assert.ok(resumed);
+  assert.deepEqual(requestedMethods, [
+    'thread/backgroundTerminals/list',
+    'thread/resume',
+    'thread/backgroundTerminals/list',
+  ]);
+
+  // 2) When liveThreads was cleared by process exit / recycle, ensureLive resumes before calling list
+  (adapter as any).liveThreads.clear();
+  requestedMethods.length = 0;
+  resumed = false;
+  listCalls = 1; // second call succeeds directly
+  const terminalsAfterClear = await adapter.backgroundTerminals('th-rec');
+  assert.equal(terminalsAfterClear.length, 1);
+  assert.deepEqual(requestedMethods, [
+    'thread/resume',
+    'thread/backgroundTerminals/list',
+  ]);
+});
+
+test('parkedServerTimeoutMs expires abandoned pendingServer entries so recycleIfIdle reclaims the child', async () => {
+  const adapter = new CodexAdapter({ recycleGraceMs: 10, parkedServerTimeoutMs: 30 * 60_000 });
+  stubTransport(adapter);
+  let killed = false;
+  (adapter as any).child = { exitCode: null, kill: () => { killed = true; }, once: () => {} };
+
+  const sent: any[] = [];
+  (adapter as any).write = (msg: any) => sent.push(msg);
+
+  const events: CodexEvent[] = [];
+  adapter.onEvent((ev) => events.push(ev));
+
+  // Park an approval request
+  (adapter as any).handleServerRequest(101, 'item/commandExecution/requestApproval', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'cmd-1',
+    command: 'npm test',
+  });
+  assert.equal((adapter as any).pendingServer.has('101'), true);
+
+  // While fresh (< parkedServerTimeoutMs), recycleIfIdle must NOT kill child
+  (adapter as any).recycleIfIdle();
+  assert.equal(killed, false);
+  assert.equal((adapter as any).pendingServer.has('101'), true);
+
+  // Simulate user abandoned tab for > 30 minutes
+  const parked = (adapter as any).pendingServer.get('101');
+  assert.ok(parked);
+  parked.createdAt = Date.now() - 31 * 60_000;
+
+  // Now recycleIfIdle expires stale entry, fail-closes cleanly with cancel, and reclaims child
+  (adapter as any).recycleIfIdle();
+  assert.equal((adapter as any).pendingServer.has('101'), false);
+  assert.ok(killed);
+
+  // Verify fail-closed response sent to client
+  const cancelResponse = sent.find((m) => m.id === 101);
+  assert.ok(cancelResponse);
+  assert.deepEqual(cancelResponse.result, { decision: 'cancel' });
+
+  // Verify server-request-resolved event emitted
+  const resolvedEvent = events.find(
+    (e): e is Extract<CodexEvent, { type: 'server-request-resolved' }> =>
+      e.type === 'server-request-resolved' && e.requestId === 101,
+  );
+  assert.ok(resolvedEvent);
+  assert.equal(resolvedEvent.threadId, 'th-1');
+  assert.equal(resolvedEvent.turnId, 't-1');
+});
+
+test('parkedServerTimeoutMs=0 disables expiry and user questions expire with empty answers', async () => {
+  // 1) parkedServerTimeoutMs: 0 disables stale expiry
+  const noTimeoutAdapter = new CodexAdapter({ recycleGraceMs: 10, parkedServerTimeoutMs: 0 });
+  stubTransport(noTimeoutAdapter);
+  let killed = false;
+  (noTimeoutAdapter as any).child = { exitCode: null, kill: () => { killed = true; }, once: () => {} };
+
+  (noTimeoutAdapter as any).handleServerRequest(201, 'item/commandExecution/requestApproval', {
+    threadId: 'th-1',
+    turnId: 't-1',
+    itemId: 'cmd-1',
+    command: 'npm test',
+  });
+  (noTimeoutAdapter as any).pendingServer.get('201').createdAt = Date.now() - 60 * 60_000;
+  (noTimeoutAdapter as any).recycleIfIdle();
+  assert.equal(killed, false);
+  assert.equal((noTimeoutAdapter as any).pendingServer.has('201'), true);
+
+  // 2) user questions expire with answers: {}
+  const questionAdapter = new CodexAdapter({ recycleGraceMs: 10, parkedServerTimeoutMs: 50 });
+  stubTransport(questionAdapter);
+  (questionAdapter as any).child = { exitCode: null, kill: () => {}, once: () => {} };
+  const sent: any[] = [];
+  (questionAdapter as any).write = (msg: any) => sent.push(msg);
+  (questionAdapter as any).handleServerRequest(202, 'item/tool/requestUserInput', {
+    threadId: 'th-2',
+    turnId: 't-2',
+    itemId: 'q-1',
+    questions: [{ id: 'q1', question: 'Continue?' }],
+  });
+  assert.equal((questionAdapter as any).pendingServer.has('202'), true);
+
+  (questionAdapter as any).pendingServer.get('202').createdAt = Date.now() - 100;
+  (questionAdapter as any).recycleIfIdle();
+  assert.equal((questionAdapter as any).pendingServer.has('202'), false);
+  const questionResponse = sent.find((m) => m.id === 202);
+  assert.ok(questionResponse);
+  assert.deepEqual(questionResponse.result, { answers: {} });
+});
+
+test('setCollaborationMode respects explicit model and reasoningEffort (including null)', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const requests: any[] = [];
+  (adapter as any).request = async (method: string, params: any) => {
+    requests.push({ method, params });
+    if (method === 'config/read') return { config: { model: 'default-model' } };
+    if (method === 'thread/settings/update') return {};
+    throw new Error(`unexpected ${method}`);
+  };
+
+  // 1) Explicit model and effort
+  await adapter.setCollaborationMode('th-1', 'plan', {
+    model: 'o3-mini',
+    reasoningEffort: 'high',
+    developerInstructions: 'custom instructions',
+  });
+  assert.deepEqual(requests[0], {
+    method: 'thread/settings/update',
+    params: {
+      threadId: 'th-1',
+      collaborationMode: {
+        mode: 'plan',
+        settings: {
+          model: 'o3-mini',
+          reasoningEffort: 'high',
+          developerInstructions: 'custom instructions',
+        },
+      },
+    },
+  });
+
+  // 2) Explicit reasoningEffort: null does not get overwritten by prior effort
+  requests.length = 0;
+  await adapter.setCollaborationMode('th-1', 'default', { reasoningEffort: null });
+  assert.deepEqual(requests[0], {
+    method: 'thread/settings/update',
+    params: {
+      threadId: 'th-1',
+      collaborationMode: {
+        mode: 'default',
+        settings: {
+          model: 'o3-mini', // cached from prior call
+          reasoningEffort: null,
+          developerInstructions: null,
+        },
+      },
+    },
+  });
+});

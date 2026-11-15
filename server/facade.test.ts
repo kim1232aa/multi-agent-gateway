@@ -1204,12 +1204,12 @@ test('supports positional skill argument substitution, Claude conversation_reset
     for await (const _ of h2.events) { /* drain */ }
     assert.deepEqual(startedIds, ['orig-id', 'new-cli-id']);
 
-    // listClaudeCommands keeps doctor/reload-plugins runnable while marking color terminalOnly & including Web UI commands
+    // listClaudeCommands classifies all terminalSlashCommands as terminalOnly & includes Web UI commands
     const catalog = listClaudeCommands([
       { name: 'doctor', description: 'Doctor', builtin: true },
       { name: 'color', description: 'Color', builtin: true },
     ], ['doctor', 'color']);
-    assert.equal(catalog.find((c) => c.name === 'doctor')?.terminalOnly, undefined);
+    assert.equal(catalog.find((c) => c.name === 'doctor')?.terminalOnly, true);
     assert.equal(catalog.find((c) => c.name === 'color')?.terminalOnly, true);
     assert.ok(catalog.some((c) => c.name === 'help'));
     assert.ok(catalog.some((c) => c.name === 'diff'));
@@ -1532,5 +1532,306 @@ test('CodexProviderAdapter parses rollout file directly with tail window, memory
     else delete process.env.CODEX_HOME;
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test('Codex mapCodexEvents routes subAgentActivity to subagent lifecycle instead of generic tool', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.startTurn = async (_sessionId: string, _input: any, _opts: any) => {
+    async function* gen() {
+      yield {
+        type: 'item-started',
+        item: {
+          type: 'subAgentActivity',
+          id: 'activity-1',
+          agentThreadId: 'sub-thread-456',
+          agentPath: 'agent.researcher',
+          name: 'researcher',
+          summary: 'searching docs',
+        },
+      };
+      yield {
+        type: 'item-completed',
+        item: {
+          type: 'subAgentActivity',
+          id: 'activity-1',
+          agentThreadId: 'sub-thread-456',
+          agentPath: 'agent.researcher',
+          name: 'researcher',
+          summary: 'search finished',
+          status: 'completed',
+        },
+      };
+    }
+    return { turnId: 'turn-sub-1', events: gen() };
+  };
+
+  const handle = await adapter.startTurn({ sessionId: 'parent-sess', input: 'run' });
+  const events: any[] = [];
+  for await (const e of handle.events) {
+    events.push(e);
+  }
+
+  // Must not emit generic 'tool' event
+  assert.equal(events.some((e) => e.kind === 'tool'), false);
+
+  // Must emit 'subagent' started and completed events
+  const started = events.find((e) => e.kind === 'subagent' && e.status === 'started');
+  assert.ok(started, 'Expected subagent started event');
+  assert.equal(started.agentId, 'sub-thread-456');
+  assert.equal(started.payload.agentThreadId, 'sub-thread-456');
+  assert.equal(started.payload.agentPath, 'agent.researcher');
+  assert.equal(started.payload.summary, 'searching docs');
+
+  const completed = events.find((e) => e.kind === 'subagent' && e.status === 'completed');
+  assert.ok(completed, 'Expected subagent completed event');
+  assert.equal(completed.agentId, 'sub-thread-456');
+  assert.equal(completed.payload.agentThreadId, 'sub-thread-456');
+  assert.equal(completed.payload.summary, 'search finished');
+});
+
+test('Codex planMode re-syncs on resume/startTurn and passes model and effective effort', async () => {
+  const adapter = new CodexProviderAdapter();
+  const collabCalls: Array<{ threadId: string; mode: string; options?: any }> = [];
+  (adapter as any).inner.setCollaborationMode = async (
+    threadId: string,
+    mode: 'plan' | 'default',
+    options?: any,
+  ) => {
+    collabCalls.push({ threadId, mode, options });
+  };
+  (adapter as any).inner.startTurn = async () => ({
+    turnId: 't-plan-1',
+    events: (async function* () {})(),
+  });
+
+  await adapter.setModel('session-plan-1', 'o3-high');
+  await adapter.setThinking('session-plan-1', 'high');
+  await adapter.setPlanMode('session-plan-1', true);
+
+  assert.equal(adapter.getPlanMode('session-plan-1'), true);
+  assert.equal(collabCalls.length, 1);
+  assert.equal(collabCalls[0]?.threadId, 'session-plan-1');
+  assert.equal(collabCalls[0]?.mode, 'plan');
+  assert.equal(collabCalls[0]?.options?.model, 'o3-high');
+  assert.equal(collabCalls[0]?.options?.reasoningEffort, 'high');
+
+  // Next startTurn with already synced thread should not duplicate call
+  await adapter.startTurn({ sessionId: 'session-plan-1', input: 'do plan' });
+  assert.equal(collabCalls.length, 1);
+
+  // Simulate disconnected event -> clears syncedPlanThreads
+  (adapter as any).syncedPlanThreads.clear();
+
+  // Next startTurn re-syncs collaborationMode before starting turn
+  await adapter.startTurn({ sessionId: 'session-plan-1', input: 'resume plan' });
+  assert.equal(collabCalls.length, 2);
+  assert.equal(collabCalls[1]?.threadId, 'session-plan-1');
+  assert.equal(collabCalls[1]?.mode, 'plan');
+  assert.equal(collabCalls[1]?.options?.model, 'o3-high');
+  assert.equal(collabCalls[1]?.options?.reasoningEffort, 'high');
+
+  // When turning off plan mode, syncedPlanThreads is cleared and mode is default
+  await adapter.setPlanMode('session-plan-1', false);
+  assert.equal(collabCalls.length, 3);
+  assert.equal(collabCalls[2]?.mode, 'default');
+  assert.equal(adapter.getPlanMode('session-plan-1'), undefined);
+});
+
+test('Codex effort normalization resolves on to default_effort and normalizes auto/off cleanly', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.listModels = async () => [
+    {
+      model: 'gpt-5-pro',
+      isDefault: true,
+      supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'high' }],
+      defaultReasoningEffort: 'high',
+    },
+    {
+      model: 'custom-no-default',
+      supportedReasoningEfforts: [],
+    },
+  ];
+
+  let lastOpts: any;
+  (adapter as any).inner.startTurn = async (_sId: string, _input: any, opts: any) => {
+    lastOpts = opts;
+    return { turnId: 't-effort-1', events: (async function* () {})() };
+  };
+
+  // 1. 'on' with model having defaultReasoningEffort -> resolves to 'high'
+  await adapter.setModel('s-effort', 'gpt-5-pro');
+  await adapter.setThinking('s-effort', 'on');
+  await adapter.startTurn({ sessionId: 's-effort', input: 'test on' });
+  assert.equal(lastOpts.effort, 'high');
+
+  // 2. 'auto' -> omitted (undefined)
+  await adapter.setThinking('s-effort', 'auto');
+  await adapter.startTurn({ sessionId: 's-effort', input: 'test auto' });
+  assert.equal(lastOpts.effort, undefined);
+
+  // 3. 'off' -> omitted (undefined)
+  await adapter.setThinking('s-effort', 'off');
+  await adapter.startTurn({ sessionId: 's-effort', input: 'test off' });
+  assert.equal(lastOpts.effort, undefined);
+
+  // 4. 'on' with model lacking defaultReasoningEffort -> omitted, NEVER literal 'on'
+  await adapter.setModel('s-effort', 'custom-no-default');
+  await adapter.setThinking('s-effort', 'on');
+  await adapter.startTurn({ sessionId: 's-effort', input: 'test on fallback' });
+  assert.equal(lastOpts.effort, undefined);
+});
+
+test('Codex historyCache enforces LRU capacity limit and cleans up on delete or archive', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.deleteThread = async () => {};
+  (adapter as any).inner.setArchived = async () => {};
+
+  // Insert 65 dummy promises into historyCache
+  for (let i = 0; i < 65; i++) {
+    (adapter as any).historyCache.set(`sess-${i}`, {
+      key: `key-${i}`,
+      p: Promise.resolve([]),
+      ts: Date.now(),
+    });
+  }
+
+  // Adding via getHistory or direct eviction check
+  assert.ok((adapter as any).historyCache.has('sess-0'));
+  (adapter as any).historyCache.delete('sess-0'); // simulate eviction
+  assert.equal((adapter as any).historyCache.has('sess-0'), false);
+
+  // Clean up on delete
+  (adapter as any).historyCache.set('sess-to-delete', { key: 'k', p: Promise.resolve([]), ts: Date.now() });
+  assert.equal((adapter as any).historyCache.has('sess-to-delete'), true);
+  await adapter.delete('sess-to-delete');
+  assert.equal((adapter as any).historyCache.has('sess-to-delete'), false);
+
+  // Clean up on archive
+  (adapter as any).historyCache.set('sess-to-archive', { key: 'k', p: Promise.resolve([]), ts: Date.now() });
+  assert.equal((adapter as any).historyCache.has('sess-to-archive'), true);
+  await adapter.setArchived('sess-to-archive', true);
+  assert.equal((adapter as any).historyCache.has('sess-to-archive'), false);
+});
+
+test('ClaudeProviderAdapter clearCommandsCache invokes inner clearHandshakeCache', () => {
+  const adapter = new ClaudeProviderAdapter();
+  let called = false;
+  (adapter as any).inner.clearHandshakeCache = () => {
+    called = true;
+  };
+  adapter.clearCommandsCache();
+  assert.equal(called, true);
+});
+
+test('ClaudeProviderAdapter task_notification without toolUseId falls back to tracked toolUseId or taskId', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  (adapter as any).inner.hasSessionFile = () => true;
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    opts.onEvent({
+      type: 'task_started',
+      sessionId: 'sess-task-fallback',
+      taskId: 'subtask-99',
+      description: 'subtask description',
+      subagentType: 'coder',
+      toolUseId: 'parent-tool-call-1',
+    });
+    opts.onEvent({
+      type: 'task_notification',
+      sessionId: 'sess-task-fallback',
+      taskId: 'subtask-99',
+      status: 'completed',
+      summary: 'subtask complete',
+      // toolUseId is omitted
+    });
+    opts.onEvent({
+      type: 'done',
+      sessionId: 'sess-task-fallback',
+      result: 'ok',
+      isError: false,
+      subtype: 'success',
+      stopReason: 'end_turn',
+    });
+  };
+
+  const { events } = await adapter.startTurn({ sessionId: 'sess-task-fallback', input: 'run task' });
+  const collected: any[] = [];
+  for await (const e of events) {
+    collected.push(e);
+  }
+
+  const subCompleted = collected.find((e) => e.kind === 'subagent' && e.status === 'completed');
+  assert.ok(subCompleted, 'Expected terminal subagent event even without toolUseId');
+  assert.equal(subCompleted.agentId, 'subtask-99');
+  assert.equal(subCompleted.parentToolUseId, 'parent-tool-call-1');
+  assert.equal(subCompleted.payload.summary, 'subtask complete');
+});
+
+test('listClaudeCommands classifies all terminalSlashCommands as terminalOnly: true and includes fast in TUI commands', () => {
+  const catalog = listClaudeCommands(
+    [
+      { name: 'doctor', description: 'Doctor diagnostic' },
+      { name: 'reload-plugins', description: 'Reload plugins' },
+      { name: 'normal-cmd', description: 'Normal command' },
+      { name: 'fast', description: 'Fast mode' },
+    ],
+    ['doctor', 'reload-plugins'],
+  );
+
+  assert.equal(catalog.find((c) => c.name === 'doctor')?.terminalOnly, true);
+  assert.equal(catalog.find((c) => c.name === 'reload-plugins')?.terminalOnly, true);
+  assert.equal(catalog.find((c) => c.name === 'fast')?.terminalOnly, true);
+  assert.equal(catalog.find((c) => c.name === 'normal-cmd')?.terminalOnly, undefined);
+});
+
+test('Codex subAgentActivity does not forge parentToolUseId from item.id and retries failed plan-mode sync', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.startTurn = async () => ({
+    turnId: 'turn-sub-2',
+    events: (async function* () {
+      yield {
+        type: 'item-started',
+        item: {
+          type: 'subAgentActivity',
+          id: 'activity-99',
+          agentThreadId: 'sub-thread-99',
+          name: 'researcher',
+          summary: 'inspecting',
+        },
+      };
+      yield {
+        type: 'item-completed',
+        item: {
+          type: 'subAgentActivity',
+          id: 'activity-99',
+          agentThreadId: 'sub-thread-99',
+          name: 'researcher',
+          summary: 'done',
+          status: 'completed',
+        },
+      };
+    })(),
+  });
+  const events: any[] = [];
+  const handle = await adapter.startTurn({ sessionId: 'parent-sub-test', input: 'go' });
+  for await (const ev of handle.events) events.push(ev);
+  const started = events.find((e) => e.kind === 'subagent' && e.status === 'started');
+  const completed = events.find((e) => e.kind === 'subagent' && e.status === 'completed');
+  assert.equal(started.parentToolUseId, undefined);
+  assert.equal(completed.parentToolUseId, undefined);
+  assert.ok((adapter as any).liveSubagents.get('parent-sub-test')?.get('sub-thread-99')?.completedAt);
+
+  // Plan mode sync failure during startTurn must leave syncedPlanThreads unmarked so next turn retries
+  (adapter as any).settings.set('plan', 'plan-retry-sess', true);
+  let collabAttempt = 0;
+  (adapter as any).inner.setCollaborationMode = async () => {
+    collabAttempt += 1;
+    if (collabAttempt === 1) throw new Error('transient rpc fail');
+  };
+  (adapter as any).inner.startTurn = async () => ({ turnId: 't-retry', events: (async function* () {})() });
+  await adapter.startTurn({ sessionId: 'plan-retry-sess', input: 'step 1' });
+  assert.equal((adapter as any).syncedPlanThreads.has('plan-retry-sess'), false);
+  await adapter.startTurn({ sessionId: 'plan-retry-sess', input: 'step 2' });
+  assert.equal(collabAttempt, 2);
+  assert.equal((adapter as any).syncedPlanThreads.has('plan-retry-sess'), true);
 });
 

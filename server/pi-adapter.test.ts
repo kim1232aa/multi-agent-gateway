@@ -422,7 +422,11 @@ while True:
             send({"type": "extension_ui_request", "id": "ff-3", "method": "setWidget", "widgetKey": "w", "widgetLines": ["line1"]})
             send({"type": "extension_ui_request", "id": "ff-4", "method": "setTitle", "title": "t"})
             send({"type": "extension_ui_request", "id": "ff-5", "method": "set_editor_text", "text": "prefill"})
-            # Unsupported editor -> expect immediate cancelled:true
+            # Unknown dialog -> expect immediate cancelled:true
+            send({"type": "extension_ui_request", "id": "uk-1", "method": "unsupported_modal", "title": "Unknown"})
+            uk_resp = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
+            log_line(os.environ.get("FAKE_UI_RESP_LOG"), uk_resp)
+            # Editor dialog -> expect client response
             send({"type": "extension_ui_request", "id": "ed-1", "method": "editor", "title": "Edit", "prefill": "x"})
             ed_resp = json.loads(sys.stdin.buffer.readline().decode("utf-8"))
             log_line(os.environ.get("FAKE_UI_RESP_LOG"), ed_resp)
@@ -974,7 +978,7 @@ test('honest capabilities and unsupported approval/rollback/goal contracts', asy
   );
 });
 
-test('bridges select/confirm/input extension UI safely and fails closed on editor/invalid/timeout/disconnect', async () => {
+test('bridges editor/select/confirm/input extension UI safely and fails closed on unsupported/invalid/timeout/disconnect', async () => {
   const base = await mkdtemp(join(tmpdir(), 'pi-ui-'));
   let adapter: PiProviderAdapter | undefined;
   try {
@@ -993,7 +997,9 @@ test('bridges select/confirm/input extension UI safely and fails closed on edito
         seen.push(ev);
         if (ev.kind === 'question' && ev.status === 'started') {
           const p = ev.payload as { questionId: string; prompt: string };
-          if (p.questionId === 'cf-1') {
+          if (p.questionId === 'ed-1') {
+            await adapter!.resolveQuestion(sess.id, p.questionId, 'edited-body');
+          } else if (p.questionId === 'cf-1') {
             await adapter!.resolveQuestion(sess.id, p.questionId, { q_0: ['yes'] });
           } else if (p.questionId === 'sl-1') {
             // Invalid selection -> must fail closed { cancelled: true }!
@@ -1014,7 +1020,8 @@ test('bridges select/confirm/input extension UI safely and fails closed on edito
       .split('\n')
       .map((l) => JSON.parse(l) as Record<string, unknown>);
     assert.deepEqual(resps, [
-      { type: 'extension_ui_response', id: 'ed-1', cancelled: true },
+      { type: 'extension_ui_response', id: 'uk-1', cancelled: true },
+      { type: 'extension_ui_response', id: 'ed-1', value: 'edited-body' },
       { type: 'extension_ui_response', id: 'cf-1', confirmed: true },
       { type: 'extension_ui_response', id: 'sl-1', cancelled: true },
       { type: 'extension_ui_response', id: 'in-1', value: 'typed-value' },
@@ -1113,7 +1120,8 @@ test('reversible model encoding, dynamic thinking levels without off, commands w
     assert.deepEqual(levels, ['low', 'medium', 'high']);
 
     // Setting `off` when model lacks `off` reads back Pi's clamped `low` via `get_state`
-    // without issuing a redundant get_available_thinking_levels RPC.
+    // without issuing a redundant get_available_thinking_levels RPC on the live process.
+    await drainEvents(await adapter.startTurn({ sessionId: sess.id, input: 'warm-live' }));
     const beforeSetCount = (await readFile(stdinLog, 'utf8')).trim().split('\n').length;
     await adapter.setThinking(sess.id, 'off');
     assert.equal(adapter.getThinking(sess.id), 'low');
@@ -1141,7 +1149,7 @@ test('reversible model encoding, dynamic thinking levels without off, commands w
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l).cmd as Record<string, unknown>)
-      .find((c) => c.type === 'prompt');
+      .find((c) => c.type === 'prompt' && c.message === '/skill:deploy prod');
     assert.equal(sentPrompt?.message, '/skill:deploy prod');
 
     // Compact & stats with null contextUsage.tokens
@@ -2141,6 +2149,10 @@ test('clamped appliedPreferences synchronization in setThinkingLevel and fork/cl
       ].join('\n') + '\n',
     );
 
+    // Ensure sess has a live process so setThinking hits live RPC clamping,
+    // then clone/fork inherit the clamped effective level 'low' in appliedPreferences.
+    await drainEvents(await adapter.startTurn({ sessionId: sess.id, input: 'hi' }));
+
     // Requesting 'off' is clamped by the model/mode to 'low'.
     // appliedPreferences must record the clamped effective level 'low', not 'off'.
     await adapter.setThinking(sess.id, 'off');
@@ -2269,3 +2281,531 @@ test('parsePiSessionEntry and readPiActiveBranchHistory map bashExecution to ass
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('disk-only methods and idle setModel/setThinkingLevel do not spawn session processes', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-disk-fallbacks-'));
+  const sessionsDir = join(base, 'sessions');
+  const agentDir = base;
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const { bin, argvLog, stdinLog } = await writeContractFakePi(base);
+
+    // Create session file on disk
+    const sid = '12345678-1234-4234-8234-123456789abc';
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const sessFile = join(cwdDir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    await writeFile(
+      sessFile,
+      [
+        JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+        JSON.stringify({ type: 'session_info', id: 'info1', parentId: null, timestamp: '2026-11-15T00:00:01.000Z', name: 'Disk Title' }),
+        JSON.stringify({ type: 'model_change', id: 'mc1', parentId: 'info1', timestamp: '2026-11-15T00:00:02.000Z', provider: 'anthropic', modelId: 'claude-sonnet-4' }),
+        JSON.stringify({ type: 'thinking_level_change', id: 'tc1', parentId: 'mc1', timestamp: '2026-11-15T00:00:03.000Z', thinkingLevel: 'high' }),
+        JSON.stringify({ type: 'message', id: 'u1', parentId: 'tc1', timestamp: '2026-11-15T00:00:04.000Z', message: { role: 'user', content: [{ type: 'text', text: 'hello from disk' }] } }),
+        JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-11-15T00:00:05.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'reply from disk' }], usage: { input: 120, output: 60, cacheRead: 15, cacheWrite: 5, totalTokens: 200, cost: { total: 0.004 } } } }),
+        JSON.stringify({ type: 'usage', id: 'u-extra', parentId: 'a1', timestamp: '2026-11-15T00:00:06.000Z', kind: 'summary', provider: 'anthropic', model: 'claude-sonnet-4', usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 } } }),
+      ].join('\n') + '\n',
+    );
+
+    // Write settings.json with compaction.enabled = false
+    await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ compaction: { enabled: false } }), 'utf8');
+
+    adapter = new PiProviderAdapter({
+      piBin: bin,
+      sessionsDir,
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_ARGV_LOG: argvLog, PI_CODING_AGENT_DIR: agentDir },
+    });
+
+    // 1. getState
+    const state = await adapter.getSessionState(sid);
+    assert.equal(state.sessionId, sid);
+    assert.equal(state.sessionName, 'Disk Title');
+    assert.equal(state.model?.provider, 'anthropic');
+    assert.equal(state.model?.id, 'claude-sonnet-4');
+    assert.equal(state.thinkingLevel, 'high');
+    assert.equal(state.messageCount, 2);
+    assert.equal(state.autoCompactionEnabled, false);
+
+    // 2. getAutoCompaction
+    const autoComp = await adapter.getAutoCompaction(sid);
+    assert.equal(autoComp, false);
+
+    // 3. getSessionStats (populate modelsCache first via ephemeral --no-session listModels)
+    await adapter.listModels();
+    const stats = await adapter.getSessionStats(sid);
+    assert.equal(stats.sessionId, sid);
+    assert.equal(stats.userMessages, 1);
+    assert.equal(stats.assistantMessages, 1);
+    assert.equal(stats.tokens?.input, 130);
+    assert.equal(stats.tokens?.output, 65);
+    assert.equal(stats.tokens?.cacheRead, 15);
+    assert.equal(stats.tokens?.cacheWrite, 5);
+    assert.equal(stats.tokens?.total, 215);
+    assert.ok(Math.abs((stats.cost ?? 0) - 0.005) < 1e-9);
+    // 200 contextTokens / 200000 default claude-sonnet-4 window -> 0.1% (0-100 scale)
+    assert.equal(stats.contextUsage?.tokens, 200);
+    assert.equal(stats.contextUsage?.contextWindow, 200000);
+    assert.ok(Math.abs((stats.contextUsage?.percent ?? 0) - 0.1) < 1e-6);
+
+    // 4. getSessionTree
+    const treeData = await adapter.getSessionTree(sid);
+    assert.ok(treeData);
+    assert.equal(treeData.leafId, 'u-extra');
+    assert.ok(Array.isArray((treeData as any).tree));
+
+    // 5. getLastAssistantText
+    const lastText = await adapter.getLastAssistantText(sid);
+    assert.equal(lastText, 'reply from disk');
+
+    // 6. getForkMessages
+    const forkMsgs = await adapter.getForkMessages(sid);
+    assert.deepEqual(forkMsgs, [{ entryId: 'u1', text: 'hello from disk' }]);
+
+    // 7. idle setModel and setThinking (with validation against available models)
+    await assert.rejects(
+      adapter.setModel(sid, 'bogus/nonexistent-model'),
+      (err: unknown) => err instanceof ProviderError && err.code === 'invalid_request',
+    );
+    await adapter.setModel(sid, 'anthropic/claude-sonnet-4');
+    assert.equal(adapter.getModel(sid), 'anthropic/claude-sonnet-4');
+    await adapter.setThinking(sid, 'low');
+    assert.equal(adapter.getThinking(sid), 'low');
+
+    // Verify argvLog has NO session spawns!
+    let argvLines: Array<{ pid: number; args: string[] }> = [];
+    try {
+      const raw = await readFile(argvLog, 'utf8');
+      argvLines = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    } catch {
+      // File may not exist if no spawns occurred
+    }
+    const sessionSpawns = argvLines.filter((l) => l.args.includes('--session') || l.args.includes('--session-id'));
+    assert.equal(sessionSpawns.length, 0, 'Must not spawn a session process for disk reads or idle settings');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('idle process recycling recycles idle process and protects active turns and parked questions', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-recycle-'));
+  const sessionsDir = join(base, 'sessions');
+  let adapter: PiAdapter | undefined;
+  try {
+    const { bin, argvLog, stdinLog } = await writeContractFakePi(base);
+    adapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir,
+      recycleGraceMs: 60,
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_ARGV_LOG: argvLog },
+    });
+
+    // Case 1: normal turn completes, then recycles when idle
+    const { sessionId: sess1 } = adapter.create(base, 'Session 1');
+    const turn1 = await adapter.startTurn(sess1, 'hello');
+    await drainEvents(turn1);
+
+    // Process is currently alive
+    const procs = (adapter as any).processes as Map<string, PiRpcClient>;
+    assert.equal(procs.get(sess1)?.isAlive, true);
+
+    // Wait past recycleGraceMs (60ms)
+    await new Promise((r) => setTimeout(r, 120));
+
+    // Process has been recycled
+    assert.equal(procs.has(sess1), false, 'Idle process should be recycled after grace period');
+    // Metadata caches preserved
+    assert.equal(adapter.getCachedSessionName(sess1), 'Session 1');
+
+    // Case 2: Active turn protection (turn in progress must NOT be recycled)
+    let adapterBusy: PiAdapter | undefined;
+    try {
+      const { bin: binBusy, stdinLog: stdinBusy, argvLog: argvBusy } = await writeContractFakePi(base);
+      adapterBusy = new PiAdapter({
+        piBin: binBusy,
+        sessionsDir,
+        recycleGraceMs: 60,
+        env: { FAKE_STDIN_LOG: stdinBusy, FAKE_ARGV_LOG: argvBusy, FAKE_PI_MODE: 'wait_for_abort' },
+      });
+      const sessBusy = '22222222-2222-4222-8222-222222222222';
+      const turnBusy = await adapterBusy.startTurn(sessBusy, 'hold');
+      const busyProcs = (adapterBusy as any).processes as Map<string, PiRpcClient>;
+      assert.equal(busyProcs.get(sessBusy)?.isAlive, true);
+
+      // Wait past grace period
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Process must still be alive!
+      assert.equal(busyProcs.has(sessBusy), true, 'Process running an active turn must not be recycled');
+      assert.equal(adapterBusy.isBusy(sessBusy), true);
+
+      // Abort turn to cleanly finish
+      await adapterBusy.abort(sessBusy);
+      await drainEvents(turnBusy);
+    } finally {
+      await adapterBusy?.dispose().catch(() => undefined);
+    }
+
+    // Case 3: Parked question protection (unanswered question must NOT be recycled)
+    let adapterQ: PiAdapter | undefined;
+    try {
+      const { bin: binQ, stdinLog: stdinQ, argvLog: argvQ } = await writeContractFakePi(base);
+      adapterQ = new PiAdapter({
+        piBin: binQ,
+        sessionsDir,
+        recycleGraceMs: 60,
+        env: { FAKE_STDIN_LOG: stdinQ, FAKE_ARGV_LOG: argvQ, FAKE_PI_MODE: 'ui_dialogs' },
+      });
+      const sessQ = '33333333-3333-4333-8333-333333333333';
+      const turnQ = await adapterQ.startTurn(sessQ, 'trigger dialog');
+      // Wait for parked confirm question
+      for (let i = 0; i < 40; i++) {
+        if ((adapterQ as any).parkedQuestions.size > 0) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal((adapterQ as any).parkedQuestions.size, 1);
+      const qProcs = (adapterQ as any).processes as Map<string, PiRpcClient>;
+      assert.equal(qProcs.get(sessQ)?.isAlive, true);
+
+      // Wait past grace period
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Must NOT be recycled while question is parked
+      assert.equal(qProcs.has(sessQ), true, 'Process with parked question must not be recycled');
+
+      // Resolve all parked dialogs in sequence: editor ('edited-body'), confirm ('yes'), select ('OptA'), input ('test input')
+      const answers = ['edited-body', 'yes', 'OptA', 'test input'];
+      for (const ans of answers) {
+        for (let i = 0; i < 40; i++) {
+          if ((adapterQ as any).parkedQuestions.size > 0) break;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        const qId = [...(adapterQ as any).parkedQuestions.keys()][0];
+        if (qId) await adapterQ.resolveQuestion(sessQ, qId, ans);
+      }
+      await drainEvents(turnQ);
+    } finally {
+      await adapterQ?.dispose().catch(() => undefined);
+    }
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('maxLiveProcesses evicts oldest-activity idle process and protects busy processes', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-lru-'));
+  const sessionsDir = join(base, 'sessions');
+  let adapter: PiAdapter | undefined;
+  try {
+    const { bin, argvLog, stdinLog } = await writeContractFakePi(base);
+    adapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir,
+      maxLiveProcesses: 2,
+      recycleGraceMs: 0, // disable timer-based recycling
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_ARGV_LOG: argvLog },
+    });
+
+    const procs = (adapter as any).processes as Map<string, PiRpcClient>;
+
+    // Start turn on sess-1
+    const sess1 = '11111111-1111-4111-8111-111111111111';
+    await drainEvents(await adapter.startTurn(sess1, 'msg1'));
+    assert.equal(procs.size, 1);
+    assert.ok(procs.has(sess1));
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Start turn on sess-2
+    const sess2 = '22222222-2222-4222-8222-222222222222';
+    await drainEvents(await adapter.startTurn(sess2, 'msg2'));
+    assert.equal(procs.size, 2);
+    assert.ok(procs.has(sess1));
+    assert.ok(procs.has(sess2));
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Start turn on sess-3 -> should evict sess-1 (oldest activity)
+    const sess3 = '33333333-3333-4333-8333-333333333333';
+    await drainEvents(await adapter.startTurn(sess3, 'msg3'));
+    assert.equal(procs.size, 2);
+    assert.equal(procs.has(sess1), false, 'sess-1 should be evicted as oldest idle process');
+    assert.ok(procs.has(sess2));
+    assert.ok(procs.has(sess3));
+
+    // Test busy process immunity:
+    // Mark sess-2 as busy
+    (adapter as any).activeTurns.set(sess2, {
+      sessionId: sess2,
+      turnId: 'dummy',
+      settled: false,
+    });
+    // sess-2 has older activity than sess-3, but sess-2 is busy!
+    // Start sess-4 -> sess-3 should be evicted instead because sess-2 is busy!
+    const sess4 = '44444444-4444-4444-8444-444444444444';
+    await drainEvents(await adapter.startTurn(sess4, 'msg4'));
+    assert.ok(procs.has(sess2), 'Busy process sess-2 must never be killed by LRU eviction');
+    assert.equal(procs.has(sess3), false, 'sess-3 should be evicted since sess-2 is busy');
+    assert.ok(procs.has(sess4));
+
+    (adapter as any).activeTurns.delete(sess2);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('maxSessionFileBytes throws invalid_request on oversized session file before spawning', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-max-size-'));
+  const sessionsDir = join(base, 'sessions');
+  let adapter: PiAdapter | undefined;
+  try {
+    const { bin, argvLog, stdinLog } = await writeContractFakePi(base);
+    adapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir,
+      maxSessionFileBytes: 1024, // 1 KiB limit
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_ARGV_LOG: argvLog },
+    });
+
+    const sid = '55555555-5555-4555-8555-555555555555';
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+    const sessFile = join(cwdDir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+
+    // Create an oversized file > 1024 bytes (e.g., 2048 bytes)
+    const padding = 'x'.repeat(2048);
+    await writeFile(
+      sessFile,
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base, pad: padding }) + '\n',
+    );
+
+    await assert.rejects(
+      adapter.startTurn(sid, 'hello'),
+      (err: unknown) => {
+        assert.ok(err instanceof ProviderError);
+        assert.equal(err.code, 'invalid_request');
+        assert.equal(err.httpStatus, 400);
+        assert.ok(err.message.includes('exceeds maximum allowed size'));
+        return true;
+      },
+    );
+
+    // Verify pi was NOT spawned for this oversized session file
+    let argvLines: Array<{ pid: number; args: string[] }> = [];
+    try {
+      const raw = await readFile(argvLog, 'utf8');
+      argvLines = raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    } catch {
+      // not created
+    }
+    const spawnedForFile = argvLines.filter((l) => l.args.includes(sessFile));
+    assert.equal(spawnedForFile.length, 0, 'Must not spawn pi for oversized session file');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('ensureSessionProcess coalesces concurrent starts, rejects when maxLiveProcesses all busy, and ignores self-parent cycles', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-concurrency-guard-'));
+  const sessionsDir = join(base, 'sessions');
+  let adapter: PiAdapter | undefined;
+  try {
+    const { bin, argvLog, stdinLog } = await writeContractFakePi(base);
+    adapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir,
+      maxLiveProcesses: 1,
+      recycleGraceMs: 0,
+      env: { FAKE_STDIN_LOG: stdinLog, FAKE_ARGV_LOG: argvLog, FAKE_PI_MODE: 'wait_for_abort' },
+    });
+
+    const sid1 = '66666666-6666-4666-8666-666666666661';
+    const sid2 = '66666666-6666-4666-8666-666666666662';
+    const cwdDir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(cwdDir, { recursive: true });
+
+    // Corrupted self-parent entry + non-active branch fork message
+    const sess1File = join(cwdDir, `2026-11-15T00-00-00-000Z_${sid1}.jsonl`);
+    await writeFile(
+      sess1File,
+      [
+        JSON.stringify({ type: 'session', version: 3, id: sid1, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+        JSON.stringify({ type: 'message', id: 'u-side', parentId: null, timestamp: '2026-11-15T00:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'side branch user' }] } }),
+        JSON.stringify({ type: 'message', id: 'u-self', parentId: 'u-self', timestamp: '2026-11-15T00:00:02.000Z', message: { role: 'user', content: [{ type: 'text', text: 'main branch user' }] } }),
+      ].join('\n') + '\n',
+    );
+
+    const tree = await adapter.getSessionTree(sid1);
+    assert.ok(tree);
+    assert.equal(JSON.stringify(tree).includes('u-self'), true);
+    const forkMsgs = await adapter.getForkMessages(sid1);
+    assert.equal(forkMsgs.length, 2, 'getForkMessages must scan all entries across branches');
+
+    // Concurrent ensureSessionProcess for sid1 must only spawn once
+    const inner = adapter as any;
+    const [c1, c2] = await Promise.all([
+      inner.ensureSessionProcess(sid1),
+      inner.ensureSessionProcess(sid1),
+    ]);
+    assert.equal(c1, c2);
+    const rawArgv = await readFile(argvLog, 'utf8');
+    const sid1Spawns = rawArgv
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as { args: string[] })
+      .filter((l) => l.args.includes(sess1File));
+    assert.equal(sid1Spawns.length, 1, 'concurrent ensureSessionProcess must coalesce into a single spawn');
+
+    // Start an active turn on sid1 -> sid2 must be rejected with busy instead of exceeding maxLiveProcesses=1
+    const turn1 = await adapter.startTurn(sid1, 'hold slot');
+    await assert.rejects(
+      adapter.startTurn(sid2, 'overflow'),
+      (err: unknown) => err instanceof ProviderError && err.code === 'busy',
+    );
+    await adapter.abort(sid1);
+    await drainEvents(turn1);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('interactive extension command avoids preflight deadlock, dedupes custom messages, tracks setStatus/setWidget/planMode, and discovers subagents', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-ext-integration-'));
+  const sessionsDir = join(base, 'sessions');
+  const scriptPath = join(base, 'fake-pi-ext');
+  const respLog = join(base, 'ext-resp.jsonl');
+  const childTranscript = join(base, 'subagent-child.jsonl');
+  let adapter: PiProviderAdapter | undefined;
+  try {
+    const subSessionId = 'sub-agent-001';
+    await writeFile(
+      childTranscript,
+      [
+        JSON.stringify({ type: 'session', version: 3, id: subSessionId, timestamp: '2026-11-15T01:00:00.000Z', cwd: base }),
+        JSON.stringify({ type: 'message', id: 'sm1', parentId: null, timestamp: '2026-11-15T01:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'Inspect files' }] } }),
+        JSON.stringify({ type: 'message', id: 'sm2', parentId: 'sm1', timestamp: '2026-11-15T01:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Subagent finished inspection.' }] } }),
+      ].join('\n') + '\n',
+    );
+
+    const py = `#!/usr/bin/env python3
+import json, os, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\\n")
+    sys.stdout.flush()
+
+resp_log = os.environ["RESP_LOG"]
+sub_transcript = os.environ["SUB_TRANSCRIPT"]
+session_id = "77777777-7777-4777-8777-777777777777"
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    cmd = json.loads(raw)
+    cid = cmd.get("id")
+    ctype = cmd.get("type")
+    if ctype == "get_state":
+        send({"id": cid, "type": "response", "command": "get_state", "success": True, "data": {
+            "sessionId": session_id, "thinkingLevel": "medium", "isStreaming": False, "isCompacting": False,
+            "steeringMode": "one-at-a-time", "followUpMode": "one-at-a-time", "autoCompactionEnabled": True,
+            "messageCount": 0, "pendingMessageCount": 0
+        }})
+    elif ctype == "get_available_models":
+        send({"id": cid, "type": "response", "command": "get_available_models", "success": True, "data": {"models": []}})
+    elif ctype == "get_commands":
+        send({"id": cid, "type": "response", "command": "get_commands", "success": True, "data": {"commands": []}})
+    elif ctype == "prompt":
+        msg = cmd.get("message", "")
+        if msg == "/interactive-cmd":
+            # Emit blocking select WITH duplicate labels BEFORE prompt response arrives (no deadlock!)
+            send({"type": "extension_ui_request", "id": "sel-dup", "method": "select", "title": "Choose", "options": ["Same", "Other", "Same"]})
+            ans = json.loads(sys.stdin.readline())
+            with open(resp_log, "a") as f:
+                f.write(json.dumps(ans) + "\\n")
+            send({"type": "extension_ui_request", "id": "st-1", "method": "setStatus", "statusKey": "plan-mode", "statusText": "Plan active"})
+            send({"type": "extension_ui_request", "id": "wg-1", "method": "setWidget", "widgetKey": "plan", "widgetLines": ["Step 1", "Step 2"]})
+            send({"type": "extension_ui_request", "id": "tt-1", "method": "setTitle", "title": "Planning"})
+            send({"type": "entry_appended", "entry": {"id": "c1", "type": "custom_message", "customType": "plan", "display": True, "content": "Custom Entry Output"}})
+            send({"type": "message_end", "message": {"role": "custom", "customType": "plan", "display": True, "content": "Custom Entry Output"}})
+            send({"type": "message_end", "message": {"role": "custom", "customType": "hidden", "display": False, "content": "Hidden Output"}})
+            send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "handled"}})
+        else:
+            send({"id": cid, "type": "response", "command": "prompt", "success": True, "data": {"disposition": "started"}})
+            send({"type": "agent_start"})
+            send({"type": "tool_execution_start", "toolCallId": "tc-sub-1", "toolName": "acp_delegate", "args": {"agent": "explorer", "task": "Explore repo"}})
+            send({"type": "tool_execution_end", "toolCallId": "tc-sub-1", "toolName": "acp_delegate", "isError": False, "result": {
+                "content": [{"type": "text", "text": "Delegated result"}],
+                "details": {"runId": "sub-agent-001", "agent": "explorer", "transcriptPath": sub_transcript}
+            }})
+            send({"type": "agent_settled", "aborted": False})
+    elif ctype == "abort":
+        send({"id": cid, "type": "response", "command": "abort", "success": True})
+`;
+    await writeFile(scriptPath, py);
+    await chmod(scriptPath, 0o755);
+
+    adapter = new PiProviderAdapter({
+      piBin: scriptPath,
+      sessionsDir,
+      requestTimeoutMs: 1500,
+      handledGraceMs: 40,
+      env: { RESP_LOG: respLog, SUB_TRANSCRIPT: childTranscript },
+    });
+
+    const sess = await adapter.create({ provider: 'pi', cwd: base });
+
+    // 1. Blocking dialog inside slash command before prompt response -> resolves without deadlock!
+    const handle = await adapter.startTurn({ sessionId: sess.id, input: '/interactive-cmd' });
+    const events: GatewayEvent[] = [];
+    for await (const ev of handle.events) {
+      events.push(ev);
+      if (ev.kind === 'question' && ev.status === 'started') {
+        const q = ev.payload as { questionId: string; rawQuestions: Array<{ options: Array<{ id: string; label: string }> }> };
+        // Pick the 3rd option ("Same__2") -> must translate back to raw label "Same"
+        assert.equal(q.rawQuestions[0]?.options[2]?.id, 'Same__2');
+        await adapter.resolveQuestion(sess.id, q.questionId, { q_0: ['Same__2'] });
+      }
+    }
+
+    const recorded = JSON.parse((await readFile(respLog, 'utf8')).trim()) as Record<string, unknown>;
+    assert.deepEqual(recorded, { type: 'extension_ui_response', id: 'sel-dup', value: 'Same' });
+
+    // Check custom_message deduplication + hidden display:false suppression
+    const customTexts = events
+      .filter((e) => e.kind === 'message' && e.status === 'delta')
+      .map((e) => (e.payload as { delta?: string }).delta);
+    assert.deepEqual(customTexts, ['Custom Entry Output']);
+
+    // Check extension UI state + planMode tracking
+    assert.equal(adapter.getPlanMode(sess.id), true);
+    assert.deepEqual(adapter.getExtensionUiState(sess.id), {
+      statuses: { 'plan-mode': 'Plan active' },
+      widgets: { plan: { lines: ['Step 1', 'Step 2'] } },
+      title: 'Planning',
+    });
+
+    // 2. Subagent discovery via acp_delegate + child JSONL read
+    const subEvents = await drainEvents(await adapter.startTurn({ sessionId: sess.id, input: 'delegate work' }));
+    assert.ok(subEvents.some((e) => e.kind === 'subagent' && e.status === 'started' && e.agentId === 'sub-agent-001'));
+    assert.ok(subEvents.some((e) => e.kind === 'subagent' && e.status === 'completed' && e.agentId === 'sub-agent-001'));
+
+    const subs = await adapter.listSubagents(sess.id);
+    assert.equal(subs.length, 1);
+    assert.equal(subs[0]?.agentId, 'sub-agent-001');
+    assert.equal(subs[0]?.subagentType, 'explorer');
+    const subMsgs = await adapter.getSubagentMessages(sess.id, 'sub-agent-001');
+    assert.equal(subMsgs.length, 2);
+    assert.equal((subMsgs[1]?.content[0] as { text?: string })?.text, 'Subagent finished inspection.');
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+

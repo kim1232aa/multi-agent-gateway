@@ -125,7 +125,6 @@ function isCodexToolItem(type: unknown): boolean {
     || type === 'imageView'
     || type === 'collabToolCall'
     || type === 'collabAgentToolCall'
-    || type === 'subAgentActivity'
     || type === 'custom_tool_call';
 }
 
@@ -350,11 +349,20 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private readonly inner: CodexAdapter;
   /** 会话级设置持久化(重启不丢;只读路径回落 undefined = 未设置)。 */
   private readonly settings: SettingsStore;
+  private readonly syncedPlanThreads = new Set<string>();
+  private cachedModels: NativeModel[] | null = null;
 
   constructor(options?: ConstructorParameters<typeof CodexAdapter>[0] & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
     this.inner = new CodexAdapter(innerOptions);
     this.settings = new SettingsStore(settingsPath);
+    if (typeof (this.inner as any).onEvent === 'function') {
+      (this.inner as any).onEvent((ev: any) => {
+        if (ev && ev.type === 'disconnected') {
+          this.syncedPlanThreads.clear();
+        }
+      });
+    }
   }
 
   capabilities(): ProviderCapabilities {
@@ -543,11 +551,46 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.threadCwd.get(sessionId);
   }
 
+  private static readonly MAX_LIVE_SUBAGENT_SESSIONS = 64;
+  private static readonly MAX_LIVE_SUBAGENTS_PER_SESSION = 64;
+  private static readonly LIVE_SUBAGENT_TERMINAL_TTL_MS = 5 * 60_000;
   private readonly activeThreadTurns = new Set<string>();
   private readonly liveSubagents = new Map<
     string,
-    Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>
+    Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; completedAt?: number }>
   >();
+
+  private pruneLiveSubagents(sessionId?: string): void {
+    const now = Date.now();
+    const pruneBucket = (
+      bucket: Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; completedAt?: number }>,
+    ): void => {
+      for (const [id, entry] of bucket) {
+        if (
+          entry.completedAt !== undefined &&
+          now - entry.completedAt >= CodexProviderAdapter.LIVE_SUBAGENT_TERMINAL_TTL_MS
+        ) {
+          bucket.delete(id);
+        }
+      }
+      while (bucket.size > CodexProviderAdapter.MAX_LIVE_SUBAGENTS_PER_SESSION) {
+        const oldest = bucket.keys().next().value;
+        if (oldest === undefined) break;
+        bucket.delete(oldest);
+      }
+    };
+    if (sessionId) {
+      const bucket = this.liveSubagents.get(sessionId);
+      if (!bucket) return;
+      pruneBucket(bucket);
+      if (bucket.size === 0) this.liveSubagents.delete(sessionId);
+      return;
+    }
+    for (const [sid, bucket] of this.liveSubagents) {
+      pruneBucket(bucket);
+      if (bucket.size === 0) this.liveSubagents.delete(sid);
+    }
+  }
 
   private recordLiveSubagent(
     sessionId: string,
@@ -555,26 +598,41 @@ export class CodexProviderAdapter implements ProviderAdapter {
     parentToolUseId?: string,
     description?: string,
     subagentType?: string,
+    completed?: boolean,
   ): void {
     if (!agentId || agentId === sessionId) return;
     let bucket = this.liveSubagents.get(sessionId);
     if (!bucket) {
+      while (this.liveSubagents.size >= CodexProviderAdapter.MAX_LIVE_SUBAGENT_SESSIONS) {
+        const oldestSid = this.liveSubagents.keys().next().value;
+        if (oldestSid === undefined) break;
+        this.liveSubagents.delete(oldestSid);
+      }
       bucket = new Map();
+      this.liveSubagents.set(sessionId, bucket);
+    } else {
+      this.liveSubagents.delete(sessionId);
       this.liveSubagents.set(sessionId, bucket);
     }
     const existing = bucket.get(agentId);
+    bucket.delete(agentId);
     bucket.set(agentId, {
       agentId,
       parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
       description: description ?? existing?.description,
       subagentType: subagentType ?? existing?.subagentType,
+      completedAt: completed ? Date.now() : (completed === false ? undefined : existing?.completedAt),
     });
+    this.pruneLiveSubagents(sessionId);
   }
 
   // thread/read 对大会话是秒级(901MB rollout 实测 9.4s),而页面加载会并发打
   // 2-3 个 getHistory。rollout 文件是真相源:按 mtimeMs:size 做缓存键,没变就
   // 复用同一个 Promise(并发合并),变了自然失效;失败删缓存不毒化。
-  private historyCache = new Map<string, { key: string; p: Promise<Message[]> }>();
+  // 有界 LRU 缓存 (最大 64 条,TTL 5 分钟)。
+  private static readonly MAX_HISTORY_CACHE_ENTRIES = 64;
+  private static readonly HISTORY_CACHE_TTL_MS = 5 * 60_000;
+  private historyCache = new Map<string, { key: string; p: Promise<Message[]>; ts: number }>();
 
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
     const isLive =
@@ -585,14 +643,25 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const stat = rollout ? await fsp.stat(rollout).catch(() => null) : null;
     if (!rollout || !stat) return this.readCodexHistory(sessionId); // 未落盘新线程或有进行中 turn,走 readCodexHistory
     const key = `${stat.mtimeMs}:${stat.size}`;
+    const now = Date.now();
     const hit = this.historyCache.get(sessionId);
-    if (hit && hit.key === key) return hit.p;
+    if (hit && hit.key === key && now - hit.ts < CodexProviderAdapter.HISTORY_CACHE_TTL_MS) {
+      this.historyCache.delete(sessionId);
+      this.historyCache.set(sessionId, hit);
+      return hit.p;
+    }
     const p = (async () => {
       const parsed = await this.readCodexRolloutHistory(rollout, sessionId, stat.size);
       if (parsed.length > 0) return parsed;
       return this.readCodexHistory(sessionId);
     })();
-    this.historyCache.set(sessionId, { key, p });
+    if (this.historyCache.has(sessionId)) {
+      this.historyCache.delete(sessionId);
+    } else if (this.historyCache.size >= CodexProviderAdapter.MAX_HISTORY_CACHE_ENTRIES) {
+      const oldest = this.historyCache.keys().next().value;
+      if (oldest !== undefined) this.historyCache.delete(oldest);
+    }
+    this.historyCache.set(sessionId, { key, p, ts: now });
     p.catch(() => {
       if (this.historyCache.get(sessionId)?.p === p) this.historyCache.delete(sessionId);
     });
@@ -1105,6 +1174,86 @@ export class CodexProviderAdapter implements ProviderAdapter {
             created_at: createdAt,
             metadata: { item_type: type },
           });
+        } else if (type === 'subAgentActivity') {
+          const receiverThreadIds = Array.isArray(it.receiverThreadIds)
+            ? (it.receiverThreadIds as string[])
+            : undefined;
+          const agentId =
+            (typeof it.agentId === 'string' && it.agentId) ||
+            (typeof it.agentThreadId === 'string' && it.agentThreadId) ||
+            (typeof it.agent_thread_id === 'string' && it.agent_thread_id) ||
+            (typeof it.agentPath === 'string' && it.agentPath) ||
+            (typeof it.receiverThreadId === 'string' && it.receiverThreadId) ||
+            receiverThreadIds?.[0] ||
+            undefined;
+          const explicitParentId =
+            (typeof it.parentToolUseId === 'string' && it.parentToolUseId) ||
+            (typeof it.call_id === 'string' && it.call_id) ||
+            undefined;
+          const matchCallId = explicitParentId ?? (typeof it.id === 'string' && it.id ? it.id : undefined);
+          let matchedExisting = false;
+          if (agentId && matchCallId) {
+            for (const msg of messages) {
+              const hasMatchingTool = msg.content.some(
+                (part) => (part.type === 'tool_use' || part.type === 'tool_result') && part.tool_call_id === matchCallId,
+              );
+              if (!hasMatchingTool) continue;
+              matchedExisting = true;
+              msg.metadata = { ...(msg.metadata ?? {}), agent_id: agentId, agentId };
+              for (const part of msg.content) {
+                if (part.type === 'tool_result') {
+                  const cur = typeof part.output === 'string' ? part.output : '';
+                  if (!cur.includes('agent_id:')) {
+                    part.output = cur ? `agent_id: ${agentId}\n${cur}` : `agent_id: ${agentId}`;
+                  }
+                }
+              }
+            }
+          }
+          if (!matchedExisting && agentId) {
+            const callId = explicitParentId ?? (typeof it.id === 'string' && it.id ? it.id : `subagent_${agentId}`);
+            const summary = typeof it.summary === 'string' ? it.summary : '';
+            const label = (typeof it.name === 'string' && it.name) || 'Subagent';
+            messages.push({
+              id: `${callId}_call`,
+              session_id: sessionId,
+              role: 'assistant',
+              content: [kimiHistoryPart({
+                type: 'tool_use',
+                tool_call_id: callId,
+                tool_name: 'Agent',
+                input: { description: summary || label },
+                ...(explicitParentId ? { parent_tool_use_id: explicitParentId } : {}),
+              })],
+              created_at: createdAt,
+              metadata: {
+                agent_id: agentId,
+                agentId,
+                ...(explicitParentId ? { parent_tool_use_id: explicitParentId, parentToolUseId: explicitParentId } : {}),
+                ...(summary ? { description: summary } : {}),
+                ...(typeof it.name === 'string' && it.name ? { subagentType: it.name } : {}),
+              },
+            });
+            const outText = summary ? `agent_id: ${agentId}\n${summary}` : `agent_id: ${agentId}`;
+            messages.push({
+              id: `${callId}_result`,
+              session_id: sessionId,
+              role: 'assistant',
+              content: [kimiHistoryPart({
+                type: 'tool_result',
+                tool_call_id: callId,
+                output: outText,
+                is_error: isCodexToolItemError(it),
+                ...(explicitParentId ? { parent_tool_use_id: explicitParentId } : {}),
+              })],
+              created_at: createdAt,
+              metadata: {
+                agent_id: agentId,
+                agentId,
+                ...(explicitParentId ? { parent_tool_use_id: explicitParentId, parentToolUseId: explicitParentId } : {}),
+              },
+            });
+          }
         } else if (isCodexToolItem(type)) {
           const callId = (it.call_id as string) ?? (it.id as string) ?? randomUUID();
           const name = (it.name as string) ?? (it.tool as string) ?? (type as string);
@@ -1194,9 +1343,35 @@ export class CodexProviderAdapter implements ProviderAdapter {
       const expanded = expandCodexSkill(prompt, await this.codexSkills(cwd));
       if (expanded != null) prompt = expanded;
     }
-    // 'off' = 用户显式关掉 thinking 控制;codex 没有"关闭推理"的概念,
-    // 诚实做法是回落到服务端默认 effort(不传),而不是造假一个档位。
+    if (this.getPlanMode(input.sessionId) === true && !this.syncedPlanThreads.has(input.sessionId)) {
+      const model = this.getModel(input.sessionId);
+      const reasoningEffort = this.resolveEffectiveEffort(input.sessionId);
+      try {
+        await this.inner.setCollaborationMode(input.sessionId, 'plan', {
+          ...(model ? { model } : {}),
+          reasoningEffort,
+        });
+        this.syncedPlanThreads.add(input.sessionId);
+      } catch {
+        // Retry syncing plan mode on the next turn when RPC fails.
+      }
+    }
+    // 'off' / 'auto' = 用户显式关掉 thinking 控制或自适应;codex 没有"关闭推理"的概念,
+    // 诚实做法是回落到服务端默认 effort(不传)。'on' 从已缓存的模型中解析 default_effort。
     const thinking = this.getThinking(input.sessionId);
+    let effort: string | undefined;
+    if (!thinking || thinking === 'off' || thinking === 'auto') {
+      effort = undefined;
+    } else if (thinking === 'on') {
+      if (!this.cachedModels) {
+        await this.listModels().catch(() => []);
+      }
+      const selectedModel = this.getModel(input.sessionId);
+      const m = this.cachedModels?.find((row) => row.model === selectedModel || (row.isDefault && !selectedModel));
+      effort = m?.default_effort;
+    } else {
+      effort = thinking;
+    }
     const attachments = input.attachments ?? [];
     const turnInput: string | Array<Record<string, unknown>> =
       attachments.length > 0 ? codexInputItems(prompt, attachments) : prompt;
@@ -1207,7 +1382,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const handle = await this.inner.startTurn(input.sessionId, turnInput, {
       ...(cwd ? { cwd } : {}),
       model: this.settings.getString('model', input.sessionId),
-      effort: thinking && thinking !== 'off' ? thinking : undefined,
+      effort,
       ...(serviceTier !== undefined ? { serviceTier } : {}),
       approvalPolicy: codexApprovalPolicy(this.settings.getString('permission', input.sessionId)),
     });
@@ -1263,13 +1438,34 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.settings.getString('permission', sessionId);
   }
 
+  private resolveEffectiveEffort(sessionId: string): string | null {
+    const thinking = this.getThinking(sessionId);
+    if (!thinking || thinking === 'off' || thinking === 'auto') return null;
+    if (thinking === 'on') {
+      const selectedModel = this.getModel(sessionId);
+      const m = this.cachedModels?.find((row) => row.model === selectedModel || (row.isDefault && !selectedModel));
+      return m?.default_effort ?? null;
+    }
+    return thinking;
+  }
+
   // -- plan 模式(collaborationMode,0.147.0 实测需 experimentalApi) --------------
 
   async setPlanMode(sessionId: string, on: boolean): Promise<void> {
+    const model = this.getModel(sessionId);
+    const reasoningEffort = this.resolveEffectiveEffort(sessionId);
     // 先落 RPC(失败不记持久态,UI 不会显示假开关)。
-    await this.inner.setCollaborationMode(sessionId, on ? 'plan' : 'default');
-    if (on) this.settings.set('plan', sessionId, true);
-    else this.settings.delete('plan', sessionId);
+    await this.inner.setCollaborationMode(sessionId, on ? 'plan' : 'default', {
+      ...(model ? { model } : {}),
+      reasoningEffort,
+    });
+    if (on) {
+      this.settings.set('plan', sessionId, true);
+      this.syncedPlanThreads.add(sessionId);
+    } else {
+      this.settings.delete('plan', sessionId);
+      this.syncedPlanThreads.delete(sessionId);
+    }
   }
 
   getPlanMode(sessionId: string): boolean | undefined {
@@ -1304,13 +1500,24 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
     await this.inner.setArchived(sessionId, archived);
+    if (archived) {
+      this.historyCache.delete(sessionId);
+      this.liveSubagents.delete(sessionId);
+      this.renames.delete(sessionId);
+      this.threadCwd.delete(sessionId);
+      this.syncedPlanThreads.delete(sessionId);
+      this.sessionUsage.delete(sessionId);
+    }
     this.invalidateListCache();
   }
 
   async delete(sessionId: string): Promise<void> {
     await this.inner.deleteThread(sessionId);
+    this.historyCache.delete(sessionId);
+    this.liveSubagents.delete(sessionId);
     this.renames.delete(sessionId);
     this.threadCwd.delete(sessionId);
+    this.syncedPlanThreads.delete(sessionId);
     this.settings.delete('model', sessionId);
     this.settings.delete('thinking', sessionId);
     this.settings.delete('permission', sessionId);
@@ -1442,6 +1649,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
         raw: r,
       });
     }
+    this.cachedModels = out;
     return out;
   }
 
@@ -1533,13 +1741,22 @@ export class CodexProviderAdapter implements ProviderAdapter {
     }
   }
 
-  async close(_sessionId: string): Promise<void> {
-    // Codex 进程常驻;会话级 close 为空操作(进程由进程级 close 管理)。
+  async close(sessionId: string): Promise<void> {
+    this.syncedPlanThreads.delete(sessionId);
   }
 
   /** 进程级清理:杀 codex app-server。网关 shutdown 时调用(此前无调用方,
    *  预热拉起的常驻进程在网关退出后成孤儿)。 */
   async dispose(): Promise<void> {
+    this.historyCache.clear();
+    this.liveSubagents.clear();
+    this.renames.clear();
+    this.threadCwd.clear();
+    this.sessionUsage.clear();
+    this.skillsCache.clear();
+    this.syncedPlanThreads.clear();
+    this.activeThreadTurns.clear();
+    this.invalidateListCache();
     this.settings.close();
     await this.inner.close();
   }
@@ -1617,22 +1834,55 @@ export class CodexProviderAdapter implements ProviderAdapter {
             const agentId =
               (typeof item.agentId === 'string' && item.agentId) ||
               (typeof item.agentThreadId === 'string' && item.agentThreadId) ||
+              (typeof item.agentPath === 'string' && item.agentPath) ||
               (typeof item.receiverThreadId === 'string' && item.receiverThreadId) ||
               receiverThreadIds?.[0] ||
-              undefined;
+              (item.type === 'subAgentActivity' ? (typeof item.id === 'string' && item.id ? item.id : undefined) : undefined);
             const parentToolUseId =
               (typeof item.parentToolUseId === 'string' && item.parentToolUseId) ||
-              (item.type === 'subAgentActivity'
-                ? ((typeof item.call_id === 'string' && item.call_id)
-                  || (typeof item.id === 'string' && item.id && item.id !== agentId ? item.id : undefined))
+              (item.type === 'subAgentActivity' && typeof item.call_id === 'string' && item.call_id
+                ? item.call_id
                 : undefined);
-            if (isCodexToolItem(item.type)) {
+            if (item.type === 'subAgentActivity') {
+              const effectiveAgentId = agentId ?? (typeof item.id === 'string' ? item.id : 'agent');
+              const resolvedParentToolUseId =
+                parentToolUseId ?? this.liveSubagents.get(sessionId)?.get(effectiveAgentId)?.parentToolUseId;
+              this.recordLiveSubagent(
+                sessionId,
+                effectiveAgentId,
+                resolvedParentToolUseId,
+                typeof item.summary === 'string' ? item.summary : undefined,
+                typeof item.name === 'string' ? item.name : undefined,
+                false,
+              );
+              yield {
+                kind: 'subagent',
+                status: 'started',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                agentId: effectiveAgentId,
+                ...(resolvedParentToolUseId ? { parentToolUseId: resolvedParentToolUseId } : {}),
+                payload: {
+                  agentId: effectiveAgentId,
+                  agent_id: effectiveAgentId,
+                  ...(typeof item.agentThreadId === 'string' ? { agentThreadId: item.agentThreadId } : {}),
+                  ...(typeof item.agentPath === 'string' ? { agentPath: item.agentPath } : {}),
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                  ...(resolvedParentToolUseId ? { parentToolUseId: resolvedParentToolUseId } : {}),
+                  name: typeof item.name === 'string' ? item.name : undefined,
+                  status: typeof item.status === 'string' ? item.status : 'started',
+                  summary: typeof item.summary === 'string' ? item.summary : undefined,
+                  raw: item,
+                },
+              };
+            } else if (isCodexToolItem(item.type)) {
               const name =
                 (typeof item.name === 'string' && item.name) ||
                 (typeof item.tool === 'string' && item.tool) ||
                 (item.type as string);
               if (agentId) {
-                this.recordLiveSubagent(sessionId, agentId, (item.id as string) ?? parentToolUseId);
+                this.recordLiveSubagent(sessionId, agentId, (item.id as string) ?? parentToolUseId, undefined, undefined, false);
               }
               yield {
                 kind: 'tool',
@@ -1651,33 +1901,6 @@ export class CodexProviderAdapter implements ProviderAdapter {
                   ...(parentToolUseId ? { parentToolUseId } : {}),
                   ...(agentId ? { agentId, agent_id: agentId } : {}),
                   ...(receiverThreadIds ? { receiverThreadIds } : {}),
-                  raw: item,
-                },
-              };
-            } else if (item.type === 'subAgentActivity' && agentId) {
-              this.recordLiveSubagent(
-                sessionId,
-                agentId,
-                parentToolUseId,
-                typeof item.summary === 'string' ? item.summary : undefined,
-                typeof item.name === 'string' ? item.name : undefined,
-              );
-              yield {
-                kind: 'subagent',
-                status: 'started',
-                sessionId,
-                turnId,
-                timestamp: ts,
-                agentId,
-                ...(parentToolUseId ? { parentToolUseId } : {}),
-                payload: {
-                  agentId,
-                  agent_id: agentId,
-                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
-                  ...(parentToolUseId ? { parentToolUseId } : {}),
-                  name: typeof item.name === 'string' ? item.name : undefined,
-                  status: typeof item.status === 'string' ? item.status : 'started',
-                  summary: typeof item.summary === 'string' ? item.summary : undefined,
                   raw: item,
                 },
               };
@@ -1706,16 +1929,50 @@ export class CodexProviderAdapter implements ProviderAdapter {
             const agentId =
               (typeof item.agentId === 'string' && item.agentId) ||
               (typeof item.agentThreadId === 'string' && item.agentThreadId) ||
+              (typeof item.agentPath === 'string' && item.agentPath) ||
               (typeof item.receiverThreadId === 'string' && item.receiverThreadId) ||
               receiverThreadIds?.[0] ||
-              undefined;
+              (item.type === 'subAgentActivity' ? (typeof item.id === 'string' && item.id ? item.id : undefined) : undefined);
             const parentToolUseId =
               (typeof item.parentToolUseId === 'string' && item.parentToolUseId) ||
-              (item.type === 'subAgentActivity'
-                ? ((typeof item.call_id === 'string' && item.call_id)
-                  || (typeof item.id === 'string' && item.id && item.id !== agentId ? item.id : undefined))
+              (item.type === 'subAgentActivity' && typeof item.call_id === 'string' && item.call_id
+                ? item.call_id
                 : undefined);
-            if (isCodexToolItem(item.type)) {
+            if (item.type === 'subAgentActivity') {
+              const effectiveAgentId = agentId ?? (typeof item.id === 'string' ? item.id : 'agent');
+              const resolvedParentToolUseId =
+                parentToolUseId ?? this.liveSubagents.get(sessionId)?.get(effectiveAgentId)?.parentToolUseId;
+              this.recordLiveSubagent(
+                sessionId,
+                effectiveAgentId,
+                resolvedParentToolUseId,
+                typeof item.summary === 'string' ? item.summary : undefined,
+                typeof item.name === 'string' ? item.name : undefined,
+                true,
+              );
+              const st = typeof item.status === 'string' ? item.status : 'completed';
+              yield {
+                kind: 'subagent',
+                status: st === 'failed' ? 'failed' : st === 'cancelled' ? 'cancelled' : 'completed',
+                sessionId,
+                turnId,
+                timestamp: ts,
+                agentId: effectiveAgentId,
+                ...(resolvedParentToolUseId ? { parentToolUseId: resolvedParentToolUseId } : {}),
+                payload: {
+                  agentId: effectiveAgentId,
+                  agent_id: effectiveAgentId,
+                  ...(typeof item.agentThreadId === 'string' ? { agentThreadId: item.agentThreadId } : {}),
+                  ...(typeof item.agentPath === 'string' ? { agentPath: item.agentPath } : {}),
+                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
+                  ...(resolvedParentToolUseId ? { parentToolUseId: resolvedParentToolUseId } : {}),
+                  name: typeof item.name === 'string' ? item.name : undefined,
+                  status: st,
+                  summary: typeof item.summary === 'string' ? item.summary : undefined,
+                  raw: item,
+                },
+              };
+            } else if (isCodexToolItem(item.type)) {
               const name =
                 (typeof item.name === 'string' && item.name) ||
                 (typeof item.tool === 'string' && item.tool) ||
@@ -1723,9 +1980,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
               let output = extractCodexToolOutput(item) ?? '';
               const resolvedAgentId = agentId ?? extractSubagentIdFromOutput(output);
               if (resolvedAgentId) {
-                this.recordLiveSubagent(sessionId, resolvedAgentId, (item.id as string) ?? parentToolUseId);
+                this.recordLiveSubagent(sessionId, resolvedAgentId, (item.id as string) ?? parentToolUseId, undefined, undefined, true);
               }
-              if (item.type === 'collabAgentToolCall' || item.type === 'subAgentActivity' || name === 'collabAgentToolCall') {
+              if (item.type === 'collabAgentToolCall' || name === 'collabAgentToolCall') {
                 if (resolvedAgentId && !output.includes('agent_id:')) {
                   output = output ? `agent_id: ${resolvedAgentId}\n${output}` : `agent_id: ${resolvedAgentId}`;
                 }
@@ -1753,35 +2010,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
                   raw: item,
                 },
               };
-            } else if (item.type === 'subAgentActivity' && agentId) {
-              this.recordLiveSubagent(
-                sessionId,
-                agentId,
-                parentToolUseId,
-                typeof item.summary === 'string' ? item.summary : undefined,
-                typeof item.name === 'string' ? item.name : undefined,
-              );
-              const st = typeof item.status === 'string' ? item.status : 'completed';
-              yield {
-                kind: 'subagent',
-                status: st === 'failed' ? 'failed' : st === 'cancelled' ? 'cancelled' : 'completed',
-                sessionId,
-                turnId,
-                timestamp: ts,
-                agentId,
-                ...(parentToolUseId ? { parentToolUseId } : {}),
-                payload: {
-                  agentId,
-                  agent_id: agentId,
-                  ...(receiverThreadIds ? { receiverThreadIds } : {}),
-                  ...(parentToolUseId ? { parentToolUseId } : {}),
-                  name: typeof item.name === 'string' ? item.name : undefined,
-                  status: st,
-                  summary: typeof item.summary === 'string' ? item.summary : undefined,
-                  raw: item,
-                },
-              };
-          } else if (item.type === 'plan') {
+            } else if (item.type === 'plan') {
             yield {
               kind: 'plan',
               status: 'completed',
@@ -2023,11 +2252,17 @@ export class CodexProviderAdapter implements ProviderAdapter {
     description?: string;
     subagentType?: string;
   }>> {
+    this.pruneLiveSubagents(sessionId);
     const messages = await this.getHistory(sessionId).catch(() => []);
     const subagentsMap = new Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>();
 
     for (const liveSub of this.liveSubagents.get(sessionId)?.values() ?? []) {
-      subagentsMap.set(liveSub.agentId, liveSub);
+      subagentsMap.set(liveSub.agentId, {
+        agentId: liveSub.agentId,
+        ...(liveSub.parentToolUseId ? { parentToolUseId: liveSub.parentToolUseId } : {}),
+        ...(liveSub.description ? { description: liveSub.description } : {}),
+        ...(liveSub.subagentType ? { subagentType: liveSub.subagentType } : {}),
+      });
     }
     for (const msg of messages) {
       const meta = msg.metadata;
@@ -2116,8 +2351,37 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly settings: SettingsStore;
   private readonly liveSubagents = new Map<
     string,
-    Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string }>
+    Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string; completedAt?: number }>
   >();
+
+  private pruneLiveSubagents(targetSessionId?: string): void {
+    const now = Date.now();
+    const MAX_ENTRIES_PER_SESSION = 64;
+    const TERMINAL_TTL_MS = 5 * 60_000;
+    const pruneList = (list: Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string; completedAt?: number }>) => {
+      const filtered = list.filter((item) => !item.completedAt || now - item.completedAt < TERMINAL_TTL_MS);
+      if (filtered.length > MAX_ENTRIES_PER_SESSION) {
+        return filtered.slice(filtered.length - MAX_ENTRIES_PER_SESSION);
+      }
+      return filtered;
+    };
+
+    if (targetSessionId) {
+      const list = this.liveSubagents.get(targetSessionId);
+      if (list) {
+        this.liveSubagents.set(targetSessionId, pruneList(list));
+      }
+    } else {
+      for (const [sId, list] of this.liveSubagents.entries()) {
+        const pruned = pruneList(list);
+        if (pruned.length === 0) {
+          this.liveSubagents.delete(sId);
+        } else {
+          this.liveSubagents.set(sId, pruned);
+        }
+      }
+    }
+  }
 
   private resolveEffectiveSessionId(sessionId: string): string {
     return this.resetSessionIds.get(sessionId) ?? this.settings.getString('resetSessionId', sessionId) ?? sessionId;
@@ -2358,9 +2622,9 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       storedModel && !/qwen/i.test(storedModel)
         ? (alias === 'default' ? undefined : (alias ?? storedModel))
         : undefined;
-    // thinking 'off' = 用户显式关闭 → 不传 --effort(CLI 无 off 档)。
+    // thinking 'off' / 'on' / 'auto' = 不传 --effort(CLI 无 off 档，'on'/'auto' 由 CLI 内部自适应)。
     const thinking = this.getThinking(sessionId);
-    const effort = thinking && thinking !== 'off' ? thinking : undefined;
+    const effort = thinking && thinking !== 'off' && thinking !== 'on' && thinking !== 'auto' ? thinking : undefined;
     const permissionMode = this.settings.getBoolean('plan', sessionId)
       ? 'plan'
       : claudePermissionMode(this.settings.getString('permission', sessionId));
@@ -2577,24 +2841,29 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
             : ev.status === 'cancelled'
               ? 'cancelled'
               : 'completed';
+          const liveList = this.liveSubagents.get(effectiveId) ?? this.liveSubagents.get(sessionId) ?? [];
+          const tracked = liveList.find((l) => l.taskId === ev.taskId || l.agentId === ev.taskId);
+          const resolvedToolUseId = ev.toolUseId ?? tracked?.parentToolUseId;
+          const fallbackParentId = resolvedToolUseId ?? ev.taskId;
           stream.push({
             kind: 'task',
             status: st,
             sessionId,
             turnId,
             timestamp: ts,
-            ...(ev.toolUseId ? { parentToolUseId: ev.toolUseId } : {}),
+            ...(resolvedToolUseId ? { parentToolUseId: resolvedToolUseId } : {}),
             payload: {
               taskId: ev.taskId,
               status: ev.status,
               summary: ev.summary,
-              ...(ev.toolUseId ? { toolUseId: ev.toolUseId } : {}),
+              ...(resolvedToolUseId ? { toolUseId: resolvedToolUseId } : {}),
               ...(ev.outputFile ? { outputFile: ev.outputFile } : {}),
               ...(ev.usage ? { usage: ev.usage } : {}),
               raw: ev,
             },
           });
-          if (subagentTasks.delete(ev.taskId) && ev.toolUseId) {
+          const wasSubagent = subagentTasks.delete(ev.taskId) || Boolean(tracked);
+          if (wasSubagent) {
             stream.push({
               kind: 'subagent',
               status: st,
@@ -2602,15 +2871,22 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
               turnId,
               timestamp: ts,
               agentId: ev.taskId,
-              parentToolUseId: ev.toolUseId,
+              ...(fallbackParentId ? { parentToolUseId: fallbackParentId } : {}),
               payload: {
                 agentId: ev.taskId,
-                parentToolUseId: ev.toolUseId,
+                ...(fallbackParentId ? { parentToolUseId: fallbackParentId } : {}),
                 status: ev.status,
                 summary: ev.summary,
                 raw: ev,
               },
             });
+            if (tracked) {
+              tracked.completedAt = Date.now();
+            }
+            this.pruneLiveSubagents(effectiveId);
+            if (effectiveId !== sessionId) {
+              this.pruneLiveSubagents(sessionId);
+            }
           }
           break;
         }
@@ -2819,6 +3095,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           timestamp: Date.now(),
           payload: { reason: 'failed', error: err instanceof Error ? err.message : String(err) },
         });
+      })
+      .finally(() => {
         stream.end();
       });
 
@@ -2895,6 +3173,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   /** 进程级清理:杀所有 running turn 进程。网关 shutdown 时调用。 */
   async dispose(): Promise<void> {
+    this.liveSubagents.clear();
+    this.renames.clear();
+    this.sessionCwd.clear();
+    this.resetSessionIds.clear();
+    this.sessionUsage.clear();
     this.settings.close();
     await this.inner.close();
   }
@@ -2995,6 +3278,13 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       if (model.supportsEffort || model.supportsAdaptiveThinking) caps.push('thinking');
       if (model.supportsAdaptiveThinking) caps.push('adaptive_thinking');
       if (model.fastMode) caps.push('fast_mode');
+      const defaultEffort =
+        typeof (model as any).defaultEffort === 'string'
+          ? (model as any).defaultEffort
+          : typeof (model as any).default_effort === 'string'
+            ? (model as any).default_effort
+            : (model.supportsEffort ? 'medium' : undefined);
+      const { resolvedModel: _rawResolved, displayName: _rawDisplay, description: _rawDesc, ...restModel } = model;
       out.push({
         provider: 'claude',
         model: modelId,
@@ -3003,6 +3293,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         max_context_size: claudeContextWindow(modelId, model.value, safeResolved),
         capabilities: caps,
         ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
+        ...(defaultEffort ? { default_effort: defaultEffort } : {}),
         ...(model.supportsAdaptiveThinking !== undefined
           ? { supportsAdaptiveThinking: model.supportsAdaptiveThinking }
           : {}),
@@ -3012,9 +3303,21 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         ...(model.fastMode !== undefined ? { fastMode: model.fastMode } : {}),
         ...(model.supportsAutoMode !== undefined ? { supportsAutoMode: model.supportsAutoMode } : {}),
         ...(alias === 'default' ? { isDefault: true } : {}),
+        raw: {
+          ...restModel,
+          displayName,
+          ...(safeDescription ? { description: safeDescription } : {}),
+          ...(safeResolved ? { resolvedModel: safeResolved } : {}),
+        },
       });
     }
     return out;
+  }
+
+  clearCommandsCache(): void {
+    if (typeof (this.inner as any).clearHandshakeCache === 'function') {
+      (this.inner as any).clearHandshakeCache();
+    }
   }
 
   async listCommands(sessionId?: string, cwdOverride?: string): Promise<NativeCommand[]> {
@@ -3032,9 +3335,15 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
-    if (archived) this.settings.set('archived', sessionId, true);
-    else this.settings.delete('archived', sessionId);
-    await this.inner.setArchived(this.resolveEffectiveSessionId(sessionId), archived).catch((err: unknown) => {
+    const effectiveId = this.resolveEffectiveSessionId(sessionId);
+    if (archived) {
+      this.settings.set('archived', sessionId, true);
+      this.liveSubagents.delete(sessionId);
+      this.liveSubagents.delete(effectiveId);
+    } else {
+      this.settings.delete('archived', sessionId);
+    }
+    await this.inner.setArchived(effectiveId, archived).catch((err: unknown) => {
       if (err instanceof ProviderError && err.code === 'not_found') return;
       throw err;
     });
@@ -3046,6 +3355,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     if (effectiveId !== sessionId) {
       await this.inner.delete(sessionId).catch(() => undefined);
     }
+    this.liveSubagents.delete(sessionId);
+    this.liveSubagents.delete(effectiveId);
     this.resetSessionIds.delete(sessionId);
     this.settings.delete('resetSessionId', sessionId);
     this.renames.delete(sessionId);

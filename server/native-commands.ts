@@ -204,13 +204,13 @@ export interface GrokGatewayCommand extends NativeCommand {
 }
 
 const GROK_GATEWAY_COMMANDS: GrokGatewayCommand[] = [
-  { name: 'compact', description: 'Compress conversation history to save context window', kind: 'prompt', takesArgs: false },
-  { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false },
-  { name: 'undo', description: 'Roll back the last turn', kind: 'prompt', takesArgs: false, aliases: ['rewind'] },
-  { name: 'usage', description: 'Show token usage for this session', kind: 'prompt', takesArgs: false },
-  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false },
-  { name: 'skills', description: 'List available Grok skills in this workspace', kind: 'prompt', takesArgs: false },
-  { name: 'help', description: 'Show available Web UI commands for Grok', kind: 'prompt', takesArgs: false },
+  { name: 'compact', description: 'Compress conversation history to save context window', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'undo', description: 'Roll back the last turn', kind: 'prompt', takesArgs: false, aliases: ['rewind'], builtin: true },
+  { name: 'usage', description: 'Show token usage for this session', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'skills', description: 'List available Grok skills in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'help', description: 'Show available Web UI commands for Grok', kind: 'prompt', takesArgs: false, builtin: true },
 ];
 
 const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
@@ -220,12 +220,14 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '[on|off]',
+    builtin: true,
   },
   {
     name: 'context',
     description: 'Show context window usage and session stats',
     kind: 'prompt',
     takesArgs: false,
+    builtin: true,
   },
   {
     name: 'session-info',
@@ -233,6 +235,7 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: false,
     aliases: ['status', 'info'],
+    builtin: true,
   },
   {
     name: 'deep-research',
@@ -240,6 +243,7 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '<query>',
+    builtin: true,
   },
   {
     name: 'workflow',
@@ -247,6 +251,7 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '<name> [--agent-budget N] [--effort LEVEL] [args] | runs | pause|resume|stop|save [name]',
+    builtin: true,
   },
   {
     name: 'goal',
@@ -254,6 +259,7 @@ const GROK_NATIVE_COMMANDS: GrokGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '<objective> [--budget <tokens>] | status | pause | resume | clear',
+    builtin: true,
   },
 ];
 
@@ -288,6 +294,9 @@ export interface GrokNativeCommandInput {
   input?: { hint?: string | null } | null;
   argumentHint?: string;
   aliases?: string[];
+  source?: string;
+  path?: string;
+  scope?: string;
 }
 
 /** grok 完整命令目录:client + 网关代执行 + Grok 1.0.77 原生命令 + 磁盘 skills。 */
@@ -309,7 +318,7 @@ export function listGrokCommands(
   }
   const clientSkip = new Set(['new', 'clear', 'model']);
   for (const raw of nativeCommands) {
-    if (!raw?.name || clientSkip.has(raw.name)) continue;
+    if (!raw?.name || clientSkip.has(raw.name) || GROK_TUI_ONLY_UNSUPPORTED.has(raw.name)) continue;
     const hint = typeof raw.argumentHint === 'string'
       ? raw.argumentHint
       : typeof raw.input?.hint === 'string'
@@ -322,12 +331,16 @@ export function listGrokCommands(
       description: raw.description || existing?.description || raw.name,
       kind: 'prompt',
       acceptsInput: acceptsInput || existing?.acceptsInput === true,
+      builtin: true,
       ...(hint ? { argumentHint: hint } : existing?.argumentHint ? { argumentHint: existing.argumentHint } : {}),
       ...(raw.aliases && raw.aliases.length > 0
         ? { aliases: [...raw.aliases] }
         : existing?.aliases
           ? { aliases: [...existing.aliases] }
           : {}),
+      ...(raw.source ? { source: raw.source } : existing?.source ? { source: existing.source } : {}),
+      ...(raw.path ? { path: raw.path } : existing?.path ? { path: existing.path } : {}),
+      ...(raw.scope ? { scope: raw.scope } : existing?.scope ? { scope: existing.scope } : {}),
     });
   }
   for (const s of skills) {
@@ -372,6 +385,7 @@ const PI_GATEWAY_COMMANDS: PiGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '[instructions]',
+    builtin: true,
   },
   {
     name: 'auto-compact',
@@ -379,15 +393,17 @@ const PI_GATEWAY_COMMANDS: PiGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '[on|off]',
+    builtin: true,
   },
-  { name: 'clone', description: 'Clone this session into a new session', kind: 'prompt', takesArgs: false },
-  { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false },
+  { name: 'clone', description: 'Clone this session into a new session', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false, builtin: true },
   {
     name: 'name',
     description: 'Rename the current session',
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '<title>',
+    builtin: true,
   },
   {
     name: 'thinking',
@@ -395,18 +411,19 @@ const PI_GATEWAY_COMMANDS: PiGatewayCommand[] = [
     kind: 'prompt',
     takesArgs: true,
     argumentHint: '[level]',
+    builtin: true,
   },
-  { name: 'status', description: 'Show current session information and state', kind: 'prompt', takesArgs: false },
-  { name: 'session', description: 'Show detailed session stats and context state', kind: 'prompt', takesArgs: false },
-  { name: 'usage', description: 'Show token usage and cost for this session', kind: 'prompt', takesArgs: false },
-  { name: 'copy', description: 'Show the last assistant reply for easy copying', kind: 'prompt', takesArgs: false },
-  { name: 'tree', description: 'Show session message branch tree summary', kind: 'prompt', takesArgs: false },
-  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false },
-  { name: 'skills', description: 'List available Pi skills and extension commands', kind: 'prompt', takesArgs: false },
-  { name: 'help', description: 'Show available Web UI commands for Pi', kind: 'prompt', takesArgs: false },
+  { name: 'status', description: 'Show current session information and state', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'session', description: 'Show detailed session stats and context state', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'usage', description: 'Show token usage and cost for this session', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'copy', description: 'Show the last assistant reply for easy copying', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'tree', description: 'Show session message branch tree summary', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'skills', description: 'List available Pi skills and extension commands', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'help', description: 'Show available Web UI commands for Pi', kind: 'prompt', takesArgs: false, builtin: true },
 ];
 
-/** Pi 仅在交互 TUI 中生效的内置命令 + 不支持的 /undo,RPC 路径禁止暴露/透传 LLM。 */
+/** Pi 仅在交互 TUI 中生效的内置命令 + 不支持的 /undo + 纯 TUI 扩展命令，RPC 路径禁止暴露/透传 LLM。 */
 const PI_TUI_ONLY_OR_UNSUPPORTED = new Set([
   'undo',
   'settings',
@@ -424,6 +441,18 @@ const PI_TUI_ONLY_OR_UNSUPPORTED = new Set([
   'quit',
   'exit',
   'import',
+  'wtf',
+  'wtf?',
+  'wtf!',
+  'fuck',
+  'fuck?',
+  'fuck!',
+  'plannotator-review',
+  'plannotator-annotate',
+  'plannotator-last',
+  'plannotator-inbox',
+  'plannotator-reload',
+  'pi-subagents-bridge',
 ]);
 
 export interface PiNativeCommandInput {
@@ -471,6 +500,7 @@ export function listPiCommands(
     const hint = typeof c.argumentHint === 'string' ? c.argumentHint.trim() : '';
     const cmdPath = c.path ?? c.sourceInfo?.path;
     const scope = c.scope ?? c.sourceInfo?.scope;
+    const source = c.source ?? c.sourceInfo?.source ?? (cmdPath ? (scope === 'project' ? 'project' : 'user') : 'extension');
     out.push({
       name: c.name,
       description: c.description || c.name,
@@ -478,7 +508,7 @@ export function listPiCommands(
       acceptsInput: true,
       ...(hint ? { argumentHint: hint } : {}),
       ...(c.aliases && c.aliases.length > 0 ? { aliases: [...c.aliases] } : {}),
-      ...(c.source ? { source: c.source } : {}),
+      ...(source ? { source } : {}),
       ...(cmdPath ? { path: cmdPath } : {}),
       ...(scope ? { scope } : {}),
     });
@@ -541,6 +571,10 @@ const CLAUDE_TUI_ONLY_COMMANDS = new Set([
   'passes',
   'powerup',
   'artifacts',
+  '__remote-workflow',
+  'workflow-launch-exec',
+  'heapdump',
+  'fast',
 ]);
 
 /** 网关为 Claude Web UI 补齐/适配的命令（原本 CLI 在 -p 模式提示不可用）。 */
@@ -582,9 +616,7 @@ export function listClaudeCommands(
   terminalSlashCommands: string[] = [],
 ): NativeCommand[] {
   const skip = new Set(['model', 'new', 'clear']);
-  const terminalCosmetics = new Set<string>(
-    terminalSlashCommands.filter((name) => name === 'color' || name === 'focus'),
-  );
+  const terminalSlashSet = new Set<string>(terminalSlashCommands);
   const prompts: NativeCommand[] = cliCatalog
     .filter((c) => !skip.has(c.name))
     .map((c) => {
@@ -595,7 +627,7 @@ export function listClaudeCommands(
         : undefined;
       const terminalOnly = c.terminalOnly === true
         || CLAUDE_TUI_ONLY_COMMANDS.has(c.name)
-        || terminalCosmetics.has(c.name);
+        || terminalSlashSet.has(c.name);
       return {
         name: c.name,
         description: c.description,

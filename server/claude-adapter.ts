@@ -53,6 +53,52 @@ const CREATE_BOUND_FLAGS =
 
 const HAS_PROC_SELF_FD = process.platform === "linux" && fs.existsSync("/proc/self/fd");
 
+export class LruCache<K, V> {
+  private readonly map = new Map<K, V>();
+  constructor(public readonly maxEntries: number = 64) {}
+
+  get(key: K): V | undefined {
+    const val = this.map.get(key);
+    if (val !== undefined) {
+      this.map.delete(key);
+      this.map.set(key, val);
+    }
+    return val;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key);
+    } else if (this.map.size >= this.maxEntries) {
+      const first = this.map.keys().next().value;
+      if (first !== undefined) {
+        this.map.delete(first);
+      }
+    }
+    this.map.set(key, value);
+  }
+
+  has(key: K): boolean {
+    return this.map.has(key);
+  }
+
+  delete(key: K): boolean {
+    return this.map.delete(key);
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+
+  keys(): IterableIterator<K> {
+    return this.map.keys();
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -822,7 +868,7 @@ export class ClaudeAdapter {
   // -- getHistory -----------------------------------------------------------
 
   /** Parse the session transcript into user/assistant messages using 16 MiB tail + branch pruning. */
-  private historyCache = new Map<string, { key: string; messages: ClaudeHistoryMessage[] }>();
+  private historyCache = new LruCache<string, { key: string; messages: ClaudeHistoryMessage[] }>(64);
 
   async getHistory(sessionId: string, options: GetHistoryOptions = {}): Promise<ClaudeHistoryMessage[]> {
     const resolvedId = options.followContinuedIn
@@ -1340,9 +1386,15 @@ export class ClaudeAdapter {
    * `result` event has been emitted (or rejects on spawn/protocol failure).
    */
   async startTurn(opts: StartTurnOptions): Promise<void> {
+    if (this.closed) {
+      throw new Error("claude-adapter: adapter closed");
+    }
     const { sessionId, prompt, onEvent } = opts;
     if (this.running.has(sessionId)) {
       await this.waitForExit(sessionId, 8_000);
+      if (this.closed) {
+        throw new Error("claude-adapter: adapter closed");
+      }
       if (this.running.has(sessionId)) {
         throw new Error(`claude-adapter: a turn is already running for session ${sessionId}`);
       }
@@ -1369,7 +1421,9 @@ export class ClaudeAdapter {
       if (opts.fork) args.push("--fork-session");
     }
     if (opts.model) args.push("--model", opts.model);
-    if (opts.effort) args.push("--effort", opts.effort);
+    if (opts.effort && opts.effort !== "auto" && opts.effort !== "on") {
+      args.push("--effort", opts.effort);
+    }
     if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
     if (opts.maxThinkingTokens !== undefined) {
       args.push("--max-thinking-tokens", String(opts.maxThinkingTokens));
@@ -1538,12 +1592,38 @@ export class ClaudeAdapter {
       detached: true,
     });
     this.activeProbes.add(child);
+    let probeTimer: NodeJS.Timeout | null = null;
+    const cleanupProbe = (): void => {
+      if (probeTimer) {
+        clearTimeout(probeTimer);
+        probeTimer = null;
+      }
+      this.activeProbes.delete(child);
+    };
+    child.once("close", cleanupProbe);
+    child.once("error", cleanupProbe);
+
     child.stdin?.on("error", () => undefined);
     child.stderr?.resume();
 
     let newSessionId: string | undefined;
     const takeId = (id: string | undefined): void => {
       if (id && id !== sessionId) newSessionId = id;
+    };
+
+    const killWithEscalation = (): void => {
+      endStdin(child);
+      if (child.exitCode === null && child.signalCode === null) {
+        this.killGroup(child, "SIGTERM");
+        if (!probeTimer) {
+          probeTimer = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) {
+              this.killGroup(child, "SIGKILL");
+            }
+          }, 1_000);
+          probeTimer.unref?.();
+        }
+      }
     };
 
     try {
@@ -1559,8 +1639,7 @@ export class ClaudeAdapter {
           else resolve();
         };
         const timer = setTimeout(() => {
-          endStdin(child);
-          this.killGroup(child, "SIGTERM");
+          killWithEscalation();
           finish(new Error(`claude-adapter: --fork-session timed out waiting for system/init for ${sessionId}`));
         }, 20_000);
         timer.unref();
@@ -1577,8 +1656,7 @@ export class ClaudeAdapter {
             if (mapped.type === "done") takeId(mapped.sessionId);
           }
           if (newSessionId) {
-            endStdin(child);
-            this.killGroup(child, "SIGTERM");
+            killWithEscalation();
             finish();
           }
         });
@@ -1598,8 +1676,6 @@ export class ClaudeAdapter {
             400,
           );
       }
-    } finally {
-      this.activeProbes.delete(child);
     }
 
     if (!newSessionId) {
@@ -2030,6 +2106,14 @@ export class ClaudeAdapter {
   /** initialize 握手整包缓存(按 cwd):commands/models 同一次 spawn 都能取到。 */
   private handshakeCache = new Map<string, { ts: number; response: any }>();
   private handshakeInflight = new Map<string, Promise<any | null>>();
+  private handshakeEpoch = 0;
+
+  /** Clear cached initialize handshake responses and any in-flight promises. */
+  clearHandshakeCache(): void {
+    this.handshakeEpoch += 1;
+    this.handshakeCache.clear();
+    this.handshakeInflight.clear();
+  }
 
   /** Zero-spawn disk discovery for `.claude/commands` and `.claude/skills` / `.agents/skills`. */
   async discoverDiskCommands(cwd?: string): Promise<ClaudeSlashCommand[]> {
@@ -2073,6 +2157,11 @@ export class ClaudeAdapter {
         ...(typeof c.source === "string" ? { source: c.source } : {}),
         ...(typeof c.path === "string" ? { path: c.path } : {}),
         ...(typeof c.scope === "string" ? { scope: c.scope } : {}),
+        ...(typeof c.terminalOnly === "boolean" ? { terminalOnly: c.terminalOnly } : {}),
+        ...(Array.isArray(c.allowedTools)
+          ? { allowedTools: c.allowedTools.filter((t: any) => typeof t === "string") }
+          : {}),
+        ...(typeof c.model === "string" ? { model: c.model } : {}),
       }));
   }
 
@@ -2092,10 +2181,13 @@ export class ClaudeAdapter {
       .filter((m: any) => m && typeof m.value === "string" && !/qwen/i.test(m.value))
       .map((m: any) => {
         const supportsFastMode = typeof m.supportsFastMode === "boolean" ? m.supportsFastMode : undefined;
-        const fastMode =
+        let fastMode =
           typeof m.fastMode === "boolean"
             ? m.fastMode
             : supportsFastMode;
+        if (fastModeState === "off" || fastModeDisabledReason === "sdk_opt_in_required") {
+          fastMode = false;
+        }
         return {
           value: m.value as string,
           resolvedModel: typeof m.resolvedModel === "string" ? m.resolvedModel : undefined,
@@ -2131,9 +2223,12 @@ export class ClaudeAdapter {
     }
     const inflight = this.handshakeInflight.get(key);
     if (inflight) return inflight;
+    const epoch = this.handshakeEpoch;
     const pending = this.spawnHandshake(cwd).then((response) => {
-      this.handshakeInflight.delete(key);
-      if (response) this.handshakeCache.set(key, { ts: Date.now(), response });
+      if (this.handshakeEpoch === epoch && this.handshakeInflight.get(key) === pending) {
+        this.handshakeInflight.delete(key);
+        if (response) this.handshakeCache.set(key, { ts: Date.now(), response });
+      }
       return response;
     });
     this.handshakeInflight.set(key, pending);
@@ -2155,9 +2250,20 @@ export class ClaudeAdapter {
       const child = spawn(
         this.claudeBin,
         ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
-        { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"] },
+        { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"], detached: true },
       );
       this.activeProbes.add(child);
+      let probeTimer: NodeJS.Timeout | null = null;
+      const cleanupProbe = (): void => {
+        if (probeTimer) {
+          clearTimeout(probeTimer);
+          probeTimer = null;
+        }
+        this.activeProbes.delete(child);
+      };
+      child.once("close", cleanupProbe);
+      child.once("error", cleanupProbe);
+
       let settled = false;
       const rl = readline.createInterface({ input: child.stdout! });
       const finish = (value: Record<string, unknown> | null): void => {
@@ -2165,12 +2271,17 @@ export class ClaudeAdapter {
         settled = true;
         clearTimeout(timer);
         rl.close();
-        this.activeProbes.delete(child);
         endStdin(child);
-        try {
-          child.kill("SIGTERM");
-        } catch {
-          // already exited
+        if (child.exitCode === null && child.signalCode === null) {
+          this.killGroup(child, "SIGTERM");
+          if (!probeTimer) {
+            probeTimer = setTimeout(() => {
+              if (child.exitCode === null && child.signalCode === null) {
+                this.killGroup(child, "SIGKILL");
+              }
+            }, 1_000);
+            probeTimer.unref?.();
+          }
         }
         resolve(value);
       };
@@ -2213,22 +2324,66 @@ export class ClaudeAdapter {
   /** Kill all running turn processes. */
   async close(): Promise<void> {
     this.closed = true;
-    this.handshakeInflight.clear();
+    this.clearHandshakeCache();
+    this.historyCache.clear();
+    this.summarizeCache.clear();
+
+    const targets: ChildProcess[] = [];
+
     for (const [sessionId, child] of this.running) {
       this.clearInterruptTimers(sessionId);
       endStdin(child);
-      this.killGroup(child, "SIGTERM");
-      this.running.delete(sessionId);
       this.dropPendingForSession(sessionId);
       this.rejectOutboundControls(sessionId, new ProviderError("not_found", "claude adapter closed", 404));
       this.sessionControls.delete(sessionId);
       this.resolveExitWaiters(sessionId);
+      targets.push(child);
     }
     for (const probe of this.activeProbes) {
       endStdin(probe);
-      this.killGroup(probe, "SIGTERM");
-      this.activeProbes.delete(probe);
+      targets.push(probe);
     }
+
+    // Send SIGTERM to all running children and active probes
+    for (const child of targets) {
+      if (child.exitCode === null && child.signalCode === null) {
+        this.killGroup(child, "SIGTERM");
+      }
+    }
+
+    // Wait briefly (up to 2.5s) for processes to exit after SIGTERM
+    const aliveTargets = targets.filter((c) => c.exitCode === null && c.signalCode === null);
+    if (aliveTargets.length > 0) {
+      const waitPromises = aliveTargets.map((proc) => {
+        if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+          const onDone = () => {
+            proc.removeListener("close", onDone);
+            proc.removeListener("exit", onDone);
+            resolve();
+          };
+          proc.once("close", onDone);
+          proc.once("exit", onDone);
+        });
+      });
+      await Promise.race([
+        Promise.all(waitPromises),
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, 2_500);
+          t.unref?.();
+        }),
+      ]);
+    }
+
+    // Escalate any still-alive child/group with SIGKILL
+    for (const child of targets) {
+      if (child.exitCode === null && child.signalCode === null) {
+        this.killGroup(child, "SIGKILL");
+      }
+    }
+
+    this.running.clear();
+    this.activeProbes.clear();
   }
 
   // -- internals --------------------------------------------------------------
@@ -2365,7 +2520,7 @@ export class ClaudeAdapter {
     return this.findSessionFile(sessionId) !== null;
   }
 
-  private summarizeCache = new Map<string, { mtimeMs: number; size: number; summary: ClaudeSessionSummary }>();
+  private summarizeCache = new LruCache<string, { mtimeMs: number; size: number; summary: ClaudeSessionSummary }>(64);
 
   /**
    * Extract session summary with O_RDONLY|O_NONBLOCK|O_NOFOLLOW `openBound`,

@@ -188,12 +188,15 @@ const SUBAGENT_TOOL_NAMES = new Set([
   'spawn_subagent',
   'spawnagent',
   'spawnsubagent',
+  'subagentactivity',
+  'subagent_activity',
   'collabagenttoolcall',
   'collab_agent_tool_call',
   'collab_tool_call',
   'agent',
   'task',
   'subagent',
+  'acp_delegate',
 ]);
 
 const FILE_SEARCH_ALIASES: Record<string, string> = {
@@ -263,7 +266,7 @@ export function normalizeKimiWebTool(name: string, input: unknown): { name: stri
   }
 
   // 2. Subagent tool names -> 'Agent'
-  if (name === 'Agent' || SUBAGENT_TOOL_NAMES.has(rawLower) || SUBAGENT_TOOL_NAMES.has(name)) {
+  if (name === 'Agent' || name === 'subAgentActivity' || SUBAGENT_TOOL_NAMES.has(rawLower) || SUBAGENT_TOOL_NAMES.has(name)) {
     let normInput: Record<string, unknown>;
     if (typeof parsedInput === 'string') {
       normInput = {
@@ -272,7 +275,7 @@ export function normalizeKimiWebTool(name: string, input: unknown): { name: stri
       };
     } else if (typeof parsedInput === 'object' && parsedInput !== null && !Array.isArray(parsedInput)) {
       const raw = parsedInput as Record<string, unknown>;
-      const prompt = raw.prompt ?? raw.message;
+      const prompt = raw.prompt ?? raw.message ?? raw.task;
       const fallbackDesc = typeof prompt === 'string' && prompt.trim()
         ? prompt.trim().split(/\r?\n/)[0]?.slice(0, 80)
         : undefined;
@@ -409,6 +412,15 @@ export class LocalTranscriptHub {
   private readonly sessions = new Map<string, TranscriptSessionState>();
   private readonly activeLocalTurns = new Map<string, LocalTranscriptTurn>();
   private static readonly JOURNAL_CAP = 200;
+  private static readonly MAX_SESSIONS = 64;
+  private static readonly PROMPTS_CAP = 100;
+  private static readonly INTERACTIONS_CAP = 100;
+  private static readonly TASKS_CAP = 100;
+  private static readonly TOOL_SUBAGENT_LINKS_CAP = 200;
+
+  sessionCount(): number {
+    return this.sessions.size;
+  }
 
   currentSeq(sessionId: string): number {
     return this.state(sessionId).seq;
@@ -457,6 +469,10 @@ export class LocalTranscriptHub {
 
     let set = state.toolSubagentLinks.get(parentToolUseId);
     if (!set) {
+      if (state.toolSubagentLinks.size >= LocalTranscriptHub.TOOL_SUBAGENT_LINKS_CAP) {
+        const oldest = state.toolSubagentLinks.keys().next().value;
+        if (oldest !== undefined) state.toolSubagentLinks.delete(oldest);
+      }
       set = new Set<string>();
       state.toolSubagentLinks.set(parentToolUseId, set);
     }
@@ -663,9 +679,23 @@ export class LocalTranscriptHub {
     this.publish(sessionId, [{ op: 'meta.merge', meta }]);
   }
 
+  private pruneMapToCap<V>(map: Map<string, V>, cap: number, isEvictable: (value: V) => boolean): void {
+    if (map.size < cap) return;
+    for (const [id, entry] of map) {
+      if (map.size < cap) break;
+      if (isEvictable(entry)) map.delete(id);
+    }
+  }
+
   upsertTask(sessionId: string, task: TranscriptTask): void {
     const state = this.state(sessionId);
+    if (!state.tasks.has(task.taskId) && state.tasks.size >= LocalTranscriptHub.TASKS_CAP) {
+      this.pruneMapToCap(state.tasks, LocalTranscriptHub.TASKS_CAP, (t) => t.state !== 'running');
+    }
     state.tasks.set(task.taskId, structuredClone(task) as TranscriptTask);
+    if (task.state !== 'running' && state.tasks.size > LocalTranscriptHub.TASKS_CAP) {
+      this.pruneMapToCap(state.tasks, LocalTranscriptHub.TASKS_CAP + 1, (t) => t.state !== 'running');
+    }
     this.publish(sessionId, [{ op: 'task.upsert', task }]);
   }
 
@@ -688,6 +718,13 @@ export class LocalTranscriptHub {
   ): void {
     const state = this.state(sessionId);
     const previous = state.prompts.get(promptId);
+    if (!previous && state.prompts.size >= LocalTranscriptHub.PROMPTS_CAP) {
+      this.pruneMapToCap(
+        state.prompts,
+        LocalTranscriptHub.PROMPTS_CAP,
+        (p) => p.status === 'completed' || p.status === 'failed' || p.status === 'aborted',
+      );
+    }
     const prompt: TranscriptPrompt = {
       promptId,
       status,
@@ -718,6 +755,13 @@ export class LocalTranscriptHub {
       ...(previous?.steeredAt === undefined ? {} : { steeredAt: previous.steeredAt }),
     };
     state.prompts.set(promptId, prompt);
+    if (state.prompts.size > LocalTranscriptHub.PROMPTS_CAP) {
+      this.pruneMapToCap(
+        state.prompts,
+        LocalTranscriptHub.PROMPTS_CAP + 1,
+        (p) => p.status === 'completed' || p.status === 'failed' || p.status === 'aborted',
+      );
+    }
     this.publish(sessionId, [{ op: 'prompt.upsert', prompt }]);
   }
 
@@ -757,11 +801,21 @@ export class LocalTranscriptHub {
       state.prompts.set(promptId, prompt);
       ops.push({ op: 'prompt.upsert', prompt });
     }
+    if (state.prompts.size > LocalTranscriptHub.PROMPTS_CAP) {
+      this.pruneMapToCap(
+        state.prompts,
+        LocalTranscriptHub.PROMPTS_CAP + 1,
+        (p) => p.status === 'completed' || p.status === 'failed' || p.status === 'aborted',
+      );
+    }
     this.publish(sessionId, ops);
   }
 
   requestInteraction(sessionId: string, interaction: TranscriptInteraction): void {
     const state = this.state(sessionId);
+    if (!state.interactions.has(interaction.interactionId) && state.interactions.size >= LocalTranscriptHub.INTERACTIONS_CAP) {
+      this.pruneMapToCap(state.interactions, LocalTranscriptHub.INTERACTIONS_CAP, (inter) => inter.state !== 'pending');
+    }
     state.interactions.set(interaction.interactionId, interaction);
     this.publish(sessionId, [{ op: 'interaction.upsert', interaction }]);
   }
@@ -777,6 +831,9 @@ export class LocalTranscriptHub {
     if (!interaction) return;
     const resolved = { ...interaction, state: stateName, response };
     state.interactions.set(interactionId, resolved);
+    if (resolved.state !== 'pending' && state.interactions.size > LocalTranscriptHub.INTERACTIONS_CAP) {
+      this.pruneMapToCap(state.interactions, LocalTranscriptHub.INTERACTIONS_CAP + 1, (inter) => inter.state !== 'pending');
+    }
     this.publish(sessionId, [{ op: 'interaction.upsert', interaction: resolved }]);
   }
 
@@ -989,29 +1046,54 @@ export class LocalTranscriptHub {
     }
   }
 
+  private evictOldestInactiveSession(): boolean {
+    for (const [sid, state] of this.sessions) {
+      const hasActive = state.activeTurns.size > 0 || this.activeLocalTurns.has(sid);
+      if (!hasActive && state.subscribers.size === 0) {
+        this.drop(sid);
+        return true;
+      }
+    }
+    for (const [sid, state] of this.sessions) {
+      const hasRunningTurn = [...state.activeTurns.values()].some((t) => t.state === 'running');
+      if (!hasRunningTurn && state.subscribers.size === 0) {
+        this.drop(sid);
+        return true;
+      }
+    }
+    return false;
+  }
+
   private state(sessionId: string): TranscriptSessionState {
     let state = this.sessions.get(sessionId);
-    if (!state) {
-      state = {
-        seq: 0,
-        lastResetSeq: 0,
-        generation: 0,
-        nextOrdinal: 1,
-        historyObserved: false,
-        journal: [],
-        subscribers: new Set(),
-        activeTurns: new Map(),
-        recentTurns: new Map(),
-        unbasedTurns: new Set(),
-        interactions: new Map(),
-        prompts: new Map(),
-        tasks: new Map(),
-        meta: {},
-        plans: [],
-        toolSubagentLinks: new Map(),
-      };
+    if (state) {
+      this.sessions.delete(sessionId);
       this.sessions.set(sessionId, state);
+      return state;
     }
+    while (this.sessions.size >= LocalTranscriptHub.MAX_SESSIONS) {
+      const evicted = this.evictOldestInactiveSession();
+      if (!evicted) break;
+    }
+    state = {
+      seq: 0,
+      lastResetSeq: 0,
+      generation: 0,
+      nextOrdinal: 1,
+      historyObserved: false,
+      journal: [],
+      subscribers: new Set(),
+      activeTurns: new Map(),
+      recentTurns: new Map(),
+      unbasedTurns: new Set(),
+      interactions: new Map(),
+      prompts: new Map(),
+      tasks: new Map(),
+      meta: {},
+      plans: [],
+      toolSubagentLinks: new Map(),
+    };
+    this.sessions.set(sessionId, state);
     return state;
   }
 

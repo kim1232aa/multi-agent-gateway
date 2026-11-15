@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import type { ProviderAdapter, ProviderCapabilities, NativeModel, NativeCommand, Session, SessionPage, Message, StartTurnInput, TurnHandle, ApprovalDecision, HistoryQuery, ListSessionsQuery, CreateSessionInput } from './types.js';
-import { detectAvailableProviders, startGateway } from './gateway.js';
+import { activeKimiTier1Names, detectAvailableProviders, executeCodexCommand, formatCodexAccountUsage, parseWireThinkingPatch, renderCodexUsage, SessionHub, skillDto, startGateway } from './gateway.js';
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
 
@@ -4397,3 +4397,815 @@ test('2.6.2 skill chip stripping, thinking config/PATCH, wireModelDto off dedup,
     await upstream.close();
   }
 });
+
+test('activeKimiTier1Names dynamically computes Tier-1 slash commands based on capabilities', () => {
+  // Always present: new, clear, login, reload, export, status
+  const base = activeKimiTier1Names();
+  assert.deepEqual([...base].sort(), ['clear', 'export', 'login', 'new', 'reload', 'status']);
+
+  // If caps.planMode === false (e.g. Pi) or caps.goals === false (e.g. Claude), plan/goal are not suppressed
+  const piCaps: ProviderCapabilities = {
+    ...capabilities,
+    planMode: false,
+    goals: false,
+    tower: false,
+    swarm: false,
+    btw: false,
+    compact: true,
+    rollback: false,
+    fork: true,
+  };
+  const piTier1 = activeKimiTier1Names(piCaps);
+  assert.equal(piTier1.has('plan'), false);
+  assert.equal(piTier1.has('goal'), false);
+  assert.equal(piTier1.has('tower'), false);
+  assert.equal(piTier1.has('swarm'), false);
+  assert.equal(piTier1.has('btw'), false);
+  assert.equal(piTier1.has('undo'), false);
+  assert.equal(piTier1.has('compact'), true);
+  assert.equal(piTier1.has('fork'), true);
+
+  // If caps advertise full capabilities
+  const fullCaps: ProviderCapabilities = {
+    ...capabilities,
+    planMode: true,
+    goals: true,
+    tower: true,
+    swarm: true,
+    btw: true,
+    compact: true,
+    rollback: true,
+    fork: true,
+  };
+  const fullTier1 = activeKimiTier1Names(fullCaps);
+  assert.equal(fullTier1.has('plan'), true);
+  assert.equal(fullTier1.has('goal'), true);
+  assert.equal(fullTier1.has('tower'), true);
+  assert.equal(fullTier1.has('swarm'), true);
+  assert.equal(fullTier1.has('btw'), true);
+  assert.equal(fullTier1.has('compact'), true);
+  assert.equal(fullTier1.has('undo'), true);
+  assert.equal(fullTier1.has('fork'), true);
+});
+
+test('/meta always returns provider_capabilities and overrides experimental_flags per provider', async () => {
+  const codex = fakeAdapter('codex');
+  codex.capabilities = () => ({ ...capabilities, planMode: true, goals: true, tower: false, swarm: false });
+  const claude = fakeAdapter('claude');
+  const grok = fakeAdapter('grok');
+  const pi = fakeAdapter('pi');
+
+  // Upstream with experimental_flags (tower: true, swarm: true)
+  const upstream = createServer((req, res) => {
+    if (req.url === '/api/v1/meta') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        code: 0,
+        data: {
+          upstream: true,
+          experimental_flags: { tower: true, swarm: true, custom_flag: 'keep-me' },
+        },
+      }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+  const upstreamPort = (upstream.address() as any).port;
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: { upstream: `http://127.0.0.1:${upstreamPort}`, token: 'up-tok' },
+    codex: codex as any,
+    claude: claude as any,
+    grok: grok as any,
+    pi: pi as any,
+    availableProviders: ['kimi', 'codex', 'claude', 'grok', 'pi'],
+  });
+
+  const getMeta = async (query = '') => {
+    const res = await fetch(`${gw.url}/api/v1/meta${query}`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    return (await res.json() as any).data;
+  };
+
+  try {
+    // 1. Base /meta includes provider_capabilities for all local providers
+    const baseMeta = await getMeta();
+    assert.ok(baseMeta.provider_capabilities);
+    assert.deepEqual(baseMeta.provider_capabilities.codex, codex.capabilities());
+    assert.deepEqual(baseMeta.provider_capabilities.claude, claude.capabilities());
+    assert.deepEqual(baseMeta.provider_capabilities.grok, grok.capabilities());
+    assert.deepEqual(baseMeta.provider_capabilities.pi, pi.capabilities());
+    // Upstream flags untouched when no provider specified
+    assert.equal(baseMeta.experimental_flags?.tower, true);
+
+    // 2. ?provider=pi overrides experimental_flags based on Pi capabilities (tower: false, plan: false, goal: false)
+    const piMeta = await getMeta('?provider=pi');
+    assert.equal(piMeta.experimental_flags.tower, false);
+    assert.equal(piMeta.experimental_flags.swarm, false);
+    assert.equal(piMeta.experimental_flags.subagent_fork, false);
+    assert.equal(piMeta.experimental_flags.notify_user, false);
+    assert.equal(piMeta.experimental_flags.wait_for, false);
+    assert.equal(piMeta.experimental_flags['tool-select'], false);
+    assert.equal(piMeta.experimental_flags.plan, false);
+    assert.equal(piMeta.experimental_flags.goal, false);
+    assert.equal(piMeta.experimental_flags.custom_flag, 'keep-me');
+
+    // 3. ?provider=codex sets plan: true, goal: true according to codex capabilities
+    const codexMeta = await getMeta('?provider=codex');
+    assert.equal(codexMeta.experimental_flags.plan, true);
+    assert.equal(codexMeta.experimental_flags.goal, true);
+    assert.equal(codexMeta.experimental_flags.tower, false);
+    assert.equal(codexMeta.experimental_flags.swarm, false);
+  } finally {
+    await gw.close();
+    await upstream.close();
+  }
+});
+
+test('POST /sessions/:id:undo supports turn_id and rejects non-main agent_id', async () => {
+  const codex = fakeAdapter('codex') as any;
+  codex.capabilities = () => ({ ...capabilities, rollback: true });
+
+  const rollbackCalls: number[] = [];
+  codex.rollback = async (_id: string, count: number) => {
+    rollbackCalls.push(count);
+  };
+
+  // Fake history with 3 user turns
+  codex.getHistory = async () => [
+    { id: 'msg-1', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'turn 1' }], created_at: new Date(1000).toISOString() },
+    { id: 'msg-1-res', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'reply 1' }], created_at: new Date(2000).toISOString() },
+    { id: 'msg-2', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'turn 2' }], created_at: new Date(3000).toISOString() },
+    { id: 'msg-2-res', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'reply 2' }], created_at: new Date(4000).toISOString() },
+    { id: 'msg-3', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'turn 3' }], created_at: new Date(5000).toISOString() },
+    { id: 'msg-3-res', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'reply 3' }], created_at: new Date(6000).toISOString() },
+  ];
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+  });
+
+  const postUndo = async (body: Record<string, unknown>) => {
+    const res = await fetch(`${gw.url}/api/v1/sessions/codex_codex-native:undo`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer gateway-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, json: await res.json() as any };
+  };
+
+  try {
+    // 1. Non-main agent_id must throw 400 with '仅支持撤销主会话轮次'
+    const nonMain = await postUndo({ agent_id: 'subagent-1', turn_id: 'hist_msg-2' });
+    assert.equal(nonMain.status, 400);
+    assert.match(nonMain.json.msg ?? '', /仅支持撤销主会话轮次/);
+
+    // 2. Matching turn_id = 'hist_msg-2' (turn 2 of 3) rolls back 2 turns
+    const undo2 = await postUndo({ agent_id: 'main', turn_id: 'hist_msg-2' });
+    assert.equal(undo2.status, 200);
+    assert.equal(undo2.json.data.undone, true);
+    assert.equal(undo2.json.data.count, 2);
+    assert.deepEqual(undo2.json.data.removed_turn_ids, ['hist_msg-2', 'hist_msg-3']);
+    assert.deepEqual(rollbackCalls, [2]);
+
+    // 3. Fallback to count 1 when turn_id is unknown
+    const undoUnknown = await postUndo({ turn_id: 'non-existent' });
+    assert.equal(undoUnknown.status, 200);
+    assert.equal(undoUnknown.json.data.count, 1);
+    assert.deepEqual(undoUnknown.json.data.removed_turn_ids, ['hist_msg-3']);
+    assert.deepEqual(rollbackCalls, [2, 1]);
+
+    // 4. Numeric count is preserved
+    const undoCount = await postUndo({ count: 3 });
+    assert.equal(undoCount.status, 200);
+    assert.equal(undoCount.json.data.count, 3);
+    assert.deepEqual(rollbackCalls, [2, 1, 3]);
+  } finally {
+    await gw.close();
+  }
+});
+
+test('Pi skills strip skill: prefix in /skills and format /skill: in :activate, while extension commands stay /name', async () => {
+  const pi = fakeAdapter('pi') as any;
+  const startedTurns: StartTurnInput[] = [];
+
+  pi.startTurn = async (input: StartTurnInput) => {
+    startedTurns.push(input);
+    return {
+      turnId: 'pi-turn-1',
+      events: (async function* () {
+        yield { sessionId: 'pi-native', turnId: 'pi-turn-1', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  pi.listSkills = async () => [
+    { name: 'skill:commit', description: 'Commit git changes', path: '/home/pi/.pi/skills/commit/SKILL.md', scope: 'user' },
+    { name: 'push', description: 'Push to remote', path: '/home/pi/.pi/skills/push/SKILL.md', scope: 'project' },
+  ];
+
+  pi.listCommands = async () => [
+    { name: 'skill:commit', description: 'Commit git changes', kind: 'prompt', source: 'skill' },
+    { name: 'my-ext', description: 'My extension command', kind: 'prompt', source: 'extension' },
+    { name: 'prompt-cmd', description: 'Prompt template', kind: 'prompt', source: 'prompt' },
+    { name: 'builtin-cmd', description: 'Builtin command', kind: 'prompt', builtin: true },
+  ];
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: pi as any,
+  });
+
+  const req = async (path: string, method = 'GET', body?: Record<string, unknown>) => {
+    const res = await fetch(`${gw.url}/api/v1${path}`, {
+      method,
+      headers: {
+        authorization: 'Bearer gateway-token',
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: res.status, json: await res.json() as any };
+  };
+
+  try {
+    // 1. GET /sessions/pi_pi-native/skills:
+    // - 'skill:commit' has 'skill:' stripped -> name is 'commit', source is 'user'
+    // - extension, prompt, and builtin commands have source: 'builtin'
+    const skillsRes = await req('/sessions/pi_pi-native/skills');
+    assert.equal(skillsRes.status, 200);
+    const skills = skillsRes.json.data.skills as any[];
+
+    const commitSkill = skills.find((s) => s.name === 'commit');
+    assert.ok(commitSkill, 'skill:commit should have leading skill: stripped to commit');
+    assert.equal(commitSkill.source, 'user');
+
+    const pushSkill = skills.find((s) => s.name === 'push');
+    assert.ok(pushSkill);
+    assert.equal(pushSkill.source, 'project');
+
+    const extCmd = skills.find((s) => s.name === 'my-ext');
+    assert.ok(extCmd);
+    assert.equal(extCmd.source, 'builtin', 'extension commands must emit source: builtin');
+
+    const promptCmd = skills.find((s) => s.name === 'prompt-cmd');
+    assert.ok(promptCmd);
+    assert.equal(promptCmd.source, 'builtin', 'prompt commands must emit source: builtin');
+
+    const builtinCmd = skills.find((s) => s.name === 'builtin-cmd');
+    assert.ok(builtinCmd);
+    assert.equal(builtinCmd.source, 'builtin', 'builtin commands must emit source: builtin');
+
+    // 2. POST /sessions/pi_pi-native/skills/commit:activate synthesizes /skill:commit
+    const actCommit = await req('/sessions/pi_pi-native/skills/commit:activate', 'POST', { args: '-m "feat: login"' });
+    assert.equal(actCommit.status, 200);
+    assert.equal(actCommit.json.data.activated, true);
+    assert.equal(startedTurns[0]?.input, '/skill:commit -m "feat: login"');
+
+    // 3. POST /sessions/pi_pi-native/skills/skill%3Acommit:activate also formats /skill:commit (single prefix)
+    const actPrefixed = await req('/sessions/pi_pi-native/skills/skill%3Acommit:activate', 'POST');
+    assert.equal(actPrefixed.status, 200);
+    assert.equal(startedTurns[1]?.input, '/skill:commit');
+
+    // 4. POST /sessions/pi_pi-native/skills/my-ext:activate stays /my-ext (NOT /skill:my-ext)
+    const actExt = await req('/sessions/pi_pi-native/skills/my-ext:activate', 'POST', { args: 'arg1' });
+    assert.equal(actExt.status, 200);
+    assert.equal(startedTurns[2]?.input, '/my-ext arg1');
+  } finally {
+    await gw.close();
+  }
+});
+
+test('POST /sessions/:id:undo matches live turn_<promptId> via opener prompt_ids, and Pi collided skill vs extension coexist', async () => {
+  const codex = fakeAdapter('codex') as any;
+  codex.capabilities = () => ({ ...capabilities, rollback: true });
+  const rollbackCalls: number[] = [];
+  codex.rollback = async (_id: string, count: number) => {
+    rollbackCalls.push(count);
+  };
+  codex.getHistory = async () => [
+    { id: 'm1', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'first' }], metadata: { prompt_id: 'p-live-1' }, created_at: new Date(1000).toISOString() },
+    { id: 'm2', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'r1' }], created_at: new Date(2000).toISOString() },
+    { id: 'm3', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'second' }], metadata: { prompt_id: 'p-live-2' }, created_at: new Date(3000).toISOString() },
+    { id: 'm4', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'r2' }], created_at: new Date(4000).toISOString() },
+  ];
+
+  const pi = fakeAdapter('pi') as any;
+  const piStarted: StartTurnInput[] = [];
+  pi.startTurn = async (input: StartTurnInput) => {
+    piStarted.push(input);
+    return {
+      turnId: 'pi-t1',
+      events: (async function* () {
+        yield { sessionId: 'pi-native', turnId: 'pi-t1', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+  pi.listSkills = async () => [
+    { name: 'skill:until-done', description: 'Skill doc', path: '/tmp/skills/until-done/SKILL.md', scope: 'user' },
+  ];
+  pi.listCommands = async () => [
+    { name: 'until-done', description: 'Extension loop command', kind: 'prompt', source: 'extension' },
+    { name: 'skill:until-done', description: 'Skill doc', kind: 'prompt', source: 'skill' },
+  ];
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: pi as any,
+  });
+
+  try {
+    const undoRes = await fetch(`${gw.url}/api/v1/sessions/codex_codex-native:undo`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ agent_id: 'main', turn_id: 'turn_p-live-1' }),
+    });
+    assert.equal(undoRes.status, 200);
+    const undoJson = (await undoRes.json()) as any;
+    assert.equal(undoJson.data.count, 2);
+    assert.deepEqual(rollbackCalls, [2]);
+
+    const piSkillsRes = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/skills`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(piSkillsRes.status, 200);
+    const piSkills = ((await piSkillsRes.json()) as any).data.skills as any[];
+    assert.ok(piSkills.some((s) => s.name === 'until-done' && s.source === 'builtin'));
+    assert.ok(piSkills.some((s) => s.name === 'until-done' && s.source === 'user' && s.path === '/tmp/skills/until-done/SKILL.md'));
+
+    await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/skills/until-done:activate`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ path: '/tmp/skills/until-done/SKILL.md', args: 'ship it' }),
+    });
+    await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/skills/until-done:activate`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ args: 'run' }),
+    });
+    assert.equal(piStarted[0]?.input, '/skill:until-done ship it');
+    assert.equal(piStarted[1]?.input, '/until-done run');
+  } finally {
+    await gw.close();
+  }
+});
+
+test('POST /sessions/:id:fork renames session if title is provided', async () => {
+  const codex = fakeAdapter('codex') as any;
+  codex.capabilities = () => ({ ...capabilities, fork: true });
+  codex.fork = async () => ({
+    id: 'forked-id',
+    workspace_id: 'wd_1',
+    title: 'Old Title',
+    created_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString(),
+    busy: false,
+    metadata: { cwd: '/tmp' },
+    provider: 'codex',
+  });
+  const renameCalls: Array<{ id: string; title: string }> = [];
+  codex.rename = async (id: string, title: string) => {
+    renameCalls.push({ id, title });
+  };
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+  });
+
+  try {
+    const res = await fetch(`${gw.url}/api/v1/sessions/codex_codex-native:fork`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer gateway-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ title: 'New Forked Session' }),
+    });
+    assert.equal(res.status, 200);
+    const data = (await res.json() as any).data;
+    assert.equal(data.title, 'New Forked Session');
+    assert.deepEqual(renameCalls, [{ id: 'forked-id', title: 'New Forked Session' }]);
+  } finally {
+    await gw.close();
+  }
+});
+
+test('/transcript?agent_id=sub-1 returns empty when getSubagentMessages is absent', async () => {
+  const pi = fakeAdapter('pi');
+  delete (pi as any).getSubagentMessages;
+  pi.getHistory = async () => [
+    {
+      id: 'm1',
+      session_id: 'pi-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'main parent prompt' }],
+      created_at: new Date().toISOString(),
+    },
+  ];
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    pi: pi as any,
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+
+  try {
+    // Child agent query
+    const childRes = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/transcript?agent_id=sub-1`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(childRes.status, 200);
+    const childData = (await childRes.json() as any).data;
+    assert.deepEqual(childData.items, []); // Empty, NOT main session history!
+
+    // Main agent query gets main history
+    const mainRes = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/transcript?agent_id=main`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(mainRes.status, 200);
+    const mainData = (await mainRes.json() as any).data;
+    assert.equal(mainData.items.length, 1);
+    assert.equal(mainData.items[0].prompt, 'main parent prompt');
+  } finally {
+    await gw.close();
+  }
+});
+
+test(':reload calls clearCommandsCache on Claude adapter', async () => {
+  const claude = fakeAdapter('claude');
+  let cacheCleared = false;
+  (claude as any).clearCommandsCache = () => {
+    cacheCleared = true;
+  };
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    claude: claude as any,
+    codex: fakeAdapter('codex') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+  });
+
+  try {
+    const res = await fetch(`${gw.url}/api/v1/sessions/claude_claude-native:reload`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(cacheCleared, true);
+  } finally {
+    await gw.close();
+  }
+});
+
+test('/profile normalizes thinking enabled: true and auto without passing raw on or auto to Pi and Codex', async () => {
+  const pi = fakeAdapter('pi');
+  let piReceivedThinking: string | undefined;
+  pi.setThinking = async (_sid, thinking) => {
+    piReceivedThinking = thinking;
+  };
+  pi.listModels = async () => [
+    { provider: 'pi', model: 'pi-model', display_name: 'Pi Model', max_context_size: 200000, capabilities: ['thinking'], default_effort: 'medium', support_efforts: ['low', 'medium', 'high'] },
+  ];
+
+  const codex = fakeAdapter('codex');
+  let codexReceivedThinking: string | undefined;
+  codex.setThinking = async (_sid, thinking) => {
+    codexReceivedThinking = thinking;
+  };
+  codex.listModels = async () => [
+    { provider: 'codex', model: 'codex-model', display_name: 'Codex Model', max_context_size: 200000, capabilities: ['thinking'], default_effort: 'low', support_efforts: ['low', 'medium', 'high'] },
+  ];
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    pi: pi as any,
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+  });
+
+  try {
+    // Test Pi with { thinking: { enabled: true } }
+    const res1 = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/profile`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ thinking: { enabled: true } }),
+    });
+    assert.equal(res1.status, 200);
+    assert.equal(piReceivedThinking, 'medium'); // Normalized, not raw 'on'!
+
+    // Test Pi with { thinking: 'auto' }
+    const res2 = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/profile`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ thinking: 'auto' }),
+    });
+    assert.equal(res2.status, 200);
+    assert.equal(piReceivedThinking, 'medium'); // Normalized, not raw 'auto'!
+
+    // Test Codex with { thinking: { enabled: true } }
+    const res3 = await fetch(`${gw.url}/api/v1/sessions/codex_codex-native/profile`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ thinking: { enabled: true } }),
+    });
+    assert.equal(res3.status, 200);
+    assert.equal(codexReceivedThinking, 'low'); // Model default_effort, not raw 'on'!
+  } finally {
+    await gw.close();
+  }
+});
+
+test('SessionHub deletes empty Set entries on unsubscribe and clears session on drop', () => {
+  const hub = new SessionHub();
+  assert.equal(hub.hasListeners('s1'), false);
+
+  const unsub1 = hub.subscribe('s1', () => {});
+  const unsub2 = hub.subscribe('s1', () => {});
+  assert.equal(hub.hasListeners('s1'), true);
+  assert.equal(hub.listenerCount('s1'), 2);
+
+  unsub1();
+  assert.equal(hub.hasListeners('s1'), true);
+  assert.equal(hub.listenerCount('s1'), 1);
+
+  unsub2();
+  // Empty Set must be deleted from listeners map!
+  assert.equal(hub.hasListeners('s1'), false);
+
+  // subscribeV262
+  const unsubV262 = hub.subscribeV262('s1', () => {});
+  assert.equal(hub.hasV262Listeners('s1'), true);
+  unsubV262();
+  assert.equal(hub.hasV262Listeners('s1'), false);
+
+  // drop clears listeners even if still subscribed
+  hub.subscribe('s2', () => {});
+  hub.subscribeV262('s2', () => {});
+  assert.equal(hub.hasListeners('s2'), true);
+  assert.equal(hub.hasV262Listeners('s2'), true);
+  hub.drop('s2');
+  assert.equal(hub.hasListeners('s2'), false);
+  assert.equal(hub.hasV262Listeners('s2'), false);
+});
+
+test('Codex executeCodexCommand undo uses thread/revert and renderCodexUsage includes account usage', async () => {
+  const codex = fakeAdapter('codex');
+  let rollbackCalls = 0;
+  codex.rollback = async () => { rollbackCalls++; };
+
+  const undoMsg = await executeCodexCommand(codex, 'native-1', 'undo', '');
+  assert.equal(rollbackCalls, 1);
+  assert.ok(undoMsg.includes('thread/revert'));
+  assert.equal(undoMsg.includes('thread/rollback'), false);
+
+  (codex as any).getAccountUsage = async () => ({
+    totalTokens: 150000,
+    inputTokens: 100000,
+    outputTokens: 50000,
+  });
+  const usageMsg = await renderCodexUsage(codex, 'native-1');
+  assert.ok(usageMsg.includes('账号用量'));
+  assert.ok(usageMsg.includes('150,000'));
+});
+
+test('gateway filters empty (session) placeholders, dedupes :activate skill chips, drives Pi /advisor and /plan interactive menus, and pushes extension_ui', async () => {
+  const prevXdg = process.env.XDG_CONFIG_HOME;
+  const cfgRoot = await mkdtemp(join(tmpdir(), 'gw-pi-advisor-xdg-'));
+  process.env.XDG_CONFIG_HOME = cfgRoot;
+
+  const pi = fakeAdapter('pi') as any;
+  const piPrompts: string[] = [];
+  let piClosed = 0;
+  pi.close = async () => { piClosed += 1; };
+  pi.listModels = async () => [
+    {
+      provider: 'alibb9',
+      model: 'alibb9/cx/gpt-6.1-sol',
+      display_name: 'GPT 6.1 Sol',
+      capabilities: ['thinking'],
+      support_efforts: ['low', 'medium', 'high'],
+    },
+  ];
+  pi.listCommands = async () => [
+    { name: 'advisor', description: 'Configure advisor', kind: 'prompt', source: 'extension', acceptsInput: true },
+    { name: 'plan', description: 'Plan mode menu', kind: 'prompt', source: 'extension', acceptsInput: true },
+    { name: 'silent-tui', description: 'Silent TUI cmd', kind: 'prompt', source: 'extension', acceptsInput: false },
+  ];
+  pi.getExtensionUiState = () => ({
+    statuses: { 'plan-mode': 'Plan active' },
+    widgets: { plan: { lines: ['Step A'] } },
+    title: 'Plan',
+  });
+  pi.startTurn = async (input: StartTurnInput) => {
+    const promptStr = typeof input.input === 'string' ? input.input : '';
+    piPrompts.push(promptStr);
+    return {
+      turnId: `t-${piPrompts.length}`,
+      events: (async function* () {
+        if (promptStr === '/plan show') {
+          yield { kind: 'message', status: 'delta', sessionId: input.sessionId, turnId: 't', timestamp: Date.now(), payload: { delta: 'Current Plan: A' } };
+        }
+        yield { kind: 'turn', status: 'completed', sessionId: input.sessionId, turnId: 't', timestamp: Date.now(), payload: { reason: 'completed' } };
+      })(),
+    };
+  };
+
+  const grok = fakeAdapter('grok') as any;
+  grok.list = async () => ({
+    items: [
+      {
+        id: 'empty-1',
+        workspace_id: 'wd_grok_empty',
+        title: '(session)',
+        created_at: '2026-11-15T00:00:00.000Z',
+        updated_at: '2026-11-15T00:00:00.000Z',
+        busy: false,
+        extras: { last_prompt: '' },
+        metadata: { cwd: '/tmp/empty' },
+        provider: 'grok',
+      },
+      {
+        id: 'real-1',
+        workspace_id: 'wd_grok_real',
+        title: 'Real Chat',
+        created_at: '2026-11-15T00:01:00.000Z',
+        updated_at: '2026-11-15T00:01:00.000Z',
+        busy: false,
+        extras: { last_prompt: 'Real Chat' },
+        metadata: { cwd: '/tmp/real' },
+        provider: 'grok',
+      },
+    ],
+  });
+
+  const gw = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok,
+    pi,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+
+  const authHeaders = { authorization: 'Bearer gateway-token', 'content-type': 'application/json' };
+  const wsFrames: Record<string, unknown>[] = [];
+  const waitFrame = (pred: (f: Record<string, unknown>) => boolean, timeoutMs = 2000): Promise<Record<string, unknown>> =>
+    new Promise((resolve, reject) => {
+      const existing = wsFrames.find(pred);
+      if (existing) { resolve(existing); return; }
+      const timer = setInterval(() => {
+        const hit = wsFrames.find(pred);
+        if (hit) {
+          clearInterval(timer);
+          clearTimeout(deadline);
+          resolve(hit);
+        }
+      }, 15);
+      const deadline = setTimeout(() => {
+        clearInterval(timer);
+        reject(new Error(`WS frame timeout; got: ${wsFrames.map((f) => `${String(f.type)}:${String(f.status ?? '')}`).join(',')}`));
+      }, timeoutMs);
+    });
+
+  let ws: WebSocket | undefined;
+  try {
+    // 1. Grok empty (session) placeholder filtered out from /sessions?exclude_empty=true and /api/v2/sessions
+    const v1List = (await (await fetch(`${gw.url}/api/v1/sessions?provider=grok&exclude_empty=true`, { headers: authHeaders })).json()) as any;
+    assert.deepEqual(v1List.data.items.map((s: any) => s.id), ['grok_real-1']);
+    const v2Groups = (await (await fetch(`${gw.url}/api/v2/sessions?provider=grok&view=by_workspace&meta.has_prompt=true`, { headers: authHeaders })).json()) as any;
+    assert.equal(v2Groups.data.groups.length, 1);
+    assert.equal(v2Groups.data.groups[0].sessions[0].id, 'grok_real-1');
+
+    // 2. GET /sessions/:id/status includes Pi extension_ui state
+    const statusBody = (await (await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/status?provider=pi`, { headers: authHeaders })).json()) as any;
+    assert.deepEqual(statusBody.data.extension_ui, {
+      statuses: { 'plan-mode': 'Plan active' },
+      widgets: { plan: { lines: ['Step A'] } },
+      title: 'Plan',
+    });
+
+    // 3. Connect WS and subscribe to pi_pi-native -> receives initial extension_ui frame
+    ws = new WebSocket(`${gw.url.replace(/^http/, 'ws')}/api/v1/ws?provider=pi`, ['kimi-code.bearer.gateway-token']);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WS open timeout')), 2000);
+      ws!.onopen = () => { clearTimeout(timer); resolve(); };
+      ws!.onerror = () => { clearTimeout(timer); reject(new Error('WS error')); };
+      ws!.onmessage = (ev) => {
+        try {
+          wsFrames.push(JSON.parse(String(ev.data)) as Record<string, unknown>);
+        } catch { /* ignore */ }
+      };
+    });
+
+    ws.send(JSON.stringify({ type: 'subscribe', request_id: 'sub-pi', session_id: 'pi_pi-native', agent_ids: ['main'] }));
+    const initialExtUi = await waitFrame((f) => f.type === 'extension_ui' && f.session_id === 'pi_pi-native');
+    assert.deepEqual((initialExtUi as any).statuses, { 'plan-mode': 'Plan active' });
+
+    // 4. POST /skills/advisor:activate with empty args and chip metadata.display_text: "advisor"
+    // must NOT forward "/advisor advisor" — instead triggers two-step QuestionCard and writes advisor.json!
+    const actRes = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/skills/advisor:activate?provider=pi`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ args: '', metadata: { display_text: 'advisor' } }),
+    });
+    assert.equal(actRes.status, 200);
+    assert.equal(piPrompts.length, 0);
+
+    const qModel = await waitFrame((f) => f.type === 'interaction' && f.kind === 'question' && f.status === 'pending' && (f.request as any)?.questions?.[0]?.id === 'advisor_model');
+    const qModelId = String(qModel.interaction_id);
+    await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/interactions/${encodeURIComponent(qModelId)}?provider=pi`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ answers: { advisor_model: { kind: 'single', option_id: 'alibb9/cx/gpt-6.1-sol' } }, method: 'click' }),
+    });
+
+    const qEffort = await waitFrame((f) => f.type === 'interaction' && f.kind === 'question' && f.status === 'pending' && (f.request as any)?.questions?.[0]?.id === 'advisor_effort');
+    const qEffortId = String(qEffort.interaction_id);
+    await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/interactions/${encodeURIComponent(qEffortId)}?provider=pi`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ answers: { advisor_effort: { kind: 'single', option_id: 'high' } }, method: 'click' }),
+    });
+
+    await waitFrame((f) => f.type === 'turn.ended' && f.session_id === 'pi_pi-native');
+    const { readFile } = await import('node:fs/promises');
+    const advisorCfg = JSON.parse(await readFile(join(cfgRoot, 'rpiv-advisor', 'advisor.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal(advisorCfg.modelKey, 'alibb9/cx/gpt-6.1-sol');
+    assert.equal(advisorCfg.effort, 'high');
+    assert.ok(piClosed >= 1);
+
+    // 5. Bare /plan triggers QuestionCard menu and translates selected choice to `/plan show`
+    wsFrames.length = 0;
+    const planRes = await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/prompts?provider=pi`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ content: [{ type: 'text', text: '/plan' }] }),
+    });
+    assert.equal(planRes.status, 200);
+    const qPlan = await waitFrame((f) => f.type === 'interaction' && f.kind === 'question' && f.status === 'pending' && (f.request as any)?.questions?.[0]?.id === 'plan_action');
+    await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/interactions/${encodeURIComponent(String(qPlan.interaction_id))}?provider=pi`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ answers: { plan_action: { kind: 'single', option_id: 'show' } }, method: 'click' }),
+    });
+    await waitFrame((f) => f.type === 'turn.ended' && f.session_id === 'pi_pi-native');
+    assert.ok(piPrompts.includes('/plan show'));
+
+    // 6. Zero-output slash command turn emits helpful fallback message instead of silent blank turn
+    wsFrames.length = 0;
+    await fetch(`${gw.url}/api/v1/sessions/pi_pi-native/prompts?provider=pi`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ content: [{ type: 'text', text: '/silent-tui' }] }),
+    });
+    const silentDelta = await waitFrame((f) => f.type === 'item.delta' && typeof (f as any).delta === 'string' && String((f as any).delta).includes('/silent-tui'));
+    assert.ok(silentDelta);
+    await waitFrame((f) => f.type === 'turn.ended' && f.session_id === 'pi_pi-native');
+  } finally {
+    ws?.close();
+    await gw.close();
+    await rm(cfgRoot, { recursive: true, force: true });
+    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = prevXdg;
+  }
+});
+
