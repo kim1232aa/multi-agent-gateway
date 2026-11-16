@@ -935,7 +935,7 @@ export class DshProviderAdapter implements ProviderAdapter {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/unknown model option/i.test(msg) || /invalid params/i.test(msg)) {
+        if (/unknown model option/i.test(msg)) {
           // Do not surface obsolete/unknown model errors to the user
           return;
         }
