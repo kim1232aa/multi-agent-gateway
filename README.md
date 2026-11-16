@@ -16,19 +16,31 @@
 
 ## 界面预览 (Screenshots)
 
-### 1. 统一多 Agent 调度外壳（Kimi / Claude / Grok / Codex / Pi）
+### 1. 统一六大 Agent 调度外壳（Kimi / Claude / Grok / Codex / Pi / Dsh）
 在保持官方 Kimi Web 2.6.2 原生视觉体系与思考折叠的同时，通过底部一体化分段控制器无缝切换底层 Agent 引擎：
 ![统一多 Agent 调度界面](docs/images/01-agent-overview.png)
 
-### 2. Grok 历史会话清洗（无空 session 污染）
+### 2. DSH（DeepSeek Harness）生产级代码开发与思考链
+原生 Agent Client Protocol (ACP) 通信通道，结合 `session_projcache` 实时账本与 `session.v4.jsonl.zstd` 持久化，支持流式高精度代码输出：
+![DSH DeepSeek Harness 真实代码开发会话](docs/images/05-dsh-agent-conversation.png)
+
+### 3. Grok 历史会话清洗（无空 session 污染）
 后端智能嗅探历史会话有效性，过滤无实质对话的系统/工作流种子目录，并提取首条真实用户提示词作为会话标题：
 ![Grok 清爽侧边栏](docs/images/02-grok-clean-sidebar.png)
 
-### 3. Pi 49 项辅助模型选择弹窗（带实时搜索与滚动容器）
+### 4. Claude Code 原生流式转译验证
+通过 `-p stream-json` 长连接劫持与标准事件转译，无缝展示 Claude Code 深度思考与上下文：
+![Claude Code 统一会话验证](docs/images/06-claude-verification.png)
+
+### 5. Codex CLI 统一工作台验证
+基于 `codex app-server` 的标准 JSON-RPC 双向协议转译，支持细粒度权限审批与会话树：
+![Codex CLI 统一会话验证](docs/images/07-codex-verification.png)
+
+### 6. Pi 49 项辅助模型选择弹窗（带实时搜索与滚动容器）
 当执行 `/advisor` 时在 Web 端弹出两步结构化 QuestionCard，超过 6 个选项自动注入实时筛选输入框与可滚动容器，支持快速搜索定位：
 ![Pi Advisor 模型选择与筛选](docs/images/03-pi-advisor-dialog.png)
 
-### 4. Pi Plan Mode 结构化操作菜单
+### 7. Pi Plan Mode 结构化操作菜单
 输入 `/plan` 自动唤醒 6 项 Plan Mode 交互动作（只读规划/查看/收敛/实施/保存/退出）及自定义任务直接输入框，并转译为原生斜杠子命令执行：
 ![Pi Plan Mode 动作选择菜单](docs/images/04-pi-plan-menu.png)
 

@@ -95,14 +95,21 @@ export class DshAdapter {
   private readonly dshBin: string;
   private readonly sessionsDir: string;
   private readonly projcacheDir: string;
+  private readonly historyCacheDir: string;
   private acpClient: DshAcpClient | null = null;
   private activeTurns = new Set<string>();
 
-  constructor(options: { dshBin?: string; sessionsDir?: string; projcacheDir?: string } = {}) {
+  constructor(options: { dshBin?: string; sessionsDir?: string; projcacheDir?: string; historyCacheDir?: string } = {}) {
     this.dshBin = resolveDshBin(options.dshBin);
     this.sessionsDir = options.sessionsDir ?? resolveDshSessionsDir();
-    this.projcacheDir = options.projcacheDir
-      ?? path.join(path.dirname(this.sessionsDir), 'storages', 'session_projcache', 'sessions');
+    const dshHome = path.dirname(this.sessionsDir);
+    this.projcacheDir = options.projcacheDir ?? path.join(dshHome, 'storages', 'session_projcache', 'sessions');
+    this.historyCacheDir = options.historyCacheDir ?? path.join(dshHome, 'gateway_history');
+    try {
+      if (!fs.existsSync(this.historyCacheDir)) fs.mkdirSync(this.historyCacheDir, { recursive: true });
+    } catch {
+      // ignore
+    }
   }
 
   get binPath(): string {
@@ -313,7 +320,62 @@ export class DshAdapter {
       // ignore
     }
 
+    if (messages.length > 0) return messages;
+
+    // Fallback: read from gateway_history cache file
+    try {
+      const cacheFile = path.join(this.historyCacheDir, `${sessionId}.json`);
+      if (fs.existsSync(cacheFile)) {
+        const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        if (Array.isArray(cached) && cached.length > 0) return cached;
+      }
+    } catch {
+      // ignore
+    }
+
     return messages;
+  }
+
+  appendHistoryCache(sessionId: string, userText: string, assistantText: string, reasoningText = ''): void {
+    try {
+      const cacheFile = path.join(this.historyCacheDir, `${sessionId}.json`);
+      let list: Message[] = [];
+      if (fs.existsSync(cacheFile)) {
+        try {
+          list = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        } catch {
+          list = [];
+        }
+      }
+
+      const now = new Date().toISOString();
+      const userIndex = list.length;
+      list.push({
+        id: `msg_u_${userIndex}`,
+        session_id: sessionId,
+        role: 'user',
+        content: [{ type: 'text', text: userText }],
+        created_at: now,
+      });
+
+      const assistantParts: MessageContentPart[] = [];
+      if (reasoningText) {
+        assistantParts.push({ type: 'thinking', thinking: reasoningText });
+      }
+      assistantParts.push({ type: 'text', text: assistantText });
+
+      list.push({
+        id: `msg_a_${userIndex + 1}`,
+        session_id: sessionId,
+        role: 'assistant',
+        content: assistantParts,
+        created_at: new Date().toISOString(),
+      });
+
+      fs.writeFileSync(cacheFile, JSON.stringify(list, null, 2), 'utf8');
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -373,8 +435,9 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async get(id: string): Promise<Session> {
+    const rawId = id.startsWith('dsh_') ? id.slice(4) : id;
     const records = this.adapter.listSessionsFromDisk();
-    const found = records.find((r) => r.id === id);
+    const found = records.find((r) => r.id === rawId);
     if (!found) {
       throw new ProviderError('not_found', `DSH session not found: ${id}`, 404);
     }
@@ -413,7 +476,7 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async getHistory(sessionId: string, query?: HistoryQuery): Promise<Message[]> {
-    const rawId = sessionId;
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
     return this.adapter.getHistoryMessages(rawId);
   }
 
@@ -510,6 +573,8 @@ export class DshProviderAdapter implements ProviderAdapter {
     const events: GatewayEvent[] = [];
     let resolveTurn: (() => void) | undefined;
     let finished = false;
+    let accumulatedAssistantText = '';
+    let accumulatedReasoningText = '';
 
     events.push({
       kind: 'turn',
@@ -524,6 +589,7 @@ export class DshProviderAdapter implements ProviderAdapter {
       if ('sessionId' in ev && ev.sessionId !== rawId) return;
 
       if (ev.type === 'thought_chunk') {
+        accumulatedReasoningText += ev.text;
         events.push({
           kind: 'thinking',
           status: 'delta',
@@ -533,6 +599,7 @@ export class DshProviderAdapter implements ProviderAdapter {
           payload: { text: ev.text, delta: ev.text },
         });
       } else if (ev.type === 'message_chunk') {
+        accumulatedAssistantText += ev.text;
         events.push({
           kind: 'message',
           status: 'delta',
@@ -595,6 +662,7 @@ export class DshProviderAdapter implements ProviderAdapter {
     client
       .prompt(rawId, promptText)
       .then(() => {
+        this.adapter.appendHistoryCache(rawId, promptText, accumulatedAssistantText, accumulatedReasoningText);
         finished = true;
         events.push({
           kind: 'turn',
