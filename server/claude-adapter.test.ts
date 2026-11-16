@@ -1966,7 +1966,7 @@ process.stdin.resume();
   }
 });
 
-test('ClaudeAdapter.listSessions filters out internal entrypoints starting with sdk-', async () => {
+test('ClaudeAdapter.listSessions includes sessions regardless of entrypoint and filters out pure slash commands', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-entrypoint-'));
   const projectsDir = join(base, 'projects');
   const projDir = join(projectsDir, 'my-proj');
@@ -1975,6 +1975,7 @@ test('ClaudeAdapter.listSessions filters out internal entrypoints starting with 
 
     const normalSessionId = '11111111-1111-4111-8111-111111111111';
     const sdkSessionId = '22222222-2222-4222-8222-222222222222';
+    const slashSessionId = '33333333-3333-4333-8333-333333333333';
 
     await writeFile(
       join(projDir, `${normalSessionId}.jsonl`),
@@ -1990,10 +1991,19 @@ test('ClaudeAdapter.listSessions filters out internal entrypoints starting with 
       ].join('\n') + '\n',
     );
 
+    await writeFile(
+      join(projDir, `${slashSessionId}.jsonl`),
+      [
+        JSON.stringify({ type: 'user', timestamp: '2026-08-11T10:02:00.000Z', entrypoint: 'sdk-cli', message: { role: 'user', content: '<command-name>/help</command-name>' } }),
+        JSON.stringify({ type: 'system', subtype: 'local_command', content: '<local-command-stdout>help output</local-command-stdout>', timestamp: '2026-08-11T10:02:01.000Z', entrypoint: 'sdk-cli' }),
+      ].join('\n') + '\n',
+    );
+
     const adapter = new ClaudeAdapter({ projectsDir });
     const sessions = await adapter.listSessions();
     assert.equal(sessions.some((s) => s.sessionId === normalSessionId), true);
-    assert.equal(sessions.some((s) => s.sessionId === sdkSessionId), false);
+    assert.equal(sessions.some((s) => s.sessionId === sdkSessionId), true);
+    assert.equal(sessions.some((s) => s.sessionId === slashSessionId), false);
   } finally {
     await rm(base, { recursive: true, force: true });
   }
@@ -2378,4 +2388,164 @@ test('clearHandshakeCache prevents stale in-flight handshake from polluting cach
   );
   await adapter.close();
 });
+
+test('review regression: listSessions includes sessions with sdk-cli entries and filters out pure slash commands without replies', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-regression-'));
+  const projectsDir = join(base, 'projects');
+  const projDir = join(projectsDir, 'my-proj');
+  try {
+    await mkdir(projDir, { recursive: true });
+
+    const sdkSessionId = '11111111-1111-4111-8111-111111111111';
+    const pureSlashSessionId = '22222222-2222-4222-8222-222222222222';
+    const slashWithReplySessionId = '33333333-3333-4333-8333-333333333333';
+
+    // 1. Session with sdk-cli turn and real question (and assistant reply) - must be included
+    await writeFile(
+      join(projDir, `${sdkSessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-16T10:00:00.000Z',
+          entrypoint: 'cli',
+          cwd: '/home/pi',
+          sessionId: sdkSessionId,
+          message: { role: 'user', content: '你是什么模型' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-11-16T10:00:02.000Z',
+          entrypoint: 'cli',
+          cwd: '/home/pi',
+          sessionId: sdkSessionId,
+          message: { role: 'assistant', content: [{ type: 'text', text: '我是 Claude' }] },
+        }),
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-16T10:01:00.000Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi',
+          sessionId: sdkSessionId,
+          message: { role: 'user', content: [{ type: 'text', text: '你能做什么？' }] },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    // 2. Pure slash command session without assistant reply - must be filtered out
+    await writeFile(
+      join(projDir, `${pureSlashSessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-15T06:46:15.253Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi/github/multi-agent-gateway',
+          sessionId: pureSlashSessionId,
+          isMeta: true,
+          message: {
+            role: 'user',
+            content: '<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It\'s recorded here as context for later messages.</local-command-caveat>',
+          },
+        }),
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-15T06:46:15.246Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi/github/multi-agent-gateway',
+          sessionId: pureSlashSessionId,
+          message: {
+            role: 'user',
+            content: '<command-name>/reload-skills</command-name>\n            <command-message>reload-skills</command-message>\n            <command-args></command-args>',
+          },
+        }),
+        JSON.stringify({
+          type: 'system',
+          subtype: 'local_command',
+          content: '<local-command-stdout>Reloaded skills: 13 skills available (none added or removed).</local-command-stdout>',
+          timestamp: '2026-11-15T06:46:15.253Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi/github/multi-agent-gateway',
+          sessionId: pureSlashSessionId,
+        }),
+      ].join('\n') + '\n',
+    );
+
+    // 3. Slash command that has an assistant reply - must be included
+    await writeFile(
+      join(projDir, `${slashWithReplySessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-15T06:47:00.000Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi',
+          sessionId: slashWithReplySessionId,
+          message: {
+            role: 'user',
+            content: '<command-name>/help</command-name>\n            <command-message>help</command-message>\n            <command-args></command-args>',
+          },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-11-15T06:47:05.000Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi',
+          sessionId: slashWithReplySessionId,
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Here are the available commands...' }],
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    // 4. Large session (> 512 KiB) spanning beyond head and tail 256 KiB windows
+    const largeSessionId = '44444444-4444-4444-8444-444444444444';
+    const paddingLine = JSON.stringify({ type: 'progress', data: 'x'.repeat(1024) });
+    const padding = Array.from({ length: 600 }, () => paddingLine).join('\n');
+    await writeFile(
+      join(projDir, `${largeSessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-15T08:00:00.000Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi',
+          sessionId: largeSessionId,
+          message: { role: 'user', content: 'Large transcript start' },
+        }),
+        padding,
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-11-15T08:10:00.000Z',
+          entrypoint: 'sdk-cli',
+          cwd: '/home/pi',
+          sessionId: largeSessionId,
+          message: { role: 'assistant', content: [{ type: 'text', text: 'Large transcript end' }] },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new ClaudeAdapter({ projectsDir });
+    const sessions = await adapter.listSessions();
+
+    const sdkFound = sessions.find((s) => s.sessionId === sdkSessionId);
+    assert.ok(sdkFound, 'session with sdk-cli turns must be listed');
+    assert.equal(sdkFound.title, '你能做什么？');
+    assert.equal(sdkFound.firstPrompt, '你是什么模型');
+
+    const pureSlashFound = sessions.find((s) => s.sessionId === pureSlashSessionId);
+    assert.equal(pureSlashFound, undefined, 'pure slash command session without assistant reply must be filtered out');
+
+    const slashWithReplyFound = sessions.find((s) => s.sessionId === slashWithReplySessionId);
+    assert.ok(slashWithReplyFound, 'slash command with assistant reply must be listed');
+
+    const largeFound = sessions.find((s) => s.sessionId === largeSessionId);
+    assert.ok(largeFound, 'large session > 512 KiB must be listed');
+    assert.equal(largeFound.firstPrompt, 'Large transcript start');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 

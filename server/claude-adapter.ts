@@ -2609,7 +2609,8 @@ export class ClaudeAdapter {
       let createdAt: string | undefined;
       let latestUserPromptMs = Number.NEGATIVE_INFINITY;
       let isSidechainHead = false;
-      let isSdkEntrypoint = false;
+      let hasRealUser = false;
+      let hasAssistant = false;
       let sessionEntrypoint: string | undefined;
       const updatedAt = stat.mtime.toISOString();
 
@@ -2651,12 +2652,8 @@ export class ClaudeAdapter {
               : typeof entry.metadata?.entrypoint === "string"
                 ? entry.metadata.entrypoint
                 : undefined;
-          if (ep) {
-            if (!sessionEntrypoint) sessionEntrypoint = ep;
-            if (ep.startsWith("sdk-")) {
-              isSdkEntrypoint = true;
-              return;
-            }
+          if (ep && !sessionEntrypoint) {
+            sessionEntrypoint = ep;
           }
           if (!createdAt && typeof entry.timestamp === "string" && !Number.isNaN(Date.parse(entry.timestamp))) {
             createdAt = entry.timestamp;
@@ -2679,6 +2676,7 @@ export class ClaudeAdapter {
           ) {
             const c = userTextCandidate(entry.message?.content);
             if (c?.kind === "text") {
+              hasRealUser = true;
               if (!firstPrompt) firstPrompt = c.text;
               setUser(c.text);
               const tsMs = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
@@ -2690,6 +2688,13 @@ export class ClaudeAdapter {
             }
           }
           if (
+            entry.type === "assistant" &&
+            !entry.isSidechain &&
+            entry.isApiErrorMessage !== true
+          ) {
+            hasAssistant = true;
+          }
+          if (
             entry.type === "attachment" &&
             !entry.isSidechain &&
             entry.attachment?.type === "queued_command" &&
@@ -2697,6 +2702,7 @@ export class ClaudeAdapter {
           ) {
             const c = userTextCandidate(entry.attachment?.prompt);
             if (c?.kind === "text") {
+              hasRealUser = true;
               const tsMs = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : NaN;
               if (!Number.isNaN(tsMs) && tsMs > latestUserPromptMs) {
                 latestUserPromptMs = tsMs;
@@ -2725,7 +2731,7 @@ export class ClaudeAdapter {
         (u) => { headUser = u; },
         (c) => { headCmd = c; },
       );
-      if (isSidechainHead || isSdkEntrypoint) return null;
+      if (isSidechainHead) return null;
 
       let tail = head;
       if (headSlice.length < stat.size) {
@@ -2745,8 +2751,14 @@ export class ClaudeAdapter {
           (u) => { tailUser = u; },
           (c) => { tailCmd = c; },
         );
-        if (isSdkEntrypoint) return null;
       }
+
+      // 过滤纯斜杠命令且无回复的垃圾会话。
+      // 文件大小在 2 * HEAD_BYTES (512 KiB) 以内时，head + tail 完全覆盖全文；
+      // 若文件超出 512 KiB，中间段未读，但真实纯命令会话无模型回复极小(实测约 1.5~5 KiB)，
+      // 超过 512 KiB 必为多轮对话真实会话，避免误过滤。
+      const hasConversation = hasRealUser || hasAssistant || stat.size > 2 * HEAD_BYTES;
+      if (!hasConversation) return null;
 
       const sessionArtifactsDir = path.join(path.dirname(filePath), sessionId);
       let sidecarCustomTitle = "";
@@ -3517,16 +3529,23 @@ function formatTranscriptUserText(text: string): string | null {
   return text;
 }
 
-/** True for CLI-local noise (`<local-command-...>`, `<command-name>`, caveats). */
+/** True for CLI-local noise (`<local-command-...>`, `<command-name>`, `<command-message>`, `<command-args>`, caveats). */
 function isLocalCommandText(text: string): boolean {
-  return text.startsWith("<local-command") || text.startsWith("<command-name") || text.startsWith("Caveat:") || text.startsWith("<local-command-caveat");
+  return (
+    text.startsWith("<local-command") ||
+    text.startsWith("<command-name") ||
+    text.startsWith("<command-message") ||
+    text.startsWith("<command-args") ||
+    text.startsWith("Caveat:") ||
+    text.startsWith("<local-command-caveat")
+  );
 }
 
 /** 原生 /resume 标题兜底候选:真实消息 → {kind:'text'};斜杠命令(还原 "/x") → {kind:'cmd'}。 */
 function userTextCandidate(content: unknown): { kind: "text" | "cmd"; text: string } | null {
   const text = extractText(content);
   if (!text) return null;
-  const cmd = /^<command-name>([^<]+)<\/command-name>/.exec(text);
+  const cmd = /<command-name>([^<]+)<\/command-name>/.exec(text);
   if (cmd) return { kind: "cmd", text: cmd[1]!.trim() };
   const bashIn = /<bash-input>([\s\S]*?)<\/bash-input>/.exec(text);
   if (bashIn) {
