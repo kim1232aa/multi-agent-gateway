@@ -5544,3 +5544,412 @@ test('review regression: tool delta with outputMode replace updates existingTool
     await fixture.close();
   }
 });
+
+test('review regression: in-flight turn refresh deduplicates disk history and active turn without dropping items, and sends pending approvals', async () => {
+  const claude = fakeAdapter('claude');
+  const priorMessages: Message[] = [
+    {
+      id: 'msg_prior_user',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'what is your name' }],
+      created_at: '2026-11-17T04:50:00.000Z',
+    },
+    {
+      id: 'msg_prior_asst',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'I am Claude' }],
+      created_at: '2026-11-17T04:50:05.000Z',
+    },
+  ];
+
+  const inFlightDiskMessages: Message[] = [
+    {
+      id: 'msg_active_user',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: '你的搜索功能有正常吗…' }],
+      created_at: '2026-11-17T05:00:00.000Z',
+    },
+    {
+      id: 'msg_active_asst_1',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: '考虑搜索功能' },
+        { type: 'tool_use', tool_call_id: 'call_3083919518963245146', tool_name: 'ToolSearch', input: { query: 'test' } },
+      ],
+      created_at: '2026-11-17T05:00:01.000Z',
+    },
+    {
+      id: 'msg_active_res_1',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_call_id: 'call_3083919518963245146', output: 'search ok', is_error: false },
+      ],
+      created_at: '2026-11-17T05:00:02.000Z',
+    },
+    {
+      id: 'msg_active_asst_2',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', tool_call_id: 'call_11394489352608667102', tool_name: 'WebSearch', input: { url: 'http://example.com' } },
+      ],
+      created_at: '2026-11-17T05:00:03.000Z',
+    },
+  ];
+
+  let currentHistory: Message[] = [...priorMessages];
+  claude.getHistory = async () => [...currentHistory];
+
+  let resolveHold!: () => void;
+  const turnHold = new Promise<void>((r) => { resolveHold = r; });
+  let resolveEventStarted!: () => void;
+  const eventStarted = new Promise<void>((r) => { resolveEventStarted = r; });
+
+  claude.startTurn = async (): Promise<TurnHandle> => {
+    // Claude CLI writes to disk as it runs
+    currentHistory = [...priorMessages, ...inFlightDiskMessages];
+    return {
+      turnId: 'claude-turn-active',
+      events: (async function* () {
+        const base = { sessionId: 'claude-native', turnId: 'claude-turn-active', timestamp: Date.now() };
+        yield { ...base, kind: 'thinking', status: 'delta', payload: { delta: '考虑搜索功能' } } as any;
+        yield { ...base, kind: 'tool', status: 'started', payload: { toolCallId: 'call_3083919518963245146', name: 'ToolSearch', input: { query: 'test' } } } as any;
+        yield { ...base, kind: 'tool', status: 'started', payload: { toolCallId: 'call_11394489352608667102', name: 'WebSearch', input: { url: 'http://example.com' } } } as any;
+        yield { ...base, kind: 'tool', status: 'started', payload: { toolCallId: 'call_mem_only', name: 'Bash', input: { command: 'echo memory' } } } as any;
+        yield { ...base, kind: 'approval', status: 'requested', payload: { approvalId: 'app-999', tool: 'Bash', input: { command: 'sudo reboot' }, itemId: 'call_mem_only' } } as any;
+        resolveEventStarted();
+        await turnHold;
+        yield { ...base, kind: 'turn', status: 'completed', payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  const fixture = await reviewRegressionFixture({ adapters: { claude } });
+  let ws: WebSocket | undefined;
+  try {
+    // Start prompt
+    const promptRes = await fixture.request('/sessions/claude_claude-native/prompts', 'POST', {
+      content: [{ type: 'text', text: '你的搜索功能有正常吗…' }],
+    });
+    assert.equal(promptRes.status, 200);
+    await eventStarted;
+
+    // Snapshot check while turn is in-flight:
+    // messages.items must not contain in-flight messages from current turn,
+    // and in_flight_turn represents the running turn.
+    const snapRes = await fixture.request('/sessions/claude_claude-native/snapshot');
+    assert.equal(snapRes.status, 200);
+    const snap = ((await snapRes.json()) as any).data;
+    assert.ok(snap.in_flight_turn, 'in_flight_turn must be present');
+    assert.equal(snap.messages.items.length, 2, 'snapshot messages.items must only contain prior completed messages');
+    assert.equal(snap.messages.items[0].id, 'msg_prior_user');
+    assert.equal(snap.messages.items[1].id, 'msg_prior_asst');
+    assert.equal(snap.pending_approvals.length, 1, 'snapshot must include pending approval');
+    assert.equal(snap.pending_approvals[0].approval_id, 'app-999');
+
+    // Simulate page refresh: new WebSocket connection subscribing to the session
+    const frames: any[] = [];
+    ws = new WebSocket(`${fixture.gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=claude`, ['kimi-code.bearer.review-token']);
+    let resolveTurns!: () => void;
+    const turnsReceived = new Promise<void>((r) => { resolveTurns = r; });
+    let resolveApproval!: () => void;
+    const approvalReceived = new Promise<void>((r) => { resolveApproval = r; });
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 2000);
+      ws!.onopen = () => { clearTimeout(timer); resolve(); };
+      ws!.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket open failed')); };
+      ws!.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data));
+        frames.push(frame);
+        if (frame.type === 'turns') resolveTurns();
+        if (frame.type === 'interaction' && frame.kind === 'approval') resolveApproval();
+      };
+    });
+
+    ws.send(JSON.stringify({ type: 'subscribe', request_id: 'sub-refresh', session_id: 'claude_claude-native', agent_ids: ['main'] }));
+
+    await Promise.race([
+      Promise.all([turnsReceived, approvalReceived]),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout waiting for turns and approval frame')), 3000)),
+    ]);
+
+    const turnsFrame = frames.find((f) => f.type === 'turns');
+    assert.ok(turnsFrame, 'turns frame must be received');
+    // Exactly 2 turns: Turn 1 (prior completed) and Turn 2 (active running). Must NOT be 3!
+    assert.equal(turnsFrame.turns.length, 2, `expected 2 turns but got ${turnsFrame.turns.length}`);
+    assert.equal(turnsFrame.turns[0].status, 'ended');
+    assert.equal(turnsFrame.turns[1].status, 'running');
+    assert.ok(turnsFrame.turns[1].turn_id.startsWith('turn_'), `active turn_id should start with turn_ but got ${turnsFrame.turns[1].turn_id}`);
+
+    const activeTurnItems = turnsFrame.turns[1].items as any[];
+    // Check user_message: exactly one opener
+    const userMessages = activeTurnItems.filter((it) => it.type === 'user_message');
+    assert.equal(userMessages.length, 1, 'must have exactly one user_message in active turn');
+    assert.equal(userMessages[0].text, '你的搜索功能有正常吗…');
+
+    // Check reasoning: exactly one
+    const reasoningItems = activeTurnItems.filter((it) => it.type === 'reasoning');
+    assert.equal(reasoningItems.length, 1, 'must have exactly one reasoning item');
+
+    // Check tool_call: call_3083919518963245146 must be ended with output from disk
+    const toolSearch = activeTurnItems.find((it) => it.item_id === 'call_3083919518963245146');
+    assert.ok(toolSearch, 'call_3083919518963245146 must be present');
+    assert.equal(toolSearch.status, 'ended', 'call_3083919518963245146 must have ended status from disk');
+    assert.equal(toolSearch.output, 'search ok', 'call_3083919518963245146 must have output from disk');
+
+    // Check tool_call: call_11394489352608667102 must be present once
+    const webSearch = activeTurnItems.filter((it) => it.item_id === 'call_11394489352608667102');
+    assert.equal(webSearch.length, 1, 'call_11394489352608667102 must appear exactly once');
+
+    // Check tool_call: call_mem_only (only in memory) must not be lost
+    const memOnly = activeTurnItems.find((it) => it.item_id === 'call_mem_only');
+    assert.ok(memOnly, 'call_mem_only from activeItems must not be dropped');
+
+    // Check pending approval frame received on subscribe
+    const approvalFrame = frames.find((f) => f.type === 'interaction' && f.kind === 'approval');
+    assert.ok(approvalFrame, 'approval interaction frame must be sent on subscribe');
+    assert.equal(approvalFrame.interaction_id, 'app-999');
+    assert.equal(approvalFrame.status, 'pending');
+    assert.equal(approvalFrame.tool_call_id, 'call_mem_only');
+  } finally {
+    resolveHold();
+    ws?.close();
+    await fixture.close();
+  }
+});
+
+test('review regression: subscribe_v2 seeds only prior history and does not observe active turn as completed', async () => {
+  const claude = fakeAdapter('claude');
+  const priorMessages: Message[] = [
+    {
+      id: 'msg_prior_user',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'hello prior' }],
+      created_at: '2026-11-17T04:50:00.000Z',
+    },
+    {
+      id: 'msg_prior_asst',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'hello response' }],
+      created_at: '2026-11-17T04:50:05.000Z',
+    },
+  ];
+  const inFlightMessages: Message[] = [
+    {
+      id: 'msg_active_user',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'active prompt' }],
+      created_at: '2026-11-17T05:00:00.000Z',
+    },
+    {
+      id: 'msg_active_asst',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'thinking' }],
+      created_at: '2026-11-17T05:00:01.000Z',
+    },
+  ];
+
+  let currentHistory: Message[] = [...priorMessages];
+  claude.getHistory = async () => [...currentHistory];
+
+  let resolveHold!: () => void;
+  const turnHold = new Promise<void>((r) => { resolveHold = r; });
+  let resolveStarted!: () => void;
+  const started = new Promise<void>((r) => { resolveStarted = r; });
+
+  claude.startTurn = async (): Promise<TurnHandle> => {
+    currentHistory = [...priorMessages, ...inFlightMessages];
+    return {
+      turnId: 'claude-turn-sub2',
+      events: (async function* () {
+        const base = { sessionId: 'claude-native', turnId: 'claude-turn-sub2', timestamp: Date.now() };
+        yield { ...base, kind: 'thinking', status: 'delta', payload: { delta: 'thinking' } } as any;
+        resolveStarted();
+        await turnHold;
+        yield { ...base, kind: 'turn', status: 'completed', payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  const fixture = await reviewRegressionFixture({ adapters: { claude } });
+  let ws: WebSocket | undefined;
+  try {
+    const promptRes = await fixture.request('/sessions/claude_claude-native/prompts', 'POST', {
+      content: [{ type: 'text', text: 'active prompt' }],
+    });
+    assert.equal(promptRes.status, 200);
+    await started;
+
+    // Connect via WS subscribe_v2
+    const frames: any[] = [];
+    ws = new WebSocket(`${fixture.gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=claude`, ['kimi-code.bearer.review-token']);
+    let resolveReset!: () => void;
+    const resetReceived = new Promise<void>((r) => { resolveReset = r; });
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 2000);
+      ws!.onopen = () => { clearTimeout(timer); resolve(); };
+      ws!.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket open failed')); };
+      ws!.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data));
+        frames.push(frame);
+        if (frame.type === 'transcript.reset') resolveReset();
+      };
+    });
+
+    ws.send(JSON.stringify({
+      type: 'subscribe_v2',
+      id: 'sub2-refresh',
+      payload: {
+        session_id: 'claude_claude-native',
+        transcript: { main: 'delta' },
+      },
+    }));
+
+    await Promise.race([
+      resetReceived,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout waiting for transcript.reset')), 3000)),
+    ]);
+
+    const resetFrame = frames.find((f) => f.type === 'transcript.reset');
+    assert.ok(resetFrame, 'transcript.reset frame must be received');
+    assert.equal(resetFrame.payload.agent_id, 'main');
+    assert.equal(resetFrame.payload.has_more_older, true);
+    // Snapshot items in resetFrame must only contain the active turn (or empty baseline), not duplicated
+    assert.ok(Array.isArray(resetFrame.payload.snapshot.items));
+  } finally {
+    resolveHold();
+    ws?.close();
+    await fixture.close();
+  }
+});
+
+test('review regression: steer during active turn and non-disk-flushing provider do not duplicate turns', async () => {
+  const claude = fakeAdapter('claude');
+  const steerDiskMessages: Message[] = [
+    {
+      id: 'msg_steer_1',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'opener user text' }],
+      created_at: '2026-11-17T06:00:00.000Z',
+    },
+    {
+      id: 'msg_steer_2',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', tool_call_id: 'call_steer_1', tool_name: 'Bash', input: { command: 'ls' } },
+      ],
+      created_at: '2026-11-17T06:00:01.000Z',
+    },
+    {
+      id: 'msg_steer_3',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: 'steer user text' }],
+      created_at: '2026-11-17T06:00:02.000Z',
+    },
+    {
+      id: 'msg_steer_4',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', tool_call_id: 'call_steer_2', tool_name: 'Bash', input: { command: 'pwd' } },
+      ],
+      created_at: '2026-11-17T06:00:03.000Z',
+    },
+  ];
+
+  let steerHistory: Message[] = [];
+  claude.getHistory = async () => [...steerHistory];
+  const origCaps = claude.capabilities();
+  claude.capabilities = () => ({ ...origCaps, steer: true });
+  claude.steer = async () => {};
+
+  let resolveSteerHold!: () => void;
+  const steerHold = new Promise<void>((r) => { resolveSteerHold = r; });
+  let resolveSteerStarted!: () => void;
+  const steerStarted = new Promise<void>((r) => { resolveSteerStarted = r; });
+
+  claude.startTurn = async (): Promise<TurnHandle> => {
+    steerHistory = [...steerDiskMessages];
+    return {
+      turnId: 'claude-turn-steer',
+      events: (async function* () {
+        const base = { sessionId: 'claude-native', turnId: 'claude-turn-steer', timestamp: Date.now() };
+        yield { ...base, kind: 'tool', status: 'started', payload: { toolCallId: 'call_steer_1', name: 'Bash', input: { command: 'ls' } } } as any;
+        resolveSteerStarted();
+        await steerHold;
+        yield { ...base, kind: 'turn', status: 'completed', payload: { reason: 'completed' } } as any;
+      })(),
+    };
+  };
+
+  const fixture = await reviewRegressionFixture({ adapters: { claude } });
+  let ws: WebSocket | undefined;
+  try {
+    const promptRes = await fixture.request('/sessions/claude_claude-native/prompts', 'POST', {
+      content: [{ type: 'text', text: 'opener user text' }],
+    });
+    assert.equal(promptRes.status, 200);
+    await steerStarted;
+
+    // Send steer
+    const steerRes = await fixture.request('/sessions/claude_claude-native/steer', 'POST', {
+      content: [{ type: 'text', text: 'steer user text' }],
+    });
+    assert.equal(steerRes.status, 200);
+
+    // Refresh via WebSocket subscribe
+    const frames: any[] = [];
+    ws = new WebSocket(`${fixture.gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=claude`, ['kimi-code.bearer.review-token']);
+    let resolveTurns!: () => void;
+    const turnsReceived = new Promise<void>((r) => { resolveTurns = r; });
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 2000);
+      ws!.onopen = () => { clearTimeout(timer); resolve(); };
+      ws!.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket open failed')); };
+      ws!.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data));
+        frames.push(frame);
+        if (frame.type === 'turns') resolveTurns();
+      };
+    });
+
+    ws.send(JSON.stringify({ type: 'subscribe', request_id: 'sub-steer-refresh', session_id: 'claude_claude-native', agent_ids: ['main'] }));
+    await turnsReceived;
+
+    const turnsFrame = frames.find((f) => f.type === 'turns');
+    assert.ok(turnsFrame);
+    // There must be exactly 1 turn (the active turn), NOT 2 or 3!
+    assert.equal(turnsFrame.turns.length, 1, `expected 1 turn but got ${turnsFrame.turns.length}`);
+    assert.equal(turnsFrame.turns[0].status, 'running');
+
+    const items = turnsFrame.turns[0].items as any[];
+    const userMsgs = items.filter((it) => it.type === 'user_message');
+    // Opener and steer user message
+    assert.equal(userMsgs.length, 2, 'must have exactly 2 user messages (opener + steer)');
+    assert.equal(userMsgs[0].placement, 'opener');
+    assert.equal(userMsgs[0].text, 'opener user text');
+    assert.equal(userMsgs[1].placement, 'steer');
+    assert.equal(userMsgs[1].text, 'steer user text');
+  } finally {
+    resolveSteerHold();
+    ws?.close();
+    await fixture.close();
+  }
+});
+
+

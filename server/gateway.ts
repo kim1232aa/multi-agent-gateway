@@ -1761,13 +1761,19 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         if (agentId === 'main') {
           history = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
           // 失败时不观察(见 driveTurn 同理注释),页面用空历史+ live turn 降级呈现。
-          if (history !== null && history.length > 0) hub.transcript.observeHistory(sid, history);
+          if (history !== null && history.length > 0) {
+            const active = hub.busy.get(sid);
+            const historyPrior = active ? filterHistoryPriorToActive(history, active) : history;
+            hub.transcript.observeHistory(sid, historyPrior);
+          }
         } else if (adapter.getSubagentMessages) {
           history = await adapter.getSubagentMessages(nativeId, agentId).catch(() => []);
         } else {
           history = [];
         }
-        return ok(res, buildLocalTranscriptPage(history ?? [], {
+        const active = hub.busy.get(sid);
+        const historyForPage = active && history ? filterHistoryPriorToActive(history, active) : (history ?? []);
+        return ok(res, buildLocalTranscriptPage(historyForPage, {
           agentId,
           beforeTurn: url.searchParams.get('before_turn') ?? undefined,
           afterTurn: url.searchParams.get('after_turn') ?? undefined,
@@ -3224,6 +3230,143 @@ async function getSession(
 /** 快照只带最后一页消息(前端 load-older 页大小=50);更早的走 /messages?before_id 翻页。 */
 const SNAPSHOT_MESSAGE_PAGE = 50;
 
+function findActiveTurnHistoryStartIndex(history: readonly Message[], active: ActiveTurn): number {
+  if (history.length === 0) return -1;
+
+  const activePromptIds = new Set<string>();
+  if (active.promptId) activePromptIds.add(active.promptId);
+  for (const item of active.v262Items) {
+    if (Array.isArray(item.prompt_ids)) {
+      for (const pid of item.prompt_ids) if (typeof pid === 'string') activePromptIds.add(pid);
+    }
+    if (typeof item.prompt_id === 'string') activePromptIds.add(item.prompt_id);
+  }
+
+  const activeToolCallIds = new Set<string>();
+  for (const item of active.v262Items) {
+    if (item.type === 'tool_call' && typeof item.item_id === 'string') {
+      activeToolCallIds.add(item.item_id);
+    }
+    if (typeof item.tool_call_id === 'string') {
+      activeToolCallIds.add(item.tool_call_id);
+    }
+  }
+  for (const tid of active.runningTools.keys()) {
+    activeToolCallIds.add(tid);
+  }
+  for (const [aid, a] of active.pendingApprovals.entries()) {
+    activeToolCallIds.add(aid);
+    if (a.itemId) activeToolCallIds.add(a.itemId);
+  }
+
+  const activeOpener = active.v262Items.find((it) => it.type === 'user_message' && it.placement === 'opener')
+    ?? active.v262Items.find((it) => it.type === 'user_message')
+    ?? active.v262Items[0];
+  const activeOpenerText = (typeof activeOpener?.text === 'string' ? activeOpener.text : '').trim();
+
+  const activeStartedMs = Date.parse(active.v262StartedAt) || Date.now();
+
+  const isOpenerMessage = (msg: Message): boolean => {
+    if (msg.role !== 'user') return false;
+    if (msg.metadata?.bash_card) return false;
+    const text = msg.content
+      .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+      .map((p) => p.text)
+      .join('\n');
+    const hasAttachments = msg.content.some((p) => p.type === 'image' || p.type === 'file' || p.type === 'document');
+    const isToolOnly = !text.trim() && !hasAttachments && msg.content.some((p) => p.type === 'tool_result' || p.type === 'tool_use' || p.type === 'tool_call');
+    return !isToolOnly;
+  };
+
+  const openerIndices: number[] = [];
+  for (let i = 0; i < history.length; i++) {
+    if (isOpenerMessage(history[i])) openerIndices.push(i);
+  }
+
+  // Signal 1: Prompt ID or Tool Call ID match in history
+  let earliestMatchIdx = -1;
+  for (let i = 0; i < history.length; i++) {
+    const msg = history[i];
+    let matched = false;
+    if (activePromptIds.has(msg.id)) matched = true;
+    if (typeof msg.metadata?.prompt_id === 'string' && activePromptIds.has(msg.metadata.prompt_id)) matched = true;
+    if (Array.isArray(msg.metadata?.prompt_ids)) {
+      for (const pid of msg.metadata.prompt_ids) {
+        if (typeof pid === 'string' && activePromptIds.has(pid)) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched && activeToolCallIds.size > 0) {
+      for (const part of msg.content) {
+        if (part.type === 'tool_call' && activeToolCallIds.has(part.id)) { matched = true; break; }
+        if (part.type === 'tool_use' && activeToolCallIds.has(part.tool_call_id)) { matched = true; break; }
+        if (part.type === 'tool_result' && activeToolCallIds.has(part.tool_call_id)) { matched = true; break; }
+      }
+      if (!matched && msg.metadata?.bash_card) {
+        const card = msg.metadata.bash_card as Record<string, unknown>;
+        if (typeof card.tool_call_id === 'string' && activeToolCallIds.has(card.tool_call_id)) matched = true;
+      }
+    }
+    if (matched) {
+      earliestMatchIdx = i;
+      break;
+    }
+  }
+
+  if (earliestMatchIdx >= 0) {
+    const matchingOpener = openerIndices.filter((idx) => idx <= earliestMatchIdx).pop();
+    if (matchingOpener !== undefined) {
+      if (activeOpenerText) {
+        const candidateEarlier = openerIndices.find((idx) => {
+          if (idx >= matchingOpener) return false;
+          const msg = history[idx];
+          const text = msg.content.filter((p): p is { type: 'text'; text: string } => p.type === 'text').map((p) => p.text).join('\n').trim();
+          const msgMs = Date.parse(msg.created_at) || 0;
+          return text === activeOpenerText && msgMs >= activeStartedMs - 15_000;
+        });
+        if (candidateEarlier !== undefined) return candidateEarlier;
+      }
+      return matchingOpener;
+    }
+    return earliestMatchIdx;
+  }
+
+  // Signal 2: No tool calls / prompt IDs yet. Check opener text & timestamp
+  if (activeOpenerText && openerIndices.length > 0) {
+    for (let j = openerIndices.length - 1; j >= 0; j--) {
+      const idx = openerIndices[j];
+      const msg = history[idx];
+      const text = msg.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n')
+        .trim();
+      const msgMs = Date.parse(msg.created_at) || 0;
+      if (text === activeOpenerText && msgMs >= activeStartedMs - 15_000) {
+        const hasOlderCompletedAssistant = history.slice(idx + 1).some((m) => {
+          if (m.role !== 'assistant') return false;
+          const asstMs = Date.parse(m.created_at) || 0;
+          return asstMs > 0 && asstMs < activeStartedMs - 1_000;
+        });
+        if (!hasOlderCompletedAssistant) {
+          return idx;
+        }
+      }
+    }
+  }
+
+  return -1;
+}
+
+function filterHistoryPriorToActive(history: Message[], active?: ActiveTurn): Message[] {
+  if (!active || history.length === 0) return history;
+  const startIdx = findActiveTurnHistoryStartIndex(history, active);
+  if (startIdx < 0) return history;
+  return history.slice(0, startIdx);
+}
+
 async function snapshot(
   adapter: ProviderAdapter,
   provider: ProviderName,
@@ -3247,6 +3390,7 @@ async function snapshot(
       status: t.status,
       ...(t.outcome ? { outcome: t.outcome } : {}),
     }));
+  const visibleHistory = active ? filterHistoryPriorToActive(history, active) : history;
   return {
     as_of_seq: hub.nextSeq(),
     epoch: hub.epoch,
@@ -3254,8 +3398,8 @@ async function snapshot(
     // 对齐 kap-server:快照=最后一页 + has_more。全量塞进来会让大会话
     // (几千条)首屏传输/渲染爆炸,前端表现为"会话无响应"。
     messages: {
-      items: history.slice(-SNAPSHOT_MESSAGE_PAGE).map((m) => messageDto(m, sid)),
-      has_more: history.length > SNAPSHOT_MESSAGE_PAGE,
+      items: visibleHistory.slice(-SNAPSHOT_MESSAGE_PAGE).map((m) => messageDto(m, sid)),
+      has_more: visibleHistory.length > SNAPSHOT_MESSAGE_PAGE,
     },
     in_flight_turn: active
       ? {
@@ -3648,7 +3792,8 @@ async function driveTurn(
   if (!hub.transcript.hasObservedHistory(sid)) {
     const history = await tryHistoryWithDemo(adapter, provider, nativeId, demoActive);
     if (history !== null && !hub.transcript.hasObservedHistory(sid) && history.length > 0) {
-      hub.transcript.observeHistory(sid, history);
+      const historyPrior = filterHistoryPriorToActive(history, turn);
+      hub.transcript.observeHistory(sid, historyPrior);
     }
   }
   const emit = (type: string, payload: Record<string, unknown>, volatile = false, offset?: number): void =>
@@ -3933,7 +4078,8 @@ async function runLocalGatewayCommand(
   try {
     const history = await tryHistoryWithDemo(adapter, provider, nativeId, demoActive);
     if (history !== null && !hub.transcript.hasObservedHistory(sid) && history.length > 0) {
-      hub.transcript.observeHistory(sid, history);
+      const historyPrior = filterHistoryPriorToActive(history, turn);
+      hub.transcript.observeHistory(sid, historyPrior);
     }
     const ordinal = history ? turnsFromHistory(history).length : 0;
     const v262TurnId = `turn_${promptId}`;
@@ -4160,7 +4306,8 @@ async function beginLocalInteractiveTurn(
   turn.v262StartedAt = createdAt;
   const history = await tryHistoryWithDemo(adapter, provider, nativeId, demoActive);
   if (history !== null && !hub.transcript.hasObservedHistory(sid) && history.length > 0) {
-    hub.transcript.observeHistory(sid, history);
+    const historyPrior = filterHistoryPriorToActive(history, turn);
+    hub.transcript.observeHistory(sid, historyPrior);
   }
   turn.transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
   turn.v262Ordinal = Math.max(0, turn.transcript.ordinal - 1);
@@ -6363,10 +6510,11 @@ function attachGatewayWebSocket(
         v262Offs.set(sid, hub.subscribeV262(sid, sendObj));
         sendObj({ type: 'response', request_id: msg.request_id, code: 0, msg: 'success' });
 
-        if (history && !hub.transcript.hasObservedHistory(sid)) {
-          hub.transcript.observeHistory(sid, history);
-        }
         const active = hub.busy.get(sid);
+        if (history && !hub.transcript.hasObservedHistory(sid)) {
+          const historyPrior = active ? filterHistoryPriorToActive(history, active) : history;
+          hub.transcript.observeHistory(sid, historyPrior);
+        }
         const allTurns = turnsFromHistory(history ?? [], active);
         const page = sliceV262Turns(allTurns, undefined, 20);
         sendObj({
@@ -6475,7 +6623,11 @@ function attachGatewayWebSocket(
             }
           }
         }
-        if (history) subscription.seed(history, hub.busy.has(sid) ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
+        const active = hub.busy.get(sid);
+        if (history) {
+          const historyForSeed = active ? filterHistoryPriorToActive(history, active) : history;
+          subscription.seed(historyForSeed, active ? 'turn' : 'idle', rawSince === undefined ? undefined : Number(rawSince));
+        }
         sendObj({
           type: 'ack', id: msg.id, code: 0, msg: 'success',
           payload: { accepted: [sid], not_found: [], resync_required: [], cursors: {} },
@@ -6766,7 +6918,7 @@ function tryHistoryStrictWithDemo(
   return adapter.getHistory(nativeId);
 }
 
-function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record<string, unknown>> {
+function buildTurnsFromHistoryMessages(history: Message[]): Array<Record<string, unknown>> {
   const turns: Array<Record<string, unknown>> = [];
   let current: {
     turn_id: string;
@@ -7008,7 +7160,330 @@ function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record
     }
   }
 
-  if (active) {
+  return turns;
+}
+
+function mergeActiveTurnItems(
+  historyActive: Message[],
+  active: ActiveTurn,
+): Array<Record<string, unknown>> {
+  const diskTurnItems: Array<Record<string, unknown>> = [];
+  const diskToolMap = new Map<string, Record<string, unknown>>();
+  let openerSeen = false;
+  let idx = 0;
+
+  for (const msg of historyActive) {
+    const msgAgentId = typeof msg.metadata?.agent_id === 'string'
+      ? msg.metadata.agent_id
+      : typeof msg.metadata?.agentId === 'string'
+        ? msg.metadata.agentId
+        : undefined;
+    const msgReceiverId = Array.isArray(msg.metadata?.receiverThreadIds) && typeof msg.metadata.receiverThreadIds[0] === 'string'
+      ? msg.metadata.receiverThreadIds[0]
+      : undefined;
+    const isBashCard = Boolean(msg.metadata?.bash_card);
+
+    if (msg.role === 'user' && !isBashCard) {
+      const text = msg.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+      const attachments = msg.content
+        .filter((p): p is Extract<Message['content'][number], { type: 'image' | 'file' | 'document' }> =>
+          p.type === 'image' || p.type === 'file' || p.type === 'document')
+        .map((p) => ({
+          kind: p.type === 'image' ? 'image' : 'file',
+          ...(p.name ? { name: p.name } : {}),
+          ...((p.mimeType ?? p.mime_type) ? { media_type: p.mimeType ?? p.mime_type } : {}),
+          ...(p.url ? { url: p.url } : {}),
+        }));
+      const isToolOnlyUser = !text.trim()
+        && attachments.length === 0
+        && msg.content.some((p) => p.type === 'tool_result' || p.type === 'tool_use' || p.type === 'tool_call');
+      if (!isToolOnlyUser) {
+        if (!openerSeen) {
+          openerSeen = true;
+          diskTurnItems.push({
+            item_id: `${msg.id}_opener`,
+            type: 'user_message',
+            placement: 'opener',
+            origin: { kind: 'user' },
+            text,
+            prompt_ids: [active.promptId],
+            attachments,
+            skills: [],
+            created_at: msg.created_at,
+          });
+        } else {
+          diskTurnItems.push({
+            item_id: `${msg.id}_steer`,
+            type: 'user_message',
+            placement: 'steer',
+            origin: { kind: 'user' },
+            text,
+            prompt_ids: typeof msg.metadata?.prompt_id === 'string' ? [msg.metadata.prompt_id] : [msg.id],
+            attachments,
+            skills: [],
+            created_at: msg.created_at,
+          });
+        }
+        continue;
+      }
+    }
+
+    if (isBashCard) {
+      const card = (typeof msg.metadata?.bash_card === 'object' && msg.metadata.bash_card !== null
+        ? msg.metadata.bash_card
+        : {}) as Record<string, unknown>;
+      const command = typeof card.command === 'string' ? card.command : typeof card.cmd === 'string' ? card.cmd : '';
+      const output = typeof card.output === 'string' ? card.output : typeof card.stdout === 'string' ? card.stdout : '';
+      const isError = card.is_error === true || card.isError === true || msg.metadata?.is_error === true;
+      const callId = (typeof card.tool_call_id === 'string' && card.tool_call_id) || `${msg.id}_bash`;
+      const norm = normalizeKimiWebTool('Bash', { command, ...(card.cwd ? { cwd: card.cwd } : {}), ...(card.workdir ? { workdir: card.workdir } : {}) });
+      const item: Record<string, unknown> = {
+        item_id: callId,
+        type: 'tool_call',
+        name: norm.name,
+        input: norm.input,
+        status: 'ended',
+        outcome: isError ? 'failed' : 'completed',
+        output,
+        ...(isError && output ? { error: output } : {}),
+        started_at: msg.created_at,
+        ended_at: msg.created_at,
+        step_index: 0,
+      };
+      diskToolMap.set(callId, item);
+      diskTurnItems.push(item);
+      continue;
+    }
+
+    for (const part of msg.content) {
+      if (part.type === 'thinking') {
+        const text = part.thinking ?? part.text ?? '';
+        if (!text) continue;
+        diskTurnItems.push({
+          item_id: `${msg.id}_think_${idx++}`,
+          type: 'reasoning',
+          status: 'ended',
+          text,
+          started_at: msg.created_at,
+          created_at: msg.created_at,
+          step_index: 0,
+        });
+      } else if (part.type === 'text') {
+        if (!part.text) continue;
+        diskTurnItems.push({
+          item_id: `${msg.id}_text_${idx++}`,
+          type: 'assistant_message',
+          status: 'ended',
+          text: part.text,
+          created_at: msg.created_at,
+          step_index: 0,
+        });
+      } else if (part.type === 'tool_call' || part.type === 'tool_use') {
+        const callId = part.type === 'tool_call' ? part.id : part.tool_call_id;
+        const rawName = part.type === 'tool_call' ? part.name : part.tool_name;
+        const normalized = normalizeKimiWebTool(rawName || 'tool', part.input ?? {});
+        const inputSubagentId = normalized.name === 'Agent' ? extractSubagentIdFromOutput(normalized.input) : undefined;
+        const agentRefs = mergeAgentRefs(
+          msg.metadata?.agent_refs ?? msg.metadata?.agentRefs,
+          [msgAgentId, msgReceiverId, inputSubagentId],
+        );
+        const item: Record<string, unknown> = {
+          item_id: callId,
+          type: 'tool_call',
+          name: normalized.name,
+          input: normalized.input ?? {},
+          status: 'ended',
+          outcome: 'completed',
+          started_at: msg.created_at,
+          ended_at: msg.created_at,
+          step_index: 0,
+          ...(agentRefs ? { agent_refs: agentRefs } : {}),
+        };
+        diskToolMap.set(callId, item);
+        diskTurnItems.push(item);
+      } else if (part.type === 'tool_result') {
+        const existing = diskToolMap.get(part.tool_call_id);
+        const structured = part.structured_output ?? part.structuredOutput;
+        const rawOut = part.output ?? part.content ?? '';
+        const output = (rawOut === '' || rawOut === undefined) && structured !== undefined
+          ? (typeof structured === 'string' ? structured : JSON.stringify(structured))
+          : rawOut;
+        const isError = part.is_error === true;
+        const outSubagentId = extractSubagentIdFromOutput(output) ?? extractSubagentIdFromOutput(structured);
+        if (existing) {
+          existing.status = 'ended';
+          existing.outcome = isError ? 'failed' : 'completed';
+          existing.output = output;
+          if (isError && typeof output === 'string') existing.error = output;
+          existing.ended_at = msg.created_at;
+          const mergedRefs = mergeAgentRefs(existing.agent_refs, [msgAgentId, msgReceiverId, outSubagentId]);
+          if (mergedRefs) existing.agent_refs = mergedRefs;
+        } else {
+          const agentRefs = mergeAgentRefs(
+            msg.metadata?.agent_refs ?? msg.metadata?.agentRefs,
+            [msgAgentId, msgReceiverId, outSubagentId],
+          );
+          const item: Record<string, unknown> = {
+            item_id: `${part.tool_call_id}_result_${idx++}`,
+            type: 'tool_call',
+            name: 'tool',
+            input: {},
+            status: 'ended',
+            outcome: isError ? 'failed' : 'completed',
+            output,
+            started_at: msg.created_at,
+            ended_at: msg.created_at,
+            step_index: 0,
+            ...(agentRefs ? { agent_refs: agentRefs } : {}),
+          };
+          diskToolMap.set(part.tool_call_id, item);
+          diskTurnItems.push(item);
+        }
+      }
+    }
+  }
+
+  const activeOpener = active.v262Items.find((it) => it.type === 'user_message' && it.placement === 'opener')
+    ?? active.v262Items.find((it) => it.type === 'user_message')
+    ?? active.v262Items[0];
+  const activeSteers = active.v262Items.filter((it) => it.type === 'user_message' && it.placement === 'steer');
+  const activeTools = new Map<string, Record<string, unknown>>();
+  for (const it of active.v262Items) {
+    if (it.type === 'tool_call' && typeof it.item_id === 'string') {
+      activeTools.set(it.item_id, it);
+    }
+  }
+  const activeReasoning = active.v262Items.find((it) => it.type === 'reasoning');
+  const activeAssistant = active.v262Items.find((it) => it.type === 'assistant_message');
+
+  const mergedItems: Array<Record<string, unknown>> = [];
+  const placedActiveItemIds = new Set<string>();
+  let placedReasoning = false;
+  let placedAssistant = false;
+  let placedOpener = false;
+
+  for (const diskItem of diskTurnItems) {
+    if (diskItem.type === 'user_message') {
+      if (!placedOpener) {
+        placedOpener = true;
+        if (activeOpener) {
+          placedActiveItemIds.add(String(activeOpener.item_id));
+          mergedItems.push({
+            ...activeOpener,
+            ...(Array.isArray(diskItem.attachments) && diskItem.attachments.length > 0 && (!Array.isArray(activeOpener.attachments) || activeOpener.attachments.length === 0)
+              ? { attachments: diskItem.attachments }
+              : {}),
+          });
+        } else {
+          mergedItems.push(diskItem);
+        }
+      } else {
+        const diskText = typeof diskItem.text === 'string' ? diskItem.text.trim() : '';
+        const matchedSteer = activeSteers.find(
+          (s) => !placedActiveItemIds.has(String(s.item_id)) && (typeof s.text === 'string' && s.text.trim() === diskText)
+        );
+        if (matchedSteer) {
+          placedActiveItemIds.add(String(matchedSteer.item_id));
+          mergedItems.push({
+            ...matchedSteer,
+            ...(Array.isArray(diskItem.attachments) && diskItem.attachments.length > 0 && (!Array.isArray(matchedSteer.attachments) || matchedSteer.attachments.length === 0)
+              ? { attachments: diskItem.attachments }
+              : {}),
+          });
+        } else {
+          mergedItems.push(diskItem);
+        }
+      }
+      continue;
+    }
+
+    if (diskItem.type === 'tool_call') {
+      const toolId = String(diskItem.item_id);
+      const activeTool = activeTools.get(toolId);
+      if (activeTool) {
+        placedActiveItemIds.add(toolId);
+        const isDiskEnded = diskItem.status === 'ended';
+        const isActiveEnded = activeTool.status === 'ended';
+        mergedItems.push({
+          ...activeTool,
+          ...diskItem,
+          status: isDiskEnded || isActiveEnded ? 'ended' : 'running',
+          outcome: diskItem.outcome ?? activeTool.outcome ?? (isDiskEnded || isActiveEnded ? 'completed' : undefined),
+          output: diskItem.output !== undefined && diskItem.output !== '' ? diskItem.output : (activeTool.output ?? ''),
+          ...(diskItem.error || activeTool.error ? { error: diskItem.error ?? activeTool.error } : {}),
+          ...(activeTool.agent_refs || diskItem.agent_refs ? { agent_refs: activeTool.agent_refs ?? diskItem.agent_refs } : {}),
+        });
+      } else {
+        mergedItems.push({ ...diskItem });
+      }
+      continue;
+    }
+
+    if (diskItem.type === 'reasoning') {
+      if (activeReasoning && !placedReasoning) {
+        placedReasoning = true;
+        placedActiveItemIds.add(String(activeReasoning.item_id));
+        const activeText = typeof activeReasoning.text === 'string' ? activeReasoning.text : '';
+        const diskText = typeof diskItem.text === 'string' ? diskItem.text : '';
+        const text = activeText.length >= diskText.length ? activeText : diskText;
+        mergedItems.push({
+          ...activeReasoning,
+          text,
+          status: activeReasoning.status ?? diskItem.status ?? 'running',
+        });
+      } else {
+        mergedItems.push({ ...diskItem });
+      }
+      continue;
+    }
+
+    if (diskItem.type === 'assistant_message') {
+      if (activeAssistant && !placedAssistant) {
+        placedAssistant = true;
+        placedActiveItemIds.add(String(activeAssistant.item_id));
+        const activeText = typeof activeAssistant.text === 'string' ? activeAssistant.text : '';
+        const diskText = typeof diskItem.text === 'string' ? diskItem.text : '';
+        const text = activeText.length >= diskText.length ? activeText : diskText;
+        mergedItems.push({
+          ...activeAssistant,
+          text,
+          status: active.assistantText ? 'running' : (activeAssistant.status ?? diskItem.status ?? 'ended'),
+        });
+      } else {
+        mergedItems.push({ ...diskItem });
+      }
+      continue;
+    }
+
+    mergedItems.push({ ...diskItem });
+  }
+
+  if (!placedOpener && activeOpener) {
+    mergedItems.unshift({ ...activeOpener });
+    placedActiveItemIds.add(String(activeOpener.item_id));
+  }
+
+  for (const it of active.v262Items) {
+    const id = String(it.item_id);
+    if (placedActiveItemIds.has(id)) continue;
+    if (it.type === 'reasoning' && placedReasoning) continue;
+    if (it.type === 'assistant_message' && placedAssistant) continue;
+    mergedItems.push({ ...it });
+  }
+
+  return mergedItems;
+}
+
+function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record<string, unknown>> {
+  if (!active) {
+    return buildTurnsFromHistoryMessages(history);
+  }
+  const activeStartIdx = findActiveTurnHistoryStartIndex(history, active);
+  if (activeStartIdx < 0) {
+    const turns = buildTurnsFromHistoryMessages(history);
     turns.push({
       turn_id: active.v262TurnId,
       ordinal: turns.length,
@@ -7019,7 +7494,23 @@ function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record
       steps: Array.from({ length: Math.max(1, active.v262StepIndex + 1) }, (_, idx) => ({ index: idx })),
       items: active.v262Items.map((item) => ({ ...item })),
     });
+    return turns;
   }
+
+  const historyPrior = history.slice(0, activeStartIdx);
+  const historyActive = history.slice(activeStartIdx);
+  const turns = buildTurnsFromHistoryMessages(historyPrior);
+  const mergedItems = mergeActiveTurnItems(historyActive, active);
+  turns.push({
+    turn_id: active.v262TurnId,
+    ordinal: turns.length,
+    turn_number: turns.length + 1,
+    kind: 'agent',
+    status: 'running',
+    started_at: active.v262StartedAt,
+    steps: Array.from({ length: Math.max(1, active.v262StepIndex + 1) }, (_, idx) => ({ index: idx })),
+    items: mergedItems,
+  });
   return turns;
 }
 
