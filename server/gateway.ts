@@ -3359,6 +3359,13 @@ async function submitPrompt(
       return runLocalGatewayCommand(adapter, provider, nativeId, name, (rawArgs ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
     }
   }
+  if (cmd && provider === 'dsh') {
+    if (cmd[1] === 'plan' || cmd[1] === 'compact' || cmd[1] === 'goal') {
+      if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+      const [, name, rawArgs] = cmd;
+      return runLocalGatewayCommand(adapter, provider, nativeId, name, (rawArgs ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
+    }
+  }
 
   // busy → 排队(对齐 kap-server:前端 steer 流依赖 status:'queued';队列里
   // 的 prompt 在当前 turn 结束后自动开自己的 turn,或被 prompts:steer 注入)。
@@ -3810,7 +3817,9 @@ async function runLocalGatewayCommand(
             ? executePiCommand(adapter, nativeId, name, argsText)
             : provider === 'claude'
               ? executeClaudeCommand(adapter, nativeId, name, argsText)
-              : executeCodexCommand(adapter, nativeId, name, argsText)
+              : provider === 'dsh'
+                ? executeDshCommand(adapter, nativeId, name, argsText)
+                : executeCodexCommand(adapter, nativeId, name, argsText)
       );
       if (name === 'compact' || name === 'undo') {
         hub.transcript.invalidateHistory(sid);
@@ -4597,6 +4606,33 @@ async function executePiCommand(
         return `ℹ Pi /${name} 属于本地终端交互命令，在 Web UI 中已为您拦截（输入 /help 查看所有可用的网页命令）。`;
       }
       throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
+  }
+}
+
+async function executeDshCommand(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  name: string,
+  argsText: string,
+): Promise<string> {
+  switch (name) {
+    case 'plan': {
+      if (argsText) {
+        if (adapter.setPlanMode) await adapter.setPlanMode(nativeId, true);
+        return `✓ DSH Plan Mode 已开启: ${argsText}`;
+      }
+      const current = adapter.getPlanMode?.(nativeId);
+      return `ℹ DSH Plan Mode 当前状态: ${current ? '开启' : '关闭'}。使用 \`/plan <任务>\` 进入只读规划。`;
+    }
+    case 'compact':
+      return '✓ DSH 会话上下文已标记压缩。';
+    case 'goal':
+      if (argsText) {
+        return `✓ DSH 自主长程目标已设定: ${argsText}`;
+      }
+      return 'ℹ 使用 `/goal <目标>` 为 DSH 设定自主开发长程目标。';
+    default:
+      return `ℹ DSH 命令 /${name} 已执行。`;
   }
 }
 

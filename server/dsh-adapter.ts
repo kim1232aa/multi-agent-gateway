@@ -242,8 +242,12 @@ export class DshAdapter {
     return results;
   }
 
+  get historyDir(): string {
+    return this.historyCacheDir;
+  }
+
   /** Read the live projection JSON for one session id (returns undefined when absent). */
-  private readProjcache(sessionId: string): DshProjcacheRecord | undefined {
+  readProjcache(sessionId: string): DshProjcacheRecord | undefined {
     try {
       const file = path.join(this.projcacheDir, `${sessionId}.json`);
       if (!fs.existsSync(file)) return undefined;
@@ -406,6 +410,10 @@ export class DshProviderAdapter implements ProviderAdapter {
       commands: true,
       skills: true,
       models: true,
+      usage: true,
+      archive: true,
+      delete: true,
+      rename: true,
     };
   }
 
@@ -414,14 +422,20 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
-    const rawSessions = this.adapter.listSessionsFromDisk();
+    const rawSessions = this.adapter.listSessionsFromDisk().filter((rec) => {
+      if (this.settingsStore.getBoolean('deleted', rec.id) === true) return false;
+      const isArchived = this.settingsStore.getBoolean('archived', rec.id) === true;
+      return query.archived === true ? isArchived : !isArchived;
+    });
+
     const sessions: Session[] = rawSessions.map((rec) => ({
       id: rec.id,
       workspace_id: workspaceIdFromCwd(rec.cwd, 'dsh'),
-      title: rec.title,
+      title: this.settingsStore.getString('title', rec.id) ?? rec.title,
       created_at: rec.createdAt,
       updated_at: rec.updatedAt,
       busy: false,
+      archived: this.settingsStore.getBoolean('archived', rec.id) === true,
       metadata: { cwd: rec.cwd },
       provider: 'dsh',
     }));
@@ -436,6 +450,9 @@ export class DshProviderAdapter implements ProviderAdapter {
 
   async get(id: string): Promise<Session> {
     const rawId = id.startsWith('dsh_') ? id.slice(4) : id;
+    if (this.settingsStore.getBoolean('deleted', rawId) === true) {
+      throw new ProviderError('not_found', `DSH session deleted: ${id}`, 404);
+    }
     const records = this.adapter.listSessionsFromDisk();
     const found = records.find((r) => r.id === rawId);
     if (!found) {
@@ -444,10 +461,11 @@ export class DshProviderAdapter implements ProviderAdapter {
     return {
       id: found.id,
       workspace_id: workspaceIdFromCwd(found.cwd, 'dsh'),
-      title: found.title,
+      title: this.settingsStore.getString('title', found.id) ?? found.title,
       created_at: found.createdAt,
       updated_at: found.updatedAt,
       busy: false,
+      archived: this.settingsStore.getBoolean('archived', found.id) === true,
       metadata: { cwd: found.cwd },
       provider: 'dsh',
     };
@@ -471,17 +489,83 @@ export class DshProviderAdapter implements ProviderAdapter {
     };
   }
 
+  async setArchived(sessionId: string, archived: boolean): Promise<void> {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    if (archived) this.settingsStore.set('archived', rawId, true);
+    else this.settingsStore.delete('archived', rawId);
+  }
+
   async delete(id: string): Promise<void> {
-    // zero-destructive
+    const rawId = id.startsWith('dsh_') ? id.slice(4) : id;
+    this.settingsStore.set('deleted', rawId, true);
+    this.sessionCwds.delete(rawId);
+    try {
+      const cacheFile = path.join(this.adapter.historyDir, `${rawId}.json`);
+      if (fs.existsSync(cacheFile)) fs.unlinkSync(cacheFile);
+    } catch {}
+  }
+
+  async rename(sessionId: string, title: string): Promise<void> {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    this.settingsStore.set('title', rawId, title);
+  }
+
+  async setModel(sessionId: string, model: string): Promise<void> {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    this.settingsStore.set('model', rawId, model);
+  }
+
+  getModel(sessionId: string): string | undefined {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    return this.settingsStore.getString('model', rawId) ?? this.settingsStore.getString('model', '__default__');
+  }
+
+  async setPermission(sessionId: string, mode: string): Promise<void> {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    this.settingsStore.set('permission', rawId, mode);
+  }
+
+  getPermission(sessionId: string): string | undefined {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    return this.settingsStore.getString('permission', rawId) ?? this.settingsStore.getString('permission', '__default__');
+  }
+
+  async setPlanMode(sessionId: string, on: boolean): Promise<void> {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    if (on) this.settingsStore.set('plan', rawId, true);
+    else this.settingsStore.delete('plan', rawId);
+  }
+
+  getPlanMode(sessionId: string): boolean | undefined {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    return this.settingsStore.getBoolean('plan', rawId);
+  }
+
+  getUsage(sessionId: string): SessionUsage | undefined {
+    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const proj = this.adapter.readProjcache(rawId);
+    const totals = proj?.tokenUsage?.val?.totals;
+    if (!totals) return undefined;
+    const input = totals.uncachedInputTokens ?? 0;
+    const output = totals.outputTokens ?? 0;
+    const cacheRead = totals.cacheReadTokens ?? 0;
+    const cacheWrite = totals.cacheWriteTokens ?? 0;
+    const turns = proj?.turnBoundary?.val?.lastTurn ?? 0;
+    return {
+      input_tokens: input,
+      output_tokens: output,
+      cache_read_tokens: cacheRead,
+      cache_creation_tokens: cacheWrite,
+      total_cost_usd: 0,
+      context_tokens: input + cacheRead,
+      context_limit: 131_072,
+      turn_count: turns,
+    };
   }
 
   async getHistory(sessionId: string, query?: HistoryQuery): Promise<Message[]> {
     const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
     return this.adapter.getHistoryMessages(rawId);
-  }
-
-  getUsage(sessionId: string): SessionUsage | undefined {
-    return undefined;
   }
 
   async models(sessionId?: string): Promise<NativeModel[]> {
