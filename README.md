@@ -1,13 +1,13 @@
 # Multi-Agent Gateway
 
-以官方 **Kimi Code Web 2.6.2** 作为统一前端外壳，后端通过 `kap-server` 兼容协议网关调度本机原生的 **Kimi / Claude / Codex / Grok / Pi** CLI。官方静态构建产物 `web-dist/` 全程保持零修改，仅通过受 `web-origin-manifest.json` SHA-256 校验保护的运行时注入（`web-extension/boot.js` + `web-extension/style.css`）增加多 Agent 切换器、能力门控、斜杠命令适配与交互增强。
+以官方 **Kimi Code Web 2.6.2** 作为统一前端外壳，后端通过 `kap-server` 兼容协议网关调度本机原生的 **Kimi / Claude / Codex / Grok / Pi / DSH** CLI。官方静态构建产物 `web-dist/` 全程保持零修改，仅通过受 `web-origin-manifest.json` SHA-256 校验保护的运行时注入（`web-extension/boot.js` + `web-extension/style.css`）增加多 Agent 切换器、能力门控、斜杠命令适配与交互增强。
 
 ---
 
 ## 核心特性与原则
 
 - **零侵入官方前端外壳**：保留 `web-dist/` 原始文件与 SHA-256 校验清单（`web-origin-manifest.json`）；若官方静态文件哈希不匹配，自动 fail-open 退回官方未注入页面。
-- **单侧边栏多 Agent 统一调度**：在同一工作台内切换 `Kimi`、`Claude`、`Codex`、`Grok`、`Pi`，分别以无前缀（Kimi）及 `claude_`、`codex_`、`grok_`、`pi_` 会话 ID 前缀隔离路由。
+- **单侧边栏多 Agent 统一调度**：在同一工作台内切换 `Kimi`、`Claude`、`Codex`、`Grok`、`Pi`、`DSH`，分别以无前缀（Kimi）及 `claude_`、`codex_`、`grok_`、`pi_`、`dsh_` 会话 ID 前缀隔离路由。
 - **复用本机原生 CLI 与凭证**：不代理云端订阅为静态 API Key，也不代管或刷新各 CLI 的 OAuth Token；每个 Agent 直接运行本机已安装并登录的原生 CLI，未安装或握手失败时如实返回错误（500/502），不伪造模型目录。
 - **双代 Kimi Web 协议兼容**：支持 Kimi Web `2.6.2` 原生 `turns/items` WebSocket 协议，并通过 `kimi-v25-bridge.ts` 兼容上游旧版 `2.5.x` `kimi web` 实例（将 `TranscriptTurn` 自动桥接为 `2.6.2` 帧格式），同时保留 `subscribe_v2` / `transcript v2` 降级通道。
 - **资源与磁盘安全保护**：大历史文件采用 16 MiB 尾窗口与 `O_NOFOLLOW` 防符号链接穿越读取；空闲子进程支持自动回收、并发上限与超大 JSONL 体积门禁。
@@ -43,6 +43,7 @@
 | **Codex** | `codex app-server` JSON-RPC (`0.169.0+` / `0.171.0-alpha.5`) | 流式输出、Thinking/Effort、颗粒度权限审批、Question/Elicitation、Plan Mode、Review、Compact、Fork、Rollback (`thread/revert`)、Goal | 自动回收空闲 `app-server` 进程；Turn 卡死看门狗；归一化 `collabAgentToolCall`/`subAgentActivity` 子代理卡片；支持 `/review`、`/goal`、`/terminals`、`/terminals-clean` |
 | **Grok** | `grok agent stdio` ACP (`1.0.77`) + `grok -p` 回退 | 流式输出、Reasoning、工具审批、Question、Plan Mode、Compact、Fork、Rollback/Rewind、Goal、`--prompt-file` 图片/大提示 | 隔离标准池与 `alwaysApprove` 池并空闲回收；自动过滤 0 轮及仅含系统种子的空 `(session)` 目录，剥离 `<user_query>` 标签提取首条用户输入作标题 |
 | **Pi** | `pi --mode rpc` (`@earendil-works/pi-coding-agent@1.5.2`) | 流式输出、Thinking、Strict LF JSONL、Question UI (`select`/`confirm`/`input`/`editor`)、Compact、Fork、Clone、Subagents (`subagent`/`acp_delegate`) | 浏览态零 spawn 直读磁盘；空闲自动回收（默认 3 分钟）与最大并发进程限制（默认 2）；解除扩展交互弹窗预检死锁；适配 `/advisor`、`/plan` 弹窗及 `setStatus`/`setWidget`/`custom_message` 渲染 |
+| **DSH** | `dsh --profile acp` DeepSeek Harness (`@deepseek-ai/dsh 0.2.2-rc.1`) | 流式输出（`agent_message_chunk`/`agent_thought_chunk` 思考链）、工具调用事件、`session/request_permission` 原生审批 | 浏览态零 spawn：合并读取 `~/.dsh/sessions/` 持久日志（zstd 压缩 JSONL）与 `~/.dsh/storages/session_projcache/` 实时投影（标题/turn/busy/token 用量即时可见）；60s 空闲自动回收 ACP 子进程；LLM 路由经 `llm-pi-ai` profile patch 接任意 OpenAI/Anthropic 兼容中转 |
 
 ---
 
@@ -78,6 +79,8 @@ multi-agent-gateway/
     ├── grok-adapter.ts           # Grok 1.0.77 ACP/CLI 适配器、空会话过滤与摘要标题提取
     ├── grok-acp.ts               # Grok ACP stdio JSON-RPC 客户端
     ├── pi-adapter.ts             # Pi 1.5.2 RPC 适配器、扩展 UI 桥接、磁盘只读与进程池管控
+    ├── dsh-adapter.ts            # DSH（DeepSeek Harness）ACP 适配器、projcache 实时会话合并与空闲回收
+    ├── dsh-acp.ts                # DSH ACP stdio JSON-RPC 客户端（握手防死锁 + 超时护栏）
     ├── local-transcript.ts       # LocalTranscriptHub 实时投影、工具卡片归一化与历史读取
     ├── native-commands.ts        # Claude / Codex / Grok / Pi 原生斜杠命令与磁盘技能发现
     ├── kimi-proxy.ts             # Kimi 上游 HTTP/WS 隧道代理
@@ -128,6 +131,9 @@ node dist/index.js
 | `GATEWAY_PI_MAX_PROCESSES` | `2` | Pi 同时存活的最大会话进程数，`0` 不限制 |
 | `GATEWAY_PI_MAX_SESSION_BYTES` | `201326592`（192 MiB） | Pi 单会话 JSONL 恢复体积门禁上限（字节），`0` 禁用 |
 | `GATEWAY_PI_EXTRA_ARGS` | 无 | 透传给 `pi --mode rpc` 的额外 CLI 参数（空格分隔） |
+| `DSH_BIN` | `~/.local/bin/dsh` 或 `PATH` | 覆盖 DeepSeek Harness 可执行文件路径 |
+| `DSH_HOME` | `~/.dsh` | 覆盖 DSH 数据根目录（sessions / storages / profiles） |
+| `CCWU_API_KEY` | 无 | DSH `llm-pi-ai` 自定义 provider（ccwu 中转路由）所需的 API Key；通过 `~/.dsh/profiles/acp/cordis.patch.yml` 配置中转端点后注入 |
 | `CLAUDE_BIN` / `CODEX_PATH` / `GROK_BIN` / `PI_BIN` / `KIMI_BIN` | `PATH` / `~/.local/bin/*` | 覆盖各原生 CLI 可执行文件路径 |
 | `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `GROK_HOME` / `PI_CODING_AGENT_DIR` / `KIMI_CODE_HOME` | 各自默认 home 目录 | 覆盖各 CLI 的数据与配置根目录 |
 | `STATIC_DIR` | `../web-dist` | 静态前端资源目录覆盖 |

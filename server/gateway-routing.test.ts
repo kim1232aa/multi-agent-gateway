@@ -2415,20 +2415,25 @@ test('detectAvailableProviders honors CLAUDE_BIN, GROK_BIN, CODEX_PATH and PI_BI
     const piBin = join(base, 'pi');
     await writeFile(piBin, '#!/bin/sh\n');
 
+    const dshBin = join(base, 'dsh');
+    await writeFile(dshBin, '#!/bin/sh\n');
+
     const present = detectAvailableProviders({
       CLAUDE_BIN: claudeBin,
       GROK_BIN: grokBin,
       CODEX_PATH: '/bin/true',
       PI_BIN: piBin,
+      DSH_BIN: dshBin,
       PATH: '',
     });
-    assert.deepEqual(present, ['kimi', 'claude', 'grok', 'codex', 'pi']);
+    assert.deepEqual(present, ['kimi', 'claude', 'grok', 'codex', 'pi', 'dsh']);
 
     const missing = detectAvailableProviders({
       CLAUDE_BIN: join(base, 'missing-claude'),
       GROK_BIN: join(base, 'missing-grok'),
       CODEX_PATH: join(base, 'missing-codex'),
       PI_BIN: join(base, 'missing-pi'),
+      DSH_BIN: join(base, 'missing-dsh'),
       PATH: '',
     });
     assert.deepEqual(missing, ['kimi']);

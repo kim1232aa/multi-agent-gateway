@@ -128,7 +128,7 @@ async function loadModeShim(): Promise<{ api: any; rows: any[] }> {
 
 test('rewrites global API URLs for the selected provider and pins prefixed sessions', async () => {
   const api = await loadShim('/');
-  assert.equal(Array.from(api.providers).join(','), 'kimi,claude,codex,grok,pi');
+  assert.equal(Array.from(api.providers).join(','), 'kimi,claude,codex,grok,pi,dsh');
   assert.equal(api.selectedProvider(), 'kimi');
   assert.equal(api.rewriteApiUrl('/api/v1/models').searchParams.get('provider'), 'kimi');
   api.setProvider('claude');
@@ -689,7 +689,7 @@ test('keeps all providers when the meta request fails', async () => {
   const api = await loadDomShim({ metaFails: true });
   await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.deepEqual(Array.from(api.providers), ['kimi', 'claude', 'codex', 'grok', 'pi']);
+  assert.deepEqual(Array.from(api.providers), ['kimi', 'claude', 'codex', 'grok', 'pi', 'dsh']);
 });
 
 test('reconciles the draft model to the provider catalog after switching', async () => {

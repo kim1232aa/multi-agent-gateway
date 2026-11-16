@@ -12,12 +12,12 @@
 // Provider
 // ---------------------------------------------------------------------------
 
-export type ProviderName = 'kimi' | 'claude' | 'codex' | 'grok' | 'pi';
+export type ProviderName = 'kimi' | 'claude' | 'codex' | 'grok' | 'pi' | 'dsh';
 
-export const PROVIDER_NAMES: readonly ProviderName[] = ['kimi', 'claude', 'codex', 'grok', 'pi'];
+export const PROVIDER_NAMES: readonly ProviderName[] = ['kimi', 'claude', 'codex', 'grok', 'pi', 'dsh'];
 
 export function isProviderName(value: unknown): value is ProviderName {
-  return value === 'kimi' || value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi';
+  return value === 'kimi' || value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi' || value === 'dsh';
 }
 
 // ---------------------------------------------------------------------------

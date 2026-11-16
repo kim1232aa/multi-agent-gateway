@@ -55,6 +55,7 @@ import {
 
 export { GrokProviderAdapter } from './grok-adapter.js';
 export { PiProviderAdapter } from './pi-adapter.js';
+export { DshProviderAdapter } from './dsh-adapter.js';
 
 // ---------------------------------------------------------------------------
 // 通用小工具

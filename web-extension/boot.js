@@ -1,8 +1,8 @@
 (function () {
   'use strict';
 
-  var PROVIDERS = ['kimi', 'claude', 'codex', 'grok', 'pi'];
-  var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok', pi: 'Pi' };
+  var PROVIDERS = ['kimi', 'claude', 'codex', 'grok', 'pi', 'dsh'];
+  var LABELS = { kimi: 'Kimi', claude: 'Claude', codex: 'Codex', grok: 'Grok', pi: 'Pi', dsh: 'Dsh' };
   var DEFAULT_CAPABILITIES = {
     kimi: {
       tower: true,
@@ -54,6 +54,16 @@
       compact: true,
       fork: true,
     },
+    dsh: {
+      tower: false,
+      swarm: false,
+      goals: true,
+      planMode: true,
+      btw: false,
+      rollback: false,
+      compact: true,
+      fork: false,
+    },
   };
   var providerCapabilities = Object.create(null);
 
@@ -102,6 +112,7 @@
     if (id.indexOf('claude_') === 0) return 'claude';
     if (id.indexOf('grok_') === 0) return 'grok';
     if (id.indexOf('pi_') === 0) return 'pi';
+    if (id.indexOf('dsh_') === 0) return 'dsh';
     return 'kimi';
   }
 

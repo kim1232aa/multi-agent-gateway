@@ -28,6 +28,7 @@ import { createStaticServer } from './static.js';
 import { CodexProviderAdapter, ClaudeProviderAdapter, claudeContextWindow } from './facade.js';
 import { GrokProviderAdapter } from './grok-adapter.js';
 import { PiProviderAdapter } from './pi-adapter.js';
+import { DshProviderAdapter } from './dsh-adapter.js';
 import { SettingsStore } from './settings-store.js';
 import {
   claudeGatewayCommandNames,
@@ -80,7 +81,7 @@ import {
 // ---------------------------------------------------------------------------
 
 type LocalProviderName = Exclude<ProviderName, 'kimi'>;
-const LOCAL_PROVIDERS: readonly LocalProviderName[] = ['codex', 'claude', 'grok', 'pi'];
+const LOCAL_PROVIDERS: readonly LocalProviderName[] = ['codex', 'claude', 'grok', 'pi', 'dsh'];
 
 export interface GatewayOptions {
   port?: number;
@@ -91,6 +92,7 @@ export interface GatewayOptions {
   claude?: ClaudeProviderAdapter;
   grok?: ProviderAdapter;
   pi?: ProviderAdapter;
+  dsh?: ProviderAdapter;
   /**
    * Kimi 路径的上游来源:
    * - 'spawn'(默认):网关自起 `kimi web` 子进程并解析它的 token;
@@ -127,6 +129,8 @@ export function detectAvailableProviders(env: NodeJS.ProcessEnv = process.env): 
   if (codexPath ? existsSync(codexPath) : onPath('codex', env.PATH)) providers.push('codex');
   const piBin = env.PI_BIN ?? path.join(os.homedir(), '.local', 'bin', 'pi');
   if (existsSync(piBin) || onPath('pi', env.PATH)) providers.push('pi');
+  const dshBin = env.DSH_BIN ?? path.join(os.homedir(), '.local', 'bin', 'dsh');
+  if (existsSync(dshBin) || onPath('dsh', env.PATH)) providers.push('dsh');
   return providers;
 }
 
@@ -161,6 +165,7 @@ const ID_PREFIX: Record<LocalProviderName, string> = {
   claude: 'claude_',
   grok: 'grok_',
   pi: 'pi_',
+  dsh: 'dsh_',
 };
 
 /** Preview transcripts. Bound per startGateway() instance — never module-global. */
@@ -239,7 +244,7 @@ function kimiDemoAdapter(): ProviderAdapter {
 }
 
 function isLocalProvider(value: string | null | undefined): value is LocalProviderName {
-  return value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi';
+  return value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi' || value === 'dsh';
 }
 
 /** Official grok-4.6 / grok-4.5 window (https://docs.x.ai/developers/models/grok-4.6). */
@@ -572,6 +577,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         ...(piExtraArgs && piExtraArgs.length > 0 ? { extraArgs: piExtraArgs } : {}),
       });
     })(),
+    dsh: options.dsh ?? new DshProviderAdapter({
+      dshBin: process.env.DSH_BIN,
+    }),
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
@@ -2177,8 +2185,8 @@ export function parseWireThinkingPatch(
   }
 
   if (parsed === 'auto') {
-    // Pi and Codex do not support 'auto'
-    if (sp === 'pi' || sp === 'codex' || sp === 'grok') {
+    // Pi, Codex, Grok, and Dsh do not support 'auto'
+    if (sp === 'pi' || sp === 'codex' || sp === 'grok' || sp === 'dsh') {
       return defaultEffort;
     }
     return 'auto';
