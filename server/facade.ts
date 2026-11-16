@@ -2154,6 +2154,24 @@ export class CodexProviderAdapter implements ProviderAdapter {
             payload: { diff: ev.diff, raw: ev },
           };
           break;
+        case 'patch-updated': {
+          // turn 进行中的文件改动增量(item/fileChange/patchUpdated):
+          // 汇总成"文件 + 行数增减"摘要,前端在终态 diff 到来前不再是黑盒。
+          const files = ev.changes.map((c) => {
+            const m = /^\+\d+(?:,\d+)?/m.exec(c.diff ?? '');
+            const d = /^-\d+(?:,-\d+)?/m.exec(c.diff ?? '');
+            return `${c.path}${m || d ? ` (+${m ? m[0].slice(1) : 0}/-${d ? d[0].slice(1) : 0})` : ''}`;
+          });
+          yield {
+            kind: 'diff',
+            status: 'delta',
+            sessionId,
+            turnId: ev.turnId,
+            timestamp: ts,
+            payload: { diff: ev.changes.map((c) => c.diff).join('\n'), files, raw: ev },
+          };
+          break;
+        }
         case 'token-usage': {
           const t = ev.usage.total;
           const last = ev.usage.last;

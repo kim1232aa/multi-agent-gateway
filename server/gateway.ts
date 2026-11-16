@@ -5726,6 +5726,18 @@ function consumeEvent(
         ...(p.data as Record<string, unknown>),
       });
     }
+  } else if (ev.kind === 'diff') {
+    // codex: turn 进行中的文件改动增量(patchUpdated)与终态 diff(diffUpdated)。
+    // delta 只推轻量文件清单;updated 落最终 diff 文本。
+    const p = ev.payload as { diff?: string; files?: string[] } | undefined;
+    if (ev.status === 'delta' && Array.isArray(p?.files) && p.files.length > 0) {
+      const sep = turn.assistantText ? '\n\n' : '';
+      emitAssistantDeltaText(`${sep}⚙ 文件改动中: ${p.files.join(', ')}`, turn, emit, ensureStep, sid, hub);
+    } else if (ev.status === 'updated' && typeof p?.diff === 'string' && p.diff.trim()) {
+      const sep = turn.assistantText ? '\n\n' : '';
+      const clipped = p.diff.length > 16 * 1024 ? `${p.diff.slice(0, 16 * 1024)}\n…(已截断)` : p.diff;
+      emitAssistantDeltaText(`${sep}\`\`\`diff\n${clipped.trimEnd()}\n\`\`\``, turn, emit, ensureStep, sid, hub);
+    }
   } else if (ev.kind === 'turn') {
     // 终态由 driveTurn 的 finally 统一广播。
   }

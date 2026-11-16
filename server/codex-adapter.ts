@@ -19,6 +19,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as readline from 'node:readline';
 import { z } from 'zod';
+import * as fs from 'node:fs';
 import { findCodexRollout } from './local-transcript.js';
 import {
   ProviderError,
@@ -85,6 +86,8 @@ const ThreadSchema = z
     cliVersion: z.string().nullish(),
     status: z.unknown().nullish(),
     turns: z.array(TurnSchema).nullish(),
+    // 0.169 起原生携带 rollout 落盘绝对路径;缓存后免目录递归扫描。
+    path: z.string().nullish(),
   })
   .catchall(z.unknown());
 export type CodexThread = z.infer<typeof ThreadSchema>;
@@ -415,6 +418,59 @@ function stripTagsOutsideMarkdownCode(
 }
 
 /** Strip `<oai-mem-citation>` blocks outside markdown code spans/fences. */
+/**
+ * Convert Codex internal `:codex-file-citation{path="..."}` directives into
+ * plain markdown links (`[path](path)`). Directives inside markdown code
+ * fences/spans are left untouched. Malformed directives are dropped.
+ */
+export function convertCodexFileCitations(text: string): string {
+  if (!text || !text.includes(':codex-file-citation')) return text;
+  const lines = text.split('\n');
+  let fence: string | null = null;
+  let inSpan = false;
+  let spanBuf: string[] = [];
+  const out: string[] = [];
+  const convert = (raw: string): string =>
+    raw.replace(/:codex-file-citation\{([^}\r\n]*)\}/g, (_m, attrs: string) => {
+      const m = /path\s*=\s*"([^"\\\r\n]*)"/.exec(attrs) ?? /path\s*=\s*'([^'\\\r\n]*)'/.exec(attrs);
+      if (!m || !m[1]) return '';
+      const p = m[1];
+      return `[${p}](${p})`;
+    });
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const fenceMatch = /^\s*(```|~~~)/.exec(line);
+    if (fence && fenceMatch && line.trim().startsWith(fence)) {
+      fence = null;
+      out.push(line);
+      continue;
+    }
+    if (!fence && fenceMatch) {
+      fence = fenceMatch[1]!;
+      out.push(line);
+      continue;
+    }
+    if (fence) {
+      out.push(line);
+      continue;
+    }
+    // code span tracking on this line: split by ` and only convert outside spans
+    const parts = line.split('`');
+    const rendered: string[] = [];
+    for (let j = 0; j < parts.length; j++) {
+      if (j % 2 === 1) {
+        rendered.push(parts[j]!);
+      } else {
+        rendered.push(convert(parts[j]!));
+      }
+    }
+    out.push(rendered.join('`'));
+    inSpan = inSpan; // spans cannot span lines in commonmark; keep simple
+    spanBuf = spanBuf;
+  }
+  return out.join('\n');
+}
+
 export function stripCodexMemoryCitations(text: string): string {
   if (!text || !/oai-mem-citation/i.test(text)) return text;
   return stripTagsOutsideMarkdownCode(text, { systemTags: false, citations: true });
@@ -498,9 +554,31 @@ export function normalizeCodexThreadItem(rawItem: CodexThreadItem): CodexThreadI
       }
       break;
     }
+    case 'fileChange': {
+      // 离线历史浏览时没有 turn/diff/updated 终态事件;从 item.changes 逆向
+      // 构造标准 unified diff,让工具卡片展示真实改动而非空白。
+      if (Array.isArray(item.changes) && item.changes.length > 0 && !item.output && !item.result) {
+        const blocks: string[] = [];
+        for (const raw of item.changes as Array<Record<string, unknown>>) {
+          if (!raw || typeof raw.path !== 'string') continue;
+          const diffText = typeof raw.diff === 'string' ? raw.diff : '';
+          const kind = typeof raw.kind === 'string' ? raw.kind : 'modify';
+          const p = raw.path;
+          if (kind === 'add') {
+            blocks.push(`diff --git a/${p} b/${p}\nnew file mode 100644\n${diffText}`);
+          } else if (kind === 'delete') {
+            blocks.push(`diff --git a/${p} b/${p}\ndeleted file mode 100644\n${diffText}`);
+          } else {
+            blocks.push(`diff --git a/${p} b/${p}\n${diffText}`);
+          }
+        }
+        if (blocks.length > 0) item.output = blocks.join('\n');
+      }
+      break;
+    }
     case 'agentMessage': {
       if (typeof item.text === 'string') {
-        item.text = stripCodexSystemTags(item.text);
+        item.text = convertCodexFileCitations(stripCodexSystemTags(item.text));
       }
       break;
     }
@@ -662,6 +740,14 @@ export type CodexEvent =
       plan: Array<{ step: string; status: string }>;
     }
   | { type: 'diff-updated'; threadId: string; turnId: string; diff: string }
+  | {
+      /** turn 进行中的文件改动增量(item/fileChange/patchUpdated),早于终态 diff。 */
+      type: 'patch-updated';
+      threadId: string;
+      turnId: string;
+      itemId: string;
+      changes: Array<{ path: string; kind?: string; diff: string }>;
+    }
   | { type: 'item-started'; threadId: string; turnId: string; item: CodexThreadItem }
   | { type: 'item-completed'; threadId: string; turnId: string; item: CodexThreadItem }
   | {
@@ -1018,6 +1104,8 @@ export class CodexAdapter {
    * 否则一个废弃草稿线程会把回收永久钉死,CLI 锁又回不来。
    */
   private unpersistedThreads = new Map<string, number>();
+  /** thread.path 缓存(thread/start、thread/resume、thread/read 回包原生携带)。 */
+  private rolloutPathCache = new Map<string, string>();
 
   constructor(options: CodexAdapterOptions = {}) {
     this.opts = {
@@ -2201,6 +2289,30 @@ export class CodexAdapter {
         }
         break;
       }
+      case 'item/fileChange/patchUpdated': {
+        if (
+          typeof p.threadId === 'string' &&
+          typeof p.turnId === 'string' &&
+          typeof p.itemId === 'string' &&
+          Array.isArray(p.changes)
+        ) {
+          const changes = (p.changes as Array<Record<string, unknown>>)
+            .filter((c) => c && typeof c.path === 'string' && typeof c.diff === 'string')
+            .map((c) => ({
+              path: String(c.path),
+              ...(typeof c.kind === 'string' ? { kind: c.kind } : {}),
+              diff: String(c.diff),
+            }));
+          this.emit({
+            type: 'patch-updated',
+            threadId: p.threadId,
+            turnId: p.turnId,
+            itemId: p.itemId,
+            changes,
+          });
+        }
+        break;
+      }
       case 'turn/diff/updated': {
         if (
           typeof p.threadId === 'string' &&
@@ -2504,13 +2616,36 @@ export class CodexAdapter {
     }
   }
 
+  /** 缓存的 rollout 落盘路径(thread.path);未缓存返回 undefined。 */
+  getCachedRolloutPath(threadId: string): string | undefined {
+    return this.rolloutPathCache.get(threadId);
+  }
+
+  /**
+   * 定位 rollout 落盘文件:优先 thread.path 缓存(O(1)),未命中回退
+   * 目录扫描回调查找(默认 findCodexRollout 递归扫 ~/.codex/sessions)。
+   */
+  async locateRollout(threadId: string, fallback: (id: string) => Promise<string | null> = findCodexRollout): Promise<string | null> {
+    const cached = this.rolloutPathCache.get(threadId);
+    if (cached) {
+      // 缓存可能因文件被删/归档失效;命中但文件已不存在时回退扫描。
+      try {
+        if (fs.existsSync(cached)) return cached;
+      } catch { /* fall through */ }
+      this.rolloutPathCache.delete(threadId);
+    }
+    const found = await fallback(threadId);
+    if (found) this.rolloutPathCache.set(threadId, found);
+    return found;
+  }
+
   /** 未落盘线程保护 + 杀进程;文件检查是异步的,单独拆出来。 */
   private async guardUnpersistedThenKill(): Promise<void> {
     const now = Date.now();
     for (const [id, createdAt] of this.unpersistedThreads) {
       if (now - createdAt > CodexAdapter.UNPERSISTED_PROTECT_MS) {
         this.unpersistedThreads.delete(id); // 废弃草稿,放弃保护
-      } else if (await findCodexRollout(id)) {
+      } else if (await this.locateRollout(id)) {
         this.unpersistedThreads.delete(id); // 首个 turn 已落盘
       }
     }
@@ -2599,6 +2734,7 @@ export class CodexAdapter {
     });
     const parsed = ThreadStartResponseSchema.parse(raw);
     const thread = parsed.thread;
+    if (thread.path) this.rolloutPathCache.set(thread.id, thread.path);
     this.liveThreads.add(thread.id);
     this.unpersistedThreads.set(thread.id, Date.now());
     const effectiveModel = options.model ?? parsed.model ?? thread.model ?? undefined;
@@ -2645,6 +2781,7 @@ export class CodexAdapter {
     }
     const parsed = ThreadResumeResponseSchema.parse(raw);
     const thread = parsed.thread;
+    if (thread.path) this.rolloutPathCache.set(threadId, thread.path);
     this.liveThreads.add(threadId);
     const effectiveModel = options.model ?? parsed.model ?? thread.model ?? undefined;
     if (effectiveModel) this.threadModels.set(threadId, effectiveModel);
@@ -3028,13 +3165,25 @@ export class CodexAdapter {
     await this.connect();
     const items =
       typeof input === 'string' ? [{ type: 'text', text: input, text_elements: [] }] : input;
-    await this.withThreadRetry(threadId, () =>
+    const steer = () =>
       this.request('turn/steer', {
         threadId,
         expectedTurnId: turnId,
         input: items,
-      }),
-    );
+      });
+    await this.withThreadRetry(threadId, async () => {
+      try {
+        await steer();
+      } catch (err) {
+        // 长挂起的线程可能已不在活跃集(THREAD_NOT_FOUND):resume 后重试一次。
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/thread not found/i.test(msg)) throw err;
+        this.liveThreads.delete(threadId);
+        await this.resume(threadId).catch(() => undefined);
+        this.liveThreads.add(threadId);
+        await steer();
+      }
+    });
   }
 
   /**

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import os, { tmpdir } from 'node:os';
+import path, { join } from 'node:path';
 import test from 'node:test';
 import {
   CodexAdapter,
@@ -1681,4 +1681,118 @@ test('setCollaborationMode respects explicit model and reasoningEffort (includin
       },
     },
   });
+});
+
+// ---------------------------------------------------------------------------
+// codex-webui 借鉴回归(TDD 红→绿)
+// ---------------------------------------------------------------------------
+
+test('review regression: thread.path from thread/start is cached and reused without rescanning', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  let scans = 0;
+  const rolloutDir = join(tmpdir(), `codex-path-cache-${Date.now()}`);
+  await fs.promises.mkdir(join(rolloutDir, 'sessions', '2026', '11', '17'), { recursive: true });
+  const rolloutFile = join(rolloutDir, 'sessions', '2026', '11', '17', `rollout-2026-11-17T00-00-00-th-path-cache.jsonl`);
+  await fs.promises.writeFile(rolloutFile, '');
+  (adapter as any).request = async (method: string, params: Record<string, unknown>) => {
+    if (method === 'thread/start') {
+      return { thread: { id: 'th-path-cache', cwd: os.tmpdir(), path: rolloutFile } };
+    }
+    throw new Error(`unexpected ${method} ${JSON.stringify(params)}`);
+  };
+  try {
+    await adapter.create({ cwd: os.tmpdir() });
+    const cached = adapter.getCachedRolloutPath('th-path-cache');
+    assert.equal(cached, rolloutFile, 'thread.path must be cached from thread/start response');
+    const found = await adapter.locateRollout('th-path-cache', () => { scans++; return Promise.resolve(null as unknown as string); });
+    assert.equal(found, rolloutFile);
+    assert.equal(scans, 0, 'cache hit must not trigger a filesystem scan');
+    assert.equal(adapter.getCachedRolloutPath('unknown-thread'), undefined);
+  } finally {
+    await fs.promises.rm(rolloutDir, { recursive: true, force: true });
+    (adapter as any).handleProcessExit(null, 1, null);
+  }
+});
+
+test('review regression: item/fileChange/patchUpdated emits incremental diff event', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const events: CodexEvent[] = [];
+  adapter.onEvent((ev) => events.push(ev));
+  try {
+    (adapter as any).handleNotification('item/fileChange/patchUpdated', {
+      threadId: 'th',
+      turnId: 'turn-1',
+      itemId: 'item-1',
+      changes: [
+        { path: 'src/a.ts', kind: 'modify', diff: '--- a\n+++ b\n@@\n-x\n+y' },
+      ],
+    });
+    const patch = events.find((ev) => ev.type === 'patch-updated');
+    assert.ok(patch, 'patch-updated event must be emitted');
+    if (patch?.type === 'patch-updated') {
+      assert.equal(patch.threadId, 'th');
+      assert.equal(patch.turnId, 'turn-1');
+      assert.equal(patch.itemId, 'item-1');
+      assert.equal(patch.changes.length, 1);
+      assert.equal(patch.changes[0]?.path, 'src/a.ts');
+      assert.equal(patch.changes[0]?.diff, '--- a\n+++ b\n@@\n-x\n+y');
+    }
+  } finally {
+    (adapter as any).handleProcessExit(null, 1, null);
+  }
+});
+
+test('review regression: steer retries thread/resume once on thread not found', async () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const calls: string[] = [];
+  (adapter as any).request = async (method: string) => {
+    calls.push(method);
+    if (method === 'turn/steer') {
+      if (calls.filter((c) => c === 'turn/steer').length === 1) {
+        throw new Error("codex 'turn/steer' failed (-32001): THREAD_NOT_FOUND: thread not found");
+      }
+      return {};
+    }
+    return {};
+  };
+  try {
+    await adapter.steerTurn('th-steer', 'turn-1', 'hello');
+    assert.ok(calls.includes('thread/resume'), `expected a thread/resume retry, calls: ${JSON.stringify(calls)}`);
+    assert.equal(calls.filter((c) => c === 'turn/steer').length, 2);
+  } finally {
+    (adapter as any).handleProcessExit(null, 1, null);
+  }
+});
+
+test('review regression: codex file citations render as markdown links', async () => {
+  const { convertCodexFileCitations } = await import('./codex-adapter.js');
+  const out = convertCodexFileCitations('edit :codex-file-citation{path="src/a.ts"} done');
+  assert.equal(out, 'edit [src/a.ts](src/a.ts) done');
+  assert.equal(convertCodexFileCitations('plain'), 'plain');
+  const fence = '```\n:codex-file-citation{path="x"}\n```';
+  assert.equal(convertCodexFileCitations(fence), fence, 'citations inside code fences stay untouched');
+});
+
+test('review regression: history fileChange items render as unified diff output', async () => {
+  const { normalizeCodexThreadItem } = await import('./codex-adapter.js');
+  const item = normalizeCodexThreadItem({
+    id: 'item-fc',
+    type: 'fileChange',
+    status: 'completed',
+    call_id: 'call-fc',
+    changes: [
+      { path: 'src/a.ts', kind: 'modify', diff: '--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-x\n+y' },
+      { path: 'src/new.ts', kind: 'add', diff: '+++ b/src/new.ts\n@@ -0,0 +1 @@\n+hello' },
+    ],
+  });
+  assert.ok(item);
+  const out = item.output ?? item.result;
+  assert.equal(typeof out, 'string');
+  const text = out as string;
+  assert.ok(text.includes('diff --git a/src/a.ts b/src/a.ts'), `unified diff header missing: ${text.slice(0, 120)}`);
+  assert.ok(text.includes('diff --git a/src/new.ts b/src/new.ts'));
+  assert.ok(text.includes('+hello'));
 });
