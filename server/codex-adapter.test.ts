@@ -18,6 +18,133 @@ function stubTransport(adapter: CodexAdapter): void {
   (adapter as any).ensureLive = async () => undefined;
 }
 
+async function reviewRegressionBounded<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('review regression: timed out')), 5_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+for (const status of ['completed', 'failed', 'interrupted'] as const) {
+  test(`review regression: ${status} terminal after response is delivered exactly once`, async () => {
+    const adapter = new CodexAdapter();
+    stubTransport(adapter);
+    (adapter as any).request = async (method: string) => {
+      assert.equal(method, 'review/start');
+      return { turn: { id: 'review-turn', status: 'inProgress' }, reviewThreadId: 'th' };
+    };
+    try {
+      const handle = await reviewRegressionBounded(adapter.reviewTurn('th'));
+      (adapter as any).handleNotification('turn/completed', {
+        threadId: 'th', turn: { id: 'review-turn', status },
+      });
+      const events = await reviewRegressionBounded((async () => {
+        const result: CodexEvent[] = [];
+        for await (const event of handle.events) result.push(event);
+        return result;
+      })());
+      const terminals = events.filter((event) => event.type === 'turn-completed');
+      assert.equal(terminals.length, 1);
+      assert.equal(terminals[0]?.type === 'turn-completed' && terminals[0].turn.status, status);
+      assert.equal((adapter as any).turnQueues.size, 0);
+    } finally {
+      (adapter as any).handleProcessExit(null, 1, null);
+    }
+  });
+}
+
+for (const end of ['completed', 'disconnected'] as const) {
+  test(`review regression: ${end} before response cannot re-register a review queue`, async () => {
+    const adapter = new CodexAdapter();
+    stubTransport(adapter);
+    let releaseResponse!: (value: unknown) => void;
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+    const response = new Promise<unknown>((resolve) => { releaseResponse = resolve; });
+    (adapter as any).request = (method: string) => {
+      assert.equal(method, 'review/start');
+      requestStarted();
+      return response;
+    };
+    const pending = adapter.reviewTurn('th', { timeoutMs: 1_000 });
+    try {
+      await reviewRegressionBounded(started);
+      (adapter as any).handleNotification('turn/started', {
+        threadId: 'th', turn: { id: 'review-turn', status: 'inProgress' },
+      });
+      if (end === 'completed') {
+        (adapter as any).handleNotification('turn/completed', {
+          threadId: 'th', turn: { id: 'review-turn', status: 'completed' },
+        });
+      } else {
+        (adapter as any).readyPromise = Promise.resolve();
+        (adapter as any).handleProcessExit(null, 1, null);
+      }
+      releaseResponse({ turn: { id: 'review-turn', status: 'inProgress' }, reviewThreadId: 'th' });
+      if (end === 'completed') {
+        const handle = await reviewRegressionBounded(pending);
+        assert.equal((adapter as any).turnQueues.size, 0);
+        assert.equal((adapter as any).pendingTurnEvents.size, 0);
+        const events = await reviewRegressionBounded((async () => {
+          const result: CodexEvent[] = [];
+          for await (const event of handle.events) result.push(event);
+          return result;
+        })());
+        assert.equal(events.filter((event) => event.type === 'turn-completed').length, 1);
+      } else {
+        const outcome = await reviewRegressionBounded(pending.then(
+          (handle) => ({ handle }),
+          (error: unknown) => ({ error }),
+        ));
+        assert.equal((adapter as any).turnQueues.size, 0);
+        assert.equal((adapter as any).pendingTurnEvents.size, 0);
+        if ('error' in outcome) {
+          assert.match(String(outcome.error), /disconnected|exited|closed/);
+        } else {
+          await assert.rejects(reviewRegressionBounded((async () => {
+            for await (const _event of outcome.handle.events) { /* drain until failure */ }
+          })()), /disconnected|exited|closed/);
+        }
+      }
+    } finally {
+      releaseResponse({ turn: { id: 'review-turn', status: 'inProgress' }, reviewThreadId: 'th' });
+      (adapter as any).handleProcessExit(null, 1, null);
+      await reviewRegressionBounded(pending).catch(() => undefined);
+    }
+  });
+}
+
+for (const method of ['thread/start', 'thread/resume'] as const) {
+  test(`review regression: ${method} does not send unsupported top-level reasoningEffort`, async () => {
+    const adapter = new CodexAdapter();
+    stubTransport(adapter);
+    let sent: Record<string, unknown> | undefined;
+    (adapter as any).request = async (actual: string, params: Record<string, unknown>) => {
+      assert.equal(actual, method);
+      sent = params;
+      return { thread: { id: 'th' }, reasoningEffort: 'medium' };
+    };
+    try {
+      if (method === 'thread/start') {
+        await reviewRegressionBounded(adapter.create({ cwd: os.tmpdir() }));
+      } else {
+        await reviewRegressionBounded(adapter.resume('th', {}));
+      }
+      assert.ok(sent);
+      assert.equal(Object.prototype.hasOwnProperty.call(sent, 'reasoningEffort'), false);
+    } finally {
+      (adapter as any).handleProcessExit(null, 1, null);
+    }
+  });
+}
+
 test('routes same-chunk turn events after startTurn registration, preserving order', async () => {
   // 回归:readline 同一 chunk 内"响应行之后"的通知行到达时 queue 还没注册
   // (注册在响应 Promise 的多个 continuation 之后),直接路由会静默丢掉;
@@ -1142,46 +1269,54 @@ test('handleNotification maps plan, diff, goal/cleared, thread/reverted, summary
   for await (const _ of h.events) { /* drain */ }
 });
 
-test('live smoke test against installed @openai/codex 0.169.0 binary when present', async (t) => {
-  const candidates = [
-    process.env.CODEX_LIVE_BIN,
-    '/tmp/codex-survey.LoV5Nh/stable/package/vendor/x86_64-unknown-linux-musl/bin/codex',
-    path.join(os.homedir(), '.local', 'bin', 'codex'),
-    ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, 'codex')),
-  ].filter((p): p is string => Boolean(p));
-  const codex0169Bin = candidates.find((p) => fs.existsSync(p));
-  if (!codex0169Bin) {
-    t.skip('0.169.0 codex binary not found');
-    return;
-  }
+test(
+  'live smoke test against installed @openai/codex 0.169.0 binary when present',
+  { timeout: 30_000 },
+  async (t) => {
+    if (process.env.GATEWAY_LIVE_CLI_TESTS !== '1') {
+      t.skip('live CLI tests disabled (set GATEWAY_LIVE_CLI_TESTS=1 to run)');
+      return;
+    }
+    const candidates = [
+      process.env.CODEX_LIVE_BIN,
+      '/tmp/codex-survey.LoV5Nh/stable/package/vendor/x86_64-unknown-linux-musl/bin/codex',
+      path.join(os.homedir(), '.local', 'bin', 'codex'),
+      ...(process.env.PATH ?? '').split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, 'codex')),
+    ].filter((p): p is string => Boolean(p));
+    const codex0169Bin = candidates.find((p) => fs.existsSync(p));
+    if (!codex0169Bin) {
+      t.skip('0.169.0 codex binary not found');
+      return;
+    }
 
-  const tmpCodexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-m10-smoke-'));
-  const adapter = new CodexAdapter({
-    codexPath: codex0169Bin,
-    env: { CODEX_HOME: tmpCodexHome },
-  });
+    const tmpCodexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-m10-smoke-'));
+    const adapter = new CodexAdapter({
+      codexPath: codex0169Bin,
+      env: { CODEX_HOME: tmpCodexHome },
+    });
 
-  try {
-    await adapter.connect();
+    try {
+      await adapter.connect();
 
-    const thread = await adapter.create({ cwd: tmpCodexHome });
-    assert.ok(thread.id.length > 0);
-    assert.equal(thread.historyMode, 'paginated');
+      const thread = await adapter.create({ cwd: tmpCodexHome });
+      assert.ok(thread.id.length > 0);
+      assert.equal(thread.historyMode, 'paginated');
 
-    // Unmaterialized new 0.169 thread should cleanly return empty history even on repeated reads
-    const history = await adapter.getHistory(thread.id);
-    assert.deepEqual(history, []);
-    await new Promise((r) => setTimeout(r, 250));
-    assert.deepEqual(await adapter.getHistory(thread.id), []);
+      // Unmaterialized new 0.169 thread should cleanly return empty history even on repeated reads
+      const history = await adapter.getHistory(thread.id);
+      assert.deepEqual(history, []);
+      await new Promise((r) => setTimeout(r, 250));
+      assert.deepEqual(await adapter.getHistory(thread.id), []);
 
-    // Skills list should succeed against 0.169 app-server
-    const skills = await adapter.listSkills({ cwd: tmpCodexHome });
-    assert.ok(Array.isArray(skills));
-  } finally {
-    await adapter.close();
-    fs.rmSync(tmpCodexHome, { recursive: true, force: true });
-  }
-});
+      // Skills list should succeed against 0.169 app-server
+      const skills = await adapter.listSkills({ cwd: tmpCodexHome });
+      assert.ok(Array.isArray(skills));
+    } finally {
+      await adapter.close();
+      fs.rmSync(tmpCodexHome, { recursive: true, force: true });
+    }
+  },
+);
 
 test('revert and rollback map real 0.169.0 legacy/ephemeral thread/revert errors to 400 unsupported', async () => {
   const adapter = new CodexAdapter();

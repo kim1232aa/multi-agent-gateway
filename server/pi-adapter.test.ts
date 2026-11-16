@@ -232,6 +232,8 @@ while True:
         else:
             thinking_level = req_lvl
         send({"id": cid, "type": "response", "command": "set_thinking_level", "success": True})
+    elif ctype == "review_wait":
+        continue
     elif ctype == "get_commands":
         send({
             "id": cid,
@@ -2064,6 +2066,7 @@ test('exposes Pi builtin extension commands (mcp/llama) and Web UI RPC helpers (
     assert.equal(await adapter.getAutoCompaction(s.id), true);
     assert.equal(await adapter.setAutoCompaction(s.id, false), false);
     assert.equal(await adapter.getAutoCompaction(s.id), false);
+    await (adapter as unknown as { inner: { ensureSessionProcess(id: string): Promise<unknown> } }).inner.ensureSessionProcess(s.id);
     assert.equal(await adapter.getLastAssistantText(s.id), 'Pi last reply');
     const tree = await adapter.getSessionTree(s.id);
     assert.equal(tree?.leafId, 'e2');
@@ -2809,3 +2812,165 @@ for raw in sys.stdin:
   }
 });
 
+
+test('review regression: fork without an entry clones the full active branch', async () => {
+  const adapter = new PiAdapter({ sessionsDir: join(tmpdir(), 'unused-review-sessions') });
+  const calls: Array<{ mode: string; entryId?: string }> = [];
+  const expected = { sessionId: 'new-session' };
+  (adapter as any).cloneOrForkIsolated = async (_sessionId: string, mode: string, entryId?: string) => {
+    calls.push({ mode, entryId });
+    return expected;
+  };
+  assert.equal(await adapter.fork('source-session'), expected);
+  assert.equal(await adapter.fork('source-session', 'u1'), expected);
+  assert.deepEqual(calls, [
+    { mode: 'clone', entryId: undefined },
+    { mode: 'fork', entryId: 'u1' },
+  ]);
+});
+
+test('review regression: offline rename preserves history when the final entry exceeds 64 KiB', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-rename-long-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '11111111-1111-4111-8111-111111111111';
+  let adapter: PiAdapter | undefined;
+  try {
+    const { bin } = await writeContractFakePi(base);
+    adapter = new PiAdapter({ piBin: bin, sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-11-15T00:00:01.000Z', message: { role: 'user', content: [{ type: 'text', text: 'hello' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-11-15T00:00:02.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(65 * 1024) }] } }),
+    ].join('\n') + '\n');
+    const before = await adapter.getHistory(sid);
+    assert.equal(before.length, 2);
+    await adapter.setSessionName(sid, 'Renamed');
+    assert.deepEqual(await adapter.getHistory(sid), before);
+    const reopened = new PiAdapter({ piBin: bin, sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+    try {
+      assert.equal((await reopened.getState(sid)).sessionName, 'Renamed');
+      assert.deepEqual(await reopened.getHistory(sid), before);
+    } finally {
+      await reopened.dispose();
+    }
+  } finally {
+    await adapter?.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: failed offline rename rejects without caching the new title', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-rename-fail-'));
+  const adapter = new PiProviderAdapter({ sessionsDir: base, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const session = await adapter.create({ provider: 'pi', cwd: base, title: 'Original' });
+    const inner = (adapter as any).inner as PiAdapter;
+    (inner as any).locateSessionFile = async () => base;
+    await assert.rejects(adapter.rename(session.id, 'Not saved'));
+    assert.equal(inner.getCachedSessionName(session.id), 'Original');
+    assert.equal((adapter as any).renames.has(session.id), false);
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: RPC framing overflow rejects pending requests and fails the active turn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-framing-'));
+  let adapter: PiAdapter | undefined;
+  try {
+    const { bin } = await writeContractFakePi(base);
+    adapter = new PiAdapter({
+      piBin: bin,
+      sessionsDir: join(base, 'sessions'),
+      env: { HOME: base, PI_CODING_AGENT_DIR: base, FAKE_PI_MODE: 'wait_for_abort' },
+      recycleGraceMs: 0,
+      requestTimeoutMs: 5_000,
+    });
+    const { sessionId } = adapter.create(base);
+    const turn = await adapter.startTurn(sessionId, 'hold');
+    const client = (adapter as any).processes.get(sessionId) as PiRpcClient;
+    (client as any).framer = new JsonlLineFramer(1024);
+    const pending = client.request({ type: 'review_wait' }).then(
+      () => 'resolved',
+      () => 'rejected',
+    );
+    const events = drainEvents(turn);
+    (client as any).child.stdout.emit('data', Buffer.alloc(1025, 'x'));
+    const outcome = await Promise.race([
+      Promise.all([pending, events]).then(([request, turnEvents]) => ({ request, turnEvents })),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
+    ]);
+    assert.ok(outcome, 'framing failure must settle the request and turn promptly');
+    assert.equal(outcome.request, 'rejected');
+    assert.ok(outcome.turnEvents.some((event) => event.kind === 'turn' && event.status === 'failed'));
+    assert.equal(client.isAlive, false);
+  } finally {
+    await adapter?.dispose().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: failed auto-compaction application remains retryable', async () => {
+  const adapter = new PiAdapter({ sessionsDir: join(tmpdir(), 'unused-review-sessions') });
+  const sessionId = 'review-compaction';
+  (adapter as any).sessionAutoCompaction.set(sessionId, false);
+  let attempts = 0;
+  let enabled = true;
+  const client = {
+    async request(command: { type: string; enabled?: boolean }) {
+      if (command.type === 'set_auto_compaction') {
+        attempts++;
+        if (attempts === 1) throw new Error('temporary RPC failure');
+        enabled = command.enabled!;
+      }
+      return { autoCompactionEnabled: enabled };
+    },
+  };
+  const sync = (initial?: { autoCompactionEnabled: boolean }) =>
+    (adapter as any).syncSessionPreferencesToClient(client, sessionId, initial) as Promise<void>;
+  await sync({ autoCompactionEnabled: true }).catch(() => undefined);
+  await sync();
+  assert.equal(attempts, 2);
+  assert.equal(enabled, false);
+});
+
+test('review regression: capacity counts a starting session only once', async () => {
+  const adapter = new PiAdapter({ sessionsDir: join(tmpdir(), 'unused-review-sessions'), maxLiveProcesses: 2 });
+  const inner = adapter as any;
+  const sessionId = 'review-starting';
+  inner.processes.set(sessionId, { isAlive: true, hasPendingRequests: () => false });
+  inner.startingSessions.add(sessionId);
+  await inner.evictOldestIdleProcessIfNeeded('review-clone', true);
+  assert.equal(inner.processes.has(sessionId), true);
+});
+
+test('review regression: same-cwd metadata commands reuse the live session', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-cwd-'));
+  const adapter = new PiAdapter({ sessionsDir: join(base, 'sessions'), env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const { sessionId } = adapter.create(base);
+    const commands = [{ name: 'skill:local', description: 'Local', source: 'skill' }];
+    let requests = 0;
+    const inner = adapter as any;
+    inner.processes.set(sessionId, {
+      isAlive: true,
+      request: async (command: { type: string }) => {
+        assert.equal(command.type, 'get_commands');
+        requests++;
+        return { commands };
+      },
+    });
+    inner.runEphemeralRpc = async () => { throw new Error('unexpected ephemeral process'); };
+    assert.deepEqual(await adapter.getCommands(sessionId, base), commands);
+    assert.equal(requests, 1);
+    inner.processes.delete(sessionId);
+  } finally {
+    (adapter as any).processes.clear();
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});

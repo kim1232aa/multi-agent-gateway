@@ -14,6 +14,107 @@ import {
   resolveClaudeBin,
   type ClaudeAdapterEvent,
 } from './claude-adapter.js';
+import { ClaudeProviderAdapter } from './facade.js';
+
+test('review regression: array history sanitizes tags and parses local commands', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'claude-review-regression-'));
+  const projectsDir = join(base, 'projects');
+  const projectDir = join(projectsDir, 'project');
+  const sessionId = '11111111-1111-4111-8111-999999999999';
+  const text = (value: string) => [{ type: 'text', text: value }];
+  const entries = [
+    { role: 'user', content: text('Check:\n<pasted_content id="1">\nconst a = 1;\n</pasted_content id="1">') },
+    { role: 'user', content: text('<local-command-caveat>ignore this</local-command-caveat>') },
+    { role: 'user', content: text('<command-name>/context</command-name><command-args>detail</command-args>') },
+    { role: 'user', content: text('<local-command-stdout>Context output</local-command-stdout>') },
+    { role: 'user', content: text('<bash-input>echo hi</bash-input>') },
+    { role: 'user', content: text('<bash-stdout>hi</bash-stdout>') },
+    { role: 'assistant', content: [
+      { type: 'text', text: 'Before' },
+      { type: 'thinking', thinking: 'reason' },
+      { type: 'text', text: 'After' },
+    ] },
+  ];
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, `${sessionId}.jsonl`), entries.map((entry, index) => JSON.stringify({
+      type: entry.role,
+      uuid: `entry-${index}`,
+      parentUuid: index ? `entry-${index - 1}` : null,
+      message: entry,
+    })).join('\n') + '\n');
+
+    const adapter = new ClaudeProviderAdapter({ projectsDir, settingsPath: join(base, 'settings.json') });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let history: Awaited<ReturnType<typeof adapter.getHistory>>;
+    try {
+      history = await Promise.race([
+        adapter.getHistory(sessionId),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('history timed out')), 1_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(history.length, 6);
+    assert.deepEqual(history.slice(0, 3).map((message) => ({ role: message.role, content: message.content })), [
+      { role: 'user', content: [{ type: 'text', text: 'Check:\nconst a = 1;' }] },
+      { role: 'user', content: [{ type: 'text', text: '/context detail' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'Context output' }] },
+    ]);
+    assert.equal(history[3]?.role, 'assistant');
+    assert.equal(history[3]?.content[0]?.type, 'tool_use');
+    assert.deepEqual((history[3]?.content[0] as any).input, { command: 'echo hi' });
+    assert.equal(history[4]?.role, 'tool');
+    assert.equal(history[4]?.content[0]?.type, 'tool_result');
+    assert.equal((history[4]?.content[0] as any).output, 'hi');
+    assert.deepEqual(history[5]?.content, [
+      { type: 'text', text: 'Before' },
+      { type: 'thinking', thinking: 'reason' },
+      { type: 'text', text: 'After' },
+    ]);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: array history retains mixed assistant text and thinking in order', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'claude-review-mixed-'));
+  const projectsDir = join(base, 'projects');
+  const projectDir = join(projectsDir, 'project');
+  const sessionId = '11111111-1111-4111-8111-999999999998';
+  try {
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, `${sessionId}.jsonl`), JSON.stringify({
+      type: 'assistant', uuid: 'a1', parentUuid: null,
+      message: { role: 'assistant', content: [
+        { type: 'text', text: 'Before' },
+        { type: 'thinking', thinking: 'reason' },
+        { type: 'text', text: 'After' },
+      ] },
+    }) + '\n');
+    const adapter = new ClaudeProviderAdapter({ projectsDir, settingsPath: join(base, 'settings.json') });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const history = await Promise.race([
+        adapter.getHistory(sessionId),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('history timed out')), 1_000);
+        }),
+      ]);
+      assert.deepEqual(history[0]?.content, [
+        { type: 'text', text: 'Before' },
+        { type: 'thinking', thinking: 'reason' },
+        { type: 'text', text: 'After' },
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
 
 test('rejects traversal session ids before reading transcript paths', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-adapter-'));
@@ -1722,7 +1823,10 @@ const LIVE_21325_BIN = process.env.CLAUDE_LIVE_BIN
 
 test(
   'live unauthenticated 2.1.325 initialize handshake exposes dynamic models, commands, and mcpStatus',
-  { skip: !existsSync(LIVE_21325_BIN) },
+  {
+    skip: process.env.GATEWAY_LIVE_CLI_TESTS !== '1' || !existsSync(LIVE_21325_BIN),
+    timeout: 30_000,
+  },
   async () => {
     const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-live-21325-'));
     try {

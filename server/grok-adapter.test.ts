@@ -17,6 +17,7 @@ import {
   discoverGrokDiskSkills,
   isKnownGrokReasoningModel,
 } from './grok-adapter.js';
+import { GrokAcpClient } from './grok-acp.js';
 import { ProviderError } from './types.js';
 
 async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: string; stdinLog: string }> {
@@ -995,7 +996,10 @@ const LIVE_GROK_BIN = process.env.GROK_LIVE_BIN
     ? '/tmp/grok-survey-80NQ6R/bin-1.0.77/grok'
     : resolveGrokBin());
 
-test('live 1.0.77 binary speaks the ACP surface this adapter targets', { skip: !existsSync(LIVE_GROK_BIN) }, async () => {
+test('live 1.0.77 binary speaks the ACP surface this adapter targets', {
+  skip: process.env.GATEWAY_LIVE_CLI_TESTS !== '1' || !existsSync(LIVE_GROK_BIN),
+  timeout: 30_000,
+}, async () => {
   const home = await mkdtemp(join(tmpdir(), 'multi-agent-grok-live-'));
   const child = spawn(LIVE_GROK_BIN, ['agent', 'stdio'], {
     cwd: home,
@@ -1739,7 +1743,7 @@ test('non-grok ACP model with empty reasoningEfforts does not inherit GROK_EFFOR
     assert.ok(geminiModel);
     assert.equal(geminiModel.support_efforts, undefined);
     assert.equal(geminiModel.default_effort, undefined);
-    assert.equal(geminiFromFallback, undefined);
+    assert.equal(geminiFromFallback?.support_efforts, undefined);
 
     await adapter.setThinking('sess-1', 'low');
     await adapter.setThinking('sess-1', 'auto');
@@ -1911,3 +1915,202 @@ test('GrokProviderAdapter hides zero-turn seed-only (session) directories and ex
 
 
 
+
+
+test('review regression: tool snapshot replacements flag outputMode replace', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-review-snapshot-'));
+  const adapter = new GrokProviderAdapter({ grokBin: join(base, 'grok'), sessionsDir: base });
+  try {
+    const events: any[] = [];
+    const stream = { push: (event: any) => events.push(event) };
+    for (const rawOutput of ['abc', 'abcdef', 'xyz']) {
+      (adapter as any).mapAcpEvent('session', 'turn', stream, {
+        type: 'tool_call_update', sessionId: 'session', toolCallId: 'tool', status: 'in_progress', rawOutput,
+      });
+    }
+    assert.equal(events[0].payload.output, 'abc');
+    assert.equal(events[0].payload.outputMode, 'replace');
+    assert.equal(events[1].payload.output, 'def');
+    assert.equal(events[1].payload.outputMode, undefined);
+    assert.equal(events[2].payload.output, 'xyz');
+    assert.equal(events[2].payload.outputMode, 'replace');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: terminal tool update retains omitted output', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-review-terminal-'));
+  const adapter = new GrokProviderAdapter({ grokBin: join(base, 'grok'), sessionsDir: base });
+  try {
+    const events: any[] = [];
+    const stream = { push: (event: any) => events.push(event) };
+    (adapter as any).mapAcpEvent('session', 'turn', stream, {
+      type: 'tool_call_update', sessionId: 'session', toolCallId: 'tool', status: 'in_progress', rawOutput: 'partial output',
+    });
+    (adapter as any).mapAcpEvent('session', 'turn', stream, {
+      type: 'tool_call_update', sessionId: 'session', toolCallId: 'tool', status: 'completed',
+    });
+    assert.equal(events[1].status, 'completed');
+    assert.equal(events[1].payload.output, 'partial output');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+for (const outcome of ['cancelled', 'error'] as const) {
+  test(`review regression: ${outcome} turn clears only its tool snapshots`, async () => {
+    const base = await mkdtemp(join(tmpdir(), 'grok-review-cleanup-'));
+    const adapter = new GrokProviderAdapter({ grokBin: join(base, 'grok'), sessionsDir: base });
+    try {
+      let listener: (event: unknown) => void = () => undefined;
+      const client = {
+        onEvent: (handler: (event: unknown) => void) => { listener = handler; return () => undefined; },
+        sessionNew: async () => ({ sessionId: 'session' }),
+        sessionSetMode: async () => undefined,
+        getConfigOptions: () => undefined,
+        sessionPrompt: async () => {
+          listener({ type: 'tool_call_update', sessionId: 'session', toolCallId: 'tool', status: 'in_progress', rawOutput: 'unfinished' });
+          if (outcome === 'error') throw new Error('disconnected');
+          return { stopReason: 'cancelled' };
+        },
+        cancelSessionPending: () => undefined,
+      };
+      const snapshots = (adapter as any).toolOutputSnapshots as Map<string, string>;
+      snapshots.set('other:tool', 'other output');
+      const run = (adapter as any).runAcpTurn(client, {
+        sessionId: 'session', turnId: 'turn', prompt: 'test', cwd: base, isNew: true,
+        plan: false, yolo: false, stream: { push: () => undefined, end: () => undefined }, emit: () => undefined,
+      });
+      if (outcome === 'error') await assert.rejects(run, /disconnected/);
+      else await run;
+      assert.equal(snapshots.has('session:tool'), false);
+      assert.equal(snapshots.get('other:tool'), 'other output');
+    } finally {
+      await adapter.dispose();
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+}
+
+test('review regression: reject selects reject_once ahead of reject_always', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-review-reject-'));
+  const adapter = new GrokProviderAdapter({ grokBin: join(base, 'grok'), sessionsDir: base });
+  try {
+    let selected: string | undefined;
+    const client = {
+      ready: true,
+      getPendingPermission: () => ({ id: 42, sessionId: 'session', options: [
+        { optionId: 'persistent', kind: 'reject_always' },
+        { optionId: 'one-time', kind: 'reject_once' },
+      ] }),
+      resolvePermission: (_id: number, optionId: string) => { selected = optionId; },
+      close: async () => undefined,
+    };
+    (adapter as any).acpClients.set(false, client);
+    await adapter.resolveApproval('session', '42', 'reject');
+    assert.equal(selected, 'one-time');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: initial catalog includes CLI-only and ACP-only models', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-review-model-union-'));
+  const adapter = new GrokProviderAdapter({ grokBin: join(base, 'grok'), sessionsDir: base });
+  try {
+    const client = {
+      ready: true,
+      modelState: { currentModelId: 'acp-model', availableModels: [{ modelId: 'acp-model', supportsReasoningEffort: false }] },
+      close: async () => undefined,
+    };
+    (adapter as any).acpClients.set(false, client);
+    (adapter as any).inner.listModels = async () => ({ defaultModel: 'cli-model', models: ['cli-model'] });
+    const models = await adapter.listModels();
+    assert.ok(models.some((model) => model.model === 'cli-model'));
+    const acpModel = models.find((model) => model.model === 'acp-model');
+    assert.ok(acpModel);
+    assert.equal(acpModel.support_efforts, undefined);
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: expired CLI model cache is refreshed alongside live ACP models', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-review-model-expiry-'));
+  const adapter = new GrokProviderAdapter({ grokBin: join(base, 'grok'), sessionsDir: base });
+  try {
+    const client = {
+      ready: true,
+      modelState: { currentModelId: 'acp-model', availableModels: [{ modelId: 'acp-model' }] },
+      close: async () => undefined,
+    };
+    (adapter as any).acpClients.set(false, client);
+    const old = { defaultModel: 'old-model', models: ['old-model'] };
+    (adapter as any).lastCliModels = old;
+    (adapter as any).inner.modelsCache = { ts: Date.now() - 10 * 60_000, value: old };
+    let calls = 0;
+    (adapter as any).inner.listModels = async () => {
+      calls++;
+      return { defaultModel: 'new-model', models: ['new-model'] };
+    };
+    const models = await adapter.listModels();
+    assert.equal(calls, 1);
+    assert.ok(models.some((model) => model.model === 'new-model'));
+    assert.ok(models.some((model) => model.model === 'acp-model'));
+    assert.equal(models.some((model) => model.model === 'old-model'), false);
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: group escalation delivers SIGKILL when group survives leader exit', async () => {
+  const adapter = new GrokProviderAdapter();
+  try {
+    const killedSignals: string[] = [];
+    let groupAlive = true;
+    const fakeChild: any = {
+      pid: 99999,
+      exitCode: null,
+      signalCode: null,
+      kill: (sig: string) => { killedSignals.push(sig); },
+      once: () => undefined,
+      stdin: { destroyed: false, write: () => true },
+    };
+    const origKill = process.kill;
+    (process as any).kill = (pid: number, signal?: string | number) => {
+      if (pid === -99999) {
+        if (signal === 0) {
+          if (!groupAlive) throw new Error('ESRCH');
+          return true;
+        }
+        killedSignals.push(String(signal));
+        return true;
+      }
+      return (origKill as any).call(process, pid, signal);
+    };
+    try {
+      const client = new GrokAcpClient({ grokBin: 'grok' });
+      (client as any).child = fakeChild;
+      (client as any).connected = true;
+
+      const closePromise = client.close();
+      // Simulate leader exiting after SIGTERM while background descendants stay alive.
+      fakeChild.exitCode = 0;
+      await new Promise((resolve) => setTimeout(resolve, 3100));
+      assert.ok(killedSignals.includes('SIGKILL'), `expected SIGKILL escalation, got: ${JSON.stringify(killedSignals)}`);
+      // Simulate group finally dying on SIGKILL so close cleans up without hanging.
+      groupAlive = false;
+      await closePromise;
+    } finally {
+      process.kill = origKill;
+    }
+  } finally {
+    await adapter.dispose();
+  }
+});

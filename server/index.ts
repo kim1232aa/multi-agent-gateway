@@ -75,7 +75,10 @@ if (web) {
   console.log(`Kimi Web baseline: ${baseline}, injection=${web.injectionEnabled ? 'enabled' : `disabled (${web.reason})`}`);
 }
 
+let shuttingDown = false;
 const shutdown = (): void => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   // 兜底:close 内部任何一步挂住都不能拖死进程,5s 后硬退。
   const hardExit = setTimeout(() => process.exit(0), 5_000);
   hardExit.unref?.();

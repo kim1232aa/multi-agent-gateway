@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { createConnection } from 'node:net';
@@ -13,7 +15,7 @@ import { activeKimiTier1Names, detectAvailableProviders, executeCodexCommand, fo
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
 
-function fakeAdapter(name: 'claude' | 'codex' | 'grok' | 'pi'): ProviderAdapter {
+function fakeAdapter(name: 'claude' | 'codex' | 'grok' | 'pi' | 'dsh'): ProviderAdapter {
   const session: Session = {
     id: `${name}-native`, workspace_id: '', title: `${name} test`, created_at: new Date(0).toISOString(), updated_at: new Date().toISOString(), busy: false, metadata: { cwd: '/tmp' }, provider: name,
   };
@@ -5215,3 +5217,330 @@ test('gateway filters empty (session) placeholders, dedupes :activate skill chip
   }
 });
 
+
+async function reviewRegressionFixture(options: {
+  kimi?: 'off' | { upstream: string; token: string };
+  adapters?: Partial<Record<'claude' | 'codex' | 'grok' | 'pi' | 'dsh', ProviderAdapter>>;
+} = {}) {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'gw-review-regression-'));
+  const adapters = {
+    claude: fakeAdapter('claude'),
+    codex: fakeAdapter('codex'),
+    grok: fakeAdapter('grok'),
+    pi: fakeAdapter('pi'),
+    dsh: fakeAdapter('dsh'),
+    ...options.adapters,
+  };
+  try {
+    const gateway = await startGateway({
+      port: 0,
+      token: 'review-token',
+      kimi: options.kimi ?? 'off',
+      settingsDir,
+      codex: adapters.codex as any,
+      claude: adapters.claude as any,
+      grok: adapters.grok as any,
+      pi: adapters.pi as any,
+      dsh: adapters.dsh as any,
+      availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi', 'dsh'],
+    });
+    const request = (path: string, method = 'GET', body?: unknown) => fetch(`${gateway.url}/api/v1${path}`, {
+      method,
+      headers: { authorization: 'Bearer review-token', ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    return {
+      gateway, adapters, request, settingsDir,
+      close: async () => {
+        try { await gateway.close(); } finally { await rm(settingsDir, { recursive: true, force: true }); }
+      },
+    };
+  } catch (err) {
+    await rm(settingsDir, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+for (const name of ['status', 'help', 'diff', 'skills']) {
+  test(`review regression: DSH builtin /${name} activation executes without skill expansion`, async () => {
+    const dsh = fakeAdapter('dsh');
+    dsh.getHistory = async () => [];
+    dsh.getCwd = () => undefined;
+    dsh.listCommands = async () => ['status', 'help', 'diff', 'skills'].map((command) => ({ name: command, description: `${command} command`, kind: 'prompt', builtin: true }));
+    let providerPrompts = 0;
+    dsh.startTurn = async () => { providerPrompts++; throw new Error('builtin sent to provider'); };
+    const fixture = await reviewRegressionFixture({ adapters: { dsh } });
+    try {
+      const response = await fixture.request(`/sessions/dsh_dsh-native/skills/${name}:activate`, 'POST', {});
+      assert.equal(response.status, 200);
+      assert.equal((await response.json() as any).data.activated, true);
+      const transcript = await fixture.request('/sessions/dsh_dsh-native/transcript?agent_id=main&page_size=20');
+      const turns = ((await transcript.json()) as any).data.items;
+      const turn = turns.find((item: any) => item.prompt === `/${name}`);
+      assert.ok(turn, `/${name} must produce a gateway command turn`);
+      const text = String(turn.steps?.[0]?.frames?.[0]?.text ?? '');
+      const expected: Record<string, RegExp> = {
+        status: /DSH 会话状态/,
+        help: /dsh Web UI 可用命令/,
+        diff: /工作目录/,
+        skills: /dsh 可用命令与技能/,
+      };
+      assert.match(text, expected[name]);
+      assert.equal(providerPrompts, 0);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test('review regression: DSH rejects a client supplied arbitrary skill path before file IO or prompt', async () => {
+  const dsh = fakeAdapter('dsh');
+  dsh.listCommands = async () => [];
+  dsh.listSkills = async () => [];
+  let providerPrompts = 0;
+  dsh.startTurn = async () => { providerPrompts++; throw new Error('unexpected provider prompt'); };
+  const fixture = await reviewRegressionFixture({ adapters: { dsh } });
+  const arbitraryPath = join(fixture.settingsDir, 'unregistered-skill.md');
+  let attemptedRead = false;
+  const originalReadFileSync = fs.readFileSync;
+  try {
+    fs.readFileSync = ((path: unknown, ...args: unknown[]) => {
+      if (String(path) === arbitraryPath) {
+        attemptedRead = true;
+        throw new Error('arbitrary skill path must not be read');
+      }
+      return (originalReadFileSync as any)(path, ...args);
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    const response = await fixture.request('/sessions/dsh_dsh-native/skills/unregistered:activate', 'POST', { path: arbitraryPath });
+    assert.equal(response.status, 400);
+    assert.equal(attemptedRead, false);
+    assert.equal(providerPrompts, 0);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    syncBuiltinESMExports();
+    await fixture.close();
+  }
+});
+
+test('review regression: Kimi wd_ trust is forwarded and local provider trust stays local', async () => {
+  const seen: Array<{ method: string; url: string; body: string }> = [];
+  const upstream = await listen(createServer((req, res) => {
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      seen.push({ method: req.method ?? '', url: req.url ?? '', body });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(envelope({ trusted: false, upstream: true }));
+    });
+  }));
+  let fixture: Awaited<ReturnType<typeof reviewRegressionFixture>> | undefined;
+  try {
+    fixture = await reviewRegressionFixture({ kimi: { upstream: upstream.url, token: 'upstream-token' } });
+    for (const query of ['', '?provider=kimi']) {
+      for (const method of ['GET', 'POST']) {
+        const body = method === 'POST' ? { marker: 'forward-unchanged' } : undefined;
+        const response = await fixture.request(`/workspaces/wd_kimi_123/trust${query}`, method, body);
+        assert.deepEqual((await response.json() as any).data, { trusted: false, upstream: true });
+        assert.ok(seen.some((entry) => entry.method === method && entry.url === '/api/v1/workspaces/wd_kimi_123/trust' && entry.body === (body ? JSON.stringify(body) : '')));
+      }
+    }
+    const upstreamCount = seen.filter((entry) => entry.url.includes('/trust')).length;
+    for (const method of ['GET', 'POST']) {
+      const response = await fixture.request('/workspaces/wd_local_123/trust?provider=claude', method, method === 'POST' ? {} : undefined);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json() as any).data.trusted, true);
+    }
+    assert.equal(seen.filter((entry) => entry.url.includes('/trust')).length, upstreamCount);
+  } finally {
+    try { await fixture?.close(); } finally { await upstream.close(); }
+  }
+});
+
+test('review regression: authenticated external directory browse does not enumerate provider sessions', async () => {
+  const external = await mkdtemp(join(tmpdir(), 'gw-review-external-'));
+  let fixture: Awaited<ReturnType<typeof reviewRegressionFixture>> | undefined;
+  try {
+    await mkdir(join(external, 'child'));
+    fixture = await reviewRegressionFixture();
+    let listCalls = 0;
+    for (const adapter of Object.values(fixture.adapters)) {
+      adapter.list = async () => { listCalls++; throw new Error('directory browse must not list sessions'); };
+    }
+    const unauthenticated = await fetch(`${fixture.gateway.url}/api/v1/fs:browse?provider=claude&path=${encodeURIComponent(external)}`);
+    assert.equal(unauthenticated.status, 401);
+    for (const target of [external, join(external, 'child')]) {
+      const response = await fixture.request(`/fs:browse?provider=claude&path=${encodeURIComponent(target)}`);
+      assert.equal(response.status, 200);
+      assert.equal((await response.json() as any).data.path, target);
+    }
+    assert.equal(listCalls, 0);
+  } finally {
+    try { await fixture?.close(); } finally { await rm(external, { recursive: true, force: true }); }
+  }
+});
+
+for (const [operation, path, method, body] of [
+  ['takeover', '/sessions/claude_claude-native:takeover', 'POST', {}],
+  ['rating response', '/sessions/claude_claude-native/rating', 'POST', { op: 'respond', appearance_id: 'survey-1', response: { score: 1 } }],
+  ['file history content', '/sessions/claude_claude-native/file-history/content?turn_number=1&path=file.txt&phase=before', 'GET', undefined],
+  ['pull request', '/sessions/claude_claude-native/fs:pull_request', 'POST', {}],
+] as const) {
+  test(`review regression: unsupported ${operation} does not report success`, async () => {
+    const fixture = await reviewRegressionFixture();
+    try {
+      const response = await fixture.request(path, method, body);
+      const result = await response.json() as any;
+      assert.equal(response.status, 400);
+      assert.notEqual(result.code, 0);
+      assert.match(String(result.msg), /unsupported|不支持|不可用/i);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test('review regression: rating evaluation can report not applicable', async () => {
+  const fixture = await reviewRegressionFixture();
+  try {
+    const response = await fixture.request('/sessions/claude_claude-native/rating', 'POST', { op: 'evaluate', turn_id: 'turn-1' });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json() as any).data, { appearance: null });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('review regression: explicit root cwd reaches the local provider unchanged', async () => {
+  const claude = fakeAdapter('claude');
+  let createdCwd: string | undefined;
+  const create = claude.create.bind(claude);
+  claude.create = async (input) => { createdCwd = input.cwd; return create(input); };
+  const fixture = await reviewRegressionFixture({ adapters: { claude } });
+  try {
+    const response = await fixture.request('/sessions?provider=claude', 'POST', { cwd: '/' });
+    assert.equal(response.status, 200);
+    assert.equal(createdCwd, '/');
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('review regression: Grok truncated turn is visible as failure or warning', async () => {
+  const grok = fakeAdapter('grok');
+  grok.getHistory = async () => [];
+  grok.startTurn = async () => ({
+    turnId: 'grok-limit-turn',
+    events: (async function* () {
+      yield { sessionId: 'grok-native', turnId: 'grok-limit-turn', kind: 'message', status: 'delta', timestamp: Date.now(), payload: { delta: 'partial answer' } } as any;
+      yield { sessionId: 'grok-native', turnId: 'grok-limit-turn', kind: 'turn', status: 'completed', timestamp: Date.now(), payload: { reason: 'completed', truncated: true } } as any;
+    })(),
+  });
+  const fixture = await reviewRegressionFixture({ adapters: { grok } });
+  let ws: WebSocket | undefined;
+  try {
+    const frames: any[] = [];
+    ws = new WebSocket(`${fixture.gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=grok`, ['kimi-code.bearer.review-token']);
+    let resolveTurn!: () => void;
+    const ended = new Promise<void>((resolve) => { resolveTurn = resolve; });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 2000);
+      ws!.onopen = () => { clearTimeout(timer); resolve(); };
+      ws!.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket open failed')); };
+      ws!.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data));
+        frames.push(frame);
+        if (frame.type === 'turn.ended') resolveTurn();
+      };
+    });
+    ws.send(JSON.stringify({ type: 'subscribe', request_id: 'review-grok', session_id: 'grok_grok-native', agent_ids: ['main'] }));
+    const subscribed = new Promise<void>((resolve, reject) => {
+      const timer = setInterval(() => {
+        if (frames.some((frame) => frame.type === 'response' && frame.request_id === 'review-grok')) {
+          clearInterval(timer); clearTimeout(deadline); resolve();
+        }
+      }, 10);
+      const deadline = setTimeout(() => { clearInterval(timer); reject(new Error('WebSocket subscribe timeout')); }, 2000);
+    });
+    await subscribed;
+    const response = await fixture.request('/sessions/grok_grok-native/prompts', 'POST', { content: [{ type: 'text', text: 'test truncation' }] });
+    assert.equal(response.status, 200);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([ended, new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error('turn timeout')), 2000); })]);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+    }
+    const turnEnd = frames.find((frame) => frame.type === 'turn.ended');
+    const visibleWarning = frames.some((frame) => {
+      const text = frame.type === 'item.delta' ? frame.delta : frame.type === 'item.ended' ? frame.item?.text : frame.type === 'notice' ? frame.message : undefined;
+      return typeof text === 'string' && /truncat|max.tokens|截断|令牌上限/i.test(text);
+    });
+    assert.ok(turnEnd?.turn?.outcome === 'failed' || turnEnd?.reason === 'failed' || visibleWarning, 'truncated output must not appear as an unqualified success');
+  } finally {
+    ws?.close();
+    await fixture.close();
+  }
+});
+
+test('review regression: tool delta with outputMode replace updates existingTool.output and emits item.updated', async () => {
+  const codex = fakeAdapter('codex');
+  codex.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'replace-turn',
+    events: (async function* () {
+      const base = { sessionId: 'codex-native', turnId: 'replace-turn', timestamp: Date.now() };
+      yield { ...base, kind: 'tool', status: 'started', payload: { toolCallId: 'call-repl', name: 'Bash', input: {} } } as any;
+      yield { ...base, kind: 'tool', status: 'delta', payload: { toolCallId: 'call-repl', name: 'Bash', output: 'step 1 snapshot' } } as any;
+      yield { ...base, kind: 'tool', status: 'delta', payload: { toolCallId: 'call-repl', name: 'Bash', output: 'step 2 replacement', outputMode: 'replace' } } as any;
+      yield { ...base, kind: 'tool', status: 'completed', payload: { toolCallId: 'call-repl', name: 'Bash' } } as any;
+      yield { ...base, kind: 'turn', status: 'completed', payload: { reason: 'completed' } } as any;
+    })(),
+  });
+  const fixture = await reviewRegressionFixture({ adapters: { codex } });
+  let ws: WebSocket | undefined;
+  try {
+    const frames: any[] = [];
+    ws = new WebSocket(`${fixture.gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=codex`, ['kimi-code.bearer.review-token']);
+    let resolveTurn!: () => void;
+    const ended = new Promise<void>((resolve) => { resolveTurn = resolve; });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 2000);
+      ws!.onopen = () => { clearTimeout(timer); resolve(); };
+      ws!.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket open failed')); };
+      ws!.onmessage = (event) => {
+        const frame = JSON.parse(String(event.data));
+        frames.push(frame);
+        if (frame.type === 'turn.ended') resolveTurn();
+      };
+    });
+    ws.send(JSON.stringify({ type: 'subscribe', request_id: 'sub-replace', session_id: 'codex_codex-native', agent_ids: ['main'] }));
+    const subscribed = new Promise<void>((resolve, reject) => {
+      const timer = setInterval(() => {
+        if (frames.some((frame) => frame.type === 'response' && frame.request_id === 'sub-replace')) {
+          clearInterval(timer); clearTimeout(deadline); resolve();
+        }
+      }, 10);
+      const deadline = setTimeout(() => { clearInterval(timer); reject(new Error('WebSocket subscribe timeout')); }, 2000);
+    });
+    await subscribed;
+    const response = await fixture.request('/sessions/codex_codex-native/prompts', 'POST', { content: [{ type: 'text', text: 'test replace' }] });
+    assert.equal(response.status, 200);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([ended, new Promise<never>((_, reject) => { deadline = setTimeout(() => reject(new Error('turn timeout')), 2000); })]);
+    } finally {
+      if (deadline) clearTimeout(deadline);
+    }
+
+    const updatedFrame = frames.find((frame) => frame.type === 'item.updated' && frame.item_id === 'call-repl');
+    assert.ok(updatedFrame, 'must broadcast item.updated for outputMode=replace');
+    assert.equal(updatedFrame.set?.output, 'step 2 replacement');
+
+    const endedItem = frames.find((frame) => frame.type === 'item.ended' && frame.item?.item_id === 'call-repl');
+    assert.equal(endedItem?.item?.output, 'step 2 replacement');
+  } finally {
+    ws?.close();
+    await fixture.close();
+  }
+});

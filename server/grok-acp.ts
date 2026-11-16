@@ -453,17 +453,38 @@ export class GrokAcpClient {
   cancelPermission(requestId: JsonRpcId): void {
     const key = String(requestId);
     this.permissions.delete(key);
-    this.respond(requestId, { outcome: { outcome: 'cancelled' } });
+    try {
+      this.respond(requestId, { outcome: { outcome: 'cancelled' } });
+    } catch {
+      // process already dead or stdin closed
+    }
+  }
+
+  cancelSessionPending(sessionId: string | string[]): void {
+    const sids = new Set((Array.isArray(sessionId) ? sessionId : [sessionId]).filter(Boolean));
+    for (const [, perm] of [...this.permissions.entries()]) {
+      if (!perm.sessionId || sids.has(perm.sessionId)) {
+        this.cancelPermission(perm.id);
+      }
+    }
+    const seen = new Set<PendingQuestion>();
+    for (const q of [...this.questions.values()]) {
+      if ((!q.sessionId || sids.has(q.sessionId)) && !seen.has(q)) {
+        seen.add(q);
+        this.cancelQuestion(q.questionId);
+      }
+    }
   }
 
   resolveQuestion(questionId: string, answer: string | Record<string, string[]>): boolean {
     const parked = this.getPendingQuestion(questionId);
     if (!parked) return false;
     this.deletePendingQuestion(parked);
-    const answers = buildQuestionAnswersMap(parked, answer);
-    if (parked.id !== undefined) {
-      this.respond(parked.id, { outcome: 'accepted', answers });
+    if (parked.id === undefined) {
+      throw new Error(`Cannot answer notification-only question '${questionId}': missing request id`);
     }
+    const answers = buildQuestionAnswersMap(parked, answer);
+    this.respond(parked.id, { outcome: 'accepted', answers });
     return true;
   }
 
@@ -472,7 +493,11 @@ export class GrokAcpClient {
     if (!parked) return false;
     this.deletePendingQuestion(parked);
     if (parked.id !== undefined) {
-      this.respond(parked.id, { outcome: 'cancelled' });
+      try {
+        this.respond(parked.id, { outcome: 'cancelled' });
+      } catch {
+        // process already dead or stdin closed
+      }
     }
     return true;
   }
@@ -493,27 +518,67 @@ export class GrokAcpClient {
     const child = this.child;
     this.child = null;
     this.rejectAll(new Error('Grok ACP client closed'));
-    if (child && child.exitCode === null && child.signalCode === null) {
+    if (child) {
+      const pid = child.pid;
+      const needsGroup = pid !== undefined && process.platform !== 'win32';
+      const isAlive = (): boolean => {
+        if (child.exitCode === null && child.signalCode === null) return true;
+        if (!needsGroup || pid === undefined) return false;
+        try {
+          process.kill(-pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      if (isAlive()) {
+        this.killGroup(child, 'SIGTERM');
+        await new Promise<void>((res) => {
+          let settled = false;
+          const finish = (): void => {
+            if (settled) return;
+            settled = true;
+            clearInterval(check);
+            clearTimeout(t);
+            res();
+          };
+          const t = setTimeout(() => {
+            if (isAlive()) {
+              this.killGroup(child, 'SIGKILL');
+            }
+            finish();
+          }, 3_000);
+          const check = setInterval(() => {
+            if (!isAlive()) {
+              finish();
+            }
+          }, 50);
+          child.once('exit', () => {
+            // exit 事件已到但组可能短暂残留:给未随组长退出的孙进程送组级
+            // SIGKILL,随即收敛——避免"只剩未决 await + unref 定时器"空转。
+            if (needsGroup && pid !== undefined) {
+              try {
+                process.kill(-pid, 0);
+                this.killGroup(child, 'SIGKILL');
+              } catch { /* group already gone */ }
+            }
+            finish();
+          });
+        });
+      }
+    }
+  }
+
+  private killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+    try {
+      if (child.pid !== undefined && process.platform !== 'win32') process.kill(-child.pid, signal);
+      else child.kill(signal);
+    } catch {
       try {
-        child.kill('SIGTERM');
+        child.kill(signal);
       } catch {
         // ignore
       }
-      await new Promise<void>((res) => {
-        const t = setTimeout(() => {
-          try {
-            if (child.exitCode === null) child.kill('SIGKILL');
-          } catch {
-            // ignore
-          }
-          res();
-        }, 3_000);
-        t.unref?.();
-        child.once('exit', () => {
-          clearTimeout(t);
-          res();
-        });
-      });
     }
   }
 
@@ -524,9 +589,11 @@ export class GrokAcpClient {
       cwd: os.homedir(),
       env: this.childEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
     });
     this.child = child;
 
+    child.stdin?.on('error', () => { /* ignore EPIPE / stream errors */ });
     child.on('error', (err) => this.handleExit(err));
     child.on('exit', (code, signal) => this.handleExit(null, code, signal));
     child.stderr?.on('data', (chunk: Buffer) => {
@@ -544,11 +611,7 @@ export class GrokAcpClient {
       this.connected = true;
     } catch (err) {
       this.connected = false;
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // ignore
-      }
+      this.killGroup(child, 'SIGTERM');
       this.child = null;
       this.rl?.close();
       this.rl = null;
@@ -994,7 +1057,9 @@ export function pickPermissionOption(
     return options.find((o) => /allow[_-]?once/.test(hay(o)))?.optionId
       ?? options.find((o) => hay(o).includes('allow'))?.optionId;
   }
-  return options.find((o) => hay(o).includes('reject'))?.optionId;
+  return options.find((o) => o.kind === 'reject_once')?.optionId
+    ?? options.find((o) => /reject[_-]?once/.test(hay(o)))?.optionId
+    ?? options.find((o) => hay(o).includes('reject'))?.optionId;
 }
 
 function pickSessionId(rec: Record<string, unknown>): string | undefined {

@@ -113,12 +113,17 @@ const ThreadTurnsListResponseSchema = z.object({
 const ThreadItemEntrySchema = z
   .object({
     turnId: z.string().optional(),
+    turn_id: z.string().optional(),
     item: ThreadItemSchema.optional(),
     outputDeferred: z.boolean().nullish(),
     startedAtMs: z.number().nullish(),
     completedAtMs: z.number().nullish(),
   })
-  .catchall(z.unknown());
+  .catchall(z.unknown())
+  .transform((entry) => ({
+    ...entry,
+    turnId: entry.turnId ?? entry.turn_id,
+  }));
 export type CodexThreadItemEntry = {
   turnId: string;
   item: CodexThreadItem;
@@ -570,6 +575,18 @@ export function normalizeCodexThreadItem(rawItem: CodexThreadItem): CodexThreadI
       }
       break;
     }
+    case 'webSearch': {
+      if (item.input === undefined) {
+        item.input = {
+          query: item.query ?? null,
+          action: item.action ?? null,
+        };
+      }
+      if (item.result === undefined && item.results !== undefined && item.results !== null) {
+        item.result = typeof item.results === 'string' ? item.results : JSON.stringify(item.results);
+      }
+      break;
+    }
     case 'enteredReviewMode':
     case 'exitedReviewMode': {
       if (typeof item.review === 'string' && item.text === undefined) {
@@ -628,7 +645,14 @@ export type CodexEvent =
       summaryIndex?: number;
       delta: string;
     }
-  | { type: 'command-output-delta'; threadId: string; turnId: string; itemId: string; delta: string }
+  | {
+      type: 'command-output-delta';
+      threadId: string;
+      turnId: string;
+      itemId: string;
+      delta: string;
+      toolName?: 'commandExecution' | 'fileChange' | string;
+    }
   | { type: 'plan-delta'; threadId: string; turnId: string; itemId: string; delta: string }
   | {
       type: 'plan-updated';
@@ -908,6 +932,9 @@ class TurnEventQueue implements AsyncIterable<CodexEvent> {
     }
   }
 
+  // close 后允许 asyncIterator 继续排空 buffer 中已入队的事件,再报告 done,
+  // 避免"消费者尚未开始迭代就 close"时缓冲事件永久滞留。
+
   fail(err: Error): void {
     if (this.done) return;
     this.failure = err;
@@ -928,7 +955,7 @@ class TurnEventQueue implements AsyncIterable<CodexEvent> {
           return Promise.resolve({ value: this.buffer.shift()!, done: false });
         }
         if (this.failure) return Promise.reject(this.failure);
-        if (this.done) {
+        if (this.done && !this.waiter) {
           return Promise.resolve({ value: undefined as unknown as CodexEvent, done: true });
         }
         return new Promise((resolve, reject) => {
@@ -958,6 +985,7 @@ export class CodexAdapter {
   private pendingServer = new Map<string, PendingServerRequest>(); // 键统一 String(requestId)
   private listeners = new Set<CodexEventHandler>();
   private turnQueues = new Map<string, TurnEventQueue>(); // key: `${threadId}:${turnId}`
+  private activeCompacts = new Set<string>();
   // queue 注册前到达的 turn 事件缓冲:startTurn 的 queue 注册在 request 响应
   // 之后(多个微任务跳),app-server 同一 chunk 内"响应行之后"的通知在那之前
   // 就派发,直接路由会静默丢掉(turn/completed 丢失挂死消费方)。注册时按序
@@ -1029,6 +1057,7 @@ export class CodexAdapter {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...inheritedEnv, ...(this.opts.env ?? {}) },
     });
+    this.child.stdin?.on('error', () => {});
     this.child.on('error', (err) => this.handleProcessExit(err));
     this.child.on('exit', (code, signal) => this.handleProcessExit(null, code, signal));
     this.child.stderr?.on('data', (chunk: Buffer) => {
@@ -2218,10 +2247,14 @@ export class CodexAdapter {
         }
         break;
       }
-      case 'item/commandExecution/outputDelta':
+      case 'item/commandExecution/outputDelta': {
+        const r = ItemRefSchema.extend({ delta: z.string() }).safeParse(p);
+        if (r.success) this.emit({ type: 'command-output-delta', ...r.data, toolName: 'commandExecution' });
+        break;
+      }
       case 'item/fileChange/outputDelta': {
         const r = ItemRefSchema.extend({ delta: z.string() }).safeParse(p);
-        if (r.success) this.emit({ type: 'command-output-delta', ...r.data });
+        if (r.success) this.emit({ type: 'command-output-delta', ...r.data, toolName: 'fileChange' });
         break;
       }
       case 'item/started': {
@@ -2316,8 +2349,8 @@ export class CodexAdapter {
 
   private handleProcessExit(err: Error | null, code: number | null = null, signal: string | null = null): void {
     const reason = err ?? (code !== null || signal !== null
-      ? new Error(`codex app-server exited (code=${code}, signal=${signal})`)
-      : new Error('codex app-server closed'));
+      ? new Error(`codex app-server disconnected (exited code=${code}, signal=${signal})`)
+      : new Error('codex app-server disconnected (closed)'));
     for (const [, pending] of this.pendingClient) {
       clearTimeout(pending.timer);
       pending.reject(reason);
@@ -2329,6 +2362,7 @@ export class CodexAdapter {
     this.pendingServer.clear();
     for (const q of this.turnQueues.values()) q.fail(reason);
     this.turnQueues.clear();
+    this.activeCompacts.clear();
     this.pendingTurnEvents.clear();
     // 进程死了,内存里的激活 thread 一并失效;下次 connect 后需重新 resume。
     this.liveThreads.clear();
@@ -2376,7 +2410,8 @@ export class CodexAdapter {
     const busy =
       this.pendingClient.size > 0 ||
       this.pendingServer.size > 0 ||
-      this.turnQueues.size > 0;
+      this.turnQueues.size > 0 ||
+      this.activeCompacts.size > 0;
     if (busy) {
       // turn 流长期静默:可能 app-server  wedge(实测:rollout 已写
       // task_complete,但 turn/completed 始终不上线,写者锁被一直占着,
@@ -2486,7 +2521,8 @@ export class CodexAdapter {
     const busy =
       this.pendingClient.size > 0 ||
       this.pendingServer.size > 0 ||
-      this.turnQueues.size > 0;
+      this.turnQueues.size > 0 ||
+      this.activeCompacts.size > 0;
     if (busy) {
       this.scheduleRecycleWhenIdle();
       return;
@@ -2567,9 +2603,6 @@ export class CodexAdapter {
     this.unpersistedThreads.set(thread.id, Date.now());
     const effectiveModel = options.model ?? parsed.model ?? thread.model ?? undefined;
     if (effectiveModel) this.threadModels.set(thread.id, effectiveModel);
-    if (parsed.reasoningEffort ?? thread.reasoningEffort) {
-      this.threadEfforts.set(thread.id, (parsed.reasoningEffort ?? thread.reasoningEffort)!);
-    }
     if (options.serviceTier !== undefined || parsed.serviceTier !== undefined) {
       this.threadServiceTiers.set(thread.id, options.serviceTier ?? parsed.serviceTier ?? null);
     }
@@ -2615,9 +2648,6 @@ export class CodexAdapter {
     this.liveThreads.add(threadId);
     const effectiveModel = options.model ?? parsed.model ?? thread.model ?? undefined;
     if (effectiveModel) this.threadModels.set(threadId, effectiveModel);
-    if (parsed.reasoningEffort ?? thread.reasoningEffort) {
-      this.threadEfforts.set(threadId, (parsed.reasoningEffort ?? thread.reasoningEffort)!);
-    }
     if (options.serviceTier !== undefined || parsed.serviceTier !== undefined) {
       this.threadServiceTiers.set(threadId, options.serviceTier ?? parsed.serviceTier ?? null);
     }
@@ -3014,65 +3044,70 @@ export class CodexAdapter {
    */
   async compact(threadId: string, timeoutMs = 180_000): Promise<void> {
     await this.connect();
+    this.activeCompacts.add(threadId);
     let off: () => void = () => undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let completionAborted = false;
 
-    const completion = new Promise<void>((resolve, reject) => {
-      const failWith = (err: Error): void => {
-        completionAborted = true;
+    try {
+      const completion = new Promise<void>((resolve, reject) => {
+        const failWith = (err: Error): void => {
+          completionAborted = true;
+          clearTimeout(timer);
+          off();
+          reject(err);
+        };
+        timer = setTimeout(() => {
+          failWith(new Error(`codex thread compact timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        timer.unref?.();
+
+        off = this.onEvent((ev) => {
+          if (ev.type === 'disconnected') {
+            failWith(new Error('codex app-server disconnected during thread compact'));
+            return;
+          }
+          if (ev.type === 'error' && (!ev.threadId || ev.threadId === threadId) && ev.willRetry !== true) {
+            failWith(new Error(ev.message || 'codex thread compact failed'));
+            return;
+          }
+          if (ev.type === 'thread-compacted' && ev.threadId === threadId) {
+            clearTimeout(timer);
+            off();
+            resolve();
+            return;
+          }
+          if (ev.type === 'item-completed' && ev.threadId === threadId && ev.item?.type === 'contextCompaction') {
+            clearTimeout(timer);
+            off();
+            resolve();
+            return;
+          }
+          if (ev.type === 'turn-completed' && ev.threadId === threadId && ev.turn?.status === 'failed') {
+            failWith(new Error(ev.error || ev.turn?.error?.message || 'codex thread compact turn failed'));
+          }
+        });
+      });
+      // Guard against unhandled rejection if the timer/disconnect rejects while withThreadRetry is still pending.
+      completion.catch(() => undefined);
+
+      try {
+        await this.withThreadRetry(threadId, () =>
+          this.request('thread/compact/start', { threadId }),
+        );
+      } catch (err) {
         clearTimeout(timer);
         off();
-        reject(err);
-      };
-      timer = setTimeout(() => {
-        failWith(new Error(`codex thread compact timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-      timer.unref?.();
-
-      off = this.onEvent((ev) => {
-        if (ev.type === 'disconnected') {
-          failWith(new Error('codex app-server disconnected during thread compact'));
-          return;
-        }
-        if (ev.type === 'error' && (!ev.threadId || ev.threadId === threadId) && ev.willRetry !== true) {
-          failWith(new Error(ev.message || 'codex thread compact failed'));
-          return;
-        }
-        if (ev.type === 'thread-compacted' && ev.threadId === threadId) {
-          clearTimeout(timer);
-          off();
-          resolve();
-          return;
-        }
-        if (ev.type === 'item-completed' && ev.threadId === threadId && ev.item?.type === 'contextCompaction') {
-          clearTimeout(timer);
-          off();
-          resolve();
-          return;
-        }
-        if (ev.type === 'turn-completed' && ev.threadId === threadId && ev.turn?.status === 'failed') {
-          failWith(new Error(ev.error || ev.turn?.error?.message || 'codex thread compact turn failed'));
-        }
-      });
-    });
-    // Guard against unhandled rejection if the timer/disconnect rejects while withThreadRetry is still pending.
-    completion.catch(() => undefined);
-
-    try {
-      await this.withThreadRetry(threadId, () =>
-        this.request('thread/compact/start', { threadId }),
-      );
-    } catch (err) {
-      clearTimeout(timer);
-      off();
-      throw err;
-    }
-    if (completionAborted) {
+        throw err;
+      }
+      if (completionAborted) {
+        await completion;
+        return;
+      }
       await completion;
-      return;
+    } finally {
+      this.activeCompacts.delete(threadId);
     }
-    await completion;
   }
 
   /** 归档/取消归档(thread/archive|unarchive)。 */
@@ -3500,6 +3535,7 @@ export class CodexAdapter {
     let resolvedTurn: CodexTurn | undefined;
     let settled = false;
     let startAborted = false;
+    let terminalSeen = false;
     let off: () => void = () => undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let resolveTurnStarted!: (turnId: string) => void;
@@ -3508,6 +3544,14 @@ export class CodexAdapter {
       for (const tId of trackedThreads) {
         this.pendingTurnEvents.delete(`${tId}:${turnId}`);
         this.seenTurnStarts.delete(`${tId}:${turnId}`);
+        this.turnQueues.delete(`${tId}:${turnId}`);
+      }
+    };
+
+    const registerTurnQueue = (turnId: string): void => {
+      if (terminalSeen || startAborted) return;
+      for (const tId of trackedThreads) {
+        this.turnQueues.set(`${tId}:${turnId}`, queue);
       }
     };
 
@@ -3537,20 +3581,31 @@ export class CodexAdapter {
           if (!firstTurnId) {
             firstTurnId = ev.turnId;
             resolvedTurn = ev.turn;
+            registerTurnQueue(ev.turnId);
             clearTimeout(timer);
             settled = true;
             resolve(ev.turnId);
-            queue.push(ev);
-          } else if (ev.turnId !== firstTurnId) {
+          } else if (ev.turnId !== firstTurnId && !this.turnQueues.has(`${ev.threadId}:${ev.turnId}`)) {
             queue.push(ev);
           }
           return;
         }
-        if (firstTurnId) queue.push(ev);
+        if (firstTurnId) {
+          const key = 'threadId' in ev && 'turnId' in ev && ev.threadId && ev.turnId
+            ? `${ev.threadId}:${ev.turnId}`
+            : null;
+          if (!key || !this.turnQueues.has(key)) {
+            queue.push(ev);
+          }
+        }
         if (ev.type === 'turn-completed') {
+          // 只标记终态并退订;队列的 push/close/delete 由 emit() 统一完成
+          // (此处先 cleanupTurnKeys 会让 emit 查不到队列,终态被转投
+          // pendingTurnEvents 缓冲,消费者永远收不到)。
+          terminalSeen = true;
           off();
-          cleanupTurnKeys(firstTurnId || ev.turnId);
-          queue.close();
+          clearTimeout(timer);
+          return;
         }
       });
     });
@@ -3575,6 +3630,7 @@ export class CodexAdapter {
     } catch (err) {
       clearTimeout(timer);
       off();
+      if (firstTurnId) cleanupTurnKeys(firstTurnId);
       throw err;
     }
 
@@ -3592,6 +3648,7 @@ export class CodexAdapter {
       if (!firstTurnId) {
         firstTurnId = respTurn.id;
         resolvedTurn = respTurn;
+        registerTurnQueue(respTurn.id);
         clearTimeout(timer);
         this.seenTurnStarts.add(`${resolvedReviewThreadId}:${respTurn.id}`);
         const startedEv: CodexEvent = {
@@ -3616,17 +3673,24 @@ export class CodexAdapter {
           for (const ev of pending) {
             if (ev.type === 'turn-started') continue;
             queue.push(ev);
-            if (ev.type === 'turn-completed') {
-              off();
-              cleanupTurnKeys(respTurn.id);
-              queue.close();
-            }
+          }
+          if (pending.some((ev) => ev.type === 'turn-completed')) {
+            terminalSeen = true;
+            off();
+            clearTimeout(timer);
+            cleanupTurnKeys(respTurn.id);
+            queue.close();
           }
         }
+      } else {
+        registerTurnQueue(firstTurnId);
       }
     } else if (parsedResp.success && parsedResp.data.reviewThreadId) {
       resolvedReviewThreadId = parsedResp.data.reviewThreadId;
       trackedThreads.add(resolvedReviewThreadId);
+      if (firstTurnId) {
+        registerTurnQueue(firstTurnId);
+      }
     }
 
     const turnId = await turnStarted;

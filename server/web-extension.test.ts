@@ -6,7 +6,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 async function loadShim(pathname = '/', options: { readyState?: string; querySelector?: (selector: string) => unknown; querySelectorAll?: (selector: string) => unknown[] } = {}): Promise<any> {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const storage = new Map<string, string>();
   const listeners = new Map<string, () => void>();
   const webSocketCalls: Array<{ url: string; protocols: unknown }> = [];
@@ -69,7 +69,7 @@ async function loadShim(pathname = '/', options: { readyState?: string; querySel
 }
 
 async function loadModeShim(): Promise<{ api: any; rows: any[] }> {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const rows = ['Plan', 'Swarm', 'Goal', 'Tower'].map((label) => {
     const attributes = new Map<string, string>([['data-mode-id', label.toLowerCase()]]);
     const classes = new Set(['am-row']);
@@ -139,6 +139,7 @@ test('rewrites global API URLs for the selected provider and pins prefixed sessi
   assert.equal(api.rewriteApiUrl('/api/v2/sessions:restore').searchParams.get('provider'), 'claude');
   // 设置页供应商目录为全局，网关 /providers、/commands、/meta、/sessions/:id/status 与工作区按当前 provider 分流。
   assert.equal(api.rewriteApiUrl('/api/v1/providers').searchParams.get('provider'), 'claude');
+  assert.equal(api.rewriteApiUrl('/api/v1/providers/dsh').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v1/commands').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v1/meta').searchParams.get('provider'), 'claude');
   assert.equal(api.rewriteApiUrl('/api/v1/sessions/claude_abc/status').searchParams.get('provider'), 'claude');
@@ -260,19 +261,39 @@ test('prevents cross-provider WebSocket subscribe frames from hitting the wrong 
   assert.equal(sentFrames.length, 0);
   assert.deepEqual(received[0], { type: 'response', request_id: 'r1', code: 0, msg: 'success' });
 
+  // Stale unsubscribe / unsubscribe_v2 from previous session -> acked locally, never sent!
+  ws.send(JSON.stringify({ type: 'unsubscribe', request_id: 'u1', session_id: 'claude_1' }));
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(sentFrames.length, 0);
+  assert.deepEqual(received[1], { type: 'response', request_id: 'u1', code: 0, msg: 'success' });
+
+  ws.send(JSON.stringify({ type: 'unsubscribe_v2', id: 'u2', payload: { session_id: 'claude_1' } }));
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(sentFrames.length, 0);
+  assert.deepEqual(received[2], {
+    type: 'ack',
+    id: 'u2',
+    code: 0,
+    msg: 'success',
+    payload: { accepted: ['claude_1'], not_found: [], resync_required: [] },
+  });
+
   // Valid matching subscribe -> sent through to server
   ws.send(JSON.stringify({ type: 'subscribe', request_id: 'r2', session_id: 'codex_1', agent_ids: ['main'] }));
   assert.equal(sentFrames.length, 1);
 
   // Subscribe matching current selectedProvider (pi) on stale codex socket -> triggers reconnect instead of mismatch
   api.setProvider('pi');
+  ws.onerror = () => {};
   ws.send(JSON.stringify({ type: 'subscribe', request_id: 'r3', session_id: 'pi_1', agent_ids: ['main'] }));
   assert.equal(sentFrames.length, 1);
   assert.deepEqual(closedReasons, [{ code: 1000, reason: 'provider-mismatch-reconnect' }]);
+  assert.equal(ws._intentionalClose, true);
+  assert.equal(ws.onerror, null);
 });
 
 test('renders the Agent switcher as an official-style segmented control', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   assert.match(source, /ui-seg ui-seg--sm multi-agent-provider-seg/);
   assert.match(source, /role:\s*['\"]tablist['\"]|setAttribute\(['\"]role['\"],\s*['\"]tablist['\"]\)/);
   assert.match(source, /setAttribute\(['\"]aria-selected['\"]/);
@@ -283,7 +304,7 @@ test('renders the Agent switcher as an official-style segmented control', async 
 });
 
 test('styles the switcher for 0.39 footer and mobile sheets without touching new chrome', async () => {
-  const css = await readFile(join(process.cwd(), '../web-extension/style.css'), 'utf8');
+  const css = await readFile(new URL('../../web-extension/style.css', import.meta.url), 'utf8');
   assert.match(css, /\.side-footer .multi-agent-provider-wrap/);
   assert.match(css, /\.sheet-panel .multi-agent-provider-wrap/);
   assert.match(css, /\.sheet-body .multi-agent-provider-wrap/);
@@ -292,7 +313,7 @@ test('styles the switcher for 0.39 footer and mobile sheets without touching new
 });
 
 test('leaves the official Kimi account controls unchanged', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const storage = new Map<string, string>();
   const classes = new Set<string>();
   const nameAttributes = new Map<string, string>();
@@ -429,7 +450,7 @@ async function loadDomShim(options: {
   hash?: string;
   serverCredential?: string;
 } = {}): Promise<any> {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const storage = new Map<string, string>();
   if (options.storedProvider) storage.set('multi-agent-gateway.provider.v1', options.storedProvider);
   if (options.serverCredential) storage.set('kimi-web.server-credential', options.serverCredential);
@@ -776,13 +797,15 @@ test('shows only provider-supported modes', async () => {
   assert.deepEqual(rows.map((row) => row.style.display), ['', 'none', 'none', 'none']);
   api.setProvider('pi');
   assert.deepEqual(rows.map((row) => row.style.display), ['none', 'none', 'none', 'none']);
+  api.setProvider('dsh');
+  assert.deepEqual(rows.map((row) => row.style.display), ['none', 'none', 'none', 'none']);
   api.setProvider('kimi');
   assert.deepEqual(rows.map((row) => row.style.display), ['', '', '', '']);
 });
 
 test('recognizes 2.6.2 composer mode rows from real zh/en labels without data-mode-id', async () => {
   // 官方 .am-row 没有 data-mode-id,gateModes 只能靠文案识别;之前测试全预置了 id。
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const makeRow = (label: string) => {
     const attributes = new Map<string, string>();
     const labelNode = { textContent: label, getAttribute: () => null };
@@ -856,6 +879,8 @@ test('recognizes 2.6.2 composer mode rows from real zh/en labels without data-mo
     assert.equal(rows[4].getAttribute('data-mode-id'), 'tower');
     api.setProvider('pi');
     assert.equal(rows[3].style.display, 'none');
+    api.setProvider('dsh');
+    assert.equal(rows[3].style.display, 'none');
   }
 });
 
@@ -890,6 +915,8 @@ test('hides official slash items that are not Kimi slots for the current provide
   assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '', 'none']);
   api.setProvider('codex');
   assert.deepEqual(items.map((item) => item.row.style.display), ['', 'none', '', 'none', '', '', 'none']);
+  api.setProvider('dsh');
+  assert.deepEqual(items.map((item) => item.row.style.display), ['none', 'none', 'none', 'none', '', 'none', 'none']);
   api.setProvider('kimi');
   assert.deepEqual(items.map((item) => item.row.style.display), ['', '', '', '', '', '', '']);
 });
@@ -1137,7 +1164,7 @@ test('resyncs when the mobile session list tabs are mounted', async () => {
 });
 
 test('refreshes Kimi 2.6.2 Pinia stores and reconciles models when KimiWebClientFacade is absent', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const storage = new Map<string, string>();
   const fetchCalls: Array<{ url: string; method: string; auth?: string; body?: string }> = [];
   const callLog: string[] = [];
@@ -1301,7 +1328,7 @@ test('refreshes Kimi 2.6.2 Pinia stores and reconciles models when KimiWebClient
 });
 
 test('closes stale gateway WebSockets on visibility/online wakeup and closes all on pagehide', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const winListeners = new Map<string, Array<() => void>>();
   const docListeners = new Map<string, Array<() => void>>();
   const createdSockets: any[] = [];
@@ -1587,7 +1614,7 @@ test('slash menu keyboard navigation skips hidden rows and blocks hidden active 
 });
 
 test('reads 2.6.2 credential field and isolates Pinia model/workspace state across rapid provider switches', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const storage = new Map<string, string>();
   storage.set(
     'kimi-web.server-credential',
@@ -2442,7 +2469,7 @@ test('handles argument_hint and argumentHint cleanly for both /cmd and /skill:cm
 });
 
 test('enhanceQuestionCards adds live filter bar for >6 options and syncExtBar renders Pi extension statuses/widgets', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const qopts = fakeElement('div');
   qopts.className = 'qopts';
   for (let i = 0; i < 8; i += 1) {
@@ -2573,7 +2600,7 @@ test('enhanceQuestionCards adds live filter bar for >6 options and syncExtBar re
 });
 
 test('Pi bare /plan bypasses Kimi mode hijack and dispatches POST /prompts on Enter and Send click', async () => {
-  const source = await readFile(join(process.cwd(), '../web-extension/boot.js'), 'utf8');
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
   const editor = fakeElement('div');
   editor.className = 'ProseMirror';
   editor.textContent = '/plan';
@@ -2671,4 +2698,204 @@ test('Pi bare /plan bypasses Kimi mode hijack and dispatches POST /prompts on En
   assert.equal(posted.length, 2);
 });
 
+test('sanitizes Request body when input is Request and init is passed without body', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+  let forwardedRequest: any = null;
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+  const context: any = {
+    window: windowObject,
+    document: { readyState: 'complete', documentElement: {}, querySelector: () => null, querySelectorAll: () => [], addEventListener: () => {} },
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async (req: any) => {
+      forwardedRequest = req;
+      return new Response('{}');
+    },
+    console,
+    setTimeout,
+    clearTimeout,
+  };
+  vm.runInNewContext(source, context, { filename: 'boot.js' });
+  const rawBody = JSON.stringify({
+    content: [{ type: 'text', text: 'hello [/advisor](kimi-code://skill/advisor)' }],
+  });
+  const inputReq = new Request('http://localhost:58630/api/v1/sessions/pi_1/prompts', {
+    method: 'POST',
+    body: rawBody,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  // init has headers but NO body
+  await windowObject.fetch(inputReq, { headers: { 'X-Custom': 'val' } });
+  assert.ok(forwardedRequest);
+  const text = await forwardedRequest.text();
+  assert.equal(text.includes('kimi-code://skill/advisor'), false);
+  assert.equal(JSON.parse(text).content[0].text, 'hello /advisor');
+});
 
+async function loadReviewShim(options: {
+  pathname?: string;
+  stores?: Map<string, any>;
+  fetch?: (input: any, init?: any) => Promise<Response>;
+} = {}): Promise<{ windowObject: any; api: any }> {
+  const source = await readFile(new URL('../../web-extension/boot.js', import.meta.url), 'utf8');
+  const storage = new Map<string, string>();
+  const location = { origin: 'http://localhost:58630', pathname: options.pathname ?? '/', search: '', hash: '' };
+  const appRoot = { __vue_app__: { config: { globalProperties: { $pinia: { _s: options.stores ?? new Map() } } } } };
+  const windowObject: any = {
+    location,
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
+    sessionStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+    },
+    addEventListener: () => {},
+    dispatchEvent: () => true,
+    history: {
+      pushState(_state: unknown, _title: string, url: string) { location.pathname = url; },
+      replaceState(_state: unknown, _title: string, url: string) { location.pathname = url; },
+    },
+  };
+  const context: any = {
+    window: windowObject,
+    document: {
+      readyState: 'loading',
+      documentElement: {},
+      querySelector: (selector: string) => selector === '#app' ? appRoot : null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+    },
+    location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: options.fetch ?? (async () => new Response('{}')),
+    console,
+    setTimeout,
+    clearTimeout,
+  };
+  vm.runInNewContext(source, context, { filename: 'boot.js' });
+  return { windowObject, api: windowObject.__multiAgent };
+}
+
+test('review regression: switching providers does not save session thinking as global config', async () => {
+  const writes: Array<{ provider: string | null; body: any }> = [];
+  const loads: string[] = [];
+  const globalThinking = { claude: 'low', pi: 'medium' };
+  const modeStore: any = { thinking: 'high', thinkingBySession: { claude_1: 'high' } };
+  const sessionsStore: any = { activeSessionId: 'claude_1', setActiveSessionId(id: string | undefined) { this.activeSessionId = id; } };
+  let api: any;
+  const configStore: any = {
+    config: { thinking: { enabled: true, effort: 'low' } },
+    loadConfig() {
+      const provider = api.selectedProvider() as keyof typeof globalThinking;
+      loads.push(provider);
+      this.config = { thinking: { enabled: true, effort: globalThinking[provider] } };
+    },
+  };
+  const stores = new Map<string, any>([
+    ['kimi.mode', modeStore],
+    ['kimi.sessions', sessionsStore],
+    ['kimi.config', configStore],
+  ]);
+  ({ api } = await loadReviewShim({
+    pathname: '/sessions/claude_1',
+    stores,
+    fetch: async (input, init) => {
+      const url = new URL(String(input), 'http://localhost:58630');
+      if (url.pathname === '/api/v1/config' && init?.method === 'POST') {
+        const provider = url.searchParams.get('provider');
+        const body = JSON.parse(init.body);
+        writes.push({ provider, body });
+        if ((provider === 'claude' || provider === 'pi') && body.thinking !== undefined) {
+          const value = typeof body.thinking === 'string' ? body.thinking : body.thinking.effort;
+          if (typeof value === 'string') globalThinking[provider] = value;
+        }
+      }
+      return new Response('{}');
+    },
+  }));
+
+  api.switchProvider('pi');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  api.switchProvider('claude');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(loads, ['pi', 'claude']);
+  assert.equal(configStore.config.thinking.effort, 'low');
+  assert.equal(globalThinking.claude, 'low');
+  assert.deepEqual(writes.filter((write) => write.provider === 'claude' && 'thinking' in write.body), []);
+});
+
+test('review regression: Request with init inherits original abort signal while sanitizing body', async () => {
+  const captured: { request?: Request } = {};
+  const { windowObject } = await loadReviewShim({
+    fetch: async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost:58630');
+      if (url.pathname.endsWith('/prompts')) captured.request = new Request(input instanceof Request ? input : url, init);
+      return new Response('{}');
+    },
+  });
+  const controller = new AbortController();
+  const request = new Request('http://localhost:58630/api/v1/sessions/pi_1/prompts', {
+    method: 'POST',
+    headers: { 'X-Original': 'original' },
+    signal: controller.signal,
+    body: JSON.stringify({ content: [{ type: 'text', text: 'hello [/advisor](kimi-code://skill/advisor)' }] }),
+  });
+  await windowObject.fetch(request, { headers: { 'X-Custom': 'override' } });
+  const forwarded = captured.request;
+  assert.ok(forwarded);
+  assert.equal(forwarded.headers.get('X-Custom'), 'override');
+  assert.equal(forwarded.headers.get('X-Original'), null);
+  assert.equal(JSON.parse(await forwarded.text()).content[0].text, 'hello /advisor');
+  controller.abort();
+  assert.equal(forwarded.signal.aborted, true);
+});
+
+test('review regression: Request init abort signal overrides original while sanitizing body', async () => {
+  const captured: { request?: Request } = {};
+  const { windowObject } = await loadReviewShim({
+    fetch: async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost:58630');
+      if (url.pathname.endsWith('/prompts')) captured.request = new Request(input instanceof Request ? input : url, init);
+      return new Response('{}');
+    },
+  });
+  const original = new AbortController();
+  const override = new AbortController();
+  const request = new Request('http://localhost:58630/api/v1/sessions/pi_1/prompts', {
+    method: 'POST',
+    headers: { 'X-Original': 'original' },
+    signal: original.signal,
+    body: JSON.stringify({ content: [{ type: 'text', text: 'hello [/advisor](kimi-code://skill/advisor)' }] }),
+  });
+  await windowObject.fetch(request, { headers: { 'X-Custom': 'override' }, signal: override.signal });
+  const forwarded = captured.request;
+  assert.ok(forwarded);
+  assert.equal(forwarded.headers.get('X-Custom'), 'override');
+  assert.equal(forwarded.headers.get('X-Original'), null);
+  assert.equal(JSON.parse(await forwarded.text()).content[0].text, 'hello /advisor');
+  original.abort();
+  assert.equal(forwarded.signal.aborted, false);
+  override.abort();
+  assert.equal(forwarded.signal.aborted, true);
+});

@@ -16,6 +16,7 @@ import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import { DshAcpClient, type DshAcpEvent } from './dsh-acp.js';
 import { workspaceIdFromCwd } from './facade.js';
+import { listDshCommands } from './native-commands.js';
 import { SettingsStore } from './settings-store.js';
 import {
   ProviderError,
@@ -36,6 +37,175 @@ import {
   type StartTurnInput,
   type TurnHandle,
 } from './types.js';
+
+const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+export function validateSessionId(sessionId: string): string {
+  const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+  if (!rawId || !SESSION_ID_RE.test(rawId)) {
+    throw new ProviderError('invalid_request', `Invalid DSH session ID: ${sessionId}`, 400);
+  }
+  return rawId;
+}
+
+function parseConfigModels(configOptions: unknown): NativeModel[] | null {
+  if (!Array.isArray(configOptions)) return null;
+  const modelOpt = configOptions.find((opt: any) => opt && typeof opt === 'object' && opt.id === 'model') as any;
+  if (!modelOpt || !Array.isArray(modelOpt.options) || modelOpt.options.length === 0) return null;
+
+  const reasoningOpt = configOptions.find((opt: any) => opt && typeof opt === 'object' && opt.id === 'reasoning_effort') as any;
+  let supportEfforts: string[] | undefined;
+  let defaultEffort: string | undefined;
+  let supportsThinkingOff: boolean | undefined;
+  if (reasoningOpt && Array.isArray(reasoningOpt.options)) {
+    supportEfforts = [];
+    for (const item of reasoningOpt.options) {
+      if (!item || typeof item !== 'object') continue;
+      if (typeof item.value === 'string') {
+        if (item.value) {
+          supportEfforts.push(item.value);
+        } else {
+          supportsThinkingOff = true;
+        }
+      }
+    }
+    if (typeof reasoningOpt.currentValue === 'string') {
+      defaultEffort = reasoningOpt.currentValue;
+    }
+  }
+
+  const models: NativeModel[] = [];
+  const currentModelVal = typeof modelOpt.currentValue === 'string' ? modelOpt.currentValue : undefined;
+
+  for (const item of modelOpt.options) {
+    if (!item || typeof item !== 'object') continue;
+    if (Array.isArray(item.options)) {
+      const groupProvider = typeof item.group === 'string' && item.group ? item.group : 'dsh';
+      for (const opt of item.options) {
+        if (!opt || typeof opt.value !== 'string') continue;
+        models.push({
+          provider: groupProvider,
+          model: opt.value,
+          display_name: opt.name || opt.value,
+          ...(opt.description ? { description: opt.description } : {}),
+          max_context_size: 131_072,
+          isDefault: currentModelVal !== undefined ? opt.value === currentModelVal : models.length === 0,
+          ...(supportEfforts && supportEfforts.length > 0 ? { support_efforts: supportEfforts } : {}),
+          ...(defaultEffort !== undefined ? { default_effort: defaultEffort } : {}),
+          ...(supportsThinkingOff ? { supportsThinkingOff: true } : {}),
+        });
+      }
+    } else if (typeof item.value === 'string') {
+      models.push({
+        provider: 'dsh',
+        model: item.value,
+        display_name: item.name || item.value,
+        ...(item.description ? { description: item.description } : {}),
+        max_context_size: 131_072,
+        isDefault: currentModelVal !== undefined ? item.value === currentModelVal : models.length === 0,
+        ...(supportEfforts && supportEfforts.length > 0 ? { support_efforts: supportEfforts } : {}),
+        ...(defaultEffort !== undefined ? { default_effort: defaultEffort } : {}),
+        ...(supportsThinkingOff ? { supportsThinkingOff: true } : {}),
+      });
+    }
+  }
+
+  return models.length > 0 ? models : null;
+}
+
+function formatToolOutput(rawOutput: unknown): string {
+  if (typeof rawOutput === 'string') return rawOutput;
+  if (rawOutput === null || rawOutput === undefined) return '';
+
+  if (Array.isArray(rawOutput)) {
+    const parts: string[] = [];
+    for (const item of rawOutput) {
+      if (!item || typeof item !== 'object') {
+        parts.push(String(item));
+        continue;
+      }
+      if (item.type === 'content' && item.content) {
+        if (typeof item.content === 'string') {
+          parts.push(item.content);
+        } else if (item.content.type === 'text' && typeof item.content.text === 'string') {
+          parts.push(item.content.text);
+        } else if (typeof item.content.text === 'string') {
+          parts.push(item.content.text);
+        } else {
+          parts.push(JSON.stringify(item.content));
+        }
+      } else if (item.type === 'text' && typeof item.text === 'string') {
+        parts.push(item.text);
+      } else if (item.type === 'diff') {
+        const filePath = item.path ? `--- ${item.path}\n+++ ${item.path}\n` : '';
+        if (item.oldText != null) {
+          parts.push(`${filePath}Original:\n${item.oldText}\nModified:\n${item.newText ?? ''}`);
+        } else {
+          parts.push(`${filePath}New file:\n${item.newText ?? ''}`);
+        }
+      } else if (item.type === 'terminal' && typeof item.text === 'string') {
+        parts.push(item.text);
+      } else if (typeof item.text === 'string') {
+        parts.push(item.text);
+      } else {
+        parts.push(JSON.stringify(item));
+      }
+    }
+    return parts.join('\n');
+  }
+
+  if (typeof rawOutput === 'object') {
+    const item = rawOutput as any;
+    if (item.type === 'diff') {
+      const filePath = item.path ? `--- ${item.path}\n+++ ${item.path}\n` : '';
+      if (item.oldText != null) {
+        return `${filePath}Original:\n${item.oldText}\nModified:\n${item.newText ?? ''}`;
+      }
+      return `${filePath}New file:\n${item.newText ?? ''}`;
+    }
+    if (item.type === 'text' && typeof item.text === 'string') return item.text;
+    if (typeof item.text === 'string') return item.text;
+    return JSON.stringify(rawOutput);
+  }
+
+  return String(rawOutput);
+}
+
+class AsyncEventQueue {
+  private queue: GatewayEvent[] = [];
+  private waiter: (() => void) | null = null;
+  private finished = false;
+
+  push(event: GatewayEvent): void {
+    this.queue.push(event);
+    if (this.waiter) {
+      const w = this.waiter;
+      this.waiter = null;
+      w();
+    }
+  }
+
+  finish(): void {
+    this.finished = true;
+    if (this.waiter) {
+      const w = this.waiter;
+      this.waiter = null;
+      w();
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterableIterator<GatewayEvent> {
+    while (!this.finished || this.queue.length > 0) {
+      if (this.queue.length > 0) {
+        yield this.queue.shift()!;
+      } else if (!this.finished) {
+        await new Promise<void>((resolve) => {
+          this.waiter = resolve;
+        });
+      }
+    }
+  }
+}
 
 const DEFAULT_DSH_BIN = path.join(os.homedir(), '.local', 'bin', 'dsh');
 
@@ -78,6 +248,7 @@ export interface DshSessionRecord {
   filePath: string;
   busy: boolean;
   turnCount: number;
+  lastPrompt?: string;
 }
 
 /** Live per-session state from dsh's projection cache (~/.dsh/storages/session_projcache). */
@@ -96,20 +267,27 @@ export class DshAdapter {
   private readonly sessionsDir: string;
   private readonly projcacheDir: string;
   private readonly historyCacheDir: string;
+  private readonly recycleGraceMs: number;
+  private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
   private acpClient: DshAcpClient | null = null;
   private activeTurns = new Set<string>();
 
-  constructor(options: { dshBin?: string; sessionsDir?: string; projcacheDir?: string; historyCacheDir?: string } = {}) {
+  constructor(options: {
+    dshBin?: string;
+    sessionsDir?: string;
+    projcacheDir?: string;
+    historyCacheDir?: string;
+    recycleGraceMs?: number;
+    permissionModeForSession?: (sessionId: string) => string | undefined;
+  } = {}) {
     this.dshBin = resolveDshBin(options.dshBin);
     this.sessionsDir = options.sessionsDir ?? resolveDshSessionsDir();
     const dshHome = path.dirname(this.sessionsDir);
     this.projcacheDir = options.projcacheDir ?? path.join(dshHome, 'storages', 'session_projcache', 'sessions');
     this.historyCacheDir = options.historyCacheDir ?? path.join(dshHome, 'gateway_history');
-    try {
-      if (!fs.existsSync(this.historyCacheDir)) fs.mkdirSync(this.historyCacheDir, { recursive: true });
-    } catch {
-      // ignore
-    }
+    const envTimeout = process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS ? Number(process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS) : undefined;
+    this.recycleGraceMs = options.recycleGraceMs ?? (Number.isFinite(envTimeout) && envTimeout! > 0 ? envTimeout! : 60_000);
+    this.permissionModeForSession = options.permissionModeForSession;
   }
 
   get binPath(): string {
@@ -121,11 +299,12 @@ export class DshAdapter {
   }
 
   getAcpClient(alwaysApprove = false): DshAcpClient {
-    if (!this.acpClient || !this.acpClient.isConnected()) {
+    if (!this.acpClient || this.acpClient.isClosed()) {
       this.acpClient = new DshAcpClient({
         dshBin: this.dshBin,
         alwaysApprove,
-        recycleGraceMs: 60_000,
+        recycleGraceMs: this.recycleGraceMs,
+        permissionModeForSession: this.permissionModeForSession,
         env: {
           // dsh profile patches route llm through the ccwu relay; it needs this key.
           ...(process.env.CCWU_API_KEY ? { CCWU_API_KEY: process.env.CCWU_API_KEY } : {}),
@@ -217,7 +396,7 @@ export class DshAdapter {
           const isPlaceholder = userMsgCount === 0 && !explicitTitle && !liveTitle && turnCount === 0;
           if (isPlaceholder) continue;
 
-          const title = explicitTitle || liveTitle || firstUserPrompt || '(session)';
+          const title = explicitTitle || liveTitle || firstUserPrompt || '';
           const createdAt = header.createdAt ? new Date(header.createdAt).toISOString() : stats.birthtime.toISOString();
           const updatedAt = stats.mtime.toISOString();
 
@@ -231,6 +410,7 @@ export class DshAdapter {
             filePath: sessionFile,
             busy,
             turnCount,
+            lastPrompt: firstUserPrompt || '',
           });
         } catch {
           // ignore corrupted/partial writes
@@ -248,8 +428,9 @@ export class DshAdapter {
 
   /** Read the live projection JSON for one session id (returns undefined when absent). */
   readProjcache(sessionId: string): DshProjcacheRecord | undefined {
+    const rawId = validateSessionId(sessionId);
     try {
-      const file = path.join(this.projcacheDir, `${sessionId}.json`);
+      const file = path.join(this.projcacheDir, `${rawId}.json`);
       if (!fs.existsSync(file)) return undefined;
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { record?: { rows?: DshProjcacheRecord } };
       return parsed.record?.rows ?? undefined;
@@ -259,8 +440,9 @@ export class DshAdapter {
   }
 
   getHistoryMessages(sessionId: string): Message[] {
+    const rawId = validateSessionId(sessionId);
     const records = this.listSessionsFromDisk();
-    const record = records.find((r) => r.id === sessionId);
+    const record = records.find((r) => r.id === rawId);
     if (!record || !fs.existsSync(record.filePath)) return [];
 
     const messages: Message[] = [];
@@ -328,7 +510,7 @@ export class DshAdapter {
 
     // Fallback: read from gateway_history cache file
     try {
-      const cacheFile = path.join(this.historyCacheDir, `${sessionId}.json`);
+      const cacheFile = path.join(this.historyCacheDir, `${rawId}.json`);
       if (fs.existsSync(cacheFile)) {
         const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
         if (Array.isArray(cached) && cached.length > 0) return cached;
@@ -341,8 +523,12 @@ export class DshAdapter {
   }
 
   appendHistoryCache(sessionId: string, userText: string, assistantText: string, reasoningText = ''): void {
+    const rawId = validateSessionId(sessionId);
     try {
-      const cacheFile = path.join(this.historyCacheDir, `${sessionId}.json`);
+      if (!fs.existsSync(this.historyCacheDir)) {
+        fs.mkdirSync(this.historyCacheDir, { recursive: true });
+      }
+      const cacheFile = path.join(this.historyCacheDir, `${rawId}.json`);
       let list: Message[] = [];
       if (fs.existsSync(cacheFile)) {
         try {
@@ -381,6 +567,19 @@ export class DshAdapter {
       // ignore
     }
   }
+
+  markTurnStart(turnId: string): void {
+    this.activeTurns.add(turnId);
+  }
+
+  markTurnEnd(turnId: string): void {
+    this.activeTurns.delete(turnId);
+  }
+
+  dispose(): void {
+    this.acpClient?.close();
+    this.acpClient = null;
+  }
 }
 
 export class DshProviderAdapter implements ProviderAdapter {
@@ -389,10 +588,21 @@ export class DshProviderAdapter implements ProviderAdapter {
   private readonly settingsStore: SettingsStore;
   /** Gateway native id → cwd (recorded at create/resume time for later turns). */
   private readonly sessionCwds = new Map<string, string>();
+  private cachedModels: NativeModel[] | null = null;
 
-  constructor(options: { dshBin?: string; sessionsDir?: string; settingsPath?: string; settingsStore?: SettingsStore } = {}) {
-    this.adapter = new DshAdapter(options);
+  constructor(options: { dshBin?: string; sessionsDir?: string; settingsPath?: string; settingsStore?: SettingsStore; recycleGraceMs?: number } = {}) {
     this.settingsStore = options.settingsStore ?? new SettingsStore(options.settingsPath);
+    this.adapter = new DshAdapter({
+      ...options,
+      permissionModeForSession: (sessionId: string) => this.getPermission(sessionId),
+    });
+  }
+
+  private updateCachedConfigOptions(configOptions: unknown): void {
+    const models = parseConfigModels(configOptions);
+    if (models && models.length > 0) {
+      this.cachedModels = models;
+    }
   }
 
   capabilities(): ProviderCapabilities {
@@ -404,8 +614,12 @@ export class DshProviderAdapter implements ProviderAdapter {
       questions: false,
       interrupt: true,
       history: true,
-      planMode: true,
-      permissionModes: ['default', 'auto', 'bypassPermissions', 'plan'],
+      planMode: false,
+      fork: false,
+      rollback: false,
+      goals: false,
+      compact: false,
+      permissionModes: ['default', 'auto'],
       manualApproval: true,
       commands: true,
       skills: true,
@@ -438,6 +652,9 @@ export class DshProviderAdapter implements ProviderAdapter {
       archived: this.settingsStore.getBoolean('archived', rec.id) === true,
       metadata: { cwd: rec.cwd },
       provider: 'dsh',
+      extras: {
+        last_prompt: rec.lastPrompt || (this.settingsStore.getString('title', rec.id) ?? rec.title ?? ''),
+      },
     }));
 
     const limit = query.limit ?? 50;
@@ -449,7 +666,7 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async get(id: string): Promise<Session> {
-    const rawId = id.startsWith('dsh_') ? id.slice(4) : id;
+    const rawId = validateSessionId(id);
     if (this.settingsStore.getBoolean('deleted', rawId) === true) {
       throw new ProviderError('not_found', `DSH session deleted: ${id}`, 404);
     }
@@ -468,6 +685,9 @@ export class DshProviderAdapter implements ProviderAdapter {
       archived: this.settingsStore.getBoolean('archived', found.id) === true,
       metadata: { cwd: found.cwd },
       provider: 'dsh',
+      extras: {
+        last_prompt: found.lastPrompt ?? '',
+      },
     };
   }
 
@@ -475,28 +695,34 @@ export class DshProviderAdapter implements ProviderAdapter {
     const cwd = input.cwd || process.cwd();
     const client = this.adapter.getAcpClient();
     const res = await client.newSession(cwd);
+    if (res?.configOptions) {
+      this.updateCachedConfigOptions(res.configOptions);
+    }
     this.sessionCwds.set(res.sessionId, cwd);
     const now = new Date().toISOString();
     return {
       id: res.sessionId,
       workspace_id: workspaceIdFromCwd(cwd, 'dsh'),
-      title: input.title || 'New Session',
+      title: input.title || '',
       created_at: now,
       updated_at: now,
       busy: false,
       metadata: { cwd },
       provider: 'dsh',
+      extras: {
+        last_prompt: '',
+      },
     };
   }
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     if (archived) this.settingsStore.set('archived', rawId, true);
     else this.settingsStore.delete('archived', rawId);
   }
 
   async delete(id: string): Promise<void> {
-    const rawId = id.startsWith('dsh_') ? id.slice(4) : id;
+    const rawId = validateSessionId(id);
     this.settingsStore.set('deleted', rawId, true);
     this.sessionCwds.delete(rawId);
     try {
@@ -506,46 +732,90 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async rename(sessionId: string, title: string): Promise<void> {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     this.settingsStore.set('title', rawId, title);
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
+    if (rawId === '__default__') {
+      this.settingsStore.set('model', '__default__', model);
+      return;
+    }
+    const client = this.adapter.getAcpClient();
+    if (client.isConnected()) {
+      const res = await client.setConfigOption(rawId, 'model', model);
+      if (res?.configOptions) {
+        this.updateCachedConfigOptions(res.configOptions);
+      }
+    }
     this.settingsStore.set('model', rawId, model);
   }
 
   getModel(sessionId: string): string | undefined {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     return this.settingsStore.getString('model', rawId) ?? this.settingsStore.getString('model', '__default__');
   }
 
+  async setThinking(sessionId: string, thinking: string): Promise<void> {
+    const rawId = validateSessionId(sessionId);
+    if (rawId === '__default__') {
+      this.settingsStore.set('thinking', '__default__', thinking);
+      return;
+    }
+    const client = this.adapter.getAcpClient();
+    if (client.isConnected()) {
+      const effort = thinking === 'off' ? '' : thinking;
+      const res = await client.setConfigOption(rawId, 'reasoning_effort', effort);
+      if (res?.configOptions) {
+        this.updateCachedConfigOptions(res.configOptions);
+      }
+    }
+    this.settingsStore.set('thinking', rawId, thinking);
+  }
+
+  getThinking(sessionId: string): string | undefined {
+    const rawId = validateSessionId(sessionId);
+    return this.settingsStore.getString('thinking', rawId) ?? this.settingsStore.getString('thinking', '__default__');
+  }
+
   async setPermission(sessionId: string, mode: string): Promise<void> {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     this.settingsStore.set('permission', rawId, mode);
   }
 
   getPermission(sessionId: string): string | undefined {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     return this.settingsStore.getString('permission', rawId) ?? this.settingsStore.getString('permission', '__default__');
   }
 
   async setPlanMode(sessionId: string, on: boolean): Promise<void> {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     if (on) this.settingsStore.set('plan', rawId, true);
     else this.settingsStore.delete('plan', rawId);
   }
 
   getPlanMode(sessionId: string): boolean | undefined {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     return this.settingsStore.getBoolean('plan', rawId);
   }
 
   getUsage(sessionId: string): SessionUsage | undefined {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     const proj = this.adapter.readProjcache(rawId);
     const totals = proj?.tokenUsage?.val?.totals;
-    if (!totals) return undefined;
+    if (!totals) {
+      return {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        total_cost_usd: 0,
+        context_tokens: 0,
+        context_limit: 131_072,
+        turn_count: 0,
+      };
+    }
     const input = totals.uncachedInputTokens ?? 0;
     const output = totals.outputTokens ?? 0;
     const cacheRead = totals.cacheReadTokens ?? 0;
@@ -564,11 +834,14 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async getHistory(sessionId: string, query?: HistoryQuery): Promise<Message[]> {
-    const rawId = sessionId.startsWith('dsh_') ? sessionId.slice(4) : sessionId;
+    const rawId = validateSessionId(sessionId);
     return this.adapter.getHistoryMessages(rawId);
   }
 
-  async models(sessionId?: string): Promise<NativeModel[]> {
+  async listModels(): Promise<NativeModel[]> {
+    if (this.cachedModels && this.cachedModels.length > 0) {
+      return this.cachedModels;
+    }
     return [
       {
         provider: 'dsh',
@@ -597,28 +870,12 @@ export class DshProviderAdapter implements ProviderAdapter {
     ];
   }
 
-  async commands(sessionId?: string): Promise<NativeCommand[]> {
-    return [
-      {
-        name: '/plan',
-        description: 'Switch DSH to read-only plan mode',
-        kind: 'client',
-      },
-      {
-        name: '/compact',
-        description: 'Trigger context compaction in DSH',
-        kind: 'client',
-      },
-      {
-        name: '/goal',
-        description: 'Set an autonomous durable goal for DSH',
-        kind: 'prompt',
-      },
-    ];
+  async listCommands(_sessionId?: string, _cwd?: string): Promise<NativeCommand[]> {
+    return listDshCommands();
   }
 
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
-    let rawId = input.sessionId;
+    let rawId = validateSessionId(input.sessionId);
     const client = this.adapter.getAcpClient();
     const sessionId = input.sessionId;
     const turnId = randomUUID();
@@ -633,30 +890,18 @@ export class DshProviderAdapter implements ProviderAdapter {
       const cwdMeta = input.metadata?.cwd;
       cwd = typeof cwdMeta === 'string' && cwdMeta ? cwdMeta : process.cwd();
     }
-    // The dsh ACP connection may have been recycled since this session was
-    // created. Resume it; on "unknown session" (fresh process) re-create a
-    // session on the same cwd and remap the id for this turn.
-    try {
-      await client.resumeSession(rawId, cwd);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes('unknown session')) {
-        const remapped = await client.newSession(cwd);
-        rawId = remapped.sessionId;
-        this.sessionCwds.set(rawId, cwd);
-        console.warn(`[dsh-adapter] recycled session ${input.sessionId} remapped to ${rawId} (cwd=${cwd})`);
-      } else {
-        console.warn(`[dsh-adapter] resumeSession(${rawId}) failed: ${message}`);
-      }
+    const resumeRes = await client.resumeSession(rawId, cwd);
+    if (resumeRes?.configOptions) {
+      this.updateCachedConfigOptions(resumeRes.configOptions);
     }
 
     const promptText = typeof input.input === 'string'
       ? input.input
       : input.input.map((p) => ('text' in p ? p.text : '')).join(' ');
 
-    const events: GatewayEvent[] = [];
-    let resolveTurn: (() => void) | undefined;
-    let finished = false;
+    this.adapter.markTurnStart(turnId);
+    const events = new AsyncEventQueue();
+    const toolCalls = new Map<string, { name: string; input: unknown }>();
     let accumulatedAssistantText = '';
     let accumulatedReasoningText = '';
 
@@ -702,6 +947,7 @@ export class DshProviderAdapter implements ProviderAdapter {
           },
         });
       } else if (ev.type === 'tool_call') {
+        toolCalls.set(ev.toolCallId, { name: ev.title, input: ev.rawInput });
         events.push({
           kind: 'tool',
           status: 'started',
@@ -715,19 +961,23 @@ export class DshProviderAdapter implements ProviderAdapter {
           },
         });
       } else if (ev.type === 'tool_call_update') {
+        const isFailed = ev.status === 'failed' || ev.status === 'error';
         events.push({
           kind: 'tool',
-          status: 'completed',
+          status: isFailed ? 'failed' : 'completed',
           sessionId,
           turnId,
           timestamp: Date.now(),
           payload: {
             toolCallId: ev.toolCallId,
             name: ev.title || 'tool',
-            output: typeof ev.rawOutput === 'string' ? ev.rawOutput : JSON.stringify(ev.rawOutput),
+            output: formatToolOutput(ev.rawOutput),
+            is_error: isFailed,
           },
         });
       } else if (ev.type === 'permission_request') {
+        const callId = String(ev.toolCall?.toolCallId ?? ev.toolCall?.callId ?? '');
+        const prevTool = callId ? toolCalls.get(callId) : undefined;
         events.push({
           kind: 'approval',
           status: 'started',
@@ -736,8 +986,9 @@ export class DshProviderAdapter implements ProviderAdapter {
           timestamp: Date.now(),
           payload: {
             approvalId: String(ev.requestId),
-            tool: String(ev.toolCall?.name || 'tool'),
-            input: ev.toolCall?.arguments,
+            tool: prevTool?.name || String(ev.toolCall?.name || 'tool'),
+            input: prevTool?.input ?? ev.toolCall?.arguments ?? ev.toolCall?.input,
+            itemId: callId || String(ev.requestId),
           },
         });
       }
@@ -745,57 +996,48 @@ export class DshProviderAdapter implements ProviderAdapter {
 
     client
       .prompt(rawId, promptText)
-      .then(() => {
+      .then((res) => {
         this.adapter.appendHistoryCache(rawId, promptText, accumulatedAssistantText, accumulatedReasoningText);
-        finished = true;
+        const isCancelled = res?.stopReason === 'cancelled';
         events.push({
           kind: 'turn',
-          status: 'completed',
+          status: isCancelled ? 'cancelled' : 'completed',
           sessionId,
           turnId,
           timestamp: Date.now(),
-          payload: { reason: 'completed' },
+          payload: { reason: isCancelled ? 'cancelled' : 'completed' },
         });
-        resolveTurn?.();
       })
       .catch((err) => {
         console.error(`[dsh-adapter] prompt(${rawId}) failed:`, err instanceof Error ? err.message : err);
-        finished = true;
         events.push({
           kind: 'turn',
           status: 'failed',
           sessionId,
           turnId,
           timestamp: Date.now(),
-          payload: { reason: 'failed', error: err.message },
+          payload: { reason: 'failed', error: err instanceof Error ? err.message : String(err) },
         });
-        resolveTurn?.();
       })
       .finally(() => {
+        this.adapter.markTurnEnd(turnId);
+        events.finish();
         unsubscribe();
       });
 
-    async function* eventStream(): AsyncIterable<GatewayEvent> {
-      while (!finished || events.length > 0) {
-        if (events.length > 0) {
-          yield events.shift()!;
-        } else {
-          await new Promise((r) => setTimeout(r, 25));
-        }
-      }
-    }
-
     return {
       turnId,
-      events: eventStream(),
+      events,
     };
   }
 
   async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
-    const rawId = sessionId;
+    const rawId = validateSessionId(sessionId);
     const client = this.adapter.getAcpClient();
-    const approved = decision === 'approve' || decision === 'approve_always';
-    client.resolvePermission(rawId, approved);
+    const resolved = client.resolvePermission(approvalId, decision, rawId);
+    if (!resolved) {
+      throw new ProviderError('not_found', `Approval ${approvalId} not found for session ${sessionId}`, 404);
+    }
   }
 
   async resolveQuestion(sessionId: string, questionId: string, answer: string): Promise<void> {
@@ -803,13 +1045,18 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    const rawId = sessionId;
+    const rawId = validateSessionId(sessionId);
     const client = this.adapter.getAcpClient();
     await client.cancel(rawId);
   }
 
-  async close(): Promise<void> {
-    const client = this.adapter.getAcpClient();
-    client.close();
+  async close(sessionId: string): Promise<void> {
+    const rawId = validateSessionId(sessionId);
+    this.sessionCwds.delete(rawId);
+    this.sessionCwds.delete(sessionId);
+  }
+
+  async dispose(): Promise<void> {
+    this.adapter.dispose();
   }
 }

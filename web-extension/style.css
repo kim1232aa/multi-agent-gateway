@@ -22,13 +22,16 @@
 
 .multi-agent-provider-seg {
   width: 100%;
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px;
 }
 
 .multi-agent-provider-seg.ui-seg {
   position: relative;
-  display: inline-flex;
-  gap: 1px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 2px;
   padding: 2px;
   background: var(--color-surface-sunken);
   border: 0.5px solid var(--color-line);

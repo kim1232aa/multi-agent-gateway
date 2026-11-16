@@ -57,11 +57,11 @@
     dsh: {
       tower: false,
       swarm: false,
-      goals: true,
-      planMode: true,
+      goals: false,
+      planMode: false,
       btw: false,
       rollback: false,
-      compact: true,
+      compact: false,
       fork: false,
     },
   };
@@ -166,7 +166,7 @@
 
   function needsProvider(pathname) {
     // /api/v1/auth 与 /api/v2/mcp/* 永不带 provider:登录和官方 MCP 认证是 Kimi 全局状态。
-    if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta' || pathname === '/api/v1/providers') return true;
+    if (pathname === '/api/v1/models' || pathname === '/api/v1/workspaces' || pathname === '/api/v1/config' || pathname === '/api/v1/commands' || pathname === '/api/v1/meta' || pathname === '/api/v1/providers' || /^\/api\/v1\/providers\/[^/]+$/.test(pathname)) return true;
     if (pathname === '/api/v1/sessions' || pathname === '/api/v2/sessions' || pathname === '/api/v2/sessions:archive' || pathname === '/api/v2/sessions:restore' || pathname === '/api/v1/files' || pathname === '/api/v1/fs:home' || pathname === '/api/v1/fs:browse' || pathname === '/api/v1/fs:suggest' || pathname === '/api/v1/workspace/fs:list' || pathname === '/api/v1/workspace/fs:search' || pathname === '/api/v1/workspace/fs:suggest' || /^\/api\/v1\/files\//.test(pathname) || /^\/api\/v1\/sessions\/[^/]+\/status$/.test(pathname)) return true;
     // 2.6.2 / 0.39 全局能力不跟 Agent 切换走:
     // /v1/remote*、/capabilities、/plugins、/remote-control*、/api/v2/mcp/*、/providers、/catalog/providers、/fs:content。
@@ -375,20 +375,27 @@
     if (isPromptWrite) {
       if (init && typeof init.body === 'string') {
         init = Object.assign({}, init, { body: sanitizePromptBody(init.body) });
-      } else if (!init && input instanceof Request && typeof input.clone === 'function') {
+      } else if (input instanceof Request && typeof input.clone === 'function' && (!init || init.body === undefined)) {
         var sourceRequest = input;
         input = sourceRequest.clone();
         var rewritten = input.text().then(function (bodyText) {
-          return new Request(url.href, {
+          var sanitizedBody = sanitizePromptBody(bodyText);
+          var reqInit = Object.assign({
             method: sourceRequest.method,
             headers: sourceRequest.headers,
-            body: sanitizePromptBody(bodyText),
+            body: sanitizedBody,
             credentials: sourceRequest.credentials,
             cache: sourceRequest.cache,
             redirect: sourceRequest.redirect,
             referrer: sourceRequest.referrer,
+            referrerPolicy: sourceRequest.referrerPolicy,
             integrity: sourceRequest.integrity,
-          });
+            keepalive: sourceRequest.keepalive,
+            mode: sourceRequest.mode,
+            signal: sourceRequest.signal,
+          }, init || {});
+          reqInit.body = sanitizedBody;
+          return new Request(url.href, reqInit);
         });
         return rewritten.then(function (request) {
           return originalFetch.call(window, request);
@@ -503,7 +510,12 @@
                   if (sidProv !== ws._maProvider) {
                     if (fType === 'subscribe' || fType === 'subscribe_v2') {
                       if (sidProv === selectedProvider()) {
-                        try { ws.close(1000, 'provider-mismatch-reconnect'); } catch (_) {}
+                        try {
+                          ws._intentionalClose = true;
+                          ws._maIntentionalClose = true;
+                          ws.onerror = null;
+                          ws.close(1000, 'provider-mismatch-reconnect');
+                        } catch (_) {}
                         return;
                       }
                       var okAck = fType === 'subscribe'
@@ -516,6 +528,17 @@
                             payload: { accepted: [sid], not_found: [], resync_required: [], cursors: {} },
                           };
                       emitSyntheticWsMessage(ws, okAck);
+                    } else if (fType === 'unsubscribe' || fType === 'unsubscribe_v2') {
+                      var unAck = fType === 'unsubscribe'
+                        ? { type: 'response', request_id: frame.request_id, code: 0, msg: 'success' }
+                        : {
+                            type: 'ack',
+                            id: frame.id,
+                            code: 0,
+                            msg: 'success',
+                            payload: { accepted: [sid], not_found: [], resync_required: [] },
+                          };
+                      emitSyntheticWsMessage(ws, unAck);
                     }
                     return;
                   }
@@ -570,7 +593,12 @@
   function closeProviderSockets(reason) {
     providerSockets.forEach(function (ws) {
       clearWakeProbe(ws);
-      try { ws.close(1000, reason || 'provider-switch'); } catch (_) {}
+      try {
+        ws._intentionalClose = true;
+        ws._maIntentionalClose = true;
+        ws.onerror = null;
+        ws.close(1000, reason || 'provider-switch');
+      } catch (_) {}
     });
     providerSockets.clear();
   }
@@ -701,6 +729,14 @@
           return;
         }
         var changed = filtered.length !== PROVIDERS.length;
+        if (!changed) {
+          for (var i = 0; i < filtered.length; i += 1) {
+            if (filtered[i] !== PROVIDERS[i]) {
+              changed = true;
+              break;
+            }
+          }
+        }
         PROVIDERS.length = 0;
         Array.prototype.push.apply(PROVIDERS, filtered);
         if (window.__multiAgent) window.__multiAgent.providers = PROVIDERS;
@@ -1662,9 +1698,8 @@
   function syncExtBar() {
     if (!document.querySelector || typeof document.createElement !== 'function') return;
     var existingBars = document.querySelectorAll ? Array.prototype.slice.call(document.querySelectorAll('.multi-agent-ext-bar')) : [];
-    var provider = selectedProvider();
     var sid = currentSessionIdForExtUi();
-    var ext = provider === 'pi' && sid ? extUiBySession[sid] : null;
+    var ext = sid ? extUiBySession[sid] : null;
     var statusKeys = ext && ext.statuses ? Object.keys(ext.statuses).filter(function (k) { return ext.statuses[k]; }) : [];
     var widgetKeys = ext && ext.widgets ? Object.keys(ext.widgets).filter(function (k) { return ext.widgets[k] && Array.isArray(ext.widgets[k].lines) && ext.widgets[k].lines.length > 0; }) : [];
     if (statusKeys.length === 0 && widgetKeys.length === 0) {

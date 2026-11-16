@@ -179,6 +179,7 @@ export interface PiSessionSummary {
   createdAt: string;
   updatedAt: string;
   parentSession?: string;
+  firstUserPrompt?: string;
 }
 
 export interface PiAdapterOptions {
@@ -211,7 +212,7 @@ export interface PiAdapterOptions {
   /** Optional stderr line callback for diagnostics. */
   onStderr?: (line: string) => void;
   /** Optional preference resolver (used by PiProviderAdapter to sync SettingsStore). */
-  resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
+  resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string; autoCompaction?: boolean };
   /** Idle process recycle grace period in ms. Default 180_000 (3 min); 0 disables. */
   recycleGraceMs?: number;
   /** Maximum concurrent live session processes. Default 2; 0 disables. */
@@ -242,9 +243,18 @@ export interface PiStartTurnResult {
 export class JsonlLineFramer {
   private readonly decoder = new StringDecoder('utf8');
   private buffer = '';
+  private readonly maxBufferBytes: number;
+
+  constructor(maxBufferBytes = 16 * 1024 * 1024) {
+    this.maxBufferBytes = maxBufferBytes;
+  }
 
   push(chunk: Buffer | string): string[] {
     this.buffer += typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
+    if (this.buffer.length > this.maxBufferBytes) {
+      this.buffer = '';
+      throw new Error(`JsonlLineFramer buffer exceeded maximum size of ${this.maxBufferBytes} bytes`);
+    }
     const lines: string[] = [];
     let start = 0;
     for (;;) {
@@ -263,6 +273,10 @@ export class JsonlLineFramer {
 
   flush(): string[] {
     this.buffer += this.decoder.end();
+    if (this.buffer.length > this.maxBufferBytes) {
+      this.buffer = '';
+      throw new Error(`JsonlLineFramer buffer exceeded maximum size of ${this.maxBufferBytes} bytes`);
+    }
     if (this.buffer.length === 0) return [];
     let line = this.buffer;
     this.buffer = '';
@@ -604,13 +618,21 @@ export class PiRpcClient {
     this.writer = new StdinLineWriter(child.stdin!);
 
     child.stdout?.on('data', (chunk: Buffer | string) => {
-      for (const line of this.framer.push(chunk)) {
-        this.handleLine(line);
+      try {
+        for (const line of this.framer.push(chunk)) {
+          this.handleLine(line);
+        }
+      } catch (err) {
+        this.handleProcessExit(null, null, err instanceof Error ? err : new Error(String(err)));
       }
     });
     child.stdout?.on('end', () => {
-      for (const line of this.framer.flush()) {
-        this.handleLine(line);
+      try {
+        for (const line of this.framer.flush()) {
+          this.handleLine(line);
+        }
+      } catch (err) {
+        this.handleProcessExit(null, null, err instanceof Error ? err : new Error(String(err)));
       }
     });
     child.stderr?.on('data', (chunk: Buffer | string) => {
@@ -627,8 +649,13 @@ export class PiRpcClient {
       this.handleProcessExit(null, null, err);
     });
     child.once('close', (code, signal) => {
-      for (const line of this.framer.flush()) {
-        this.handleLine(line);
+      try {
+        for (const line of this.framer.flush()) {
+          this.handleLine(line);
+        }
+      } catch (err) {
+        this.handleProcessExit(code, signal, err instanceof Error ? err : new Error(String(err)));
+        return;
       }
       this.handleProcessExit(code, signal);
     });
@@ -796,6 +823,10 @@ export class PiRpcClient {
     const exitErr = new ProviderError('upstream_error', detail, 502, err);
     this.exitError = exitErr;
 
+    if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
+      killProcessGroup(this.child, 'SIGTERM');
+    }
+
     this.writer?.abort(exitErr);
     this.writer = null;
 
@@ -897,7 +928,7 @@ export class PiAdapter {
   private readonly maxHistoryTailBytes: number;
   private readonly handledGraceMs: number;
   private readonly onStderr?: (line: string) => void;
-  private readonly resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string };
+  private readonly resolveSessionPreferences?: (sessionId: string) => { model?: string; thinking?: string; autoCompaction?: boolean };
   private readonly recycleGraceMs: number;
   private readonly maxLiveProcesses: number;
   private readonly maxSessionFileBytes: number;
@@ -918,7 +949,8 @@ export class PiAdapter {
   private readonly sessionUsage = new Map<string, SessionUsage>();
   private readonly sessionModels = new Map<string, string>();
   private readonly sessionThinkings = new Map<string, string>();
-  private readonly appliedPreferences = new Map<string, { model?: string; thinking?: string }>();
+  private readonly sessionAutoCompaction = new Map<string, boolean>();
+  private readonly appliedPreferences = new Map<string, { model?: string; thinking?: string; autoCompaction?: boolean }>();
   private readonly extensionUiStates = new Map<string, PiExtensionUiState>();
   private readonly discoveredSubagents = new Map<string, Map<string, PiDiscoveredSubagent>>();
   private readonly lastActivityAt = new Map<string, number>();
@@ -1071,20 +1103,34 @@ export class PiAdapter {
       return this.modelsCache.models;
     }
     if (this.modelsInflight) return this.modelsInflight;
-    const inflight = this.runEphemeralRpc(async (client) => {
-      const data = await client.request<{ models?: PiModelInfo[] }>({ type: 'get_available_models' });
-      const models = Array.isArray(data?.models) ? data.models : [];
-      this.modelsCache = { ts: Date.now(), models };
-      return models;
-    }).finally(() => {
+    const inflight = (async () => {
+      for (const [, client] of this.processes) {
+        if (client.isAlive) {
+          try {
+            const data = await client.request<{ models?: PiModelInfo[] }>({ type: 'get_available_models' });
+            const models = Array.isArray(data?.models) ? data.models : [];
+            this.modelsCache = { ts: Date.now(), models };
+            return models;
+          } catch {
+            // fall through to next client or ephemeral
+          }
+        }
+      }
+      return this.runEphemeralRpc(async (client) => {
+        const data = await client.request<{ models?: PiModelInfo[] }>({ type: 'get_available_models' });
+        const models = Array.isArray(data?.models) ? data.models : [];
+        this.modelsCache = { ts: Date.now(), models };
+        return models;
+      });
+    })().finally(() => {
       this.modelsInflight = null;
     });
     this.modelsInflight = inflight;
     return inflight;
   }
 
-  async getCommands(sessionId?: string): Promise<PiNativeCommandInput[]> {
-    const cwd = sessionId ? await this.resolveSessionCwd(sessionId) : process.cwd();
+  async getCommands(sessionId?: string, cwdOverride?: string): Promise<PiNativeCommandInput[]> {
+    const cwd = cwdOverride || (sessionId ? await this.resolveSessionCwd(sessionId) : process.cwd());
     const cacheKey = cwd;
     const hit = this.commandsCache.get(cacheKey);
     if (hit && Date.now() - hit.ts < COMMANDS_TTL_MS) {
@@ -1094,7 +1140,21 @@ export class PiAdapter {
     if (inflight) return inflight;
 
     const task = (async () => {
-      const existing = sessionId ? this.processes.get(sessionId) : undefined;
+      let existing: PiRpcClient | undefined;
+      if (sessionId) {
+        const sessionCwd = await this.resolveSessionCwd(sessionId);
+        if (!cwdOverride || cwdOverride === sessionCwd) {
+          existing = this.processes.get(sessionId);
+        }
+      }
+      if (!existing?.isAlive) {
+        for (const [sid, client] of this.processes) {
+          if (client.isAlive && this.sessionCwd.get(sid) === cwd) {
+            existing = client;
+            break;
+          }
+        }
+      }
       let cmds: PiNativeCommandInput[];
       if (existing?.isAlive) {
         const data = await existing.request<{ commands?: PiNativeCommandInput[] }>({ type: 'get_commands' });
@@ -1165,9 +1225,14 @@ export class PiAdapter {
       return st;
     };
     if (method === 'setStatus') {
-      const key = typeof req.statusKey === 'string' ? req.statusKey : '';
+      const key = typeof req.statusKey === 'string' && req.statusKey
+        ? req.statusKey
+        : (typeof req.key === 'string' && req.key ? req.key : (typeof req.id === 'string' ? req.id : ''));
       if (!key) return false;
-      const text = typeof req.statusText === 'string' ? req.statusText.trim() : '';
+      const rawText = typeof req.statusText === 'string'
+        ? req.statusText
+        : (typeof req.text === 'string' ? req.text : '');
+      const text = rawText.trim();
       if (!text) {
         return st ? st.statuses.delete(key) : false;
       }
@@ -1175,11 +1240,18 @@ export class PiAdapter {
       return true;
     }
     if (method === 'setWidget') {
-      const key = typeof req.widgetKey === 'string' ? req.widgetKey : '';
+      const key = typeof req.widgetKey === 'string' && req.widgetKey
+        ? req.widgetKey
+        : (typeof req.key === 'string' && req.key ? req.key : (typeof req.id === 'string' ? req.id : ''));
       if (!key) return false;
-      const lines = Array.isArray(req.widgetLines)
-        ? req.widgetLines.filter((l): l is string => typeof l === 'string')
-        : null;
+      let lines: string[] | null = null;
+      if (Array.isArray(req.widgetLines)) {
+        lines = req.widgetLines.filter((l): l is string => typeof l === 'string');
+      } else if (Array.isArray(req.lines)) {
+        lines = req.lines.filter((l): l is string => typeof l === 'string');
+      } else if (typeof req.text === 'string') {
+        lines = [req.text];
+      }
       if (!lines || lines.length === 0) {
         return st ? st.widgets.delete(key) : false;
       }
@@ -1358,11 +1430,18 @@ export class PiAdapter {
   }
 
   async setAutoCompaction(sessionId: string, enabled: boolean): Promise<boolean> {
-    const client = await this.ensureSessionProcess(sessionId);
-    await client.request({ type: 'set_auto_compaction', enabled });
-    const state = await client.request<PiSessionState>({ type: 'get_state' }).catch(() => null);
-    if (state) this.recordState(sessionId, state);
-    return state?.autoCompactionEnabled ?? enabled;
+    assertSafeSessionId(sessionId);
+    const existing = this.processes.get(sessionId);
+    if (existing?.isAlive) {
+      this.touchActivity(sessionId);
+      await existing.request({ type: 'set_auto_compaction', enabled });
+      const state = await existing.request<PiSessionState>({ type: 'get_state' }).catch(() => null);
+      if (state) this.recordState(sessionId, state);
+      this.sessionAutoCompaction.set(sessionId, enabled);
+      return state?.autoCompactionEnabled ?? enabled;
+    }
+    this.sessionAutoCompaction.set(sessionId, enabled);
+    return enabled;
   }
 
   async getAutoCompaction(sessionId: string): Promise<boolean | undefined> {
@@ -1374,6 +1453,8 @@ export class PiAdapter {
       this.recordState(sessionId, state);
       return state.autoCompactionEnabled;
     }
+    const pref = this.resolveSessionPreferences?.(sessionId)?.autoCompaction ?? this.sessionAutoCompaction.get(sessionId);
+    if (pref !== undefined) return pref;
     return this.readConfiguredCompactionEnabled();
   }
 
@@ -1448,17 +1529,58 @@ export class PiAdapter {
     if (!trimmed) {
       throw new ProviderError('invalid_request', 'Session name cannot be empty', 400);
     }
-    this.sessionNames.set(sessionId, trimmed);
     const existing = this.processes.get(sessionId);
     if (existing?.isAlive) {
       await existing.request({ type: 'set_session_name', name: trimmed }).catch(() => undefined);
+      this.sessionNames.set(sessionId, trimmed);
       return;
     }
     const filePath = await this.locateSessionFile(sessionId);
     if (filePath) {
-      await this.runEphemeralRpc(async (client) => {
-        await client.request({ type: 'set_session_name', name: trimmed });
-      }, await this.resolveSessionCwd(sessionId), ['--session', filePath]).catch(() => undefined);
+      if (this.maxSessionFileBytes > 0) {
+        const st = await fsp.stat(filePath).catch(() => null);
+        if (st && st.size > this.maxSessionFileBytes) {
+          throw new ProviderError(
+            'invalid_request',
+            `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${filePath}`,
+            400,
+          );
+        }
+      }
+      const realRoot = await safeRealpath(this.sessionsDir);
+      if (!realRoot) {
+        throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+      }
+      let lastId: string | null = null;
+      await forEachJsonlEntryNoFollow(filePath, realRoot, (entry) => {
+        if (typeof entry.id === 'string' && entry.id) lastId = entry.id;
+      });
+      if (!lastId) {
+        throw new ProviderError('invalid_request', 'Cannot rename session without a valid session leaf', 400);
+      }
+      const entry = {
+        type: 'session_info',
+        id: randomUUID().slice(0, 8),
+        parentId: lastId,
+        timestamp: new Date().toISOString(),
+        name: trimmed,
+      };
+      const anchor = await openAnchoredParentDir(filePath, realRoot);
+      try {
+        const fh = await fsp.open(anchor.anchoredPath, fsConstants.O_WRONLY | fsConstants.O_APPEND | (fsConstants.O_NOFOLLOW ?? 0));
+        try {
+          await fh.writeFile(JSON.stringify(entry) + '\n', 'utf8');
+        } finally {
+          await fh.close();
+        }
+      } finally {
+        await anchor.close().catch(() => undefined);
+      }
+      this.sessionNames.set(sessionId, trimmed);
+    } else if (this.draftSessions.has(sessionId)) {
+      this.sessionNames.set(sessionId, trimmed);
+    } else {
+      throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
     }
   }
 
@@ -1479,6 +1601,16 @@ export class PiAdapter {
     if (!filePath) {
       if (this.draftSessions.has(sessionId)) return [];
       throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+    if (this.maxSessionFileBytes > 0) {
+      const st = await fsp.stat(filePath).catch(() => null);
+      if (st && st.size > this.maxSessionFileBytes) {
+        throw new ProviderError(
+          'invalid_request',
+          `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${filePath}`,
+          400,
+        );
+      }
     }
     const realRoot = await safeRealpath(this.sessionsDir);
     if (!realRoot) {
@@ -1502,10 +1634,8 @@ export class PiAdapter {
   }
 
   async fork(sessionId: string, entryId?: string): Promise<PiSessionSummary> {
-    if (entryId) {
-      return this.cloneOrForkIsolated(sessionId, 'fork', entryId);
-    }
-    return this.cloneOrForkIsolated(sessionId, 'clone');
+    if (!entryId) return this.cloneOrForkIsolated(sessionId, 'clone');
+    return this.cloneOrForkIsolated(sessionId, 'fork', entryId);
   }
 
   private async cloneOrForkIsolated(
@@ -1559,11 +1689,21 @@ export class PiAdapter {
       throw new ProviderError('not_found', 'pi adapter disposed', 404);
     }
 
+    const reservationKey = '__clone_fork_' + randomUUID();
+    await this.withCapacityLock(async () => {
+      if (this.disposed) {
+        throw new ProviderError('not_found', 'pi adapter disposed', 404);
+      }
+      await this.evictOldestIdleProcessIfNeeded(reservationKey, true);
+      this.startingSessions.add(reservationKey);
+    });
+
     // Spawn an isolated RPC process for the cloned/forked session so the source
     // session's running process is never switched or mutated.
-    const newClient = this.createClient(sourceCwd, launchArgs);
-    this.ephemeralClients.add(newClient);
+    let newClient: PiRpcClient | null = null;
     try {
+      newClient = this.createClient(sourceCwd, launchArgs);
+      this.ephemeralClients.add(newClient);
       newClient.start();
       const preState = await newClient.request<PiSessionState>({ type: 'get_state' });
       if ((preState.messageCount ?? 0) === 0) {
@@ -1610,6 +1750,10 @@ export class PiAdapter {
       const sourcePrefs = this.resolveSessionPreferences?.(sourceSessionId);
       const sourceModel = this.sessionModels.get(sourceSessionId) ?? sourcePrefs?.model;
       const sourceThinking = this.sessionThinkings.get(sourceSessionId) ?? sourcePrefs?.thinking;
+      const sourceAutoCompaction = sourcePrefs?.autoCompaction ?? this.sessionAutoCompaction.get(sourceSessionId);
+      if (sourceAutoCompaction !== undefined) {
+        this.sessionAutoCompaction.set(newSessionId, sourceAutoCompaction);
+      }
       const clonedModel = newState.model?.provider && newState.model?.id && newState.model.id !== 'unknown'
         ? encodePiModelId(newState.model.provider, newState.model.id)
         : undefined;
@@ -1625,6 +1769,10 @@ export class PiAdapter {
         await newClient.request({ type: 'set_thinking_level', level: sourceThinking }).catch(() => undefined);
         stateNeedsRefresh = true;
       }
+      if (sourceAutoCompaction !== undefined && sourceAutoCompaction !== newState.autoCompactionEnabled) {
+        await newClient.request({ type: 'set_auto_compaction', enabled: sourceAutoCompaction }).catch(() => undefined);
+        stateNeedsRefresh = true;
+      }
       if (stateNeedsRefresh) {
         newState = await newClient.request<PiSessionState>({ type: 'get_state' });
       }
@@ -1633,7 +1781,6 @@ export class PiAdapter {
         throw new ProviderError('not_found', 'pi adapter disposed', 404);
       }
       this.ephemeralClients.delete(newClient);
-      await this.evictOldestIdleProcessIfNeeded(newSessionId, false);
       const displaced = this.processes.get(newSessionId);
       if (displaced && displaced !== newClient) {
         this.clientToSession.delete(displaced);
@@ -1652,10 +1799,11 @@ export class PiAdapter {
       }
       this.recordState(newSessionId, newState);
       const effectiveThinking = newState.thinkingLevel ?? sourceThinking;
-      if (sourceModel || effectiveThinking) {
+      if (sourceModel || effectiveThinking || sourceAutoCompaction !== undefined) {
         this.appliedPreferences.set(newSessionId, {
           ...(sourceModel ? { model: sourceModel } : {}),
           ...(effectiveThinking ? { thinking: effectiveThinking } : {}),
+          ...(sourceAutoCompaction !== undefined ? { autoCompaction: sourceAutoCompaction } : {}),
         });
       }
 
@@ -1675,9 +1823,13 @@ export class PiAdapter {
         parentSession: resolvedSourceFile,
       };
     } catch (err) {
-      this.ephemeralClients.delete(newClient);
-      await newClient.close().catch(() => undefined);
+      if (newClient) {
+        this.ephemeralClients.delete(newClient);
+        await newClient.close().catch(() => undefined);
+      }
       throw err;
+    } finally {
+      this.startingSessions.delete(reservationKey);
     }
   }
 
@@ -2008,6 +2160,7 @@ export class PiAdapter {
     this.modelsInflight = null;
     this.thinkingLevelsCache.clear();
     this.commandsInflight.clear();
+    this.sessionAutoCompaction.clear();
     const sessionIds = new Set([...this.processes.keys(), ...this.activeTurns.keys()]);
     const ephemeral = [...this.ephemeralClients];
     this.ephemeralClients.clear();
@@ -2062,7 +2215,7 @@ export class PiAdapter {
       this.lastActivityAt.delete(sessionId);
       return;
     }
-    const hasParked = this.hasParkedQuestions(sessionId);
+    const hasParked = this.hasParkedQuestions(sessionId) || this.hasParkedApprovals(sessionId);
     const busy = this.activeTurns.has(sessionId) || hasParked || client.hasPendingRequests();
     if (busy) {
       this.scheduleRecycle(sessionId);
@@ -2089,15 +2242,27 @@ export class PiAdapter {
     return false;
   }
 
+  private hasParkedApprovals(sessionId: string): boolean {
+    for (const a of this.parkedApprovals.values()) {
+      if (a.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
   private async evictOldestIdleProcessIfNeeded(excludeSid?: string, strict = true): Promise<void> {
     if (this.maxLiveProcesses <= 0) return;
-    while (this.processes.size + this.startingSessions.size >= this.maxLiveProcesses) {
+    const startingOnly = new Set<string>();
+    for (const sid of this.startingSessions) {
+      if (this.processes.has(sid)) continue;
+      startingOnly.add(sid);
+    }
+    while (this.processes.size + startingOnly.size >= this.maxLiveProcesses) {
       let oldestSid: string | null = null;
       let oldestTime = Infinity;
       for (const [sid, client] of this.processes) {
         if (sid === excludeSid) continue;
         if (this.activeTurns.has(sid)) continue;
-        if (this.hasParkedQuestions(sid)) continue;
+        if (this.hasParkedQuestions(sid) || this.hasParkedApprovals(sid)) continue;
         if (this.ensureInflight.has(sid) || this.startingSessions.has(sid)) continue;
         if (client.hasPendingRequests()) continue;
         const t = this.lastActivityAt.get(sid) ?? 0;
@@ -2370,6 +2535,16 @@ export class PiAdapter {
       }
       throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
     }
+    if (this.maxSessionFileBytes > 0) {
+      const st = await fsp.stat(filePath).catch(() => null);
+      if (st && st.size > this.maxSessionFileBytes) {
+        throw new ProviderError(
+          'invalid_request',
+          `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${filePath}`,
+          400,
+        );
+      }
+    }
 
     const realRoot = await safeRealpath(this.sessionsDir);
     if (!realRoot) {
@@ -2461,6 +2636,16 @@ export class PiAdapter {
         return emptyStats;
       }
       throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
+    }
+    if (this.maxSessionFileBytes > 0) {
+      const st = await fsp.stat(filePath).catch(() => null);
+      if (st && st.size > this.maxSessionFileBytes) {
+        throw new ProviderError(
+          'invalid_request',
+          `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${filePath}`,
+          400,
+        );
+      }
     }
 
     const realRoot = await safeRealpath(this.sessionsDir);
@@ -2621,6 +2806,16 @@ export class PiAdapter {
       }
       throw new ProviderError('not_found', `pi-adapter: session not found: ${sessionId}`, 404);
     }
+    if (this.maxSessionFileBytes > 0) {
+      const st = await fsp.stat(filePath).catch(() => null);
+      if (st && st.size > this.maxSessionFileBytes) {
+        throw new ProviderError(
+          'invalid_request',
+          `Session file exceeds maximum allowed size (${st.size} > ${this.maxSessionFileBytes} bytes): ${filePath}`,
+          400,
+        );
+      }
+    }
 
     const realRoot = await safeRealpath(this.sessionsDir);
     if (!realRoot) {
@@ -2699,6 +2894,7 @@ export class PiAdapter {
     const resolved = this.resolveSessionPreferences?.(sessionId);
     const desiredModel = resolved?.model ?? this.sessionModels.get(sessionId);
     const desiredThinking = resolved?.thinking ?? this.sessionThinkings.get(sessionId);
+    const desiredAutoCompaction = resolved?.autoCompaction ?? this.sessionAutoCompaction.get(sessionId);
     const applied = this.appliedPreferences.get(sessionId);
 
     const currentModel = initialState?.model?.provider && initialState?.model?.id && initialState.model.id !== 'unknown'
@@ -2733,6 +2929,21 @@ export class PiAdapter {
       changed = true;
     }
 
+    const shouldSyncAutoCompaction = Boolean(
+      desiredAutoCompaction !== undefined &&
+      (isStartup || desiredAutoCompaction !== applied?.autoCompaction),
+    );
+    let autoCompactionApplied = false;
+    if (shouldSyncAutoCompaction && desiredAutoCompaction !== undefined) {
+      try {
+        await client.request({ type: 'set_auto_compaction', enabled: desiredAutoCompaction });
+        changed = true;
+        autoCompactionApplied = true;
+      } catch {
+        // failed to apply, remains retryable on next sync
+      }
+    }
+
     if (changed) {
       const refreshed = await client.request<PiSessionState>({ type: 'get_state' });
       this.recordState(sessionId, refreshed);
@@ -2741,6 +2952,7 @@ export class PiAdapter {
     this.appliedPreferences.set(sessionId, {
       model: opts?.skipModelSync ? applied?.model : (desiredModel ?? applied?.model),
       thinking: opts?.skipThinkingSync ? applied?.thinking : (desiredThinking ?? applied?.thinking),
+      autoCompaction: autoCompactionApplied ? desiredAutoCompaction : applied?.autoCompaction,
     });
   }
 
@@ -2752,12 +2964,21 @@ export class PiAdapter {
     if (this.disposed) {
       throw new ProviderError('not_found', 'pi adapter disposed', 404);
     }
+    const reservationKey = '__ephemeral_' + randomUUID();
+    await this.withCapacityLock(async () => {
+      if (this.disposed) {
+        throw new ProviderError('not_found', 'pi adapter disposed', 404);
+      }
+      await this.evictOldestIdleProcessIfNeeded(reservationKey, false);
+      this.startingSessions.add(reservationKey);
+    });
     const client = this.createClient(cwd ?? process.cwd(), args);
     this.ephemeralClients.add(client);
     client.start();
     try {
       return await fn(client);
     } finally {
+      this.startingSessions.delete(reservationKey);
       this.ephemeralClients.delete(client);
       await client.close().catch(() => undefined);
     }
@@ -3042,6 +3263,7 @@ export class PiAdapter {
 
     if (ev.kind === 'exit') {
       this.failCloseSessionQuestions(turn.sessionId);
+      this.failCloseSessionApprovals(turn.sessionId);
       if (this.processes.get(turn.sessionId) === turn.client) {
         this.processes.delete(turn.sessionId);
       }
@@ -3590,20 +3812,45 @@ export class PiAdapter {
     let rawQuestions: unknown[];
 
     if (method === 'select') {
-      const validOptions = Array.isArray(req.options)
-        ? req.options.filter((o): o is string => typeof o === 'string')
-        : [];
-      if (validOptions.length === 0) {
+      optionById = new Map<string, string>();
+      const normalizedOptions: string[] = [];
+      const mappedOptions: Array<{ id: string; label: string }> = [];
+
+      if (Array.isArray(req.options)) {
+        for (let idx = 0; idx < req.options.length; idx++) {
+          const opt = req.options[idx];
+          if (typeof opt === 'string') {
+            const key = optionById.has(opt) ? `${opt}__${idx}` : opt;
+            optionById.set(key, opt);
+            normalizedOptions.push(opt);
+            mappedOptions.push({ id: key, label: opt });
+          } else if (isRecord(opt)) {
+            const val = typeof opt.value === 'string'
+              ? opt.value
+              : (typeof opt.id === 'string' ? opt.id : (typeof opt.label === 'string' ? opt.label : ''));
+            const lbl = typeof opt.label === 'string' && opt.label
+              ? opt.label
+              : (typeof opt.value === 'string' && opt.value ? opt.value : (typeof opt.id === 'string' && opt.id ? opt.id : `Option ${idx + 1}`));
+            const rawId = typeof opt.id === 'string' && opt.id ? opt.id : (typeof opt.value === 'string' && opt.value ? opt.value : `opt_${idx}`);
+            const key = optionById.has(rawId) ? `${rawId}__${idx}` : rawId;
+            optionById.set(key, val);
+            if (lbl && !optionById.has(lbl)) {
+              optionById.set(lbl, val);
+            }
+            if (val && !optionById.has(val)) {
+              optionById.set(val, val);
+            }
+            normalizedOptions.push(lbl);
+            mappedOptions.push({ id: key, label: lbl });
+          }
+        }
+      }
+
+      if (mappedOptions.length === 0) {
         this.failCloseExtensionUiRequest(turn.client, req);
         return;
       }
-      options = validOptions;
-      optionById = new Map<string, string>();
-      const mappedOptions = validOptions.map((opt, idx) => {
-        const key = optionById!.has(opt) ? `${opt}__${idx}` : opt;
-        optionById!.set(key, opt);
-        return { id: key, label: opt };
-      });
+      options = normalizedOptions;
       rawQuestions = [
         {
           id: 'q_0',
@@ -3838,7 +4085,7 @@ export class PiAdapter {
         this.settleTurn(turn, 'cancelled');
         return;
       }
-      if (this.hasParkedQuestions(turn.sessionId)) {
+      if (this.hasParkedQuestions(turn.sessionId) || this.hasParkedApprovals(turn.sessionId)) {
         this.scheduleHandledGraceSettle(turn);
         return;
       }
@@ -3854,6 +4101,7 @@ export class PiAdapter {
         }
         if (
           this.hasParkedQuestions(turn.sessionId) ||
+          this.hasParkedApprovals(turn.sessionId) ||
           (state &&
             (state.isStreaming === true ||
               state.isCompacting === true ||
@@ -3863,7 +4111,13 @@ export class PiAdapter {
           return;
         }
       }
-      if (!turn.settled && !turn.inAgentRun && !turn.sawAgentStart && !this.hasParkedQuestions(turn.sessionId)) {
+      if (
+        !turn.settled &&
+        !turn.inAgentRun &&
+        !turn.sawAgentStart &&
+        !this.hasParkedQuestions(turn.sessionId) &&
+        !this.hasParkedApprovals(turn.sessionId)
+      ) {
         this.settleTurn(turn, 'completed');
       }
     };
@@ -3908,6 +4162,7 @@ export class PiProviderAdapter implements ProviderAdapter {
       resolveSessionPreferences: (sessionId) => ({
         model: this.settings.getString('model', sessionId) ?? this.settings.getString('model', '__default__'),
         thinking: this.settings.getString('thinking', sessionId) ?? this.settings.getString('thinking', '__default__'),
+        autoCompaction: this.settings.getBoolean('auto_compaction', sessionId),
       }),
     });
   }
@@ -4130,13 +4385,13 @@ export class PiProviderAdapter implements ProviderAdapter {
     );
   }
 
-  async listCommands(sessionId?: string): Promise<NativeCommand[]> {
-    const cmds = await this.inner.getCommands(sessionId);
+  async listCommands(sessionId?: string, cwd?: string): Promise<NativeCommand[]> {
+    const cmds = await this.inner.getCommands(sessionId, cwd);
     return listPiCommands(cmds);
   }
 
-  async listSkills(sessionId?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>> {
-    const cmds = await this.inner.getCommands(sessionId);
+  async listSkills(sessionId?: string, cwd?: string): Promise<Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }>> {
+    const cmds = await this.inner.getCommands(sessionId, cwd);
     const out: Array<{ name: string; description: string; path?: string; scope?: string; enabled?: boolean }> = [];
     const seen = new Set<string>();
     for (const cmd of cmds) {
@@ -4160,7 +4415,9 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   async setAutoCompaction(sessionId: string, enabled: boolean): Promise<boolean> {
-    return this.inner.setAutoCompaction(sessionId, enabled);
+    const res = await this.inner.setAutoCompaction(sessionId, enabled);
+    this.settings.set('auto_compaction', sessionId, res);
+    return res;
   }
 
   async getAutoCompaction(sessionId: string): Promise<boolean | undefined> {
@@ -4196,8 +4453,8 @@ export class PiProviderAdapter implements ProviderAdapter {
     if (!trimmed) {
       throw new ProviderError('invalid_request', 'Session title cannot be empty', 400);
     }
-    this.renames.set(sessionId, trimmed);
     await this.inner.setSessionName(sessionId, trimmed);
+    this.renames.set(sessionId, trimmed);
   }
 
   async clone(sessionId: string): Promise<Session> {
@@ -4297,7 +4554,7 @@ export class PiProviderAdapter implements ProviderAdapter {
       busy: this.inner.isBusy(s.sessionId),
       archived,
       extras: {
-        last_prompt: title,
+        last_prompt: s.firstUserPrompt || (this.renames.get(s.sessionId) ?? this.inner.getCachedSessionName(s.sessionId) ?? s.title ?? ''),
         ...(s.parentSession ? { parent_session: s.parentSession } : {}),
       },
       metadata: { cwd: s.cwd },
@@ -5024,6 +5281,7 @@ async function summarizePiSessionFile(filePath: string, realRoot: string): Promi
       cwd,
       createdAt: header.timestamp || stat.birthtime.toISOString(),
       updatedAt: lastTimestamp,
+      ...(firstUserPrompt ? { firstUserPrompt } : {}),
       ...(header.parentSession ? { parentSession: header.parentSession } : {}),
     };
   } catch {
@@ -5317,21 +5575,20 @@ function buildExtensionUiResponse(
     return fail();
   }
 
-  // `input` / `editor` dialog: reject empty/blank dismisses fail-closed.
-  if (extracted.length === 0) return fail();
+  // `input` / `editor` dialog: an explicit empty-string answer returns { value: '' } not cancelled.
   return { type: 'extension_ui_response', id: parked.id, value: extracted };
 }
 
 function extractSingleAnswer(answer: string | Record<string, string[]>): string | null {
   if (typeof answer === 'string') {
-    return answer.length > 0 ? answer : null;
+    return answer;
   }
   if (!isRecord(answer)) return null;
   const entries = Object.entries(answer);
   if (entries.length === 0) return null;
   for (const [, values] of entries) {
     if (!Array.isArray(values) || values.length === 0) continue;
-    const first = values.find((v): v is string => typeof v === 'string' && v.length > 0);
+    const first = values.find((v): v is string => typeof v === 'string');
     if (first !== undefined) return first;
   }
   return null;

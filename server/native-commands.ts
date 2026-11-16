@@ -149,6 +149,8 @@ function expandSkillMarkdown(
   if (!hit) return null;
   let body: string;
   try {
+    const st = fs.statSync(hit.path);
+    if (!st.isFile() || st.size > 512 * 1024) return null;
     body = fs.readFileSync(hit.path, 'utf8');
   } catch {
     return null;
@@ -207,6 +209,15 @@ const GROK_GATEWAY_COMMANDS: GrokGatewayCommand[] = [
   { name: 'compact', description: 'Compress conversation history to save context window', kind: 'prompt', takesArgs: false, builtin: true },
   { name: 'fork', description: 'Fork this session into a new session', kind: 'prompt', takesArgs: false, builtin: true },
   { name: 'undo', description: 'Roll back the last turn', kind: 'prompt', takesArgs: false, aliases: ['rewind'], builtin: true },
+  {
+    name: 'thinking',
+    description: 'Show or set thinking level (off|minimal|low|medium|high|xhigh)',
+    kind: 'prompt',
+    takesArgs: true,
+    argumentHint: '[level]',
+    aliases: ['effort'],
+    builtin: true,
+  },
   { name: 'usage', description: 'Show token usage for this session', kind: 'prompt', takesArgs: false, builtin: true },
   { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
   { name: 'skills', description: 'List available Grok skills in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
@@ -585,6 +596,7 @@ const CLAUDE_GATEWAY_COMMANDS: Array<{
   argumentHint?: string;
 }> = [
   { name: 'status', description: 'Show Claude session model, effort, permission and usage', takesArgs: false },
+  { name: 'fork', description: 'Fork this session into a new session', takesArgs: false },
   { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', takesArgs: false },
   { name: 'skills', description: 'List available Claude commands and skills in this workspace', takesArgs: false },
   {
@@ -951,4 +963,58 @@ function parseCommandMarkdown(raw: string): {
   }
 
   return { name, description, argumentHint, aliases, allowedTools, model, userInvocable };
+}
+
+// ---------------------------------------------------------------------------
+// dsh 网关代执行命令与目录
+// ---------------------------------------------------------------------------
+
+export interface DshGatewayCommand extends NativeCommand {
+  takesArgs: boolean;
+}
+
+const DSH_GATEWAY_COMMANDS: DshGatewayCommand[] = [
+  { name: 'status', description: 'Show DSH session model, permission, and usage', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'skills', description: 'List available DSH skills in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'help', description: 'Show available Web UI commands for DSH', kind: 'prompt', takesArgs: false, builtin: true },
+];
+
+export function dshGatewayCommandNames(): Set<string> {
+  return new Set(DSH_GATEWAY_COMMANDS.map((c) => c.name));
+}
+
+export function listDshCommands(
+  skills: SkillCommandInput[] = [],
+): NativeCommand[] {
+  const out: NativeCommand[] = [
+    ...clientCommands(),
+    ...DSH_GATEWAY_COMMANDS.map(({ takesArgs, ...c }) => ({
+      ...c,
+      acceptsInput: takesArgs,
+    })),
+  ];
+  const seen = new Set(out.map((c) => c.name));
+  for (const s of skills) {
+    if (seen.has(s.name)) continue;
+    seen.add(s.name);
+    out.push({
+      name: s.name,
+      description: s.description,
+      kind: 'prompt',
+      acceptsInput: true,
+      ...(s.argumentHint ? { argumentHint: s.argumentHint } : {}),
+      ...(s.aliases && s.aliases.length > 0 ? { aliases: [...s.aliases] } : {}),
+      ...(s.path ? { path: s.path } : {}),
+      ...(s.scope ? { scope: s.scope } : {}),
+    });
+  }
+  return out;
+}
+
+export function expandDshSkill(
+  text: string,
+  skills: Array<{ name: string; path: string }>,
+): string | null {
+  return expandSkillMarkdown(text, skills);
 }

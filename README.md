@@ -130,15 +130,15 @@ node dist/index.js
 | `GATEWAY_HOST` | `127.0.0.1` | 网关绑定地址 |
 | `GATEWAY_TOKEN` | 自动生成写入 `<settingsDir>/gateway.token` | 访问认证令牌（`Bearer` / URL `#token=`） |
 | `GATEWAY_SETTINGS_DIR` | `~/.config/multi-agent-gateway` | 网关会话配置、工作区、上传缓存与日志目录 |
-| `GATEWAY_KIMI` | 启动/探测本地 Kimi | 设为 `off` 时不启动 Kimi Core，仅服务本地 4 个 CLI |
+| `GATEWAY_KIMI` | 启动/探测本地 Kimi | 设为 `off` 时不启动 Kimi Core，仅服务本地 5 个 CLI |
 | `GATEWAY_KIMI_STANDBY` | 未开启 | 设为 `1` 且无外部上游配置时启用 standby 兜底 |
 | `KIMI_UPSTREAM_URL` | 探测本地 `kimi web` | 显式指定 Kimi Web 上游地址 |
-| `GATEWAY_PROVIDERS` | 自动检测已安装 CLI | 逗号分隔的启用 Provider 列表（覆盖 `/meta` 检测） |
 | `GATEWAY_DEMO` | 关闭 | 设为 `on` / `1` 开启预览示例会话（不伪造 `/models`） |
 | `GATEWAY_WARMUP` | 按需预热 | 设为 `full` 时启动阶段全量预热目录 |
 | `GATEWAY_REGION` | `global` | `mainland-cn` 可切国内区域标识 |
 | `GATEWAY_CODEX_IDLE_TIMEOUT_MS` | 适配器默认（60s） | Codex 空闲进程回收延迟（ms） |
 | `GATEWAY_GROK_IDLE_TIMEOUT_MS` | `180000`（3 min） | Grok ACP 空闲进程回收延迟（ms） |
+| `GATEWAY_DSH_IDLE_TIMEOUT_MS` | `60000`（60s） | DSH ACP 空闲进程回收延迟（ms） |
 | `GATEWAY_PI_IDLE_TIMEOUT_MS` | `180000`（3 min） | Pi 空闲进程回收延迟（ms），`0` 禁用 |
 | `GATEWAY_PI_MAX_PROCESSES` | `2` | Pi 同时存活的最大会话进程数，`0` 不限制 |
 | `GATEWAY_PI_MAX_SESSION_BYTES` | `201326592`（192 MiB） | Pi 单会话 JSONL 恢复体积门禁上限（字节），`0` 禁用 |
@@ -164,15 +164,15 @@ node dist/index.js
   - 完成资源管控：浏览态（`getState`/`getSessionStats`/`getSessionTree`/`getForkMessages`/空闲切模型思考度）100% 磁盘直读零进程拉起，引入活跃/提问保护下的 3 分钟空闲回收、并发进程上限及体积门禁。
   - 解决交互式扩展命令阻塞 `prompt` 响应导致的预检死锁；补齐 `editor` 弹窗、`setStatus`/`setWidget`/`setTitle` 状态推送、`custom_message` 去重与渲染、`subagent`/`acp_delegate` 子代理发现。
   - 在网关与注入层落地 `/advisor` 与裸 `/plan` 交互式 `QuestionCard`、技能芯片去重与长列表实时筛选框。
-- **M14 — Facade 契约与权限/隔离加固**：统一 4 个本地适配器能力契约、完善 `SettingsStore` 原子落盘与跨重启继承、规范上传文件魔数嗅探与敏感 MIME 隔离。
+- **M14 — Facade 契约与权限/隔离加固**：统一 5 个本地适配器能力契约、完善 `SettingsStore` 原子落盘与跨重启继承、规范上传文件魔数嗅探与敏感 MIME 隔离。
 - **M15 — Kimi Web `2.6.2` 兼容与 `2.5.x` 协议桥接**：实现 `turns/items` WebSocket 协议、`kimi-v25-bridge.ts` 向上游 2.5.x 服务桥接、`subscribe_v2` 回滚兼容与 `/meta` 动态能力表下发。
 - **M16 — `web-extension` `2.6.2` 零侵入注入完善**：适配 2.6.2 Pinia 状态隔离（模型/工作区/思考度/模式隔离）、分级斜杠菜单门控、WS 唤醒主动 ping 探活重连、选项搜索过滤及 Pi 扩展状态栏。
 
 ### 当前状态与待办事项
 
-- **当前验证状态**（基于 `claude 2.1.325`、`codex-cli 0.169.0`、`grok 1.0.77`、`pi 1.5.2`、`kimi 2.5.3` 与 `Kimi Web 2.6.2`）：
-  - 全量单元测试 **14 个测试文件共 398 项用例全部通过**（`claude-adapter`: 40、`codex-adapter`: 38、`facade`: 54、`gateway-routing`: 76、`grok-adapter`: 47、`kimi-child`: 18、`kimi-proxy`: 2、`kimi-v25-bridge`: 3、`local-transcript`: 25、`pi-adapter`: 36、`settings-store`: 9、`static`: 3、`web-assets`: 3、`web-extension`: 44）。
-  - 已通过 Headless Chrome CDP 对网关页面进行真实点击验收：验证五端切换无报错、Grok 空 `(session)` 清零、Pi `/advisor` 49 项可搜索 `QuestionCard` 及 `/plan` → `/plan show` 与 `pi-cache-stats` 扩展状态胶囊端到端渲染。
+- **当前验证状态**（基于 `claude 2.1.325`、`codex-cli 0.169.0`、`grok 1.0.77`、`pi 1.5.2`、`dsh 0.2.2-rc.1`、`kimi 2.5.3` 与 `Kimi Web 2.6.2`）：
+  - 全量单元测试均已通过，覆盖网关路由、各 Provider 适配器、协议桥接、安全边界与 Web 扩展交互注入等全量测试用例。
+  - 已通过 Headless Chrome CDP 对网关页面进行真实点击验收：验证六端切换无报错、Grok 空 `(session)` 清零、Pi `/advisor` 49 项可搜索 `QuestionCard` 及 `/plan` → `/plan show` 与 `pi-cache-stats` 扩展状态胶囊端到端渲染。
 - **后续计划**：
   - [ ] **大历史会话断点分叉续聊（Pi）**：当历史 JSONL 超过体积门禁时，在 Web UI 提供一键从最近一次 `compaction` 节点分叉新会话继续对话的交互动作。
   - [ ] **更多 CLI 交互式扩展命令适配**：持续补充 Pi 社区高频扩展（如 `/rewind`、`/subagents` 等）及后续新版 Claude / Codex / Grok / Kimi CLI 协议演进。
@@ -187,7 +187,7 @@ cd server
 npm run build
 ```
 
-全量测试包含 14 个测试文件及对本机已安装 CLI 的真实协议冒烟检查。在 8 GB 内存等资源受限主机上，建议限制单进程堆内存并按单个文件顺序运行（避免全量并发测试触发内存峰值）：
+全量测试包含网关各模块测试文件及对本机已安装 CLI 的真实协议冒烟检查。在 8 GB 内存等资源受限主机上，建议限制单进程堆内存并按单个文件顺序运行（避免全量并发测试触发内存峰值）：
 
 ```sh
 cd server

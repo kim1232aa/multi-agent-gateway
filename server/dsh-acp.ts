@@ -14,6 +14,22 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 
+function buildChildEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('GATEWAY_')) delete env[key];
+  }
+  const loopback = ['127.0.0.1', 'localhost', '::1'];
+  const current = String(env.NO_PROXY ?? env.no_proxy ?? '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const merged = [...new Set([...current, ...loopback])].join(',');
+  env.NO_PROXY = merged;
+  env.no_proxy = merged;
+  return env;
+}
+
 export type JsonRpcId = string | number;
 
 export interface DshAcpPermissionOption {
@@ -68,6 +84,7 @@ export interface DshAcpOptions {
   requestTimeoutMs?: number;
   promptTimeoutMs?: number;
   recycleGraceMs?: number;
+  permissionModeForSession?: (sessionId: string) => string | undefined;
   onStderr?: (line: string) => void;
 }
 
@@ -92,6 +109,7 @@ export class DshAcpClient {
   private readonly requestTimeoutMs: number;
   private readonly promptTimeoutMs: number;
   private readonly recycleGraceMs: number;
+  private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
   private readonly onStderr?: (line: string) => void;
 
   private child: ChildProcess | null = null;
@@ -100,12 +118,13 @@ export class DshAcpClient {
   private pending = new Map<JsonRpcId, PendingRequest>();
   private readonly permissions = new Map<string, PendingDshPermission>();
   private readonly listeners = new Set<DshAcpEventHandler>();
+  private readonly activeSessions = new Set<string>();
   private readyPromise: Promise<void> | null = null;
-  /** True only while spawnAndHandshake() runs — lets request() skip ensureReady(). */
-  private handshaking = false;
   private connected = false;
   private closed = false;
   private activeTurns = 0;
+  private inFlightRequests = 0;
+  private childGeneration = 0;
   private recycleTimer: NodeJS.Timeout | null = null;
 
   constructor(options: DshAcpOptions) {
@@ -115,6 +134,7 @@ export class DshAcpClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 25_000;
     this.promptTimeoutMs = options.promptTimeoutMs ?? 0;
     this.recycleGraceMs = options.recycleGraceMs ?? 60_000;
+    this.permissionModeForSession = options.permissionModeForSession;
     this.onStderr = options.onStderr;
   }
 
@@ -137,8 +157,12 @@ export class DshAcpClient {
     return this.connected && Boolean(this.child && !this.child.killed);
   }
 
+  isClosed(): boolean {
+    return this.closed;
+  }
+
   isBusy(): boolean {
-    return this.activeTurns > 0 || this.permissions.size > 0;
+    return this.activeTurns > 0 || this.inFlightRequests > 0 || this.permissions.size > 0;
   }
 
   async ensureReady(): Promise<void> {
@@ -149,9 +173,7 @@ export class DshAcpClient {
     }
     if (this.readyPromise) return this.readyPromise;
 
-    this.handshaking = true;
     this.readyPromise = this.spawnAndHandshake().finally(() => {
-      this.handshaking = false;
       this.readyPromise = null;
     });
     return this.readyPromise;
@@ -159,86 +181,91 @@ export class DshAcpClient {
 
   private async spawnAndHandshake(): Promise<void> {
     this.cancelRecycleTimer();
-    const env: Record<string, string> = {
-      ...process.env as Record<string, string>,
-      ...this.env,
-    };
-
+    const generation = ++this.childGeneration;
     const child = spawn(this.dshBin, ['--profile', 'acp'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env,
+      env: buildChildEnv(this.env),
     });
-
     this.child = child;
     this.connected = false;
+    child.stdin?.on('error', () => {});
 
-    const rl = readline.createInterface({
-      input: child.stdout!,
-      crlfDelay: Infinity,
-    });
+    const rl = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
     this.rl = rl;
-
-    rl.on('line', (line) => this.handleStdoutLine(line));
-
+    rl.on('line', (line) => this.handleStdoutLine(line, child, generation));
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
       for (const line of text.split(/\r?\n/)) {
-        if (!line.trim()) continue;
-        if (this.onStderr) this.onStderr(line);
+        if (line.trim()) this.onStderr?.(line);
       }
     });
-
     child.on('error', (err) => {
+      if (generation !== this.childGeneration) return;
       this.emit({ type: 'error', message: `dsh process error: ${err.message}` });
-      this.cleanupProcess(null, null);
+      this.cleanupProcess(child, generation, null, null);
     });
-
-    child.on('close', (code, signal) => {
-      this.cleanupProcess(code, signal);
-    });
+    child.on('close', (code, signal) => this.cleanupProcess(child, generation, code, signal));
 
     try {
-      await this.request('initialize', {
+      await this.sendRequest('initialize', {
         protocolVersion: 1,
         clientCapabilities: {
           imagePrompt: false,
           fs: { readTextFile: false, writeTextFile: false },
         },
         clientInfo: { name: 'multi-agent-gateway', version: '0.1.0' },
-      });
+      }, undefined, child, generation);
+      if (generation !== this.childGeneration || this.closed) throw new Error('dsh process disconnected during initialize');
       this.connected = true;
     } catch (err) {
-      this.cleanupProcess(null, null);
+      await this.terminateChild(child);
+      this.cleanupProcess(child, generation, null, null);
       throw err;
     }
   }
 
-  private cleanupProcess(code: number | null, signal: string | null): void {
+  private async terminateChild(child: ChildProcess): Promise<void> {
+    if (child.exitCode != null || child.signalCode != null) return;
+    try { child.stdin?.end(); } catch { /* ignore */ }
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        finish();
+      }, 250);
+      timer.unref?.();
+      child.once('close', finish);
+      try { child.kill('SIGTERM'); } catch { finish(); }
+    });
+  }
+
+  private cleanupProcess(child: ChildProcess, generation: number, code: number | null, signal: string | null): void {
+    if (generation !== this.childGeneration || child !== this.child) return;
     const wasConnected = this.connected;
     this.connected = false;
     this.child = null;
     if (this.rl) {
-      try {
-        this.rl.close();
-      } catch {
-        // ignore
-      }
+      try { this.rl.close(); } catch { /* ignore */ }
       this.rl = null;
     }
-
     for (const [id, req] of this.pending) {
       if (req.timer) clearTimeout(req.timer);
       req.reject(new Error(`dsh process disconnected before response (id=${id})`));
     }
     this.pending.clear();
     this.permissions.clear();
-
-    if (wasConnected) {
-      this.emit({ type: 'disconnected', code, signal });
-    }
+    this.activeSessions.clear();
+    if (wasConnected) this.emit({ type: 'disconnected', code, signal });
   }
 
-  private handleStdoutLine(line: string): void {
+  private handleStdoutLine(line: string, child: ChildProcess, generation: number): void {
+    if (generation !== this.childGeneration || child !== this.child) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let message: any;
@@ -283,12 +310,19 @@ export class DshAcpClient {
       const options: DshAcpPermissionOption[] = Array.isArray(params.options) ? params.options : [];
       const toolCall = params.toolCall;
 
-      if (this.alwaysApprove) {
-        this.respond(id, { outcome: { outcome: 'selected', optionId: 'allow-once' } });
+      const sessionMode = this.permissionModeForSession?.(sessionId);
+      const autoApprove = this.alwaysApprove || sessionMode === 'auto' || sessionMode === 'bypassPermissions';
+
+      if (autoApprove) {
+        const allowOpt = options.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always')
+          ?? options.find((o) => o.optionId.includes('allow'))
+          ?? options[0];
+        const optionId = allowOpt?.optionId ?? 'allow-once';
+        this.respond(id, { outcome: { outcome: 'selected', optionId } });
         return;
       }
 
-      this.permissions.set(sessionId, { id, sessionId, options, toolCall });
+      this.permissions.set(String(id), { id, sessionId, options, toolCall });
       this.emit({
         type: 'permission_request',
         sessionId,
@@ -351,38 +385,61 @@ export class DshAcpClient {
           toolCallId: String(update.toolCallId ?? ''),
           title: update.title,
           status: update.status ?? 'completed',
-          rawOutput: update.content,
+          rawOutput: update.content ?? update.rawOutput,
         });
       }
     }
   }
 
-  async request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
-    // Skip ensureReady() during handshake — spawnAndHandshake() itself calls
-    // this method for `initialize`, and awaiting our own readyPromise would
-    // self-deadlock (the exact bug that once hung the test runner).
-    if (!this.handshaking) await this.ensureReady();
+  private sendRequest<T = unknown>(
+    method: string,
+    params: Record<string, unknown> = {},
+    timeoutMs?: number,
+    child?: ChildProcess,
+    generation?: number,
+  ): Promise<T> {
     const id = this.nextId++;
     const actualTimeout = timeoutMs !== undefined ? timeoutMs : this.requestTimeoutMs;
+    this.inFlightRequests++;
+    this.cancelRecycleTimer();
 
     return new Promise<T>((resolve, reject) => {
+      let settled = false;
       let timer: NodeJS.Timeout | null = null;
+      const finish = (fn: (value?: unknown) => void, value?: unknown): void => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        this.inFlightRequests = Math.max(0, this.inFlightRequests - 1);
+        (fn as (v?: unknown) => void)(value);
+        this.scheduleRecycleIfIdle();
+      };
       if (actualTimeout > 0) {
         timer = setTimeout(() => {
           this.pending.delete(id);
-          reject(new Error(`dsh request timed out after ${actualTimeout}ms: ${method} (id=${id})`));
+          finish(reject, new Error(`dsh request timed out after ${actualTimeout}ms: ${method} (id=${id})`));
         }, actualTimeout);
       }
 
       this.pending.set(id, {
         method,
-        resolve: resolve as (val: unknown) => void,
-        reject,
+        resolve: (value) => finish(resolve as (v?: unknown) => void, value),
+        reject: (error) => finish(reject as (v?: unknown) => void, error),
         timer,
       });
 
-      this.sendJson({ jsonrpc: '2.0', id, method, params });
+      try {
+        this.sendJson({ jsonrpc: '2.0', id, method, params }, child, generation);
+      } catch (error) {
+        this.pending.delete(id);
+        finish(reject, error instanceof Error ? error : new Error(String(error)));
+      }
     });
+  }
+
+  async request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+    await this.ensureReady();
+    return this.sendRequest<T>(method, params, timeoutMs);
   }
 
   respond(id: JsonRpcId, result: unknown): void {
@@ -393,25 +450,53 @@ export class DshAcpClient {
     this.sendJson({ jsonrpc: '2.0', method, params });
   }
 
-  private sendJson(payload: Record<string, unknown>): void {
-    if (!this.child || !this.child.stdin || this.child.stdin.destroyed) {
+  private sendJson(payload: Record<string, unknown>, targetChild?: ChildProcess, targetGeneration?: number): void {
+    const child = targetChild ?? this.child;
+    if (targetGeneration !== undefined && targetGeneration !== this.childGeneration) {
+      throw new Error('Cannot write to dsh process: generation mismatch');
+    }
+    if (!child || !child.stdin || child.stdin.destroyed) {
       throw new Error('Cannot write to dsh process: stdin not writable');
     }
-    this.child.stdin.write(JSON.stringify(payload) + '\n');
+    child.stdin.write(JSON.stringify(payload) + '\n');
   }
 
   async newSession(cwd: string): Promise<{ sessionId: string; configOptions?: unknown }> {
-    return this.request<{ sessionId: string; configOptions?: unknown }>('session/new', {
+    const res = await this.request<{ sessionId: string; configOptions?: unknown }>('session/new', {
       cwd,
       mcpServers: [],
     });
+    this.activeSessions.add(res.sessionId);
+    return res;
   }
 
   async resumeSession(sessionId: string, cwd: string): Promise<{ configOptions?: unknown }> {
-    return this.request<{ configOptions?: unknown }>('session/resume', {
+    if (this.activeSessions.has(sessionId)) {
+      return {};
+    }
+    try {
+      const res = await this.request<{ configOptions?: unknown }>('session/resume', {
+        sessionId,
+        cwd,
+        mcpServers: [],
+      });
+      this.activeSessions.add(sessionId);
+      return res;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('already active')) {
+        this.activeSessions.add(sessionId);
+        return {};
+      }
+      throw err;
+    }
+  }
+
+  async setConfigOption(sessionId: string, configId: string, value: string): Promise<{ configOptions?: unknown }> {
+    return this.request<{ configOptions?: unknown }>('session/set_config_option', {
       sessionId,
-      cwd,
-      mcpServers: [],
+      configId,
+      value,
     });
   }
 
@@ -435,14 +520,49 @@ export class DshAcpClient {
 
   async cancel(sessionId: string): Promise<void> {
     this.notify('session/cancel', { sessionId });
+    for (const [key, perm] of this.permissions.entries()) {
+      if (perm.sessionId === sessionId) {
+        this.permissions.delete(key);
+        this.respond(perm.id, { outcome: { outcome: 'cancelled' } });
+      }
+    }
   }
 
-  resolvePermission(sessionId: string, approved: boolean): boolean {
-    const pending = this.permissions.get(sessionId);
+  resolvePermission(approvalIdOrSessionId: string, decision: string | boolean, expectedSessionId?: string): boolean {
+    const key = String(approvalIdOrSessionId);
+    let pending = this.permissions.get(key);
+    if (!pending) {
+      for (const [k, p] of this.permissions.entries()) {
+        if (p.sessionId === key) {
+          if (expectedSessionId && p.sessionId !== expectedSessionId) continue;
+          pending = p;
+          this.permissions.delete(k);
+          break;
+        }
+      }
+    } else {
+      if (expectedSessionId && pending.sessionId !== expectedSessionId) {
+        return false;
+      }
+      this.permissions.delete(key);
+    }
     if (!pending) return false;
-    this.permissions.delete(sessionId);
 
-    const optionId = approved ? 'allow-once' : 'reject-once';
+    let matched: DshAcpPermissionOption | undefined;
+    if (decision === 'approve_always') {
+      matched = pending.options.find((o) => o.kind === 'allow_always')
+        ?? pending.options.find((o) => o.kind === 'allow_once')
+        ?? pending.options.find((o) => o.optionId.includes('allow'));
+    } else if (decision === 'approve' || decision === true) {
+      matched = pending.options.find((o) => o.kind === 'allow_once')
+        ?? pending.options.find((o) => o.kind === 'allow_always')
+        ?? pending.options.find((o) => o.optionId.includes('allow'));
+    } else {
+      matched = pending.options.find((o) => o.kind === 'reject_once')
+        ?? pending.options.find((o) => o.kind?.startsWith('reject'))
+        ?? pending.options.find((o) => o.optionId.includes('reject'));
+    }
+    const optionId = matched?.optionId ?? (decision === 'approve' || decision === 'approve_always' || decision === true ? 'allow-once' : 'reject-once');
     this.respond(pending.id, {
       outcome: { outcome: 'selected', optionId },
     });
@@ -485,6 +605,7 @@ export class DshAcpClient {
       this.child = null;
     }
     this.connected = false;
+    this.activeSessions.clear();
   }
 
   close(): void {

@@ -298,7 +298,7 @@ export class GrokAdapter {
   constructor(options: GrokAdapterOptions = {}) {
     this.grokBin = resolveGrokBin(options.grokBin);
     this.env = { ...(options.env ?? {}) };
-    const grokHome = process.env.GROK_HOME ?? path.join(os.homedir(), '.grok');
+    const grokHome = options.env?.GROK_HOME ?? process.env.GROK_HOME ?? path.join(os.homedir(), '.grok');
     this.sessionsDir = options.sessionsDir ?? path.join(grokHome, 'sessions');
   }
 
@@ -443,6 +443,13 @@ export class GrokAdapter {
     return pending;
   }
 
+  getCachedModels(): { defaultModel?: string; models: string[] } | null {
+    if (this.modelsCache && Date.now() - this.modelsCache.ts < GrokAdapter.MODELS_TTL_MS) {
+      return this.modelsCache.value;
+    }
+    return null;
+  }
+
   async startTurn(opts: GrokStartTurnOptions): Promise<void> {
     const { sessionId, prompt, onEvent } = opts;
     if (this.running.has(sessionId)) {
@@ -555,15 +562,40 @@ export class GrokAdapter {
 
   async close(): Promise<void> {
     this.closed = true;
+    const dying: ChildProcess[] = [];
     for (const [sessionId, child] of this.running) {
       this.killGroup(child, 'SIGTERM');
+      dying.push(child);
       this.running.delete(sessionId);
       this.resolveExitWaiters(sessionId);
     }
     for (const child of this.ephemeralChildren) {
       this.killGroup(child, 'SIGTERM');
+      dying.push(child);
       this.ephemeralChildren.delete(child);
     }
+    // 有界等待:SIGTERM 后轮询,最多 3s 升级 SIGKILL,保证 close/dispose 必然返回。
+    await new Promise<void>((resolve) => {
+      if (dying.length === 0) { resolve(); return; }
+      const settled = () => dying.every((c) => c.exitCode !== null || c.signalCode !== null);
+      if (settled()) { resolve(); return; }
+      const escalate = setTimeout(() => {
+        clearInterval(check);
+        for (const c of dying) {
+          if (c.exitCode === null && c.signalCode === null) this.killGroup(c, 'SIGKILL');
+        }
+        resolve();
+      }, 3_000);
+      escalate.unref?.();
+      const check = setInterval(() => {
+        if (settled()) {
+          clearInterval(check);
+          clearTimeout(escalate);
+          resolve();
+        }
+      }, 50);
+      check.unref?.();
+    });
     this.sessionCwd.clear();
     this.interruptRequested.clear();
     this.exitWaiters.clear();
@@ -860,10 +892,14 @@ export class GrokAdapter {
 
   private killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
     try {
-      if (child.pid !== undefined) process.kill(-child.pid, signal);
+      if (child.pid !== undefined && process.platform !== 'win32') process.kill(-child.pid, signal);
       else child.kill(signal);
     } catch {
-      child.kill(signal);
+      try {
+        child.kill(signal);
+      } catch {
+        // already exited
+      }
     }
   }
 }
@@ -892,9 +928,23 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private static readonly SKILL_CACHE_TTL_MS = 30_000;
   private static readonly COMMANDS_TTL_MS = 5 * 60_000;
   private static readonly MAX_CACHE_ENTRIES = 64;
+  private static readonly MAX_TOOL_SNAPSHOTS = 128;
+  private static readonly MAX_TOOL_SNAPSHOT_BYTES = 256 * 1024;
   private readonly recycleGraceMs: number;
   private recycleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly commandsCache = new Map<string, { ts: number; commands: GrokNativeCommandInput[] }>();
+  private readonly toolOutputSnapshots = new Map<string, string>();
+  private readonly toolSnapshotTurns = new Map<string, string>();
+  private lastCliModels?: { defaultModel?: string; models: string[] };
+
+  private clearToolSnapshots(sessionId: string, turnId?: string): void {
+    for (const key of this.toolOutputSnapshots.keys()) {
+      if (!key.startsWith(`${sessionId}:`)) continue;
+      if (turnId !== undefined && this.toolSnapshotTurns.get(key) !== turnId) continue;
+      this.toolOutputSnapshots.delete(key);
+      this.toolSnapshotTurns.delete(key);
+    }
+  }
 
   constructor(options?: GrokProviderAdapterOptions) {
     const { settingsPath, recycleGraceMs, ...innerOptions } = options ?? {};
@@ -1448,8 +1498,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.acpTurns.set(opts.sessionId, opts.stream);
     this.sessionClient.set(opts.sessionId, acp);
     const unsub = acp.onEvent((ev) => this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev));
+    let acpSessionId = this.acpId(opts.sessionId);
     try {
-      let acpSessionId = this.acpId(opts.sessionId);
       if (opts.isNew) {
         const created = await acp.sessionNew({
           cwd,
@@ -1492,18 +1542,24 @@ export class GrokProviderAdapter implements ProviderAdapter {
       });
       const prompt = acpPrompt(opts.prompt, opts.contentBlocks);
       const { stopReason } = await acp.sessionPrompt({ sessionId: acpSessionId, prompt });
-      const cancelled = stopReason === 'cancelled' || stopReason === 'max_tokens';
+      const cancelled = stopReason === 'cancelled';
+      const truncated = stopReason === 'max_tokens';
       opts.stream.push({
         kind: 'turn',
         status: cancelled ? 'cancelled' : 'completed',
         sessionId: opts.sessionId,
         turnId: opts.turnId,
         timestamp: Date.now(),
-        payload: { reason: cancelled ? 'cancelled' : 'completed' },
+        payload: {
+          reason: cancelled ? 'cancelled' : 'completed',
+          ...(truncated ? { truncated: true } : {}),
+        },
       });
       opts.stream.end();
     } finally {
       unsub();
+      acp.cancelSessionPending([opts.sessionId, acpSessionId]);
+      this.clearToolSnapshots(opts.sessionId, opts.turnId);
       this.acpTurns.delete(opts.sessionId);
       if (this.recycleGraceMs > 0) {
         this.scheduleRecycleWhenIdle();
@@ -1568,11 +1624,48 @@ export class GrokProviderAdapter implements ProviderAdapter {
         const isTerminal = isFailed || ev.status === 'completed';
         const status: EventStatus = isTerminal ? (isFailed ? 'failed' : 'completed') : 'delta';
         const hasRawOutput = ev.rawOutput !== undefined && ev.rawOutput !== null;
-        const output = !hasRawOutput
+        const fullOutput = !hasRawOutput
           ? undefined
           : typeof ev.rawOutput === 'string'
             ? ev.rawOutput
             : JSON.stringify(ev.rawOutput);
+
+        let output = fullOutput;
+        let outputMode: 'append' | 'replace' | undefined;
+        const toolKey = `${sessionId}:${ev.toolCallId}`;
+        if (!isTerminal) this.toolSnapshotTurns.set(toolKey, turnId);
+        const previous = this.toolOutputSnapshots.get(toolKey);
+        if (fullOutput !== undefined) {
+          if (isTerminal) {
+            output = fullOutput;
+          } else if (previous !== undefined && fullOutput.startsWith(previous)) {
+            output = fullOutput.slice(previous.length);
+          } else {
+            outputMode = 'replace';
+          }
+          if (Buffer.byteLength(fullOutput, 'utf8') <= GrokProviderAdapter.MAX_TOOL_SNAPSHOT_BYTES) {
+            if (!this.toolOutputSnapshots.has(toolKey)) {
+              while (this.toolOutputSnapshots.size >= GrokProviderAdapter.MAX_TOOL_SNAPSHOTS) {
+                const oldest = this.toolOutputSnapshots.keys().next().value;
+                if (oldest === undefined) break;
+                this.toolOutputSnapshots.delete(oldest);
+                this.toolSnapshotTurns.delete(oldest);
+              }
+            }
+            this.toolOutputSnapshots.delete(toolKey);
+            this.toolOutputSnapshots.set(toolKey, fullOutput);
+          } else {
+            outputMode = 'replace';
+            this.toolOutputSnapshots.delete(toolKey);
+          }
+        } else if (isTerminal) {
+          output = previous;
+        }
+        if (isTerminal) {
+          this.toolOutputSnapshots.delete(toolKey);
+          this.toolSnapshotTurns.delete(toolKey);
+        }
+
         stream.push({
           kind: 'tool',
           status,
@@ -1583,6 +1676,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
             toolCallId: ev.toolCallId,
             name: ev.title ?? '',
             ...(output !== undefined ? { output } : {}),
+            ...(outputMode ? { outputMode } : {}),
             is_error: isFailed,
           },
         });
@@ -1662,9 +1756,17 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async interrupt(sessionId: string): Promise<void> {
+    const acpId = this.acpId(sessionId);
+    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
+      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    for (const client of candidates) {
+      if (client.ready) {
+        client.cancelSessionPending([sessionId, acpId]);
+      }
+    }
     const client = this.clientForSession(sessionId);
     if (client?.ready) {
-      await client.sessionCancel(this.acpId(sessionId)).catch(() => undefined);
+      await client.sessionCancel(acpId).catch(() => undefined);
     }
     this.inner.interrupt(sessionId);
   }
@@ -1678,7 +1780,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
       if (!pending) continue;
       if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
       if (decision === 'reject') {
-        client.cancelPermission(pending.id);
+        const rejectOpt = pickPermissionOption(pending.options, 'reject');
+        if (rejectOpt) {
+          client.resolvePermission(pending.id, rejectOpt);
+        } else {
+          client.cancelPermission(pending.id);
+        }
         if (this.recycleGraceMs > 0) this.scheduleRecycleWhenIdle();
         return;
       }
@@ -1765,7 +1872,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async close(sessionId: string): Promise<void> {
-    const acpId = this.acpSessionIds.get(sessionId);
+    const acpId = this.acpId(sessionId);
+    const client = this.clientForSession(sessionId);
+    if (client?.ready && typeof client.sessionClose === 'function') {
+      await client.sessionClose(acpId).catch(() => undefined);
+    }
     this.renames.delete(sessionId);
     if (acpId) this.renames.delete(acpId);
     this.sessionCwd.delete(sessionId);
@@ -1778,6 +1889,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.sessionGoals.delete(sessionId);
     this.commandsCache.delete(sessionId);
     if (acpId) this.commandsCache.delete(acpId);
+    this.clearToolSnapshots(sessionId);
   }
 
   async dispose(): Promise<void> {
@@ -1788,6 +1900,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
     this.commandsCache.clear();
     this.skillCache.clear();
+    this.toolOutputSnapshots.clear();
+    this.toolSnapshotTurns.clear();
     this.sessionCwd.clear();
     this.sessionUsage.clear();
     this.renames.clear();
@@ -1970,29 +2084,61 @@ export class GrokProviderAdapter implements ProviderAdapter {
       };
     };
 
-    try {
-      const { defaultModel, models } = await this.inner.listModels();
-      if (defaultModel) this.defaultModel = defaultModel;
-      else if (liveState?.currentModelId) this.defaultModel = liveState.currentModelId;
+    const toCliModel = (model: string, isDefault: boolean): NativeModel => {
+      const isGrok = isKnownGrokReasoningModel(model);
+      return {
+        provider: 'grok',
+        model,
+        display_name: model,
+        max_context_size: grokContextWindow(model),
+        capabilities: isGrok ? ['thinking'] : [],
+        support_efforts: isGrok ? [...GROK_EFFORTS] : undefined,
+        default_effort: isGrok ? 'high' : undefined,
+        isDefault,
+      };
+    };
 
-      return models.map((model) => {
+    if (liveState && liveState.availableModels.length > 0) {
+      if (liveState.currentModelId) this.defaultModel = liveState.currentModelId;
+      let cli = this.inner.getCachedModels?.() ?? null;
+      if (!cli) {
+        try {
+          cli = await this.inner.listModels();
+        } catch {
+          cli = this.lastCliModels ?? null;
+        }
+      }
+      if (cli) this.lastCliModels = cli;
+      const defaultModel = liveState.currentModelId ?? cli?.defaultModel ?? this.defaultModel;
+      const seen = new Set<string>();
+      const out: NativeModel[] = [];
+      for (const m of liveState.availableModels) {
+        seen.add(m.modelId);
+        out.push(toAcpModel(m.modelId, m, defaultModel === m.modelId));
+      }
+      if (cli?.models) {
+        for (const model of cli.models) {
+          if (!seen.has(model)) {
+            seen.add(model);
+            out.push(toCliModel(model, defaultModel === model));
+          }
+        }
+      }
+      return out;
+    }
+
+    try {
+      const cli = await this.inner.listModels();
+      this.lastCliModels = cli;
+      const defaultModel = cli.defaultModel ?? this.defaultModel;
+      if (cli.defaultModel) this.defaultModel = cli.defaultModel;
+
+      return cli.models.map((model) => {
         const acpInfo = acpModelMap.get(model);
         if (acpInfo) {
-          const isDefault = defaultModel ? defaultModel === model : (liveState?.currentModelId === model);
-          return toAcpModel(model, acpInfo, isDefault);
+          return toAcpModel(model, acpInfo, defaultModel === model);
         }
-
-        const isGrok = isKnownGrokReasoningModel(model);
-        return {
-          provider: 'grok',
-          model,
-          display_name: model,
-          max_context_size: grokContextWindow(model),
-          capabilities: isGrok ? ['thinking'] : [],
-          support_efforts: isGrok ? [...GROK_EFFORTS] : undefined,
-          default_effort: isGrok ? 'high' : undefined,
-          isDefault: defaultModel === model,
-        };
+        return toCliModel(model, defaultModel === model);
       });
     } catch (err) {
       if (liveState && liveState.availableModels.length > 0) {
@@ -2185,9 +2331,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private async applyLiveConfig(
     acp: GrokAcpClient,
     acpSessionId: string,
-    opts: { model?: string; effort?: string; plan: boolean },
+    opts: { model?: string; effort?: string; plan?: boolean },
   ): Promise<void> {
-    if (opts.plan) await acp.sessionSetMode(acpSessionId, 'plan').catch(() => undefined);
+    if (opts.plan !== undefined) {
+      await acp.sessionSetMode(acpSessionId, opts.plan ? 'plan' : 'default').catch(() => undefined);
+    }
     if (opts.model) {
       await acp.sessionSetModel(acpSessionId, opts.model).catch(async () => {
         await acp.sessionSetConfigOption(acpSessionId, 'model', opts.model as string).catch(() => undefined);

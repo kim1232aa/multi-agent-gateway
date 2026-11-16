@@ -1780,8 +1780,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
       busy: false,
       // thread/list archived=true 的条目本身就是已归档,但响应经常不带 archived 字段。
       archived: listedArchived || thread.archived === true,
-      // 0.37 Done 页过滤空 last_prompt;preview/标题都能撑起一条可见项。
-      extras: { last_prompt: preview || title },
+      // 0.37 Done 页过滤空 last_prompt;preview 撑起可见项。
+      extras: { last_prompt: preview || (this.renames.get(id) ?? (typeof thread.name === 'string' ? thread.name : '')) },
       metadata: { cwd },
       provider: 'codex',
     };
@@ -1823,7 +1823,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
               sessionId,
               turnId,
               timestamp: ts,
-              payload: { toolCallId: ev.itemId, name: 'commandExecution', output: ev.delta },
+              payload: { toolCallId: ev.itemId, name: ev.toolName ?? 'commandExecution', output: ev.delta },
             };
             break;
           case 'item-started': {
@@ -3418,7 +3418,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
       updated_at: s.updatedAt,
       busy: false,
       archived,
-      extras: { last_prompt: s.firstPrompt || title },
+      extras: { last_prompt: s.firstPrompt || (this.renames.get(s.sessionId) ?? s.title ?? '') },
       metadata: { cwd: s.cwd },
       provider: 'claude',
     };

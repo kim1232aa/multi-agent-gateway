@@ -39,6 +39,8 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
+const noop = (): void => {};
+
 export function v25FrameToV262Item(
   frame: Record<string, unknown>,
   stepIndex: number,
@@ -773,6 +775,7 @@ export function bridgeKimiV25Ws(
           return { agentId, ...page };
         }),
       );
+      fetchPromise.catch(noop);
       pendingSubscribes.set(requestId, { sessionId, agentIds, fetchPromise });
       const transcriptSpec: Record<string, string> = {};
       for (const a of agentIds) transcriptSpec[a] = 'delta';

@@ -241,6 +241,10 @@ function trySpawn(bin: string, port: number, extraEnv?: Record<string, string>):
         process: child,
         close: () =>
           new Promise((done) => {
+            if (child.exitCode !== null || child.signalCode !== null) {
+              done();
+              return;
+            }
             child.once('exit', () => done());
             child.kill('SIGTERM');
             setTimeout(() => {

@@ -227,6 +227,14 @@ export type ClaudeAdapterEvent =
       uuid?: string;
     }
   | {
+      type: "compact_boundary";
+      sessionId: string;
+      uuid?: string;
+      logicalParentUuid?: string;
+      parentUuid?: string | null;
+      compactMetadata?: Record<string, unknown>;
+    }
+  | {
       type: "text_delta";
       text: string;
       uuid?: string;
@@ -436,6 +444,7 @@ export interface StartTurnOptions {
    * default/acceptEdits/auto/bypassPermissions/manual/dontAsk/plan)。
    */
   permissionMode?: string;
+  permission_mode?: string;
   /** Optional max thinking tokens budget passed to CLI. */
   maxThinkingTokens?: number;
   /** Whether to forward subagent text & thinking (`--forward-subagent-text`, default true). */
@@ -599,6 +608,17 @@ export function mapControlPermissionMode(mode: string): string {
   if (trimmed === "yolo") return "bypassPermissions";
   if (CONTROL_PERMISSION_MODES.has(trimmed)) return trimmed;
   throw new ProviderError("invalid_request", `claude-adapter: unsupported permission mode: ${mode}`, 400);
+}
+
+function validateCliArg(name: string, val: unknown): void {
+  if (val === undefined || val === null || val === "") return;
+  if (typeof val !== "string" || val.startsWith("-") || /[\s\x00-\x1f\x7f]/.test(val)) {
+    throw new ProviderError(
+      "invalid_request",
+      `claude-adapter: invalid ${name} "${val}": cannot start with '-' or contain whitespace/control characters`,
+      400,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -894,9 +914,23 @@ export class ClaudeAdapter {
 
     const { fh, stat: st } = opened;
     try {
+      let subMtime = 0;
+      if (options.includeSubagents) {
+        try {
+          const subagentsDir = path.join(path.dirname(filePath), resolvedId, "subagents");
+          const subStat = await fsp.stat(subagentsDir);
+          subMtime = subStat.mtimeMs;
+        } catch {
+          subMtime = 0;
+        }
+      }
+
       const cacheKey = `${resolvedId}:${options.includeSubagents ? "sub" : "main"}`;
+      const cacheTag = options.includeSubagents
+        ? `${st.mtimeMs}:${st.size}:${subMtime}`
+        : `${st.mtimeMs}:${st.size}`;
       const hit = this.historyCache.get(cacheKey);
-      if (hit && hit.key === `${st.mtimeMs}:${st.size}`) {
+      if (hit && hit.key === cacheTag) {
         return hit.messages;
       }
 
@@ -911,7 +945,7 @@ export class ClaudeAdapter {
         }
       }
 
-      this.historyCache.set(cacheKey, { key: `${st.mtimeMs}:${st.size}`, messages });
+      this.historyCache.set(cacheKey, { key: cacheTag, messages });
       return messages;
     } finally {
       await fh.close().catch(() => undefined);
@@ -1420,11 +1454,19 @@ export class ClaudeAdapter {
       args.push("--resume", sessionId);
       if (opts.fork) args.push("--fork-session");
     }
-    if (opts.model) args.push("--model", opts.model);
-    if (opts.effort && opts.effort !== "auto" && opts.effort !== "on") {
-      args.push("--effort", opts.effort);
+    const model = opts.model;
+    const effort = opts.effort;
+    const permissionMode = opts.permissionMode ?? opts.permission_mode;
+
+    validateCliArg("model", model);
+    validateCliArg("effort", effort);
+    validateCliArg("permission_mode", permissionMode);
+
+    if (model) args.push("--model", model);
+    if (effort && effort !== "auto" && effort !== "on") {
+      args.push("--effort", effort);
     }
-    if (opts.permissionMode) args.push("--permission-mode", opts.permissionMode);
+    if (permissionMode) args.push("--permission-mode", permissionMode);
     if (opts.maxThinkingTokens !== undefined) {
       args.push("--max-thinking-tokens", String(opts.maxThinkingTokens));
     }
@@ -1736,7 +1778,7 @@ export class ClaudeAdapter {
       if (child.exitCode !== null || child.signalCode !== null) return;
       endStdin(child);
       try {
-        child.kill("SIGINT");
+        this.killGroup(child, "SIGINT");
       } catch {
         // ignore if already dead
       }
@@ -1956,7 +1998,8 @@ export class ClaudeAdapter {
     const req = pending.request;
     const isDeny = decision === "deny" || decision === "reject";
     const isAlways = decision === "approve_always";
-    const toolUseId = typeof req.tool_use_id === "string" && req.tool_use_id ? req.tool_use_id : undefined;
+    const rawToolUseId = req.tool_use_id ?? req.toolUseID;
+    const toolUseId = typeof rawToolUseId === "string" && rawToolUseId ? rawToolUseId : undefined;
 
     let response: Record<string, unknown>;
     if (isDeny) {
@@ -2034,18 +2077,30 @@ export class ClaudeAdapter {
       req.input && typeof req.input === "object" && !Array.isArray(req.input)
         ? (req.input as Record<string, unknown>)
         : {};
-    const toolUseId = typeof req.tool_use_id === "string" && req.tool_use_id ? req.tool_use_id : undefined;
+    const rawToolUseId = req.tool_use_id ?? req.toolUseID;
+    const toolUseId = typeof rawToolUseId === "string" && rawToolUseId ? rawToolUseId : undefined;
+
+    const isEmptyAnswers =
+      !answer ||
+      (typeof answer === "string" && !answer.trim()) ||
+      (typeof answer === "object" && Object.keys(encodedAnswers).length === 0);
 
     const response: Record<string, unknown> =
       req.subtype === "can_use_tool"
-        ? {
-            behavior: "allow",
-            updatedInput: {
-              ...rawInput,
-              answers: encodedAnswers,
-            },
-            ...(toolUseId ? { toolUseID: toolUseId } : {}),
-          }
+        ? isEmptyAnswers
+          ? {
+              behavior: "deny",
+              message: "User dismissed question",
+              ...(toolUseId ? { toolUseID: toolUseId } : {}),
+            }
+          : {
+              behavior: "allow",
+              updatedInput: {
+                ...rawInput,
+                answers: encodedAnswers,
+              },
+              ...(toolUseId ? { toolUseID: toolUseId } : {}),
+            }
         : { answers: encodedAnswers };
 
     await this.writeControlResponse(sessionId, {
@@ -2747,7 +2802,7 @@ export class ClaudeAdapter {
         headUser ||
         tailCmd ||
         headCmd ||
-        "(session)";
+        "";
 
       const summary: ClaudeSessionSummary = {
         sessionId,
@@ -3287,15 +3342,21 @@ function parseHistoryTranscript(
     if (!msg || msg.role !== type) continue;
 
     const blocks: NonNullable<ClaudeHistoryMessage["blocks"]> = [];
+    let hasNonTextStructuredBlock = false;
     if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (!block || typeof block !== "object") continue;
         const b = block as Record<string, unknown>;
-        if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
+        if (b.type === "text" && typeof b.text === "string") {
+          blocks.push({ type: "text", text: b.text });
+        } else if (b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim()) {
+          hasNonTextStructuredBlock = true;
           blocks.push({ type: "thinking", text: b.thinking });
         } else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
+          hasNonTextStructuredBlock = true;
           blocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
         } else if (b.type === "tool_result") {
+          hasNonTextStructuredBlock = true;
           const raw = b.content;
           const out =
             typeof raw === "string"
@@ -3314,7 +3375,7 @@ function parseHistoryTranscript(
     }
 
     const rawText = extractText(msg.content);
-    if (type === "user" && blocks.length === 0) {
+    if (type === "user" && !hasNonTextStructuredBlock) {
       const legacyOutput = extractLocalCommandOutput(rawText);
       if (legacyOutput !== null) {
         if (legacyOutput) {
@@ -3332,14 +3393,26 @@ function parseHistoryTranscript(
     }
     const isBashOut = type === "user" && (rawText.includes("<bash-stdout>") || rawText.includes("<bash-stderr>"));
     const formattedText = type === "user" ? formatTranscriptUserText(rawText) : rawText;
-    if (formattedText === null && blocks.length === 0) continue;
+    if (formattedText === null && !hasNonTextStructuredBlock) continue;
+    // 清洗后为空(caveat 等纯噪音)且没有结构化块:整条丢弃,不留空 user 消息。
+    if (formattedText !== null && !formattedText.trim() && !hasNonTextStructuredBlock) continue;
     const finalText = formattedText ?? "";
     if (!finalText && blocks.length === 0) continue;
+
+    // 对 user 角色且没有非文本结构化块（thinking/tool_use/tool_result）的消息，
+    // 不透传原始未清洗的 blocks，使 facade 能够使用经过 formatTranscriptUserText 清洗后的 text；
+    // 同时保留 assistant 的纯文本或混合 thinking/tool_use blocks。
+    const effectiveBlocks =
+      type === "user" && !hasNonTextStructuredBlock
+        ? undefined
+        : blocks.length > 0
+          ? blocks
+          : undefined;
 
     messages.push({
       role: type,
       text: finalText,
-      ...(blocks.length > 0 ? { blocks } : {}),
+      ...(effectiveBlocks ? { blocks: effectiveBlocks } : {}),
       timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
       model: type === "assistant" && typeof msg.model === "string" ? msg.model : undefined,
       isError: type === "assistant" && entry.isApiErrorMessage === true,
@@ -3446,7 +3519,7 @@ function formatTranscriptUserText(text: string): string | null {
 
 /** True for CLI-local noise (`<local-command-...>`, `<command-name>`, caveats). */
 function isLocalCommandText(text: string): boolean {
-  return text.startsWith("<local-command") || text.startsWith("<command-name") || text.startsWith("Caveat:");
+  return text.startsWith("<local-command") || text.startsWith("<command-name") || text.startsWith("Caveat:") || text.startsWith("<local-command-caveat");
 }
 
 /** 原生 /resume 标题兜底候选:真实消息 → {kind:'text'};斜杠命令(还原 "/x") → {kind:'cmd'}。 */
@@ -3602,6 +3675,16 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
   switch (ev?.type) {
     case "system":
       if (ev.subtype === "init") {
+        const rawPermMode = ev.permissionMode ?? ev.permission_mode;
+        const permissionMode = typeof rawPermMode === "string" ? rawPermMode : undefined;
+        const rawSlash = Array.isArray(ev.slash_commands)
+          ? ev.slash_commands
+          : Array.isArray(ev.commands)
+            ? ev.commands
+            : undefined;
+        const slashCommands = rawSlash
+          ?.map((c: unknown) => (typeof c === "string" ? c : (c && typeof c === "object" && typeof (c as any).name === "string" ? (c as any).name : undefined)))
+          .filter((c: unknown): c is string => typeof c === "string");
         out.push({
           type: "init",
           sessionId: ev.session_id,
@@ -3609,13 +3692,13 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           tools: Array.isArray(ev.tools) ? ev.tools : [],
           ...(uuid ? { uuid } : {}),
           ...(typeof ev.model === "string" ? { model: ev.model } : {}),
-          ...(typeof ev.permissionMode === "string" ? { permissionMode: ev.permissionMode } : {}),
-          ...(Array.isArray(ev.slash_commands) ? { slashCommands: ev.slash_commands } : {}),
+          ...(permissionMode ? { permissionMode } : {}),
+          ...(slashCommands ? { slashCommands } : {}),
           ...(Array.isArray(ev.terminal_slash_commands)
             ? {
-                terminalSlashCommands: ev.terminal_slash_commands.filter(
-                  (c: unknown): c is string => typeof c === "string",
-                ),
+                terminalSlashCommands: ev.terminal_slash_commands
+                  .map((c: unknown) => (typeof c === "string" ? c : (c && typeof c === "object" && typeof (c as any).name === "string" ? (c as any).name : undefined)))
+                  .filter((c: unknown): c is string => typeof c === "string"),
               }
             : {}),
           ...(Array.isArray(ev.skills) ? { skills: ev.skills } : {}),
@@ -3623,6 +3706,25 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           ...(typeof ev.claude_code_version === "string" ? { claudeCodeVersion: ev.claude_code_version } : {}),
           ...(typeof ev.fast_mode_state === "string" ? { fastModeState: ev.fast_mode_state } : {}),
           ...(ev.effort !== undefined ? { effort: ev.effort as string | null } : {}),
+        });
+      } else if (ev.subtype === "compact_boundary") {
+        const rawLogicalParentUuid = ev.logical_parent_uuid ?? ev.logicalParentUuid;
+        const logicalParentUuid =
+          typeof rawLogicalParentUuid === "string" && rawLogicalParentUuid ? rawLogicalParentUuid : undefined;
+        const rawParentUuid = ev.parent_uuid !== undefined ? ev.parent_uuid : ev.parentUuid;
+        const parentUuid = typeof rawParentUuid === "string" || rawParentUuid === null ? rawParentUuid : undefined;
+        const rawMeta = ev.compact_metadata ?? ev.compactMetadata;
+        const compactMetadata =
+          rawMeta && typeof rawMeta === "object" && !Array.isArray(rawMeta)
+            ? (rawMeta as Record<string, unknown>)
+            : undefined;
+        out.push({
+          type: "compact_boundary",
+          sessionId: String(ev.session_id ?? ""),
+          ...(uuid ? { uuid } : {}),
+          ...(logicalParentUuid ? { logicalParentUuid } : {}),
+          ...(parentUuid !== undefined ? { parentUuid } : {}),
+          ...(compactMetadata ? { compactMetadata } : {}),
         });
       } else if (ev.subtype === "conversation_reset") {
         out.push({
@@ -3633,12 +3735,14 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           ...(uuid ? { uuid } : {}),
         });
       } else if (ev.subtype === "task_started" && typeof ev.task_id === "string") {
+        const rawTaskToolUseId = ev.tool_use_id ?? ev.parent_tool_use_id;
+        const toolUseId = typeof rawTaskToolUseId === "string" && rawTaskToolUseId ? rawTaskToolUseId : undefined;
         out.push({
           type: "task_started",
           sessionId: String(ev.session_id ?? ""),
           taskId: ev.task_id,
           description: String(ev.description ?? ""),
-          ...(typeof ev.tool_use_id === "string" ? { toolUseId: ev.tool_use_id } : {}),
+          ...(toolUseId ? { toolUseId } : {}),
           ...(typeof ev.subagent_type === "string" ? { subagentType: ev.subagent_type } : {}),
           ...(typeof ev.is_backgrounded === "boolean" ? { isBackgrounded: ev.is_backgrounded } : {}),
           ...(typeof ev.spawn_depth === "number" ? { spawnDepth: ev.spawn_depth } : {}),
@@ -3647,12 +3751,14 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           ...(uuid ? { uuid } : {}),
         });
       } else if (ev.subtype === "task_progress" && typeof ev.task_id === "string") {
+        const rawTaskToolUseId = ev.tool_use_id ?? ev.parent_tool_use_id;
+        const toolUseId = typeof rawTaskToolUseId === "string" && rawTaskToolUseId ? rawTaskToolUseId : undefined;
         out.push({
           type: "task_progress",
           sessionId: String(ev.session_id ?? ""),
           taskId: ev.task_id,
           description: String(ev.description ?? ""),
-          ...(typeof ev.tool_use_id === "string" ? { toolUseId: ev.tool_use_id } : {}),
+          ...(toolUseId ? { toolUseId } : {}),
           ...(typeof ev.subagent_type === "string" ? { subagentType: ev.subagent_type } : {}),
           ...(ev.usage && typeof ev.usage === "object" ? { usage: ev.usage } : {}),
           ...(typeof ev.last_tool_name === "string" ? { lastToolName: ev.last_tool_name } : {}),
@@ -3668,13 +3774,15 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           ...(uuid ? { uuid } : {}),
         });
       } else if (ev.subtype === "task_notification" && typeof ev.task_id === "string") {
+        const rawTaskToolUseId = ev.tool_use_id ?? ev.parent_tool_use_id;
+        const toolUseId = typeof rawTaskToolUseId === "string" && rawTaskToolUseId ? rawTaskToolUseId : undefined;
         out.push({
           type: "task_notification",
           sessionId: String(ev.session_id ?? ""),
           taskId: ev.task_id,
           status: String(ev.status ?? ""),
           summary: String(ev.summary ?? ""),
-          ...(typeof ev.tool_use_id === "string" ? { toolUseId: ev.tool_use_id } : {}),
+          ...(toolUseId ? { toolUseId } : {}),
           ...(typeof ev.output_file === "string" ? { outputFile: ev.output_file } : {}),
           ...(ev.usage && typeof ev.usage === "object" ? { usage: ev.usage } : {}),
           ...(uuid ? { uuid } : {}),
@@ -3735,11 +3843,10 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
               ...(agentId ? { agentId } : {}),
             });
           }
-        } else if (parentToolUseId) {
-          // `--forward-subagent-text` forwards subagent text/thinking on `assistant` frames
-          // (without preceding `stream_event` deltas); emit deltas only if not already streamed.
-          const alreadyStreamed = state?.streamedParentKeys.has(parentToolUseId) ?? false;
-          state?.streamedParentKeys.delete(parentToolUseId);
+        } else {
+          const streamKey = parentToolUseId ?? "__main__";
+          const alreadyStreamed = state?.streamedParentKeys.has(streamKey) ?? false;
+          state?.streamedParentKeys.delete(streamKey);
           if (!alreadyStreamed) {
             for (const block of content) {
               if (block?.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
@@ -3747,7 +3854,7 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
                   type: "thinking_delta",
                   text: block.thinking,
                   ...(uuid ? { uuid } : {}),
-                  parentToolUseId,
+                  ...(parentToolUseId ? { parentToolUseId } : {}),
                   ...(agentId ? { agentId } : {}),
                   ...(subagentType ? { subagentType } : {}),
                 });
@@ -3756,15 +3863,13 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
                   type: "text_delta",
                   text: block.text,
                   ...(uuid ? { uuid } : {}),
-                  parentToolUseId,
+                  ...(parentToolUseId ? { parentToolUseId } : {}),
                   ...(agentId ? { agentId } : {}),
                   ...(subagentType ? { subagentType } : {}),
                 });
               }
             }
           }
-        } else {
-          state?.streamedParentKeys.delete("__main__");
         }
 
         for (const block of content) {
@@ -3796,7 +3901,9 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
               content:
                 typeof block.content === "string"
                   ? block.content
-                  : JSON.stringify(block.content ?? ""),
+                  : Array.isArray(block.content)
+                    ? (block.content as Array<Record<string, unknown>>).map((x) => (x?.text as string) ?? "").join("")
+                    : JSON.stringify(block.content ?? ""),
               isError: block.is_error === true,
               ...(ev.tool_use_result !== undefined ? { toolUseResult: ev.tool_use_result } : {}),
               ...(uuid ? { uuid } : {}),
@@ -3847,9 +3954,10 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
         });
       }
       const totalCostUsd = typeof ev.total_cost_usd === "number" ? ev.total_cost_usd : undefined;
+      const rawModelUsage = ev.modelUsage ?? ev.model_usage;
       const modelUsage =
-        ev.modelUsage && typeof ev.modelUsage === "object" && !Array.isArray(ev.modelUsage)
-          ? (ev.modelUsage as Record<string, unknown>)
+        rawModelUsage && typeof rawModelUsage === "object" && !Array.isArray(rawModelUsage)
+          ? (rawModelUsage as Record<string, unknown>)
           : undefined;
       out.push({
         type: "done",
@@ -3881,7 +3989,8 @@ function mapStreamEvent(ev: any, state?: StreamMapperState): ClaudeAdapterEvent[
           : parentToolUseId;
       const reqAgentId =
         typeof req.agent_id === "string" && req.agent_id ? req.agent_id : agentId;
-      const itemId = typeof req.tool_use_id === "string" && req.tool_use_id ? req.tool_use_id : undefined;
+      const rawToolUseId = req.tool_use_id ?? req.toolUseID;
+      const itemId = typeof rawToolUseId === "string" && rawToolUseId ? rawToolUseId : undefined;
 
       if (kind === "question") {
         const questions = extractQuestions(req);

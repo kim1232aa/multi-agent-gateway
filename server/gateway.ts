@@ -13,7 +13,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createConnection } from 'node:net';
-import { randomUUID, createHash, randomBytes } from 'node:crypto';
+import { randomUUID, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Duplex } from 'node:stream';
 import * as fsp from 'node:fs/promises';
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from 'node:fs';
@@ -34,6 +34,8 @@ import {
   claudeGatewayCommandNames,
   claudeUnsupportedTuiCommandNames,
   codexGatewayCommandNames,
+  dshGatewayCommandNames,
+  expandDshSkill,
   grokGatewayCommandNames,
   grokUnsupportedTuiCommandNames,
   piGatewayCommandNames,
@@ -250,6 +252,11 @@ function isLocalProvider(value: string | null | undefined): value is LocalProvid
 /** Official grok-4.6 / grok-4.5 window (https://docs.x.ai/developers/models/grok-4.6). */
 function grokStatusContextFallback(): number {
   return 500_000;
+}
+
+/** Official DeepSeek V3 / R1 context window (128K). */
+function dshStatusContextFallback(): number {
+  return 131_072;
 }
 
 function prefixedId(provider: ProviderName, nativeId: string): string {
@@ -525,7 +532,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 }> {
   const port = options.port ?? 58629;
   const host = options.host ?? '127.0.0.1';
-  const token = options.token ?? randomBytes(24).toString('base64url');
+  const token = (options.token?.trim()) || randomBytes(24).toString('base64url');
   const settingsDir = options.settingsDir
     ?? process.env.GATEWAY_SETTINGS_DIR
     ?? path.join(os.homedir(), '.config', 'multi-agent-gateway');
@@ -540,6 +547,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     : 3 * 60_000;
   const codexRecycleGraceMs = process.env.GATEWAY_CODEX_IDLE_TIMEOUT_MS !== undefined
     ? Number(process.env.GATEWAY_CODEX_IDLE_TIMEOUT_MS)
+    : undefined;
+  const dshRecycleGraceMs = process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS !== undefined
+    ? Number(process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS)
     : undefined;
   const adapters: Record<LocalProviderName, ProviderAdapter> = {
     codex: options.codex ?? new CodexProviderAdapter({
@@ -578,7 +588,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       });
     })(),
     dsh: options.dsh ?? new DshProviderAdapter({
+      settingsPath: path.join(settingsDir, 'session-settings.dsh.json'),
       dshBin: process.env.DSH_BIN,
+      ...(dshRecycleGraceMs !== undefined && Number.isFinite(dshRecycleGraceMs) ? { recycleGraceMs: dshRecycleGraceMs } : {}),
     }),
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
@@ -984,6 +996,16 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (isLocalProvider(provider) && sub === '/providers' && req.method === 'GET') {
       return ok(res, { items: [await providerDto(provider, adapters[provider])] }, requestId);
     }
+    const singleProviderMatch = /^\/providers\/([^/:]+)$/.exec(sub);
+    if (singleProviderMatch && req.method === 'GET') {
+      const p = decodeURIComponent(singleProviderMatch[1]);
+      if (isLocalProvider(p)) {
+        return ok(res, await providerDto(p, adapters[p]), requestId);
+      }
+      if (p === 'kimi' && !kimi) {
+        return fail(res, 404, 40401, 'provider not found', requestId);
+      }
+    }
     if (isLocalProvider(provider) && isProviderRefreshRoute(sub) && req.method === 'POST') {
       try {
         await adapters[provider].listModels?.();
@@ -1039,10 +1061,25 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       res.end(f.data);
       return;
     }
+    const mediaMatch = /^\/media\/([^/:]+)$/.exec(sub);
+    if (mediaMatch && req.method === 'GET') {
+      const f = await uploadStore.read(decodeURIComponent(mediaMatch[1]));
+      if (!f) return fail(res, 404, 40401, 'media not found', requestId);
+      res.writeHead(200, {
+        'content-type': f.media_type,
+        'content-length': String(f.data.byteLength),
+        'x-content-type-options': 'nosniff',
+        'cache-control': 'no-store',
+        'access-control-allow-origin': '*',
+      });
+      res.end(f.data);
+      return;
+    }
 
     // --- 目录浏览(前端"添加本地项目"选目录;PRESUMED 端点,本网关实现) ---
     if (sub === '/fs:browse' && req.method === 'GET') {
-      const target = url.searchParams.get('path') || os.homedir();
+      const rawTarget = url.searchParams.get('path');
+      const target = path.resolve(rawTarget || os.homedir());
       const dirents = await fsp.readdir(target, { withFileTypes: true }).catch((err: unknown) => {
         throw new ProviderError('invalid_request', `cannot list ${target}: ${err instanceof Error ? err.message : String(err)}`, 400);
       });
@@ -1209,23 +1246,30 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
       const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
       const hit = wsItems.find((w) => w.id === body.workspace);
-      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : os.homedir();
-      return ok(res, await fsList(cwd, body), requestId);
+      if (!hit || typeof hit.root !== 'string' || !hit.root) {
+        return ok(res, { items: [], truncated: false }, requestId);
+      }
+      return ok(res, await fsList(hit.root, body), requestId);
     }
     if ((sub === '/workspace/fs:search' || sub === '/workspace/fs:suggest') && req.method === 'POST' && provider && provider !== 'kimi') {
       const body = (await readBody(req)) as { workspace?: string; query?: string; limit?: number };
       const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
       const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
       const hit = wsItems.find((w) => w.id === body.workspace);
-      const cwd = typeof hit?.root === 'string' && hit.root ? hit.root : os.homedir();
-      return ok(res, await fsSearch(cwd, { query: body.query ?? '', limit: body.limit }), requestId);
+      if (!hit || typeof hit.root !== 'string' || !hit.root) {
+        return ok(res, { items: [], truncated: false }, requestId);
+      }
+      return ok(res, await fsSearch(hit.root, { query: body.query ?? '', limit: body.limit }), requestId);
     }
     if (sub === '/fs:suggest' && req.method === 'POST' && provider && provider !== 'kimi') {
       const body = (await readBody(req).catch(() => ({}))) as { roots?: unknown[]; query?: string; limit?: number };
       const roots = Array.isArray(body.roots) ? body.roots.filter((r): r is string => typeof r === 'string' && r.length > 0) : [];
       const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore);
       const wsItems = (all as { items?: Array<Record<string, unknown>> }).items ?? [];
-      const allowedRoot = roots.find((r) => wsItems.some((w) => w.root === r)) ?? (typeof wsItems[0]?.root === 'string' ? wsItems[0].root : os.homedir());
+      const allowedRoot = roots.find((r) => wsItems.some((w) => w.root === r));
+      if (!allowedRoot) {
+        return ok(res, { items: [], truncated: false }, requestId);
+      }
       return ok(res, await fsSearch(allowedRoot, { query: body.query ?? '', limit: body.limit }), requestId);
     }
 
@@ -1431,6 +1475,33 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         // 前端每次打开会话自动拉;本地 provider 无警告机制,回空。
         return ok(res, { warnings: [] }, requestId);
       }
+      if (tail === ':takeover' && req.method === 'POST') {
+        throw new ProviderError('unsupported', `${sp} 不支持 takeover`, 400);
+      }
+      if (tail === '/rating' && req.method === 'POST') {
+        const body = (await readBody(req).catch(() => ({}))) as { op?: string };
+        if (body.op === 'evaluate') {
+          return ok(res, { appearance: null }, requestId);
+        }
+        throw new ProviderError('unsupported', `${sp} 不支持评价反馈`, 400);
+      }
+      if (tail === '/file-history/content' && req.method === 'GET') {
+        throw new ProviderError('unsupported', `${sp} 不支持读取历史文件内容`, 400);
+      }
+      const sessionMediaMatch = /^\/media\/([^/:]+)$/.exec(tail);
+      if (sessionMediaMatch && req.method === 'GET') {
+        const f = await uploadStore.read(decodeURIComponent(sessionMediaMatch[1]));
+        if (!f) return fail(res, 404, 40401, 'media not found', requestId);
+        res.writeHead(200, {
+          'content-type': f.media_type,
+          'content-length': String(f.data.byteLength),
+          'x-content-type-options': 'nosniff',
+          'cache-control': 'no-store',
+          'access-control-allow-origin': '*',
+        });
+        res.end(f.data);
+        return;
+      }
       if (tail === '/file-history/changes' && req.method === 'GET') {
         return ok(res, { recorded: false, changes: [] }, requestId);
       }
@@ -1482,22 +1553,40 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 
         let commandPrefix = `/${name}`;
         if (sp === 'pi') {
-          const bareName = name.startsWith('skill:') ? name.slice(6) : name;
           const [skills, commands] = await Promise.all([
             adapter.listSkills ? adapter.listSkills(nativeId).catch(() => []) : Promise.resolve([]),
             adapter.listCommands ? adapter.listCommands(nativeId).catch(() => []) : Promise.resolve([]),
           ]);
-          const matchingSkill = skills.find((s) => s && (s.name === name || s.name === `skill:${bareName}`));
+          const matchingSkill = skills.find((s) => s && (s.name === name || s.name === `skill:${bareSkillName}`));
           const nonSkillCmd = commands.find(
-            (c) => c && (c.name === name || c.name === bareName) && c.source && c.source !== 'skill',
+            (c) => c && (c.name === name || c.name === bareSkillName) && c.source && c.source !== 'skill',
           );
           const requestedSkillByPath = typeof body.path === 'string' && body.path.length > 0 && matchingSkill?.path === body.path;
           if (matchingSkill && (requestedSkillByPath || !nonSkillCmd)) {
-            commandPrefix = `/skill:${bareName}`;
+            commandPrefix = `/skill:${bareSkillName}`;
           }
         }
 
-        const text = `${commandPrefix}${cleanArgs ? ` ${cleanArgs}` : ''}`;
+        let text = `${commandPrefix}${cleanArgs ? ` ${cleanArgs}` : ''}`;
+        if (sp === 'dsh') {
+          if (dshGatewayCommandNames().has(bareSkillName) || dshGatewayCommandNames().has(name)) {
+            text = `/${bareSkillName}${cleanArgs ? ` ${cleanArgs}` : ''}`;
+          } else {
+            const skills = await adapterSkills(adapter, nativeId).catch(() => []);
+            const matchingSkill = skills.find((s) => s && (s.name === name || s.name === bareSkillName || s.name === `skill:${bareSkillName}`));
+            if (!matchingSkill || typeof matchingSkill.path !== 'string' || !matchingSkill.path) {
+              throw new ProviderError('invalid_request', `dsh 技能 ${name} 不存在`, 400);
+            }
+            const promptToExpand = `/${bareSkillName}${cleanArgs ? ` ${cleanArgs}` : ''}`;
+            const expanded = typeof expandDshSkill === 'function'
+              ? expandDshSkill(promptToExpand, [{ name: bareSkillName, path: matchingSkill.path }])
+              : null;
+            if (!expanded) {
+              throw new ProviderError('unsupported', `dsh 技能 ${name} 无法展开`, 400);
+            }
+            text = expanded;
+          }
+        }
         const content: Array<Record<string, unknown>> = [{ type: 'text', text }];
         if (Array.isArray(body.attachments)) {
           for (const att of body.attachments) {
@@ -1561,6 +1650,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           }
           return ok(res, { results, errors }, requestId);
         }
+        if (tail === '/fs:pull_request' && req.method === 'POST') {
+          throw new ProviderError('unsupported', `${sp} 不支持 pull_request 查询`, 400);
+        }
         if (tail === '/fs:pull_request:batch' && req.method === 'POST') {
           return ok(res, { results: {}, errors: {} }, requestId);
         }
@@ -1574,6 +1666,13 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       if (tail === '/goal' && req.method === 'GET') {
         if (caps.goals === false || !adapter.getGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
         return ok(res, localGoalToWire(await adapter.getGoal(nativeId), nativeId), requestId);
+      }
+      if (tail === '/goal' && req.method === 'PATCH') {
+        if (caps.goals === false || !adapter.setGoal) throw new ProviderError('unsupported', `${sp} 不支持 goal`, 400);
+        const body = (await readBody(req).catch(() => ({}))) as { objective?: string };
+        const objective = typeof body.objective === 'string' ? body.objective : '';
+        const updated = await adapter.setGoal(nativeId, objective);
+        return ok(res, localGoalToWire(updated, nativeId), requestId);
       }
       if (tail === '/export' && req.method === 'POST') {
         const session = await getSession(adapter, sp, nativeId, demoActive);
@@ -1605,6 +1704,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         }
         if (contextLimit <= 0 && sp === 'grok') {
           contextLimit = grokStatusContextFallback();
+        }
+        if (contextLimit <= 0 && sp === 'dsh') {
+          contextLimit = dshStatusContextFallback();
         }
         const contextUnavailable = usage?.context_unavailable === true;
         const extUi = (adapter as { getExtensionUiState?: (id: string) => unknown }).getExtensionUiState?.(nativeId);
@@ -2000,12 +2102,16 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         for (const socket of gatewaySockets) socket.destroy();
         server.close(() => {
           // 关停也要释放 provider 子进程;allSettled 保证一个挂了不拖住整体。
+          const kimiChildren = new Set<KimiChild>();
+          if (kimiFallback?.owned) kimiChildren.add(kimiFallback);
+          if (kimi?.child?.owned) kimiChildren.add(kimi.child);
           void Promise.allSettled([
-            kimiFallback?.close() ?? kimi?.child?.close() ?? Promise.resolve(),
+            ...Array.from(kimiChildren).map((c) => c.close()),
             adapters.claude.dispose?.() ?? Promise.resolve(),
             adapters.codex.dispose?.() ?? Promise.resolve(),
             adapters.grok.dispose?.() ?? Promise.resolve(),
             adapters.pi.dispose?.() ?? Promise.resolve(),
+            adapters.dsh.dispose?.() ?? Promise.resolve(),
           ]).then(() => resolveClose());
         });
         // 流式/长连接会挡住 server.close 的回调,主动掐掉空闲 keep-alive。
@@ -2018,14 +2124,35 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
 // 鉴权
 // ---------------------------------------------------------------------------
 
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) {
+    timingSafeEqual(bufA, bufA);
+    return false;
+  }
+  return timingSafeEqual(bufA, bufB);
+}
+
 function authed(req: IncomingMessage, token: string): boolean {
   const header = req.headers.authorization;
-  if (header === `Bearer ${token}`) return true;
+  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+    if (safeEqual(header.slice(7).trim(), token)) return true;
+  }
   const proto = req.headers['sec-websocket-protocol'];
-  if (typeof proto === 'string' && proto.includes(`kimi-code.bearer.${token}`)) return true;
+  if (typeof proto === 'string') {
+    const parts = proto.split(',').map((p) => p.trim());
+    for (const part of parts) {
+      if (part.startsWith('kimi-code.bearer.')) {
+        if (safeEqual(part.slice('kimi-code.bearer.'.length), token)) return true;
+      }
+    }
+  }
   // 开发期:允许 query token
   const url = new URL(req.url ?? '/', 'http://localhost');
-  return url.searchParams.get('token') === token;
+  const qToken = url.searchParams.get('token');
+  if (typeof qToken === 'string' && safeEqual(qToken, token)) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2734,7 +2861,8 @@ function isEmptyPlaceholderSession(item: Record<string, unknown>, busy: boolean)
   if (busy) return false;
   const title = typeof item.title === 'string' ? item.title.trim() : '';
   const lastPrompt = typeof item.last_prompt === 'string' ? item.last_prompt.trim() : '';
-  return lastPrompt.length === 0 && (title.length === 0 || title === '(session)');
+  const promptEmpty = lastPrompt.length === 0 || lastPrompt === '(session)';
+  return promptEmpty && (title.length === 0 || title === '(session)');
 }
 
 /**
@@ -2744,11 +2872,14 @@ function isEmptyPlaceholderSession(item: Record<string, unknown>, busy: boolean)
 function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<string, unknown> {
   const groupPageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('group.page_size') ?? 5) || 5));
   const hasPrompt = url.searchParams.get('meta.has_prompt') === 'true';
+  const excludeEmpty = url.searchParams.get('exclude_empty') === 'true';
   const buckets = new Map<string, { workspace: { id: string; cwd: string }; sessions: Record<string, unknown>[] }>();
   for (const item of items) {
     const meta = item.meta && typeof item.meta === 'object' ? item.meta as Record<string, unknown> : {};
     const lastPrompt = typeof meta.last_prompt === 'string' ? meta.last_prompt.trim() : '';
     if (hasPrompt && (lastPrompt.length === 0 || lastPrompt === '(session)')) continue;
+    const isBusy = Boolean((item.activity && typeof item.activity === 'object' && (item.activity as Record<string, unknown>).status === 'running') || item.busy);
+    if (excludeEmpty && isEmptyPlaceholderSession({ title: meta.title, last_prompt: meta.last_prompt }, isBusy)) continue;
     const workspace = item.workspace && typeof item.workspace === 'object'
       ? item.workspace as Record<string, unknown>
       : {};
@@ -2784,6 +2915,14 @@ function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<stri
   const metadata = (item.metadata && typeof item.metadata === 'object')
     ? item.metadata as Record<string, unknown>
     : {};
+  const agentConfig = (item.agent_config && typeof item.agent_config === 'object')
+    ? item.agent_config as Record<string, unknown>
+    : {};
+  const model = typeof item.model === 'string' && item.model
+    ? item.model
+    : typeof agentConfig.model === 'string' && agentConfig.model
+      ? agentConfig.model
+      : undefined;
   const created = Date.parse(String(item.created_at ?? '')) || 0;
   const updated = Date.parse(String(item.updated_at ?? '')) || created;
   return {
@@ -2800,7 +2939,10 @@ function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<stri
       archived: Boolean(item.archived),
       archived_at: null,
     },
-    activity: { status: busy ? 'running' : 'idle' },
+    activity: {
+      status: busy ? 'running' : 'idle',
+      ...(model ? { model } : {}),
+    },
   };
 }
 
@@ -2934,7 +3076,9 @@ async function listSessions(
   if (demoActive && (!provider || provider === 'kimi')) {
     for (const session of listDemoSessions('kimi')) {
       if (rootNorm && normalizeWorkspaceRoot(session.metadata.cwd) !== rootNorm) continue;
-      items.push(sessionDto(session, getDemoModel('kimi', session.id)));
+      const demoDto = sessionDto(session, getDemoModel('kimi', session.id));
+      if (excludeEmpty && isEmptyPlaceholderSession(demoDto, Boolean(demoDto.busy))) continue;
+      items.push(demoDto);
     }
   }
   if (provider === 'kimi') {
@@ -2959,7 +3103,9 @@ async function listSessions(
         const cwd = typeof s.metadata?.cwd === 'string' ? String(s.metadata.cwd) : '';
         if (normalizeWorkspaceRoot(cwd) !== rootNorm) continue;
       }
-      items.push(sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id))));
+      const dto = sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id)));
+      if (excludeEmpty && isEmptyPlaceholderSession(dto, Boolean(dto.busy))) continue;
+      items.push(dto);
     }
   }
   items.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
@@ -2988,10 +3134,15 @@ async function createLocalSession(
     } else {
       const all = await listWorkspaces(adapters, null, provider, false, workspaceStore).catch(() => ({ items: [] }));
       const hit = ((all as { items?: Array<Record<string, unknown>> }).items ?? []).find((w) => w.id === b.workspace_id);
-      if (typeof hit?.root === 'string' && hit.root) resolvedWorkspaceRoot = hit.root;
+      if (typeof hit?.root === 'string' && hit.root) {
+        resolvedWorkspaceRoot = hit.root;
+      } else {
+        throw new ProviderError('not_found', `workspace not found: ${b.workspace_id}`, 404);
+      }
     }
   }
-  const cwd = b.metadata?.cwd ?? b.cwd ?? resolvedWorkspaceRoot ?? os.homedir();
+  const rawCwd = b.metadata?.cwd ?? b.cwd ?? resolvedWorkspaceRoot ?? os.homedir();
+  const cwd = path.resolve(rawCwd);
   const adapter = adapters[provider];
   const caps = adapter.capabilities();
   const createCfg = (b as {
@@ -3360,7 +3511,10 @@ async function submitPrompt(
     }
   }
   if (cmd && provider === 'dsh') {
-    if (cmd[1] === 'plan' || cmd[1] === 'compact' || cmd[1] === 'goal') {
+    if (cmd[1] === 'undo' || cmd[1] === 'fork' || cmd[1] === 'compact' || cmd[1] === 'goal' || cmd[1] === 'plan') {
+      throw new ProviderError('unsupported', `dsh 不支持 /${cmd[1]}`, 400);
+    }
+    if (dshGatewayCommandNames().has(cmd[1])) {
       if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
       const [, name, rawArgs] = cmd;
       return runLocalGatewayCommand(adapter, provider, nativeId, name, (rawArgs ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
@@ -3635,13 +3789,19 @@ async function driveTurn(
   void (async () => {
     let reason: 'completed' | 'failed' = 'completed';
     let turnError: string | undefined;
+    let turnTruncated = false;
     try {
       for await (const ev of handle.events) {
         if (hub.busy.get(sid) !== turn) break;
-        if (ev.kind === 'turn' && (ev.status === 'failed' || ev.status === 'cancelled')) {
-          reason = 'failed';
-          const errText = (ev.payload as { error?: string } | undefined)?.error;
-          if (typeof errText === 'string' && errText) turnError = errText;
+        if (ev.kind === 'turn') {
+          if (ev.status === 'failed' || ev.status === 'cancelled') {
+            reason = 'failed';
+            const errText = (ev.payload as { error?: string } | undefined)?.error;
+            if (typeof errText === 'string' && errText) turnError = errText;
+          }
+          if ((ev.payload as { truncated?: boolean } | undefined)?.truncated === true) {
+            turnTruncated = true;
+          }
         }
         consumeEvent(ev, turn, emit, ensureStep, completeStep, sid, hub, provider);
       }
@@ -3649,6 +3809,10 @@ async function driveTurn(
       reason = 'failed';
       turnError = err instanceof Error ? err.message : String(err);
     } finally {
+      if (turnTruncated) {
+        const truncMsg = '⚠ 模型输出达到 token 上限已截断。';
+        emitAssistantDeltaText(turn.assistantText ? `\n\n${truncMsg}` : truncMsg, turn, emit, ensureStep, sid, hub);
+      }
       completeStep(reason === 'failed' ? 'failed' : 'completed');
       closeV262Thinking(hub, sid, turn);
       closeV262Assistant(hub, sid, turn);
@@ -4616,23 +4780,22 @@ async function executeDshCommand(
   argsText: string,
 ): Promise<string> {
   switch (name) {
-    case 'plan': {
-      if (argsText) {
-        if (adapter.setPlanMode) await adapter.setPlanMode(nativeId, true);
-        return `✓ DSH Plan Mode 已开启: ${argsText}`;
-      }
-      const current = adapter.getPlanMode?.(nativeId);
-      return `ℹ DSH Plan Mode 当前状态: ${current ? '开启' : '关闭'}。使用 \`/plan <任务>\` 进入只读规划。`;
-    }
+    case 'undo':
+    case 'fork':
     case 'compact':
-      return '✓ DSH 会话上下文已标记压缩。';
     case 'goal':
-      if (argsText) {
-        return `✓ DSH 自主长程目标已设定: ${argsText}`;
-      }
-      return 'ℹ 使用 `/goal <目标>` 为 DSH 设定自主开发长程目标。';
+    case 'plan':
+      throw new ProviderError('unsupported', `dsh 不支持 /${name}`, 400);
+    case 'status':
+      return renderDshStatus(adapter, nativeId);
+    case 'diff':
+      return renderRepoDiffCommand(adapter, nativeId);
+    case 'skills':
+      return renderProviderSkills(adapter, 'dsh', nativeId);
+    case 'help':
+      return renderProviderHelp(adapter, 'dsh', nativeId);
     default:
-      return `ℹ DSH 命令 /${name} 已执行。`;
+      throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
   }
 }
 
@@ -4645,6 +4808,11 @@ async function executeClaudeCommand(
   switch (name) {
     case 'status':
       return renderClaudeStatus(adapter, nativeId);
+    case 'fork': {
+      if (!adapter.fork) throw new ProviderError('unsupported', 'claude fork 不可用', 400);
+      const s = await adapter.fork(nativeId);
+      return `⑂ 已分叉新会话:「${s.title}」\nID:${prefixedId('claude', s.id)}\n刷新会话列表后可见。`;
+    }
     case 'diff':
       return renderRepoDiffCommand(adapter, nativeId);
     case 'skills':
@@ -4820,6 +4988,25 @@ function renderPiStatus(adapter: ProviderAdapter, nativeId: string): string {
   } else if (usage && usage.context_limit > 0) {
     const pct = ((usage.context_tokens / usage.context_limit) * 100).toFixed(1);
     lines.push(`· 上下文:${usage.context_tokens.toLocaleString()} / ${usage.context_limit.toLocaleString()} tokens(${pct}%)`);
+  }
+  return lines.join('\n');
+}
+
+function renderDshStatus(adapter: ProviderAdapter, nativeId: string): string {
+  const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
+  const permission = adapter.getPermission?.(nativeId) ?? 'default';
+  const plan = adapter.getPlanMode?.(nativeId) === true;
+  const usage = adapter.getUsage?.(nativeId);
+  const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : dshStatusContextFallback();
+  const lines = [
+    '⚙ DSH 会话状态',
+    `· 模型: ${model}`,
+    `· 权限: ${permission}${plan ? ' · Plan 模式: 开启' : ''}`,
+  ];
+  if (usage) {
+    const pct = limit > 0 ? ((usage.context_tokens / limit) * 100).toFixed(1) : '0.0';
+    lines.push(`· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`);
+    lines.push(`· 累计用量: input ${usage.input_tokens.toLocaleString()} · output ${usage.output_tokens.toLocaleString()}`);
   }
   return lines.join('\n');
 }
@@ -5110,6 +5297,7 @@ function emitV262Usage(
   const model = adapter.getModel?.(nativeId) ?? '';
   if (contextLimit <= 0 && provider === 'claude' && model) contextLimit = claudeContextWindow(model);
   if (contextLimit <= 0 && provider === 'grok') contextLimit = grokStatusContextFallback();
+  if (contextLimit <= 0 && provider === 'dsh') contextLimit = dshStatusContextFallback();
   hub.broadcastV262(sid, {
     type: 'usage',
     session_id: sid,
@@ -5288,27 +5476,42 @@ function consumeEvent(
     } else if (ev.status === 'delta') {
       const delta = p.output ?? '';
       if (!delta) return;
-      emit('tool.progress', { turnId: 0, toolCallId: p.toolCallId, output: delta });
+      const mode = (p as { outputMode?: string; output_mode?: string }).outputMode
+        ?? (p as { outputMode?: string; output_mode?: string }).output_mode
+        ?? 'append';
+      emit('tool.progress', { turnId: 0, toolCallId: p.toolCallId, output: delta, ...(mode !== 'append' ? { outputMode: mode } : {}) });
       const existingTool = turn.v262ItemMap.get(p.toolCallId);
       if (existingTool) {
-        existingTool.output = `${String(existingTool.output ?? '')}${delta}`;
-        hub.broadcastV262(sid, {
-          type: 'item.delta',
-          session_id: sid,
-          agent_id: 'main',
-          turn_id: turn.v262TurnId,
-          item_id: p.toolCallId,
-          field: 'output',
-          delta,
-        });
+        if (mode === 'replace') {
+          existingTool.output = delta;
+          hub.broadcastV262(sid, {
+            type: 'item.updated',
+            session_id: sid,
+            agent_id: 'main',
+            turn_id: turn.v262TurnId,
+            item_id: p.toolCallId,
+            set: { output: delta },
+          });
+        } else {
+          existingTool.output = `${String(existingTool.output ?? '')}${delta}`;
+          hub.broadcastV262(sid, {
+            type: 'item.delta',
+            session_id: sid,
+            agent_id: 'main',
+            turn_id: turn.v262TurnId,
+            item_id: p.toolCallId,
+            field: 'output',
+            delta,
+          });
+        }
       }
     } else {
       turn.runningTools.delete(p.toolCallId);
       const isError = p.isError ?? p.is_error ?? (ev.status === 'failed');
+      const existingTool = turn.v262ItemMap.get(p.toolCallId);
       const resolvedOut = (p.output === undefined || p.output === '') && p.structuredOutput !== undefined
         ? (typeof p.structuredOutput === 'string' ? p.structuredOutput : JSON.stringify(p.structuredOutput))
-        : (p.output ?? '');
-      const existingTool = turn.v262ItemMap.get(p.toolCallId);
+        : (p.output ?? (existingTool?.output as string | undefined) ?? '');
       const extractedOutId = extractSubagentIdFromOutput(resolvedOut) ?? extractSubagentIdFromOutput(p.structuredOutput);
       const linked = hub.transcript.getLinkedSubagents(sid, p.toolCallId);
       const agentRefs = mergeAgentRefs(existingTool?.agent_refs, [directAgentId, extractedOutId, ...linked]);
@@ -5317,7 +5520,7 @@ function consumeEvent(
           hub.transcript.linkSubagentToToolCall(sid, p.toolCallId, ref.agent_id);
         }
       }
-      turn.transcript?.toolResult(p.toolCallId, p.output ?? '', isError, {
+      turn.transcript?.toolResult(p.toolCallId, resolvedOut, isError, {
         ...(p.structuredOutput !== undefined ? { structuredOutput: p.structuredOutput } : {}),
         ...(ev.phase ? { phase: ev.phase } : {}),
         ...(ev.parentToolUseId ? { parentToolUseId: ev.parentToolUseId } : {}),
@@ -5504,6 +5707,7 @@ function consumeEvent(
     if (u) {
       let limit = u.context_limit ?? 0;
       if (limit <= 0 && provider === 'grok') limit = grokStatusContextFallback();
+      if (limit <= 0 && provider === 'dsh') limit = dshStatusContextFallback();
       hub.broadcastV262(sid, {
         type: 'usage',
         session_id: sid,
