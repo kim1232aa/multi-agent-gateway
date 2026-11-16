@@ -101,8 +101,7 @@ test('DshProviderAdapter: contract methods', async () => {
     assert.equal(caps.thinking, true);
 
     const models = await adapter.listModels();
-    assert.ok(models.length >= 3);
-    assert.ok(models.some((m) => m.model === 'deepseek-v4-flash'));
+    assert.equal(models.some((m) => m.model === 'deepseek-v4-flash'), false, 'fake models like deepseek-v4-flash must never be returned');
 
     const cmds = await adapter.listCommands();
     assert.ok(cmds.length > 0);
@@ -537,3 +536,231 @@ test('review regression: failed resume never silently creates a new empty sessio
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('review regression: real DSH session disk format parses user content, filters runtime-context, maps tool calls and results, and uses event timestamps and stable ids', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'dsh-test-real-disk-'));
+  try {
+    const groupDir = join(tempDir, '--test-workspace--');
+    const sessionId = 'real-sess-uuid-1';
+    const sessionDir = join(groupDir, sessionId);
+    await mkdir(sessionDir, { recursive: true });
+
+    const lines = [
+      JSON.stringify({ type: 'session', version: 4, id: sessionId, createdAt: 1700000000000, cwd: '/workspace' }),
+      JSON.stringify({
+        type: 'user/message',
+        seq: 8,
+        time: 1794810800682,
+        data: {
+          content: [{ type: 'text', text: 'Analyze multi-agent-gateway design' }],
+          source: { kind: 'user' },
+          role: 'user',
+          id: 'user-msg-uuid-1',
+        },
+      }),
+      JSON.stringify({
+        type: 'user/message',
+        seq: 9,
+        time: 1794810800684,
+        data: {
+          source: { kind: 'runtime-context', form: 'snapshot' },
+          role: 'user',
+          id: 'rc-msg-uuid-2',
+          content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes earlier runtime-context snapshots.' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant/message',
+        seq: 13,
+        time: 1794810834906,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'assistant',
+            content: [{ type: 'tool-call', id: 'call_glob_1', name: 'glob', arguments: '{"pattern":"*.ts"}' }],
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'tool/result',
+        seq: 15,
+        time: 1794810835251,
+        data: {
+          turn: 1,
+          step: 1,
+          message: {
+            role: 'tool',
+            toolCallId: 'call_glob_1',
+            content: [{ type: 'text', text: 'file1.ts\nfile2.ts' }],
+            isError: false,
+            id: 'tr-uuid-1',
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'assistant/message',
+        seq: 18,
+        time: 1794810850000,
+        data: {
+          turn: 1,
+          step: 2,
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Found 2 files.' }],
+          },
+        },
+      }),
+    ].join('\n');
+
+    const compressed = zlib.zstdCompressSync(Buffer.from(lines, 'utf8'));
+    await writeFile(join(sessionDir, 'session.v4.jsonl.zstd'), compressed);
+
+    const adapter = new DshAdapter({ sessionsDir: tempDir });
+    const sessions = adapter.listSessionsFromDisk();
+
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0]?.id, sessionId);
+    assert.equal(sessions[0]?.title, 'Analyze multi-agent-gateway design');
+    assert.equal(sessions[0]?.messageCount, 1);
+
+    const history = adapter.getHistoryMessages(sessionId);
+    assert.equal(history.length, 4, 'must have user message, tool call assistant, tool result, and final text assistant (runtime-context skipped)');
+
+    // 1. User message
+    assert.equal(history[0]?.role, 'user');
+    assert.equal(history[0]?.id, 'user-msg-uuid-1');
+    assert.equal(history[0]?.created_at, new Date(1794810800682).toISOString());
+    assert.equal(history[0]?.content[0]?.type, 'text');
+    assert.equal((history[0]?.content[0] as any)?.text, 'Analyze multi-agent-gateway design');
+
+    // 2. Assistant tool-call
+    assert.equal(history[1]?.role, 'assistant');
+    assert.equal(history[1]?.created_at, new Date(1794810834906).toISOString());
+    assert.deepEqual(history[1]?.content, [
+      {
+        type: 'tool_call',
+        id: 'call_glob_1',
+        name: 'glob',
+        input: { pattern: '*.ts' },
+      },
+    ]);
+
+    // 3. Tool result
+    assert.equal(history[2]?.role, 'tool');
+    assert.equal(history[2]?.id, 'tr-uuid-1');
+    assert.equal(history[2]?.created_at, new Date(1794810835251).toISOString());
+    assert.equal(history[2]?.content[0]?.type, 'tool_result');
+    assert.equal((history[2]?.content[0] as any)?.tool_call_id, 'call_glob_1');
+    assert.equal((history[2]?.content[0] as any)?.output, 'file1.ts\nfile2.ts');
+    assert.equal((history[2]?.content[0] as any)?.is_error, false);
+
+    // 4. Final assistant text
+    assert.equal(history[3]?.role, 'assistant');
+    assert.equal(history[3]?.created_at, new Date(1794810850000).toISOString());
+    assert.equal((history[3]?.content[0] as any)?.text, 'Found 2 files.');
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('review regression: listModels removes hardcoded fake DeepSeek models and setModel ignores obsolete models safely', { timeout: 2000 }, async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'dsh-test-fake-models-'));
+  try {
+    await withMockDsh((message, child) => {
+      if (message.method === 'initialize') child.send({ id: message.id, result: { protocolVersion: 1 } });
+      if (message.method === 'session/new') child.send({ id: message.id, result: { sessionId: 'sess-fake-test', configOptions: reviewConfigOptions } });
+      if (message.method === 'session/set_config_option') {
+        const val = message.params?.value;
+        if (val === 'deepseek-v4-flash') {
+          child.send({ id: message.id, error: { code: -32602, message: 'Invalid params: unknown model option: deepseek-v4-flash' } });
+        } else {
+          child.send({ id: message.id, result: { configOptions: reviewConfigOptions } });
+        }
+      }
+    }, async () => {
+      const adapter = new DshProviderAdapter({ dshBin: 'mock', sessionsDir: tempDir, recycleGraceMs: 0 });
+      try {
+        const session = await adapter.create({ provider: 'dsh', cwd: tempDir });
+        const models = await adapter.listModels();
+        assert.ok(!models.some((m) => m.model === 'deepseek-v4-flash'), 'must not return fake deepseek-v4-flash');
+
+        // Setting obsolete model that is not in the allowed options should not throw an unhandled error to the user
+        await adapter.setModel(session.id, 'deepseek-v4-flash');
+      } finally {
+        await adapter.dispose();
+      }
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('review regression: listSessionsFromDisk caches parsed files by mtime and size without re-decompressing', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'dsh-test-cache-'));
+  try {
+    const groupDir = join(tempDir, '--test-cache-ws--');
+    const sessionId = 'cached-sess-1';
+    const sessionDir = join(groupDir, sessionId);
+    await mkdir(sessionDir, { recursive: true });
+
+    const lines = [
+      JSON.stringify({ type: 'session', version: 4, id: sessionId, createdAt: 1700000000000, cwd: '/workspace' }),
+      JSON.stringify({
+        type: 'user/message',
+        seq: 1,
+        time: 1794810800000,
+        data: {
+          content: [{ type: 'text', text: 'Cached user message' }],
+          source: { kind: 'user' },
+          role: 'user',
+          id: 'user-cached-1',
+        },
+      }),
+    ].join('\n');
+
+    const compressed = zlib.zstdCompressSync(Buffer.from(lines, 'utf8'));
+    const sessionFile = join(sessionDir, 'session.v4.jsonl.zstd');
+    await writeFile(sessionFile, compressed);
+
+    const adapter = new DshAdapter({ sessionsDir: tempDir });
+    const firstList = adapter.listSessionsFromDisk();
+    assert.equal(firstList.length, 1);
+    assert.equal(firstList[0]?.title, 'Cached user message');
+
+    const cacheEntry = (adapter as any).sessionFileCache.get(sessionFile);
+    assert.ok(cacheEntry, 'session file must be cached in sessionFileCache');
+    assert.equal(cacheEntry.firstUserPrompt, 'Cached user message');
+
+    // Second call: mtime and size did not change, must hit cache and return identical cache entry reference
+    const secondList = adapter.listSessionsFromDisk();
+    assert.equal(secondList.length, 1);
+    assert.equal(secondList[0]?.title, 'Cached user message');
+    assert.equal((adapter as any).sessionFileCache.get(sessionFile), cacheEntry, 'must reuse cached entry object');
+
+    // getHistoryMessages should also hit cache and reuse messages array
+    const history = adapter.getHistoryMessages(sessionId);
+    assert.equal(history, cacheEntry.messages, 'getHistoryMessages must reuse cached messages array');
+
+    // Updating file invalidates cache and triggers re-parse
+    const updatedLines = lines + '\n' + JSON.stringify({
+      type: 'user/message',
+      seq: 2,
+      time: 1794810810000,
+      data: {
+        content: [{ type: 'text', text: 'Second message' }],
+        source: { kind: 'user' },
+      },
+    });
+    await writeFile(sessionFile, zlib.zstdCompressSync(Buffer.from(updatedLines, 'utf8')));
+
+    const thirdList = adapter.listSessionsFromDisk();
+    assert.equal(thirdList[0]?.messageCount, 2);
+    const updatedCacheEntry = (adapter as any).sessionFileCache.get(sessionFile);
+    assert.notEqual(updatedCacheEntry, cacheEntry, 'cache entry must be updated after file modification');
+    assert.equal(updatedCacheEntry.userMsgCount, 2);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+

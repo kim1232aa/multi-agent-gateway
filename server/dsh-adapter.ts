@@ -9,6 +9,7 @@
  * - Process lifecycle: recycles idle dsh processes after 60s of inactivity.
  */
 
+import * as childProcess from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -111,6 +112,87 @@ function parseConfigModels(configOptions: unknown): NativeModel[] | null {
   }
 
   return models.length > 0 ? models : null;
+}
+
+export function parseCordisPatchModels(content: string): NativeModel[] {
+  const models: NativeModel[] = [];
+  const lines = content.split('\n');
+  let inLlm = false;
+  let currentProvider = '';
+  let defaultProvider = '';
+  let defaultModelId = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^- id:\s*acp\b/.test(line)) {
+      for (let j = i + 1; j < lines.length && !/^- id:/.test(lines[j]); j++) {
+        const pMatch = lines[j].match(/^\s+provider:\s*(\S+)/);
+        if (pMatch) defaultProvider = pMatch[1];
+        const mMatch = lines[j].match(/^\s+model:\s*(\S+)/);
+        if (mMatch) defaultModelId = mMatch[1];
+      }
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^- id:\s*llm-pi-ai\b/.test(line)) inLlm = true;
+    else if (/^- id:\s*/.test(line)) inLlm = false;
+
+    if (inLlm) {
+      const provMatch = line.match(/^\s{6}([a-zA-Z0-9_-]+):\s*$/);
+      if (provMatch) {
+        currentProvider = provMatch[1];
+      }
+      const modelIdMatch = line.match(/^\s+-\s*id:\s*([a-zA-Z0-9_.-]+)/);
+      if (modelIdMatch && currentProvider) {
+        const id = modelIdMatch[1];
+        let displayName = id;
+        if (i + 1 < lines.length) {
+          const dnMatch = lines[i + 1].match(/^\s+displayName:\s*(.+)$/);
+          if (dnMatch) displayName = dnMatch[1].trim();
+        }
+        const optValue = JSON.stringify([currentProvider, id]);
+        const isDefault = currentProvider === defaultProvider && id === defaultModelId;
+        models.push({
+          provider: currentProvider,
+          model: optValue,
+          display_name: displayName,
+          max_context_size: 131_072,
+          isDefault,
+        });
+      }
+    }
+  }
+  return models;
+}
+
+export function discoverStaticModels(sessionsDir: string, dshBin: string): NativeModel[] | null {
+  const dshHome = path.dirname(sessionsDir);
+  const patchFile = path.join(dshHome, 'profiles', 'acp', 'cordis.patch.yml');
+  if (fs.existsSync(patchFile)) {
+    try {
+      const content = fs.readFileSync(patchFile, 'utf8');
+      const models = parseCordisPatchModels(content);
+      if (models.length > 0) return models;
+    } catch {
+      // ignore
+    }
+  }
+  if (isExecutableFile(dshBin)) {
+    try {
+      const out = childProcess.execFileSync(dshBin, ['--profile', 'acp', '--dump-config'], {
+        timeout: 5000,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const models = parseCordisPatchModels(out);
+      if (models.length > 0) return models;
+    } catch {
+      // ignore
+    }
+  }
+  return null;
 }
 
 function formatToolOutput(rawOutput: unknown): string {
@@ -262,6 +344,17 @@ interface DshProjcacheRecord {
   };
 }
 
+interface CachedSessionFile {
+  mtimeMs: number;
+  size: number;
+  header: any;
+  explicitTitle: string;
+  firstUserPrompt: string;
+  userMsgCount: number;
+  createdAt: string;
+  messages: Message[];
+}
+
 export class DshAdapter {
   private readonly dshBin: string;
   private readonly sessionsDir: string;
@@ -271,6 +364,7 @@ export class DshAdapter {
   private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
   private acpClient: DshAcpClient | null = null;
   private activeTurns = new Set<string>();
+  private readonly sessionFileCache = new Map<string, CachedSessionFile>();
 
   constructor(options: {
     dshBin?: string;
@@ -294,6 +388,10 @@ export class DshAdapter {
     return this.dshBin;
   }
 
+  get sessionsDirectory(): string {
+    return this.sessionsDir;
+  }
+
   isBusy(): boolean {
     return this.activeTurns.size > 0 || (this.acpClient?.isBusy() ?? false);
   }
@@ -312,6 +410,152 @@ export class DshAdapter {
       });
     }
     return this.acpClient;
+  }
+
+  private parseSessionFile(sessionFile: string, sessionId: string, stats: fs.Stats): CachedSessionFile {
+    const buf = fs.readFileSync(sessionFile);
+    const raw = zlib.zstdDecompressSync(buf).toString('utf8');
+    const lines = raw.trim().split('\n').filter(Boolean);
+
+    let header: any = null;
+    let explicitTitle = '';
+    let firstUserPrompt = '';
+    let userMsgCount = 0;
+    const messages: Message[] = [];
+    let msgIndex = 0;
+
+    for (const line of lines) {
+      let ev: any;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      const createdAt = typeof ev.time === 'number' && Number.isFinite(ev.time)
+        ? new Date(ev.time).toISOString()
+        : (header?.createdAt ? new Date(header.createdAt).toISOString() : stats.birthtime.toISOString());
+
+      if (ev.type === 'session' && !header) {
+        header = ev;
+      } else if (ev.type === 'session/title' && ev.data?.title) {
+        explicitTitle = ev.data.title;
+      } else if (ev.type === 'user/message') {
+        const sourceKind = ev.data?.source?.kind;
+        if (sourceKind && sourceKind !== 'user') {
+          continue;
+        }
+        userMsgCount++;
+
+        let text = '';
+        const rawContent = ev.data?.content ?? ev.data?.message?.content;
+        if (Array.isArray(rawContent)) {
+          for (const part of rawContent) {
+            if (part && part.type === 'text' && typeof part.text === 'string') {
+              text += part.text;
+            }
+          }
+        } else if (typeof rawContent === 'string') {
+          text = rawContent;
+        }
+
+        if (!firstUserPrompt && text.trim()) {
+          firstUserPrompt = text.trim().slice(0, 80);
+        }
+
+        const id = ev.data?.id ?? ev.id ?? (ev.seq != null ? `msg_u_${ev.seq}` : `msg_u_${msgIndex++}`);
+        messages.push({
+          id: String(id),
+          session_id: sessionId,
+          role: 'user',
+          content: [{ type: 'text', text }],
+          created_at: createdAt,
+        });
+      } else if (ev.type === 'assistant/message') {
+        const parts: MessageContentPart[] = [];
+        let text = '';
+        const rawContent = ev.data?.message?.content ?? ev.data?.content;
+        if (Array.isArray(rawContent)) {
+          for (const part of rawContent) {
+            if (!part || typeof part !== 'object') continue;
+            if (part.type === 'reasoning' || part.type === 'thinking') {
+              const thinkingText = typeof part.text === 'string' ? part.text : (typeof part.thinking === 'string' ? part.thinking : '');
+              parts.push({ type: 'thinking', thinking: thinkingText });
+            } else if (part.type === 'text' && typeof part.text === 'string') {
+              text += part.text;
+              parts.push({ type: 'text', text: part.text });
+            } else if (part.type === 'tool-call' || part.type === 'tool_call') {
+              let input: unknown = part.arguments ?? part.input ?? {};
+              if (typeof input === 'string') {
+                try {
+                  input = JSON.parse(input);
+                } catch {
+                  // keep as string
+                }
+              }
+              parts.push({
+                type: 'tool_call',
+                id: String(part.id ?? ''),
+                name: String(part.name ?? 'tool'),
+                input,
+              });
+            }
+          }
+        }
+        const id = ev.data?.message?.id ?? ev.data?.id ?? ev.id ?? (ev.seq != null ? `msg_a_${ev.seq}` : `msg_a_${msgIndex++}`);
+        messages.push({
+          id: String(id),
+          session_id: sessionId,
+          role: 'assistant',
+          content: parts.length > 0 ? parts : [{ type: 'text', text }],
+          created_at: createdAt,
+        });
+      } else if (ev.type === 'tool/result') {
+        const toolCallId = String(ev.data?.message?.toolCallId ?? ev.data?.toolCallId ?? '');
+        let output = '';
+        const rawContent = ev.data?.message?.content ?? ev.data?.content;
+        if (Array.isArray(rawContent)) {
+          for (const part of rawContent) {
+            if (part && typeof part.text === 'string') {
+              output += part.text;
+            }
+          }
+        } else if (typeof rawContent === 'string') {
+          output = rawContent;
+        }
+        const isError = Boolean(ev.data?.message?.isError ?? ev.data?.isError);
+        const id = ev.data?.message?.id ?? ev.data?.id ?? ev.id ?? (ev.seq != null ? `msg_t_${ev.seq}` : `msg_t_${msgIndex++}`);
+        messages.push({
+          id: String(id),
+          session_id: sessionId,
+          role: 'tool',
+          content: [
+            {
+              type: 'tool_result',
+              tool_call_id: toolCallId,
+              output,
+              content: output,
+              is_error: isError,
+            },
+          ],
+          created_at: createdAt,
+        });
+      }
+    }
+
+    const createdAt = header?.createdAt ? new Date(header.createdAt).toISOString() : stats.birthtime.toISOString();
+    const cached: CachedSessionFile = {
+      mtimeMs: stats.mtimeMs,
+      size: stats.size,
+      header,
+      explicitTitle,
+      firstUserPrompt,
+      userMsgCount,
+      createdAt,
+      messages,
+    };
+    this.sessionFileCache.set(sessionFile, cached);
+    return cached;
   }
 
   /**
@@ -349,41 +593,11 @@ export class DshAdapter {
 
         try {
           const stats = fs.statSync(sessionFile);
-          const buf = fs.readFileSync(sessionFile);
-          const raw = zlib.zstdDecompressSync(buf).toString('utf8');
-          const lines = raw.trim().split('\n').filter(Boolean);
-          if (lines.length === 0) continue;
-
-          let header: any = null;
-          let firstUserPrompt = '';
-          let explicitTitle = '';
-          let userMsgCount = 0;
-
-          for (const line of lines) {
-            let ev: any;
-            try {
-              ev = JSON.parse(line);
-            } catch {
-              continue;
-            }
-            if (ev.type === 'session' && !header) {
-              header = ev;
-            } else if (ev.type === 'session/title' && ev.data?.title) {
-              explicitTitle = ev.data.title;
-            } else if (ev.type === 'user/message') {
-              userMsgCount++;
-              if (!firstUserPrompt && Array.isArray(ev.data?.message?.content)) {
-                for (const part of ev.data.message.content) {
-                  if (part.type === 'text' && typeof part.text === 'string' && part.text.trim()) {
-                    firstUserPrompt = part.text.trim().slice(0, 80);
-                    break;
-                  }
-                }
-              }
-            }
+          let cached = this.sessionFileCache.get(sessionFile);
+          if (!cached || cached.mtimeMs !== stats.mtimeMs || cached.size !== stats.size) {
+            cached = this.parseSessionFile(sessionFile, sessionId, stats);
           }
-
-          if (!header) continue;
+          if (!cached.header) continue;
 
           // Live projection overlay (title/turn/busy from the projcache JSON).
           const proj = this.readProjcache(sessionId);
@@ -393,24 +607,24 @@ export class DshAdapter {
 
           // Placeholder = no log events yet, no live title, zero turns. Skip those
           // to keep the sidebar clean; a session shows up right after its first turn.
-          const isPlaceholder = userMsgCount === 0 && !explicitTitle && !liveTitle && turnCount === 0;
+          const isPlaceholder = cached.userMsgCount === 0 && !cached.explicitTitle && !liveTitle && turnCount === 0;
           if (isPlaceholder) continue;
 
-          const title = explicitTitle || liveTitle || firstUserPrompt || '';
-          const createdAt = header.createdAt ? new Date(header.createdAt).toISOString() : stats.birthtime.toISOString();
+          const title = cached.explicitTitle || liveTitle || cached.firstUserPrompt || '';
+          const createdAt = cached.createdAt;
           const updatedAt = stats.mtime.toISOString();
 
           results.push({
             id: sessionId,
-            cwd: header.cwd || process.cwd(),
+            cwd: cached.header.cwd || process.cwd(),
             title,
             createdAt,
             updatedAt,
-            messageCount: userMsgCount,
+            messageCount: cached.userMsgCount,
             filePath: sessionFile,
             busy,
             turnCount,
-            lastPrompt: firstUserPrompt || '',
+            lastPrompt: cached.firstUserPrompt || '',
           });
         } catch {
           // ignore corrupted/partial writes
@@ -443,65 +657,28 @@ export class DshAdapter {
     const rawId = validateSessionId(sessionId);
     const records = this.listSessionsFromDisk();
     const record = records.find((r) => r.id === rawId);
-    if (!record || !fs.existsSync(record.filePath)) return [];
-
-    const messages: Message[] = [];
-    try {
-      const buf = fs.readFileSync(record.filePath);
-      const raw = zlib.zstdDecompressSync(buf).toString('utf8');
-      const lines = raw.trim().split('\n').filter(Boolean);
-
-      let msgIndex = 0;
-      for (const line of lines) {
-        let ev: any;
-        try {
-          ev = JSON.parse(line);
-        } catch {
-          continue;
+    if (!record || !fs.existsSync(record.filePath)) {
+      // Fallback: read from gateway_history cache file
+      try {
+        const cacheFile = path.join(this.historyCacheDir, `${rawId}.json`);
+        if (fs.existsSync(cacheFile)) {
+          const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+          if (Array.isArray(cached) && cached.length > 0) return cached;
         }
-
-        if (ev.type === 'user/message') {
-          let text = '';
-          if (Array.isArray(ev.data?.message?.content)) {
-            for (const part of ev.data.message.content) {
-              if (part.type === 'text' && typeof part.text === 'string') {
-                text += part.text;
-              }
-            }
-          }
-          messages.push({
-            id: `msg_u_${msgIndex++}`,
-            session_id: sessionId,
-            role: 'user',
-            content: [{ type: 'text', text }],
-            created_at: new Date().toISOString(),
-          });
-        } else if (ev.type === 'assistant/message') {
-          let text = '';
-          let reasoning = '';
-          const parts: MessageContentPart[] = [];
-
-          if (Array.isArray(ev.data?.message?.content)) {
-            for (const part of ev.data.message.content) {
-              if (part.type === 'reasoning' && typeof part.text === 'string') {
-                reasoning += part.text;
-                parts.push({ type: 'thinking', thinking: part.text });
-              } else if (part.type === 'text' && typeof part.text === 'string') {
-                text += part.text;
-                parts.push({ type: 'text', text: part.text });
-              }
-            }
-          }
-
-          messages.push({
-            id: `msg_a_${msgIndex++}`,
-            session_id: sessionId,
-            role: 'assistant',
-            content: parts.length > 0 ? parts : [{ type: 'text', text }],
-            created_at: new Date().toISOString(),
-          });
-        }
+      } catch {
+        // ignore
       }
+      return [];
+    }
+
+    let messages: Message[] = [];
+    try {
+      const stats = fs.statSync(record.filePath);
+      let cached = this.sessionFileCache.get(record.filePath);
+      if (!cached || cached.mtimeMs !== stats.mtimeMs || cached.size !== stats.size) {
+        cached = this.parseSessionFile(record.filePath, rawId, stats);
+      }
+      messages = cached.messages;
     } catch {
       // ignore
     }
@@ -742,11 +919,27 @@ export class DshProviderAdapter implements ProviderAdapter {
       this.settingsStore.set('model', '__default__', model);
       return;
     }
+    if (this.cachedModels && this.cachedModels.length > 0) {
+      const exists = this.cachedModels.some((m) => m.model === model);
+      if (!exists) {
+        // Obsolete or invalid model (e.g. legacy deepseek-v4-flash) — ignore silently
+        return;
+      }
+    }
     const client = this.adapter.getAcpClient();
     if (client.isConnected()) {
-      const res = await client.setConfigOption(rawId, 'model', model);
-      if (res?.configOptions) {
-        this.updateCachedConfigOptions(res.configOptions);
+      try {
+        const res = await client.setConfigOption(rawId, 'model', model);
+        if (res?.configOptions) {
+          this.updateCachedConfigOptions(res.configOptions);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/unknown model option/i.test(msg) || /invalid params/i.test(msg)) {
+          // Do not surface obsolete/unknown model errors to the user
+          return;
+        }
+        throw err;
       }
     }
     this.settingsStore.set('model', rawId, model);
@@ -842,32 +1035,12 @@ export class DshProviderAdapter implements ProviderAdapter {
     if (this.cachedModels && this.cachedModels.length > 0) {
       return this.cachedModels;
     }
-    return [
-      {
-        provider: 'dsh',
-        model: 'deepseek-v4-flash',
-        display_name: 'DeepSeek V4 Flash',
-        description: 'Fast, lightweight agent model for code execution',
-        max_context_size: 131_072,
-        isDefault: true,
-      },
-      {
-        provider: 'dsh',
-        model: 'deepseek-chat',
-        display_name: 'DeepSeek Chat (V3)',
-        description: 'DeepSeek general high-intelligence chat & code model',
-        max_context_size: 131_072,
-        isDefault: false,
-      },
-      {
-        provider: 'dsh',
-        model: 'deepseek-reasoner',
-        display_name: 'DeepSeek Reasoner (R1)',
-        description: 'DeepSeek full reasoning chain model with deep thought',
-        max_context_size: 131_072,
-        isDefault: false,
-      },
-    ];
+    const staticModels = discoverStaticModels(this.adapter.sessionsDirectory, this.adapter.binPath);
+    if (staticModels && staticModels.length > 0) {
+      this.cachedModels = staticModels;
+      return staticModels;
+    }
+    return [];
   }
 
   async listCommands(_sessionId?: string, _cwd?: string): Promise<NativeCommand[]> {
