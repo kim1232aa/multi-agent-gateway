@@ -2548,4 +2548,111 @@ test('review regression: listSessions includes sessions with sdk-cli entries and
   }
 });
 
+test('review regression: spawnControlProbe passes --no-session-persistence while conversation turns and forkSession omit it', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-claude-probe-persistence-'));
+  const log = join(base, 'args.log');
+  try {
+    const bin = join(base, 'claude-mock');
+    await writeFile(
+      bin,
+      `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+const log = ${JSON.stringify(log)};
+fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + '\\n');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.type === 'control_request' && msg.request?.subtype === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: {
+        request_id: msg.request_id,
+        subtype: 'success',
+        response: {
+          commands: [{ name: 'help', description: 'Show help', argumentHint: '', aliases: [] }],
+          models: [{ value: 'claude-3-5-sonnet' }],
+        },
+      },
+    }) + '\\n');
+  } else if (msg.type === 'control_request' && msg.request?.subtype === 'mcp_status') {
+    process.stdout.write(JSON.stringify({
+      type: 'control_response',
+      response: {
+        request_id: msg.request_id,
+        subtype: 'success',
+        response: [],
+      },
+    }) + '\\n');
+  } else if (msg.type === 'user') {
+    process.stdout.write(JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: 'ok',
+      session_id: '123e4567-e89b-12d3-a456-426614174000',
+    }) + '\\n');
+  }
+});
+if (process.argv.includes('--fork-session')) {
+  process.stdout.write(JSON.stringify({
+    type: 'system',
+    subtype: 'init',
+    session_id: 'forked-session-id-4567',
+  }) + '\\n');
+}
+rl.on('close', () => process.exit(0));
+`,
+    );
+    await chmod(bin, 0o755);
+
+    const adapter = new ClaudeAdapter({ claudeBin: bin });
+    try {
+      // 1. Probe: listSlashCommands invokes spawnHandshake -> spawnControlProbe
+      const commands = await adapter.listSlashCommands(base);
+      assert.equal(commands.length, 1);
+
+      // 2. Real conversation turn: startTurn
+      await adapter.startTurn({
+        sessionId: '123e4567-e89b-12d3-a456-426614174000',
+        prompt: 'hello',
+        onEvent: () => {},
+      });
+
+      // 3. Session fork: forkSession
+      const forked = await adapter.forkSession('123e4567-e89b-12d3-a456-426614174000', base);
+      assert.equal(forked.sessionId, 'forked-session-id-4567');
+
+      const lines = (await readFile(log, 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+      assert.equal(lines.length, 3);
+
+      const probeArgs: string[] = lines[0];
+      assert.ok(
+        probeArgs.includes('--no-session-persistence'),
+        `expected probe args to include --no-session-persistence, got: ${probeArgs.join(' ')}`,
+      );
+      assert.ok(probeArgs.includes('-p'), 'probe args must include -p');
+
+      const turnArgs: string[] = lines[1];
+      assert.equal(
+        turnArgs.includes('--no-session-persistence'),
+        false,
+        `conversation turn must NOT include --no-session-persistence, got: ${turnArgs.join(' ')}`,
+      );
+
+      const forkArgs: string[] = lines[2];
+      assert.equal(
+        forkArgs.includes('--no-session-persistence'),
+        false,
+        `forkSession must NOT include --no-session-persistence, got: ${forkArgs.join(' ')}`,
+      );
+    } finally {
+      await adapter.close();
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+
 

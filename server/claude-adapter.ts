@@ -2304,7 +2304,7 @@ export class ClaudeAdapter {
       const requestId = request.subtype === "initialize" ? "gw_init" : `probe_${randomUUID()}`;
       const child = spawn(
         this.claudeBin,
-        ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
+        ["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
         { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"], detached: true },
       );
       this.activeProbes.add(child);
