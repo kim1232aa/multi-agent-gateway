@@ -941,6 +941,52 @@ test('ClaudeProviderAdapter maps approval events and resolveApproval writes allo
   ]);
 });
 
+test('Claude yolo auto-allows residual can_use_tool requests but still prompts for user-interaction tools and in plan mode', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mag-claude-yolo-'));
+  try {
+    const adapter = new ClaudeProviderAdapter({ settingsPath: join(dir, 's.json') } as any);
+    const resolved: Array<[string, string, string]> = [];
+    const modeCalls: Array<[string, string]> = [];
+    (adapter as any).inner.resolveApproval = async (sessionId: string, approvalId: string, decision: string) => {
+      resolved.push([sessionId, approvalId, decision]);
+    };
+    (adapter as any).inner.setPermissionMode = async (sessionId: string, mode: string) => {
+      modeCalls.push([sessionId, mode]);
+      return {};
+    };
+    (adapter as any).inner.hasSessionFile = () => true;
+    (adapter as any).inner.startTurn = async (opts: any) => {
+      opts.onEvent({ type: 'approval', approvalId: 'rm-1', tool: 'Bash', input: { command: 'rm -rf build' } });
+      opts.onEvent({ type: 'approval', approvalId: 'mcp-1', tool: 'mcp__x__pick', input: {}, requiresUserInteraction: true });
+      opts.onEvent({ type: 'done', sessionId: 's', result: '', isError: false, subtype: 'success', stopReason: null });
+    };
+    const kinds = async () => {
+      const handle = await adapter.startTurn({ sessionId: 's', input: 'go' });
+      const out: Array<{ kind: string; payload?: any }> = [];
+      for await (const ev of handle.events) out.push(ev as any);
+      return out.filter((e) => e.kind === 'approval').map((e) => e.payload?.approvalId);
+    };
+
+    await adapter.setPermission('s', 'yolo');
+    assert.deepEqual(modeCalls, [['s', 'bypassPermissions']]);
+    assert.deepEqual(await kinds(), ['mcp-1']);
+    assert.deepEqual(resolved, [['s', 'rm-1', 'allow']]);
+
+    await adapter.setPlanMode('s', true);
+    resolved.length = 0;
+    assert.deepEqual(await kinds(), ['rm-1', 'mcp-1']);
+    assert.deepEqual(resolved, []);
+
+    await adapter.setPlanMode('s', false);
+    await adapter.setPermission('s', 'manual');
+    assert.deepEqual(modeCalls.at(-1), ['s', 'manual']);
+    assert.deepEqual(await kinds(), ['rm-1', 'mcp-1']);
+    assert.deepEqual(resolved, []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('ClaudeProviderAdapter maps AskUserQuestion control events to question', async () => {
   const adapter = new ClaudeProviderAdapter();
   const answered: Array<[string, string, unknown]> = [];

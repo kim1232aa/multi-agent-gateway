@@ -3099,6 +3099,19 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           });
           break;
         case 'approval':
+          // bypassPermissions 下 CLI 仍会对少数操作发 can_use_tool(危险 rm、ask 规则等,
+          // 见 code.claude.com/docs/en/permission-modes)。用户选了"完全自动"就直接放行;
+          // requiresUserInteraction 的工具按官方语义必须由人回答,照常弹卡。
+          if (
+            ev.requiresUserInteraction !== true &&
+            !this.settings.getBoolean('plan', sessionId) &&
+            this.getPermission(sessionId) === 'yolo'
+          ) {
+            void this.inner
+              .resolveApproval(this.resolveEffectiveSessionId(sessionId), ev.approvalId, 'allow')
+              .catch(() => undefined);
+            break;
+          }
           stream.push({
             kind: 'approval',
             status: 'started',
@@ -3408,6 +3421,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   async setPermission(sessionId: string, mode: string): Promise<void> {
     this.settings.set('permission', sessionId, mode);
+    // 进行中的 turn 用的是启动时的 --permission-mode;同步给活 CLI,否则本轮仍按旧模式问。
+    // 计划模式优先,不在这里覆盖。bypassPermissions 需要启动时已允许,CLI 拒绝时下一轮生效。
+    if (sessionId === '__default__' || this.settings.getBoolean('plan', sessionId)) return;
+    const cliMode = claudePermissionMode(mode);
+    if (!cliMode) return;
+    void this.inner
+      .setPermissionMode(this.resolveEffectiveSessionId(sessionId), cliMode)
+      .catch(() => undefined);
   }
 
   getPermission(sessionId: string): string | undefined {
