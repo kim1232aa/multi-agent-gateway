@@ -272,6 +272,8 @@ export interface GrokAdapterOptions {
   grokBin?: string;
   env?: Record<string, string>;
   sessionsDir?: string;
+  /** Gateway-managed provider env (GROK_MODELS_BASE_URL/XAI_API_KEY/GROK_CONFIG), read at every spawn. */
+  injection?: () => { args: string[]; env: Record<string, string> };
 }
 
 export interface GrokProviderAdapterOptions extends GrokAdapterOptions {
@@ -295,9 +297,12 @@ export class GrokAdapter {
   private modelsCache: { ts: number; value: { defaultModel?: string; models: string[] } } | null = null;
   private modelsInflight: Promise<{ defaultModel?: string; models: string[] }> | null = null;
 
+  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+
   constructor(options: GrokAdapterOptions = {}) {
     this.grokBin = resolveGrokBin(options.grokBin);
     this.env = { ...(options.env ?? {}) };
+    this.injection = options.injection;
     const grokHome = options.env?.GROK_HOME ?? process.env.GROK_HOME ?? path.join(os.homedir(), '.grok');
     this.sessionsDir = options.sessionsDir ?? path.join(grokHome, 'sessions');
   }
@@ -658,7 +663,12 @@ export class GrokAdapter {
 
   /** CLI 子进程继承用户环境(含代理),去掉 GATEWAY_* 并补 loopback NO_PROXY。 */
   private childEnv(): NodeJS.ProcessEnv {
-    return grokChildEnv(this.env);
+    return grokChildEnv({ ...this.env, ...(this.injection?.().env ?? {}) });
+  }
+
+  /** Provider config changed: drop the cached `grok models` catalog. */
+  invalidateModels(): void {
+    this.modelsCache = null;
   }
 
   /**
@@ -945,6 +955,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private static readonly MAX_TOOL_SNAPSHOTS = 128;
   private static readonly MAX_TOOL_SNAPSHOT_BYTES = 256 * 1024;
   private readonly recycleGraceMs: number;
+  private readonly injection?: () => { args: string[]; env: Record<string, string> };
   private recycleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly commandsCache = new Map<string, { ts: number; commands: GrokNativeCommandInput[] }>();
   private readonly toolOutputSnapshots = new Map<string, string>();
@@ -966,6 +977,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.settings = new SettingsStore(settingsPath);
     this.grokBin = this.inner.binPath;
     this.grokEnv = innerOptions.env ?? {};
+    this.injection = innerOptions.injection;
     this.recycleGraceMs = typeof recycleGraceMs === 'number' && recycleGraceMs > 0 ? recycleGraceMs : 0;
     this.restoreAcpSessionIds();
   }
@@ -1044,6 +1056,14 @@ export class GrokProviderAdapter implements ProviderAdapter {
       if ((c.questions?.size ?? 0) > 0) return true;
     }
     return false;
+  }
+
+  /** Gateway provider changed: forget model catalogs and respawn idle ACP processes. */
+  providerChanged(): void {
+    this.inner.invalidateModels();
+    this.lastCliModels = undefined;
+    this.defaultModel = undefined;
+    void this.recycleIfIdle();
   }
 
   async recycleIfIdle(): Promise<void> {
@@ -1462,7 +1482,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
       }
       const client = new GrokAcpClient({
         grokBin: this.grokBin,
-        env: this.grokEnv,
+        env: { ...this.grokEnv, ...(this.injection?.().env ?? {}) },
         alwaysApprove,
         requestTimeoutMs: 20_000,
         // Turns can legitimately run for minutes; the old 20s cap killed live turns.

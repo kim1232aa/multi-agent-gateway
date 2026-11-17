@@ -2690,6 +2690,145 @@ test('surfaces provider DTO catalog errors instead of faking an empty list', asy
   }
 });
 
+test('gateway-injected providers: CRUD, native row read-only, protocol check, adapter notified', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-providers-'));
+  const grok = fakeAdapter('grok') as any;
+  let changed = 0;
+  grok.providerChanged = () => { changed += 1; };
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir,
+    codex: fakeAdapter('codex') as any,
+    claude: fakeAdapter('claude') as any,
+    grok,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const call = async (method: string, path: string, body?: unknown) => {
+    const response = await fetch(`${gateway.url}/api/v1${path}`, {
+      method,
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: response.status, body: (await response.json()) as any };
+  };
+  try {
+    const native = await call('PUT', '/providers/grok?provider=grok', { type: 'openai', models: [] });
+    assert.equal(native.status, 403);
+
+    const wrongType = await call('POST', '/providers?provider=grok', {
+      id: 'relay', type: 'anthropic', base_url: 'https://relay.example/v1', api_key: 'sk-x',
+      models: [{ model: 'm1', max_context_size: 1000 }],
+    });
+    assert.equal(wrongType.status, 400);
+    assert.match(wrongType.body.msg, /supported: openai/);
+
+    const created = await call('POST', '/providers?provider=grok', {
+      id: 'relay', type: 'openai', base_url: 'https://relay.example/v1', api_key: 'sk-x',
+      models: [{ model: 'm1', max_context_size: 1000 }],
+    });
+    assert.equal(created.status, 200);
+    assert.equal(created.body.data.has_api_key, true);
+    assert.equal(created.body.data.status, 'connected');
+    assert.equal(created.body.data.api_key, undefined);
+    assert.equal(changed, 1);
+
+    const list = await call('GET', '/providers?provider=grok');
+    assert.deepEqual(list.body.data.items.map((p: any) => [p.id, p.status, p.read_only]), [
+      ['grok', 'inactive', true],
+      ['relay', 'connected', false],
+    ]);
+    assert.ok(!JSON.stringify(list.body).includes('sk-x'));
+
+    const updated = await call('PUT', '/providers/relay?provider=grok', {
+      type: 'openai', base_url: 'https://relay2.example/v1', models: [{ model: 'm2', max_context_size: 1000 }],
+    });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.data.provider.base_url, 'https://relay2.example/v1');
+    assert.equal(updated.body.data.provider.has_api_key, true);
+
+    const config = await call('GET', '/config?provider=grok');
+    assert.equal(config.body.data.default_provider, 'relay');
+    assert.equal(config.body.data.models['relay/m2'].provider, 'relay');
+
+    const back = await call('POST', '/config?provider=grok', { default_provider: 'grok' });
+    assert.equal(back.body.data.default_provider, 'grok');
+
+    const removed = await call('DELETE', '/providers/relay?provider=grok');
+    assert.equal(removed.status, 200);
+    const after = await call('GET', '/providers?provider=grok');
+    assert.deepEqual(after.body.data.items.map((p: any) => p.id), ['grok']);
+    assert.equal(after.body.data.items[0].status, 'connected');
+    assert.equal(changed, 4);
+  } finally {
+    await gateway.close();
+    await rm(settingsDir, { recursive: true, force: true });
+  }
+});
+
+test('codex login routes delegate to the CLI (device code + poll + logout)', async () => {
+  const codex = fakeAdapter('codex') as any;
+  const calls: string[] = [];
+  let loggedIn = false;
+  codex.startLogin = async (mode: string | { apiKey: string }) => {
+    calls.push(`start:${typeof mode === 'string' ? mode : 'apiKey'}`);
+    return { type: 'chatgptDeviceCode', loginId: 'login-1', userCode: 'ABCD-1234', verificationUrl: 'https://auth.example/device' };
+  };
+  codex.readAccount = async () => ({ account: loggedIn ? { type: 'chatgpt', email: 'a@b.c', planType: 'plus' } : null, requiresOpenaiAuth: true });
+  codex.cancelLogin = async (id: string) => { calls.push(`cancel:${id}`); };
+  codex.logoutAccount = async () => { calls.push('logout'); loggedIn = false; };
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const call = async (method: string, path: string, body?: unknown) => {
+    const response = await fetch(`${gateway.url}/api/v1${path}`, {
+      method,
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: response.status, body: (await response.json()) as any };
+  };
+  try {
+    const started = await call('POST', '/oauth/login?provider=codex', { mode: 'deviceCode' });
+    assert.equal(started.status, 200);
+    assert.equal(started.body.data.status, 'pending');
+    assert.equal(started.body.data.user_code, 'ABCD-1234');
+    assert.equal(started.body.data.verification_uri, 'https://auth.example/device');
+    assert.equal(started.body.data.interval, 3);
+
+    const pending = await call('GET', '/oauth/login?provider=codex');
+    assert.equal(pending.body.data.status, 'pending');
+
+    loggedIn = true;
+    await new Promise((r) => setTimeout(r, 30));
+    const done = await call('GET', '/oauth/login?provider=codex');
+    assert.equal(done.body.data.status, 'authenticated');
+
+    const info = await call('GET', '/oauth/userinfo?provider=codex');
+    assert.equal(info.body.data.email, 'a@b.c');
+    assert.equal(info.body.data.plan, 'plus');
+
+    const out = await call('POST', '/oauth/logout?provider=codex');
+    assert.equal(out.body.data.logged_out, true);
+    assert.deepEqual(calls, ['start:deviceCode', 'logout']);
+
+    const claudeLogin = await call('POST', '/oauth/login?provider=claude', {});
+    assert.equal(claudeLogin.status, 501);
+    assert.match(claudeLogin.body.msg, /claude auth login/);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('rejects unsupported Claude goal routes and profile controls', async () => {
   const gateway = await startGateway({
     port: 0,

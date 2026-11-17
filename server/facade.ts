@@ -1772,6 +1772,23 @@ export class CodexProviderAdapter implements ProviderAdapter {
     return this.inner.accountRateLimits();
   }
 
+  /** Codex 自己的官方登录接口(网关不读写 ~/.codex 凭据)。 */
+  async startLogin(mode?: 'deviceCode' | 'browser' | { apiKey: string }): Promise<Record<string, unknown>> {
+    return this.inner.startLogin(mode);
+  }
+
+  async cancelLogin(loginId: string): Promise<void> {
+    return this.inner.cancelLogin(loginId);
+  }
+
+  async readAccount(): Promise<{ account: Record<string, unknown> | null; requiresOpenaiAuth: boolean } | null> {
+    return this.inner.readAccount();
+  }
+
+  async logoutAccount(): Promise<void> {
+    return this.inner.logoutAccount();
+  }
+
   async getAccountUsage(sessionId?: string): Promise<Record<string, unknown> | null> {
     return this.inner.accountUsage(sessionId);
   }
@@ -1826,6 +1843,13 @@ export class CodexProviderAdapter implements ProviderAdapter {
     }
     this.cachedModels = out;
     return out;
+  }
+
+  /** Gateway provider changed: forget the catalog/default and restart app-server once idle. */
+  providerChanged(): void {
+    this.cachedModels = null;
+    this.defaultModel = undefined;
+    this.inner.recycleSoon();
   }
 
   /**
@@ -3469,6 +3493,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
    * - 其他非 qwen 动态模型保留完整 ID 与能力元数据。
    * 握手失败如实抛错,不伪造空目录,也不进缓存。
    */
+  /** Gateway provider changed: each turn spawns a fresh CLI, so only the handshake catalog is stale. */
+  providerChanged(): void {
+    this.inner.clearHandshakeCache();
+  }
+
   async listModels(): Promise<NativeModel[]> {
     const builtin = await this.inner.listBuiltinModels();
     const seen = new Set<string>();

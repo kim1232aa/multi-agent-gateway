@@ -42,6 +42,7 @@ import {
   piUnsupportedTuiCommandNames,
 } from './native-commands.js';
 import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsRepoDiff, fsSearch } from './fs-local.js';
+import { ProviderStore, ProviderStoreError, SUPPORTED_TYPES, type InjectedProvider } from './provider-store.js';
 import {
   buildLocalTranscriptPage,
   extractSubagentIdFromOutput,
@@ -553,18 +554,23 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const dshRecycleGraceMs = process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS !== undefined
     ? Number(process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS)
     : undefined;
+  const providerStore = new ProviderStore(settingsDir);
+  providerStore.syncLaunchFiles();
   const adapters: Record<LocalProviderName, ProviderAdapter> = {
     codex: options.codex ?? new CodexProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.codex.json'),
+      injection: () => providerStore.injectionFor('codex'),
       ...(codexRecycleGraceMs !== undefined && Number.isFinite(codexRecycleGraceMs) ? { recycleGraceMs: codexRecycleGraceMs } : {}),
     }),
     claude: options.claude ?? new ClaudeProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.claude.json'),
       claudeBin: process.env.CLAUDE_BIN,
+      injection: () => providerStore.injectionFor('claude'),
     }),
     grok: options.grok ?? new GrokProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.grok.json'),
       grokBin: process.env.GROK_BIN,
+      injection: () => providerStore.injectionFor('grok'),
       ...(Number.isFinite(grokRecycleGraceMs) ? { recycleGraceMs: grokRecycleGraceMs } : {}),
     }),
     pi: options.pi ?? (() => {
@@ -583,6 +589,8 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       return new PiProviderAdapter({
         settingsPath: path.join(settingsDir, 'session-settings.pi.json'),
         piBin: process.env.PI_BIN,
+        injection: () => providerStore.injectionFor('pi'),
+        injectedDefaultModel: () => providerStore.activeModelId('pi'),
         ...(piRecycleGraceMs !== undefined && Number.isFinite(piRecycleGraceMs) ? { recycleGraceMs: piRecycleGraceMs } : {}),
         ...(piMaxLiveProcesses !== undefined && Number.isFinite(piMaxLiveProcesses) ? { maxLiveProcesses: piMaxLiveProcesses } : {}),
         ...(piMaxSessionFileBytes !== undefined && Number.isFinite(piMaxSessionFileBytes) ? { maxSessionFileBytes: piMaxSessionFileBytes } : {}),
@@ -592,6 +600,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     dsh: options.dsh ?? new DshProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.dsh.json'),
       dshBin: process.env.DSH_BIN,
+      injection: () => providerStore.injectionFor('dsh'),
       ...(dshRecycleGraceMs !== undefined && Number.isFinite(dshRecycleGraceMs) ? { recycleGraceMs: dshRecycleGraceMs } : {}),
     }),
   };
@@ -1101,12 +1110,67 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const region = process.env.GATEWAY_REGION === 'mainland-cn' ? 'mainland-cn' : 'global';
       return ok(res, { region }, requestId);
     }
+    // 登录走各家 CLI 自己的官方接口,网关只转发/轮询,不读写它们的凭据文件。
+    if (sub === '/oauth/login' && isLocalProvider(provider)) {
+      const codex = provider === 'codex' ? (adapters.codex as unknown as CodexLoginCapable) : null;
+      if (provider === 'codex' && !codex?.startLogin) {
+        return fail(res, 501, 50101, 'codex adapter does not expose login', requestId);
+      }
+      if (provider !== 'codex') {
+        return fail(res, 501, 50101, loginHint(provider), requestId);
+      }
+      if (req.method === 'POST') {
+        const body = (await readBody(req).catch(() => ({}))) as Record<string, unknown>;
+        const mode = body.mode === 'browser' ? 'browser' : body.mode === 'apiKey' && typeof body.api_key === 'string' ? { apiKey: body.api_key } : 'deviceCode';
+        const started = await codex!.startLogin!(mode);
+        const probe = async (): Promise<boolean> => Boolean((await codex!.readAccount!())?.account);
+        return ok(res, oauthLoginDto(started, probe), requestId);
+      }
+      if (req.method === 'GET') {
+        const flow = providerLogins.get('codex');
+        if (!flow) {
+          const account = await codex!.readAccount!().catch(() => null);
+          return ok(res, account?.account
+            ? { flow_id: 'account', status: 'authenticated', resolved_at: new Date().toISOString(), error_message: null }
+            : null, requestId);
+        }
+        return ok(res, await flowSnapshot(flow), requestId);
+      }
+      if (req.method === 'DELETE') {
+        const flow = providerLogins.get('codex');
+        if (flow?.loginId) await codex!.cancelLogin!(flow.loginId);
+        if (flow) flow.status = 'cancelled';
+        providerLogins.delete('codex');
+        return ok(res, { cancelled: true, status: 'cancelled' }, requestId);
+      }
+    }
+    if (sub === '/oauth/logout' && req.method === 'POST' && isLocalProvider(provider)) {
+      if (provider !== 'codex') return fail(res, 501, 50101, loginHint(provider), requestId);
+      const codex = adapters.codex as unknown as CodexLoginCapable;
+      if (!codex?.logoutAccount) return fail(res, 501, 50101, 'codex adapter does not expose logout', requestId);
+      await codex.logoutAccount();
+      providerLogins.delete('codex');
+      return ok(res, { logged_out: true }, requestId);
+    }
+    if (sub === '/oauth/userinfo' && req.method === 'GET' && isLocalProvider(provider)) {
+      if (provider !== 'codex') return ok(res, {}, requestId);
+      const codex = adapters.codex as unknown as CodexLoginCapable;
+      const account = (await codex?.readAccount?.().catch(() => null))?.account ?? null;
+      if (!account) return ok(res, {}, requestId);
+      return ok(res, {
+        ...(typeof account.email === 'string' ? { email: account.email } : {}),
+        ...(typeof account.planType === 'string' ? { plan: account.planType } : {}),
+        ...(typeof account.workspaceName === 'string' ? { workspace: account.workspaceName } : {}),
+        provider: 'codex',
+        auth_method: account.type,
+      }, requestId);
+    }
     if (sub === '/config' && (req.method === 'GET' || req.method === 'POST')) {
       if (isLocalProvider(provider)) {
         const patch = req.method === 'POST'
           ? ((await readBody(req)) as Record<string, unknown>)
           : {};
-        return ok(res, await providerConfigView(provider, adapters[provider], kimiFetch, patch), requestId);
+        return ok(res, await providerConfigView(provider, adapters[provider], kimiFetch, patch, providerStore), requestId);
       }
       if (!kimi) {
         const patch = req.method === 'POST'
@@ -1123,15 +1187,44 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
     }
     if (isLocalProvider(provider) && sub === '/providers' && req.method === 'GET') {
-      return ok(res, { items: [await providerDto(provider, adapters[provider])] }, requestId);
+      return ok(res, { items: await providerList(provider, adapters[provider], providerStore) }, requestId);
+    }
+    if (isLocalProvider(provider) && sub === '/providers' && req.method === 'POST') {
+      const body = (await readBody(req)) as Record<string, unknown>;
+      const saved = runProviderStore(() => providerStore.upsert(provider, body));
+      await notifyProviderChanged(adapters[provider]);
+      return ok(res, injectedProviderDto(provider, saved, providerStore), requestId);
     }
     const singleProviderMatch = /^\/providers\/([^/:]+)$/.exec(sub);
-    if (singleProviderMatch && req.method === 'GET') {
+    if (singleProviderMatch) {
       const p = decodeURIComponent(singleProviderMatch[1]);
-      if (isLocalProvider(p)) {
-        return ok(res, await providerDto(p, adapters[p]), requestId);
-      }
-      if (p === 'kimi' && !kimi) {
+      if (isLocalProvider(provider)) {
+        const injected = providerStore.get(provider, p);
+        if (req.method === 'GET') {
+          if (injected) return ok(res, injectedProviderDto(provider, injected, providerStore), requestId);
+          if (p === provider) return ok(res, await nativeProviderDto(provider, adapters[provider], providerStore), requestId);
+          return fail(res, 404, 40401, 'provider not found', requestId);
+        }
+        if (req.method === 'PUT' || req.method === 'DELETE') {
+          if (!injected) {
+            const msg = p === provider
+              ? `${provider} 的原生配置由 ${provider} CLI 自己管理，网关只读；如需改用第三方中转，请"添加供应商"（只在网关启动 ${provider} 时注入，不改 CLI 配置文件）`
+              : 'provider not found';
+            return fail(res, p === provider ? 403 : 404, p === provider ? 40301 : 40401, msg, requestId);
+          }
+          if (req.method === 'DELETE') {
+            runProviderStore(() => providerStore.remove(provider, p));
+            await notifyProviderChanged(adapters[provider]);
+            return ok(res, {}, requestId);
+          }
+          const body = (await readBody(req)) as Record<string, unknown>;
+          const saved = runProviderStore(() => providerStore.upsert(provider, body, p));
+          await notifyProviderChanged(adapters[provider]);
+          return ok(res, { provider: injectedProviderDto(provider, saved, providerStore) }, requestId);
+        }
+      } else if (req.method === 'GET' && isLocalProvider(p)) {
+        return ok(res, await nativeProviderDto(p, adapters[p], providerStore), requestId);
+      } else if (req.method === 'GET' && p === 'kimi' && !kimi) {
         return fail(res, 404, 40401, 'provider not found', requestId);
       }
     }
@@ -2359,17 +2452,157 @@ function isProviderRefreshRoute(sub: string): boolean {
   return sub === '/providers:refresh' || sub === '/providers:refresh_oauth' || /^\/providers\/[^/:]+:refresh$/.test(sub);
 }
 
-async function providerDto(provider: LocalProviderName, adapter: ProviderAdapter): Promise<Record<string, unknown>> {
+/**
+ * The CLI's own config, shown read-only. `status` says whether a gateway provider overrides it
+ * for processes the gateway starts. `type` is the CLI name: none of the form's protocols applies.
+ */
+async function nativeProviderDto(
+  provider: LocalProviderName,
+  adapter: ProviderAdapter,
+  store: ProviderStore,
+): Promise<Record<string, unknown>> {
+  const overridden = store.activeId(provider) !== undefined;
   // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
-  const models = adapter.listModels ? await adapter.listModels() : [];
+  const models = overridden ? [] : (adapter.listModels ? await adapter.listModels() : []);
   return {
     id: provider,
     type: provider,
-    default_model: models[0]?.model ?? '',
+    default_model: overridden ? '' : (adapter.getModel?.('__default__') ?? models.find((m) => m.isDefault)?.model ?? models[0]?.model ?? ''),
     has_api_key: true,
-    status: 'connected',
+    status: overridden ? 'inactive' : 'connected',
     models: models.map((model) => model.model),
+    native: true,
+    read_only: true,
+    supported_types: SUPPORTED_TYPES[provider],
   };
+}
+
+function injectedProviderDto(
+  provider: LocalProviderName,
+  injected: InjectedProvider,
+  store: ProviderStore,
+): Record<string, unknown> {
+  const active = store.activeId(provider) === injected.id;
+  return {
+    id: injected.id,
+    type: injected.type,
+    base_url: injected.base_url,
+    default_model: injected.default_model ?? injected.models[0]?.model ?? '',
+    has_api_key: store.hasKey(provider, injected.id),
+    status: active ? 'connected' : 'inactive',
+    models: injected.models.map((m) => m.model),
+    native: false,
+    read_only: false,
+  };
+}
+
+async function providerList(
+  provider: LocalProviderName,
+  adapter: ProviderAdapter,
+  store: ProviderStore,
+): Promise<Record<string, unknown>[]> {
+  const injected = store.list(provider).map((p) => injectedProviderDto(provider, p, store));
+  return [await nativeProviderDto(provider, adapter, store), ...injected];
+}
+
+interface CodexLoginCapable {
+  startLogin?(mode?: 'deviceCode' | 'browser' | { apiKey: string }): Promise<Record<string, unknown>>;
+  cancelLogin?(loginId: string): Promise<void>;
+  readAccount?(): Promise<{ account: Record<string, unknown> | null; requiresOpenaiAuth: boolean } | null>;
+  logoutAccount?(): Promise<void>;
+}
+
+interface ProviderLoginFlow {
+  flowId: string;
+  loginId?: string;
+  status: 'pending' | 'authenticated' | 'failed' | 'cancelled';
+  verificationUri?: string;
+  userCode?: string;
+  error?: string;
+  resolvedAt?: string;
+  startedAt: number;
+  /** 轮询兜底:通知丢失时用 CLI 自己的 account/read 确认。 */
+  probe?: () => Promise<boolean>;
+}
+
+/** 当前进行中的 CLI 登录流程(网关只记状态,凭据在 CLI 自己手里)。 */
+const providerLogins = new Map<string, ProviderLoginFlow>();
+
+function oauthLoginDto(started: Record<string, unknown>, probe?: () => Promise<boolean>): Record<string, unknown> {
+  const type = typeof started.type === 'string' ? started.type : '';
+  const loginId = typeof started.loginId === 'string' ? started.loginId : undefined;
+  const flow: ProviderLoginFlow = {
+    flowId: loginId ?? randomBytes(8).toString('hex'),
+    ...(loginId ? { loginId } : {}),
+    status: 'pending',
+    ...(typeof started.verificationUrl === 'string' ? { verificationUri: started.verificationUrl } : {}),
+    ...(typeof started.authUrl === 'string' ? { verificationUri: started.authUrl } : {}),
+    ...(typeof started.userCode === 'string' ? { userCode: started.userCode } : {}),
+    startedAt: Date.now(),
+    ...(probe ? { probe } : {}),
+  };
+  // 只支持一种方式时直接当作用户选中的方式;Codex 的 apiKey 方式在这里是即时完成的。
+  if (type === 'apiKey') flow.status = 'authenticated';
+  providerLogins.set('codex', flow);
+  return {
+    flow_id: flow.flowId,
+    provider: 'codex',
+    status: flow.status === 'authenticated' ? 'authenticated' : 'pending',
+    verification_uri: flow.verificationUri ?? '',
+    verification_uri_complete: flow.verificationUri ?? '',
+    user_code: flow.userCode ?? '',
+    expires_in: 900,
+    interval: 3,
+    expires_at: new Date(Date.now() + 900_000).toISOString(),
+  };
+}
+
+async function flowSnapshot(flow: ProviderLoginFlow): Promise<Record<string, unknown>> {
+  if (flow.status === 'pending' && flow.probe) {
+    // 通知可能没被转发(比如网关刚重连),用 CLI 自己的 account/read 兜底确认完成。
+    // 轮询本身就在等结果,所以这里同步等探测,而不是把结论推到下一次轮询。
+    const ok = await Promise.race([
+      flow.probe().catch(() => false),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000).unref?.()),
+    ]);
+    if (ok && flow.status === 'pending') {
+      flow.status = 'authenticated';
+      flow.resolvedAt = new Date().toISOString();
+    }
+  }
+  return {
+    flow_id: flow.flowId,
+    status: flow.status,
+    resolved_at: flow.resolvedAt ?? null,
+    error_message: flow.error ?? null,
+  };
+}
+
+function loginHint(provider: LocalProviderName): string {
+  const hint: Record<string, string> = {
+    claude: 'Claude 的登录在终端执行 `claude auth login`(网关不读写 ~/.claude 凭据)',
+    grok: 'Grok 的登录在终端执行 `grok login`(网关不读写 ~/.grok 凭据)',
+    pi: 'Pi 的登录在终端执行 `pi auth login`(网关不读写 Pi 凭据)',
+    dsh: 'DSH 的登录在终端按其提示完成(网关不读写 DSH 凭据)',
+  };
+  return hint[provider] ?? `${provider} 的登录请在该 CLI 自己的终端里完成`;
+}
+
+function runProviderStore<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof ProviderStoreError) {
+      const kind = err.status === 404 ? 'not_found' : err.status === 409 ? 'busy' : 'invalid_request';
+      throw new ProviderError(kind, err.message, err.status);
+    }
+    throw err;
+  }
+}
+
+async function notifyProviderChanged(adapter: ProviderAdapter): Promise<void> {
+  const hook = (adapter as { providerChanged?: () => void | Promise<void> }).providerChanged;
+  if (typeof hook === 'function') await Promise.resolve(hook.call(adapter)).catch(() => undefined);
 }
 
 const SKILL_CHIP_RE = /\[([^\]]+)\]\((?:kimi-code:\/\/skill\/|kimi-code-composer:\/\/skills\/)([^)\s?]+)(?:[?#][^)]*)?\)/g;
@@ -2637,8 +2870,13 @@ async function providerConfigView(
   adapter: ProviderAdapter,
   kimiFetch: KimiFetch,
   patch: Record<string, unknown>,
+  store: ProviderStore,
 ): Promise<Record<string, unknown>> {
   const base = (await kimiFetch('/config').catch(() => ({ providers: {} }))) as Record<string, unknown>;
+  if (typeof patch.default_provider === 'string' && patch.default_provider !== (store.activeId(provider) ?? provider)) {
+    runProviderStore(() => store.setActive(provider, patch.default_provider === provider ? null : patch.default_provider as string));
+    await notifyProviderChanged(adapter);
+  }
   const models = adapter.listModels ? await adapter.listModels().catch(() => []) : [];
   const requestedModel = typeof patch.default_model === 'string' ? patch.default_model : undefined;
   if (requestedModel && adapter.setModel) await adapter.setModel('__default__', requestedModel);
@@ -2662,20 +2900,40 @@ async function providerConfigView(
       ...(typeof dto.default_effort === 'string' ? { defaultEffort: dto.default_effort } : {}),
     };
   }
+  const providers: Record<string, Record<string, unknown>> = {
+    [provider]: {
+      type: provider,
+      default_model: store.activeId(provider) ? '' : defaultModel,
+      has_api_key: true,
+    },
+  };
+  for (const injected of store.list(provider)) {
+    providers[injected.id] = {
+      type: injected.type,
+      base_url: injected.base_url,
+      default_model: injected.default_model ?? injected.models[0]?.model ?? '',
+      has_api_key: store.hasKey(provider, injected.id),
+    };
+    for (const m of injected.models) {
+      const key = `${injected.id}/${m.model}`;
+      if (modelMap[key]) continue;
+      modelMap[key] = {
+        provider: injected.id,
+        model: m.model,
+        displayName: m.display_name ?? m.model,
+        ...(m.max_context_size ? { maxContextSize: m.max_context_size } : {}),
+        ...(m.capabilities ? { capabilities: m.capabilities } : {}),
+      };
+    }
+  }
   const { thinking: _kimiThinking, ...restBase } = base;
   return {
     ...restBase,
     ...patch,
     ...(wireThinking ? { thinking: wireThinking } : {}),
     models: modelMap,
-    providers: {
-      [provider]: {
-        type: provider,
-        default_model: defaultModel,
-        has_api_key: true,
-      },
-    },
-    default_provider: provider,
+    providers,
+    default_provider: store.activeId(provider) ?? provider,
     default_model: defaultModel,
   };
 }

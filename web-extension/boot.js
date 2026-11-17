@@ -1811,6 +1811,50 @@
     }
     return false;
   }
+  // 设置 → 模型供应商：与当前 CLI 同名的那一行是 CLI 自己的原生配置，网关只读（零侵入）。
+  // 打标签，并拦掉点击（否则会打开可编辑表单，保存时才收到 403）。
+  function isNativeProviderRow(row) {
+    var provider = selectedProvider();
+    if (!row || provider === 'kimi') return false;
+    var idEl = row.querySelector && row.querySelector('.pp-id');
+    return Boolean(idEl && idEl.textContent && idEl.textContent.trim() === provider);
+  }
+  function markNativeProviderRows() {
+    if (!document.querySelectorAll) return;
+    document.querySelectorAll('.pp-row').forEach(function (row) {
+      var native = isNativeProviderRow(row);
+      var tag = row.querySelector('.multi-agent-native-tag');
+      if (native && !tag) {
+        tag = document.createElement('span');
+        tag.className = 'multi-agent-native-tag';
+        tag.textContent = '只读 · CLI 原生配置';
+        var idEl = row.querySelector('.pp-id');
+        if (idEl && idEl.parentElement) idEl.parentElement.appendChild(tag);
+      } else if (!native && tag) {
+        tag.remove();
+      }
+    });
+  }
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    var row = target && target.closest ? target.closest('.pp-row') : null;
+    if (!row || !isNativeProviderRow(row)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    var hint = row.parentElement && row.parentElement.querySelector('.multi-agent-native-hint');
+    if (!hint) {
+      hint = document.createElement('div');
+      hint.className = 'multi-agent-native-hint';
+      hint.textContent = '这是 ' + selectedProvider() + ' CLI 自己的配置，由 CLI 管理，网关不改它的文件。要换中转或 API Key，请点「添加供应商」：只在网关启动 '
+        + selectedProvider() + ' 时注入，删掉即恢复原生配置。';
+      row.insertAdjacentElement('afterend', hint);
+    }
+  }, true);
+  var providersPanelObserver = new MutationObserver(function () {
+    if (document.querySelector && document.querySelector('.pp-row')) markNativeProviderRows();
+  });
+  if (document.documentElement) providersPanelObserver.observe(document.documentElement, { childList: true, subtree: true });
+
   var observer = new MutationObserver(function (records) {
     if (records.some(mutationAffectsUi)) scheduleSyncUi();
   });

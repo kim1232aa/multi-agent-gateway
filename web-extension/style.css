@@ -214,3 +214,22 @@
   line-height: 1.45;
   white-space: pre-wrap;
 }
+
+.multi-agent-native-tag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 0.5px solid var(--color-line, rgba(255, 255, 255, 0.12));
+  color: var(--color-text-muted, #9aa0a6);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.multi-agent-native-hint {
+  padding: 8px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-muted, #9aa0a6);
+  border-top: 0.5px solid var(--color-line, rgba(255, 255, 255, 0.08));
+}

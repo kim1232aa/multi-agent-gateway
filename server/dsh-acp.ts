@@ -86,6 +86,8 @@ export interface DshAcpOptions {
   recycleGraceMs?: number;
   permissionModeForSession?: (sessionId: string) => string | undefined;
   onStderr?: (line: string) => void;
+  /** Gateway-managed provider overrides (`--patch <file>` + key env), read at every spawn. */
+  injection?: () => { args: string[]; env: Record<string, string> };
 }
 
 interface PendingRequest {
@@ -111,6 +113,7 @@ export class DshAcpClient {
   private readonly recycleGraceMs: number;
   private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
   private readonly onStderr?: (line: string) => void;
+  private readonly injection?: () => { args: string[]; env: Record<string, string> };
 
   private child: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
@@ -134,6 +137,7 @@ export class DshAcpClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 25_000;
     this.promptTimeoutMs = options.promptTimeoutMs ?? 0;
     this.recycleGraceMs = options.recycleGraceMs ?? 60_000;
+    this.injection = options.injection;
     this.permissionModeForSession = options.permissionModeForSession;
     this.onStderr = options.onStderr;
   }
@@ -182,9 +186,10 @@ export class DshAcpClient {
   private async spawnAndHandshake(): Promise<void> {
     this.cancelRecycleTimer();
     const generation = ++this.childGeneration;
-    const child = spawn(this.dshBin, ['--profile', 'acp'], {
+    const injected = this.injection?.() ?? { args: [], env: {} };
+    const child = spawn(this.dshBin, ['--profile', 'acp', ...injected.args], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildChildEnv(this.env),
+      env: buildChildEnv({ ...this.env, ...injected.env }),
     });
     this.child = child;
     this.connected = false;
@@ -568,6 +573,11 @@ export class DshAcpClient {
     });
     this.scheduleRecycleIfIdle();
     return true;
+  }
+
+  /** Provider config changed: drop the process now if idle; the next request respawns with it. */
+  recycleSoon(): void {
+    if (!this.isBusy() && this.isConnected()) this.closeProcess();
   }
 
   private scheduleRecycleIfIdle(): void {

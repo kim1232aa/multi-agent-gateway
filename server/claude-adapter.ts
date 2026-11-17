@@ -502,6 +502,8 @@ export interface ClaudeAdapterOptions {
   projectsDir?: string;
   /** Root Claude config dir. Default `CLAUDE_CONFIG_DIR || ~/.claude`. */
   configDir?: string;
+  /** Gateway-managed provider (`--settings <gateway file>`), read at every spawn. */
+  injection?: () => { args: string[]; env: Record<string, string> };
 }
 
 // ---------------------------------------------------------------------------
@@ -665,10 +667,29 @@ export class ClaudeAdapter {
     this.configDir = this.explicitConfigDir ?? path.join(this.homeDir, ".claude");
     this.env = { ...DEFAULT_ENV, ...(options.env ?? {}) };
     this.projectsDir = options.projectsDir ?? path.join(this.configDir, "projects");
+    this.injection = options.injection;
   }
 
+  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+
   private childEnv(): NodeJS.ProcessEnv {
-    return buildClaudeChildEnv(this.env, this.explicitConfigDir);
+    return buildClaudeChildEnv({ ...this.env, ...(this.injection?.().env ?? {}) }, this.explicitConfigDir);
+  }
+
+  /**
+   * `--settings` for a spawn. Claude takes one `--settings`; a turn's own inline settings are
+   * merged over the gateway provider file so neither is dropped.
+   */
+  private settingsArgs(inline?: Record<string, unknown>): string[] {
+    const injected = this.injection?.().args ?? [];
+    const at = injected.indexOf("--settings");
+    const file = at >= 0 ? injected[at + 1] : undefined;
+    if (!inline) return file ? ["--settings", file] : [];
+    if (!file) return ["--settings", JSON.stringify(inline)];
+    let base: Record<string, unknown> = {};
+    try { base = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>; } catch { /* missing: inline only */ }
+    const env = { ...((base.env as Record<string, unknown>) ?? {}), ...((inline.env as Record<string, unknown>) ?? {}) };
+    return ["--settings", JSON.stringify({ ...base, ...inline, ...(Object.keys(env).length ? { env } : {}) })];
   }
 
   /** 等某会话的 running 进程退出;超时返回(不抛错,调用方自行判活)。 */
@@ -1470,9 +1491,7 @@ export class ClaudeAdapter {
     if (opts.maxThinkingTokens !== undefined) {
       args.push("--max-thinking-tokens", String(opts.maxThinkingTokens));
     }
-    if (opts.settings) {
-      args.push("--settings", JSON.stringify(opts.settings));
-    }
+    args.push(...this.settingsArgs(opts.settings));
 
     const child = spawn(this.claudeBin, args, {
       cwd,
@@ -1623,6 +1642,7 @@ export class ClaudeAdapter {
       "--verbose",
       "--resume", sessionId,
       "--fork-session",
+      ...this.settingsArgs(),
     ];
     if (this.closed) {
       throw new ProviderError("not_found", "claude adapter closed", 404);
@@ -2304,7 +2324,7 @@ export class ClaudeAdapter {
       const requestId = request.subtype === "initialize" ? "gw_init" : `probe_${randomUUID()}`;
       const child = spawn(
         this.claudeBin,
-        ["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
+        ["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...this.settingsArgs()],
         { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"], detached: true },
       );
       this.activeProbes.add(child);

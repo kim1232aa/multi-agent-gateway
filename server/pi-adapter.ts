@@ -222,9 +222,14 @@ export interface PiAdapterOptions {
   maxSessionFileBytes?: number;
   /** Optional approval extension path override. */
   approvalExtensionPath?: string;
+  /** Gateway-managed provider (`--extension <gateway file>` + key env), read at every spawn. */
+  injection?: () => { args: string[]; env: Record<string, string> };
 }
 
-export type PiProviderAdapterOptions = PiAdapterOptions;
+export type PiProviderAdapterOptions = PiAdapterOptions & {
+  /** Encoded `provider/model` the active gateway provider selects; wins over Pi's settings.json default. */
+  injectedDefaultModel?: () => string | undefined;
+};
 
 export interface PiStartTurnResult {
   turnId: string;
@@ -986,6 +991,23 @@ export class PiAdapter {
     this.maxSessionFileBytes = options.maxSessionFileBytes !== undefined ? Math.max(0, options.maxSessionFileBytes) : DEFAULT_MAX_SESSION_FILE_BYTES;
     this.settingsPath = options.settingsPath;
     this.approvalExtensionPath = options.approvalExtensionPath ?? DEFAULT_APPROVAL_EXTENSION_PATH;
+    this.injection = options.injection;
+  }
+
+  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+
+  /** Provider config changed: drop the model catalog and every idle Pi process. */
+  async providerChanged(): Promise<void> {
+    this.modelsCache = null;
+    this.thinkingLevelsCache.clear();
+    for (const [sid, client] of [...this.processes]) {
+      const busy = this.activeTurns.has(sid)
+        || this.startingSessions.has(sid)
+        || this.hasParkedQuestions(sid)
+        || this.hasParkedApprovals(sid)
+        || client.hasPendingRequests();
+      if (!busy) await this.close(sid).catch(() => undefined);
+    }
   }
 
   getPiBin(): string {
@@ -2291,14 +2313,16 @@ export class PiAdapter {
     const extArgs = !hasExplicitNoExt && this.approvalExtensionPath && fs.existsSync(this.approvalExtensionPath)
       ? ['--extension', this.approvalExtensionPath]
       : [];
+    const injected = this.injection?.() ?? { args: [], env: {} };
     const client = new PiRpcClient({
       piBin: this.getPiBin(),
       cwd,
       env: {
         ...this.env,
+        ...injected.env,
         ...(this.settingsPath ? { PI_GATEWAY_SETTINGS: this.settingsPath } : {}),
       },
-      args: [...args, ...extArgs, ...this.extraArgs],
+      args: [...args, ...extArgs, ...injected.args, ...this.extraArgs],
       requestTimeoutMs: this.requestTimeoutMs,
       shutdownGraceMs: this.shutdownGraceMs,
       killGraceMs: this.killGraceMs,
@@ -4154,21 +4178,32 @@ export class PiProviderAdapter implements ProviderAdapter {
   private readonly agentDir: string;
   private readonly renames = new Map<string, string>();
   private readonly sessionCwd = new Map<string, string>();
+  private readonly injectedDefaultModel?: () => string | undefined;
 
   constructor(options?: PiProviderAdapterOptions) {
+    this.injectedDefaultModel = options?.injectedDefaultModel;
     this.settings = new SettingsStore(options?.settingsPath);
     this.agentDir = resolvePiAgentDirForSettings(options?.env ?? {}, options?.sessionsDir);
     this.inner = new PiAdapter({
       ...options,
       resolveSessionPreferences: (sessionId) => ({
-        model: this.settings.getString('model', sessionId) ?? this.settings.getString('model', '__default__'),
+        model: this.settings.getString('model', sessionId)
+          ?? this.settings.getString('model', '__default__')
+          ?? this.injectedDefaultModel?.(),
         thinking: this.settings.getString('thinking', sessionId) ?? this.settings.getString('thinking', '__default__'),
         autoCompaction: this.settings.getBoolean('auto_compaction', sessionId),
       }),
     });
   }
 
+  /** Gateway provider changed: the injected default model and catalog are stale. */
+  async providerChanged(): Promise<void> {
+    await this.inner.providerChanged();
+  }
+
   private readConfiguredDefaultModel(): string | undefined {
+    const injected = this.injectedDefaultModel?.();
+    if (injected) return injected;
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(this.agentDir, 'settings.json'), 'utf8')) as {
         defaultProvider?: unknown;

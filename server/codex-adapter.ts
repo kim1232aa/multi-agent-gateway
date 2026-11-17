@@ -898,6 +898,8 @@ export type CodexEvent =
   | { type: 'goal-updated'; threadId: string; goal: Record<string, unknown> | null; cleared?: boolean }
   /** thread/archived / thread/unarchived。 */
   | { type: 'thread-archived-changed'; threadId: string; archived: boolean }
+  /** account/login/completed（0.169）：loginId 只在两者都有时给出。 */
+  | { type: 'account-login-completed'; success: boolean; loginId?: string; error?: string }
   | { type: 'error'; message: string; threadId?: string; turnId?: string; willRetry?: boolean; raw?: unknown };
 
 export type CodexEventHandler = (event: CodexEvent) => void;
@@ -909,6 +911,8 @@ export interface CodexAdapterOptions {
   args?: string[];
   /** Environment overrides for the child process. */
   env?: NodeJS.ProcessEnv;
+  /** Gateway-managed provider overrides, read at every spawn (args go after `app-server`). */
+  injection?: () => { args: string[]; env: Record<string, string> };
   /** clientInfo sent during initialize. */
   clientInfo?: { name: string; title?: string; version: string };
   /** Timeout for individual JSON-RPC requests (ms). Default 120_000. */
@@ -1198,13 +1202,14 @@ export class CodexAdapter {
 
   private async doConnect(): Promise<void> {
     const bin = this.opts.codexPath ?? process.env.CODEX_PATH ?? process.env.CODEX_BIN ?? 'codex';
-    const args = ['app-server', ...(this.opts.args ?? [])];
+    const injected = this.opts.injection?.() ?? { args: [], env: {} };
+    const args = ['app-server', ...(this.opts.args ?? []), ...injected.args];
     const inheritedEnv = Object.fromEntries(
       Object.entries(process.env).filter(([key]) => !/^GATEWAY_/i.test(key)),
     );
     this.child = spawn(bin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...inheritedEnv, ...(this.opts.env ?? {}) },
+      env: { ...inheritedEnv, ...(this.opts.env ?? {}), ...injected.env },
     });
     this.child.stdin?.on('error', () => {});
     this.child.on('error', (err) => this.handleProcessExit(err));
@@ -2268,6 +2273,15 @@ export class CodexAdapter {
         this.emit({ type: 'skills-changed' });
         break;
       }
+      case 'account/login/completed': {
+        this.emit({
+          type: 'account-login-completed',
+          success: p.success === true,
+          ...(typeof p.loginId === 'string' ? { loginId: p.loginId } : {}),
+          ...(typeof p.error === 'string' && p.error ? { error: p.error } : {}),
+        });
+        break;
+      }
       case 'serverRequest/resolved': {
         const reqId = p.requestId as CodexRequestId | undefined;
         const threadId = typeof p.threadId === 'string' ? p.threadId : '';
@@ -2562,6 +2576,11 @@ export class CodexAdapter {
   // unload/release RPC)。不回收的话,web 端看一眼会话,CLI 的 codex resume 就被
   // 锁到网关重启。回收走既有 'exit' → handleProcessExit 路径;重连由下次请求的
   // connect()/ensureLive 惰性完成(进程退出重连已有测试覆盖)。
+
+  /** Provider config changed: restart app-server as soon as it is idle so the next spawn picks it up. */
+  recycleSoon(): void {
+    this.recycleIfIdle();
+  }
 
   private scheduleRecycleWhenIdle(): void {
     const grace = this.opts.recycleGraceMs;
@@ -3688,6 +3707,47 @@ export class CodexAdapter {
       threadId ? { threadId } : {},
     ).catch(() => null);
     return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+  }
+
+  /**
+   * 登录走 Codex 自己的官方接口,网关不碰 ~/.codex/auth.json。
+   * `account/login/start` 三种方式里,设备码(chatgptDeviceCode)最适合远程服务器:
+   * 返回 verificationUrl + userCode,用户在任意设备上敲码,结果由
+   * `account/login/completed` 通知回来。
+   */
+  async startLogin(
+    mode: 'deviceCode' | 'browser' | { apiKey: string } = 'deviceCode',
+  ): Promise<Record<string, unknown>> {
+    await this.connect();
+    const params =
+      typeof mode === 'object'
+        ? { type: 'apiKey', apiKey: mode.apiKey }
+        : { type: mode === 'deviceCode' ? 'chatgptDeviceCode' : 'chatgpt' };
+    return (await this.request('account/login/start', params)) as Record<string, unknown>;
+  }
+
+  async cancelLogin(loginId: string): Promise<void> {
+    await this.connect();
+    await this.request('account/login/cancel', { loginId }).catch(() => undefined);
+  }
+
+  /** account/read:当前登录账号(null = 未登录)。 */
+  async readAccount(): Promise<{ account: Record<string, unknown> | null; requiresOpenaiAuth: boolean } | null> {
+    await this.connect();
+    const raw = (await this.request('account/read', {}).catch(() => null)) as
+      | { account?: unknown; requiresOpenaiAuth?: unknown }
+      | null;
+    if (!raw) return null;
+    return {
+      account: raw.account && typeof raw.account === 'object' ? (raw.account as Record<string, unknown>) : null,
+      requiresOpenaiAuth: raw.requiresOpenaiAuth === true,
+    };
+  }
+
+  /** account/logout:由 Codex 自己清它的凭据。 */
+  async logoutAccount(): Promise<void> {
+    await this.connect();
+    await this.request('account/logout', {});
   }
 
   /** 线程有效模型:显式设置过的优先,否则读 config/read 的全局默认(缓存)。 */

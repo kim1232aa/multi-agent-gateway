@@ -167,10 +167,10 @@ export function parseCordisPatchModels(content: string): NativeModel[] {
   return models;
 }
 
-export function discoverStaticModels(sessionsDir: string, dshBin: string): NativeModel[] | null {
+export function discoverStaticModels(sessionsDir: string, dshBin: string, extraArgs: string[] = []): NativeModel[] | null {
   const dshHome = path.dirname(sessionsDir);
   const patchFile = path.join(dshHome, 'profiles', 'acp', 'cordis.patch.yml');
-  if (fs.existsSync(patchFile)) {
+  if (extraArgs.length === 0 && fs.existsSync(patchFile)) {
     try {
       const content = fs.readFileSync(patchFile, 'utf8');
       const models = parseCordisPatchModels(content);
@@ -181,7 +181,7 @@ export function discoverStaticModels(sessionsDir: string, dshBin: string): Nativ
   }
   if (isExecutableFile(dshBin)) {
     try {
-      const out = childProcess.execFileSync(dshBin, ['--profile', 'acp', '--dump-config'], {
+      const out = childProcess.execFileSync(dshBin, ['--profile', 'acp', ...extraArgs, '--dump-config'], {
         timeout: 5000,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
@@ -362,6 +362,7 @@ export class DshAdapter {
   private readonly historyCacheDir: string;
   private readonly recycleGraceMs: number;
   private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
+  private readonly injection?: () => { args: string[]; env: Record<string, string> };
   private acpClient: DshAcpClient | null = null;
   private activeTurns = new Set<string>();
   private readonly sessionFileCache = new Map<string, CachedSessionFile>();
@@ -373,7 +374,9 @@ export class DshAdapter {
     historyCacheDir?: string;
     recycleGraceMs?: number;
     permissionModeForSession?: (sessionId: string) => string | undefined;
+    injection?: () => { args: string[]; env: Record<string, string> };
   } = {}) {
+    this.injection = options.injection;
     this.dshBin = resolveDshBin(options.dshBin);
     this.sessionsDir = options.sessionsDir ?? resolveDshSessionsDir();
     const dshHome = path.dirname(this.sessionsDir);
@@ -403,6 +406,7 @@ export class DshAdapter {
         alwaysApprove,
         recycleGraceMs: this.recycleGraceMs,
         permissionModeForSession: this.permissionModeForSession,
+        ...(this.injection ? { injection: this.injection } : {}),
         env: {
           // dsh profile patches route llm through the ccwu relay; it needs this key.
           ...(process.env.CCWU_API_KEY ? { CCWU_API_KEY: process.env.CCWU_API_KEY } : {}),
@@ -757,6 +761,14 @@ export class DshAdapter {
     this.acpClient?.close();
     this.acpClient = null;
   }
+
+  recycleSoon(): void {
+    this.acpClient?.recycleSoon();
+  }
+
+  injectedArgs(): string[] {
+    return this.injection?.().args ?? [];
+  }
 }
 
 export class DshProviderAdapter implements ProviderAdapter {
@@ -767,12 +779,25 @@ export class DshProviderAdapter implements ProviderAdapter {
   private readonly sessionCwds = new Map<string, string>();
   private cachedModels: NativeModel[] | null = null;
 
-  constructor(options: { dshBin?: string; sessionsDir?: string; settingsPath?: string; settingsStore?: SettingsStore; recycleGraceMs?: number } = {}) {
+  constructor(options: {
+    dshBin?: string;
+    sessionsDir?: string;
+    settingsPath?: string;
+    settingsStore?: SettingsStore;
+    recycleGraceMs?: number;
+    injection?: () => { args: string[]; env: Record<string, string> };
+  } = {}) {
     this.settingsStore = options.settingsStore ?? new SettingsStore(options.settingsPath);
     this.adapter = new DshAdapter({
       ...options,
       permissionModeForSession: (sessionId: string) => this.getPermission(sessionId),
     });
+  }
+
+  /** Gateway provider changed: forget the cached catalog and respawn the idle ACP process. */
+  providerChanged(): void {
+    this.cachedModels = null;
+    this.adapter.recycleSoon();
   }
 
   private updateCachedConfigOptions(configOptions: unknown): void {
@@ -1035,7 +1060,7 @@ export class DshProviderAdapter implements ProviderAdapter {
     if (this.cachedModels && this.cachedModels.length > 0) {
       return this.cachedModels;
     }
-    const staticModels = discoverStaticModels(this.adapter.sessionsDirectory, this.adapter.binPath);
+    const staticModels = discoverStaticModels(this.adapter.sessionsDirectory, this.adapter.binPath, this.adapter.injectedArgs());
     if (staticModels && staticModels.length > 0) {
       this.cachedModels = staticModels;
       return staticModels;
