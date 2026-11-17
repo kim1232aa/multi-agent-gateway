@@ -41,6 +41,8 @@ import {
   type GrokAcpModelState,
 } from './grok-acp.js';
 import { SettingsStore } from './settings-store.js';
+import { boundedEntries, containedRegularPath, grokDiskSubagents, subagentStatus } from './subagents.js';
+import type { SubagentInfo, SubagentStatus } from './types.js';
 import {
   ProviderError,
   type ApprovalDecision,
@@ -383,6 +385,10 @@ export class GrokAdapter {
 
   getCwd(sessionId: string): string | undefined {
     return this.sessionCwd.get(sessionId);
+  }
+
+  listSubagents(sessionId: string): SubagentInfo[] {
+    return grokDiskSubagents(this.sessionsDir, sessionId);
   }
 
   hasSessionFile(sessionId: string): boolean {
@@ -856,17 +862,11 @@ export class GrokAdapter {
 
   private findSessionDir(sessionId: string): string | null {
     if (!UUID_RE.test(sessionId)) return null;
-    let cwdDirs: fs.Dirent[];
-    try {
-      cwdDirs = fs.readdirSync(this.sessionsDir, { withFileTypes: true });
-    } catch {
-      return null;
-    }
-    for (const cwdEnt of cwdDirs) {
-      if (!cwdEnt.isDirectory()) continue;
-      const candidate = path.join(this.sessionsDir, cwdEnt.name, sessionId);
+    for (const group of boundedEntries(this.sessionsDir)) {
+      const candidate = path.join(this.sessionsDir, group, sessionId);
+      if (!containedRegularPath(this.sessionsDir, candidate)) continue;
       try {
-        if (fs.statSync(candidate).isDirectory()) return candidate;
+        if (fs.lstatSync(candidate).isDirectory()) return candidate;
       } catch {
         continue;
       }
@@ -928,6 +928,29 @@ export class GrokAdapter {
   }
 }
 
+interface LiveSubagent {
+  info: SubagentInfo;
+  updatedAt: number;
+  owner: GrokAcpClient;
+}
+
+function subagentTerminal(status: SubagentStatus | undefined): boolean {
+  return status === 'completed' || status === 'failed' || status === 'cancelled';
+}
+
+function mergeSubagent(live: LiveSubagent, disk: SubagentInfo | undefined): SubagentInfo {
+  if (!disk) return live.info;
+  const liveWins = (() => {
+    if (live.info.status === 'unknown') return false;
+    if (!subagentTerminal(disk.status)) return true;
+    const diskEnd = Date.parse(disk.endedAt ?? '');
+    return Number.isNaN(diskEnd) || live.updatedAt > diskEnd;
+  })();
+  const merged: SubagentInfo = liveWins ? { ...disk, ...live.info } : { ...live.info, ...disk };
+  if (merged.status === 'running') delete merged.endedAt;
+  return merged;
+}
+
 export class GrokProviderAdapter implements ProviderAdapter {
   readonly name = 'grok' as ProviderName;
   private readonly inner: GrokAdapter;
@@ -960,6 +983,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly commandsCache = new Map<string, { ts: number; commands: GrokNativeCommandInput[] }>();
   private readonly toolOutputSnapshots = new Map<string, string>();
   private readonly toolSnapshotTurns = new Map<string, string>();
+  /** Parent gateway session id → child agent id → live status from ACP `subagent` notifications. */
+  private readonly subagentLive = new Map<string, Map<string, LiveSubagent>>();
+  private readonly subagentListeners = new Set<(sessionId: string, subagent: SubagentInfo) => void>();
+  private static readonly MAX_LIVE_SUBAGENTS_PER_PARENT = 200;
+  private static readonly MAX_LIVE_SUBAGENT_PARENTS = 64;
   private lastCliModels?: { defaultModel?: string; models: string[] };
 
   private clearToolSnapshots(sessionId: string, turnId?: string): void {
@@ -1044,6 +1072,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   private isAcpBusy(): boolean {
     if (this.acpTurns.size > 0 || this.acpConnecting.size > 0) return true;
+    for (const children of this.subagentLive.values()) {
+      for (const live of children.values()) {
+        if (live.info.status === 'running') return true;
+      }
+    }
     for (const client of this.acpClients.values()) {
       if (!client.ready) continue;
       const c = client as unknown as {
@@ -1125,6 +1158,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
       commands: true,
       skills: true,
       usage: true,
+      subagents: true,
     };
   }
 
@@ -1527,6 +1561,22 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return evSessionId === gatewaySessionId || evSessionId === this.acpId(gatewaySessionId);
   }
 
+  async listSubagents(sessionId: string): Promise<SubagentInfo[]> {
+    const disk = this.inner.listSubagents(this.storageSessionId(sessionId));
+    const live = this.subagentLive.get(sessionId);
+    if (!live || live.size === 0) return disk;
+    const byId = new Map<string, SubagentInfo>(disk.map((child) => [child.agentId, child] as const));
+    for (const [agentId, entry] of live) byId.set(agentId, mergeSubagent(entry, byId.get(agentId)));
+    return [...byId.values()].slice(0, 200);
+  }
+
+  async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {
+    const children = await this.listSubagents(sessionId);
+    if (!children.some((child) => child.agentId === agentId)) return [];
+    if (!this.inner.hasSessionFile(this.storageSessionId(agentId))) return [];
+    return this.getHistory(agentId);
+  }
+
   private storageSessionId(sessionId: string): string {
     if (this.inner.hasSessionFile(sessionId)) return sessionId;
     const mapped = this.acpSessionIds.get(sessionId) ?? this.settings.getString('acpId', sessionId);
@@ -1647,6 +1697,16 @@ export class GrokProviderAdapter implements ProviderAdapter {
   ): void {
     const ts = Date.now();
     switch (ev.type) {
+      case 'subagent': {
+        if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
+        const status = subagentStatus(ev.status);
+        stream.push({
+          kind: 'subagent', status: status === 'running' ? 'started' : status === 'unknown' ? 'updated' : status,
+          sessionId, turnId, timestamp: ts, agentId: ev.agentId,
+          payload: { agentId: ev.agentId, status, summary: ev.description, raw: ev.raw },
+        });
+        break;
+      }
       case 'message_chunk':
         if (!this.matchesSessionId(ev.sessionId, sessionId)) return;
         stream.push({
@@ -1807,6 +1867,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   private onAcpProcessEvent(client: GrokAcpClient, alwaysApprove: boolean, ev: GrokAcpEvent): void {
+    if (ev.type === 'subagent') {
+      this.rememberLiveSubagent(client, ev);
+      return;
+    }
     if (ev.type === 'disconnected') {
       if (this.acpClients.get(alwaysApprove) === client) {
         this.acpClients.delete(alwaysApprove);
@@ -1814,7 +1878,50 @@ export class GrokProviderAdapter implements ProviderAdapter {
       for (const [sid, bound] of this.sessionClient) {
         if (bound === client) this.sessionClient.delete(sid);
       }
+      for (const children of this.subagentLive.values()) {
+        for (const live of children.values()) {
+          if (live.owner !== client || live.info.status !== 'running') continue;
+          live.info = { ...live.info, status: 'unknown' };
+          live.updatedAt = Date.now();
+        }
+      }
     }
+  }
+
+  private rememberLiveSubagent(client: GrokAcpClient, ev: Extract<GrokAcpEvent, { type: 'subagent' }>): void {
+    const parent = this.gatewaySessionIds.get(ev.sessionId) ?? ev.sessionId;
+    const status = subagentStatus(ev.status);
+    const now = Date.now();
+    let children = this.subagentLive.get(parent);
+    if (!children) {
+      if (this.subagentLive.size >= GrokProviderAdapter.MAX_LIVE_SUBAGENT_PARENTS) {
+        const oldest = this.subagentLive.keys().next().value;
+        if (oldest !== undefined) this.subagentLive.delete(oldest);
+      }
+      children = new Map();
+      this.subagentLive.set(parent, children);
+    }
+    const previous = children.get(ev.agentId);
+    if (!previous && children.size >= GrokProviderAdapter.MAX_LIVE_SUBAGENTS_PER_PARENT) {
+      const oldest = children.keys().next().value;
+      if (oldest !== undefined) children.delete(oldest);
+    }
+    children.delete(ev.agentId);
+    const description = ev.description ?? previous?.info.description;
+    const info: SubagentInfo = {
+      agentId: ev.agentId, status,
+      ...(description ? { description } : {}),
+      ...(status === 'running' ? { startedAt: previous?.info.status === 'running' ? previous.info.startedAt : new Date(now).toISOString() }
+        : previous?.info.startedAt ? { startedAt: previous.info.startedAt } : {}),
+      ...(subagentTerminal(status) ? { endedAt: new Date(now).toISOString() } : {}),
+    };
+    children.set(ev.agentId, { info, updatedAt: now, owner: client });
+    for (const listener of this.subagentListeners) listener(parent, { ...info });
+  }
+
+  onSubagentUpdate(listener: (sessionId: string, subagent: SubagentInfo) => void): () => void {
+    this.subagentListeners.add(listener);
+    return () => { this.subagentListeners.delete(listener); };
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -1949,6 +2056,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.sessionUsage.delete(sessionId);
     if (acpId) this.sessionUsage.delete(acpId);
     this.sessionGoals.delete(sessionId);
+    this.subagentLive.delete(sessionId);
     this.commandsCache.delete(sessionId);
     if (acpId) this.commandsCache.delete(acpId);
     this.clearToolSnapshots(sessionId);
@@ -1968,6 +2076,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.sessionUsage.clear();
     this.renames.clear();
     this.sessionGoals.clear();
+    this.subagentLive.clear();
+    this.subagentListeners.clear();
     const connecting = [...this.acpConnecting.values()];
     const clients = [...this.acpClients.values()];
     this.acpClients.clear();

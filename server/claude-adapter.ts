@@ -23,7 +23,8 @@ import * as readline from "node:readline";
 import { FsError, openBound, type OpenBoundOptions } from "./fs-local.js";
 import { discoverClaudeDiskCommands } from "./native-commands.js";
 import { effortArgument, ultracodeSettings } from "./thinking-levels.js";
-import { ProviderError } from "./types.js";
+import { subagentStatus } from "./subagents.js";
+import { ProviderError, type SubagentInfo, type SubagentStatus } from "./types.js";
 
 /** 会话列表扫描文件头/尾的窗口大小。 */
 const HEAD_BYTES = 256 * 1024;
@@ -31,6 +32,9 @@ const HEAD_BYTES = 256 * 1024;
 const MAX_HISTORY_TAIL_BYTES = 16 * 1024 * 1024;
 const READ_CHUNK_BYTES = 1024 * 1024;
 const MAX_SIDECAR_BYTES = 4096;
+const MAX_SUBAGENT_SIDECAR_BYTES = 64 * 1024;
+const MAX_PARENT_SCAN_BYTES = 1024 * 1024;
+const MAX_SUBAGENT_DETAILS = 200;
 const MAX_UNMATCHED_CONTROL_RESPONSES = 256;
 
 const BOUNDED_APPEND_FLAGS =
@@ -1045,14 +1049,11 @@ export class ClaudeAdapter {
     return found.map((entry) => entry.agentId);
   }
 
-  /** List subagent details including metadata mapped from `<session>/subagents/agent-*.meta.json`. */
-  async listSubagentDetails(sessionId: string): Promise<Array<{
-    agentId: string;
-    parentToolUseId?: string;
-    description?: string;
-    subagentType?: string;
-    taskId?: string;
-  }>> {
+  /**
+   * List subagents from `<session>/subagents/agent-*.{jsonl,meta.json}` with status derived from
+   * bounded parent-transcript evidence (tail window) and the sidecar; missing evidence is `unknown`.
+   */
+  async listSubagentDetails(sessionId: string): Promise<Array<SubagentInfo & { taskId?: string }>> {
     if (!UUID_RE.test(sessionId)) return [];
     const filePath = this.findSessionFile(sessionId);
     if (!filePath) return [];
@@ -1063,47 +1064,89 @@ export class ClaudeAdapter {
     if (!(await this.isSafeDirectoryWithinRoot(sessionDir, realRoot))) return [];
     if (!(await this.isSafeDirectoryWithinRoot(subagentsDir, realRoot))) return [];
 
-    const files = await this.scanSubagentFiles(subagentsDir, realRoot);
-    const results: Array<{
-      agentId: string;
-      parentToolUseId?: string;
-      description?: string;
-      subagentType?: string;
-      taskId?: string;
-    }> = [];
-
-    for (const f of files) {
-      let parentToolUseId: string | undefined;
-      let description: string | undefined;
-      let subagentType: string | undefined;
-      let taskId: string | undefined;
-
-      const metaPath = f.filePath.replace(/\.jsonl$/, ".meta.json");
-      const metaText = await this.readBoundedSidecarText(metaPath, realRoot, MAX_SIDECAR_BYTES);
-      if (metaText) {
-        try {
-          const meta = JSON.parse(metaText) as Record<string, unknown>;
-          if (typeof meta.toolUseId === "string" && meta.toolUseId) parentToolUseId = meta.toolUseId;
-          else if (typeof meta.parentToolUseId === "string" && meta.parentToolUseId) parentToolUseId = meta.parentToolUseId;
-          if (typeof meta.description === "string" && meta.description) description = meta.description;
-          if (typeof meta.agentType === "string" && meta.agentType) subagentType = meta.agentType;
-          else if (typeof meta.subagentType === "string" && meta.subagentType) subagentType = meta.subagentType;
-          if (typeof meta.taskId === "string" && meta.taskId) taskId = meta.taskId;
-        } catch {
-          // ignore malformed sidecar
-        }
-      }
-
-      results.push({
-        agentId: f.agentId,
-        ...(parentToolUseId ? { parentToolUseId } : {}),
-        ...(description ? { description } : {}),
-        ...(subagentType ? { subagentType } : {}),
-        ...(taskId ? { taskId } : {}),
-      });
+    const evidence = await this.readParentSubagentEvidence(filePath, realRoot);
+    const entries = await this.scanSubagentEntries(subagentsDir, realRoot);
+    const results: Array<SubagentInfo & { taskId?: string }> = [];
+    for (const entry of entries) {
+      const meta = entry.metaPath ? await this.readSubagentMeta(entry.metaPath, realRoot) : null;
+      results.push(buildSubagentInfo(entry.agentId, meta, evidence));
     }
-
     return results;
+  }
+
+  private async readParentSubagentEvidence(filePath: string, realRoot: string): Promise<ParentSubagentEvidence> {
+    try {
+      const { fh, stat } = await this.openTranscriptBound(filePath, realRoot);
+      let text: string;
+      try {
+        text = await readTailWindowUtf8(fh, stat.size, MAX_PARENT_SCAN_BYTES);
+      } finally {
+        await fh.close().catch(() => undefined);
+      }
+      return parseParentSubagentEvidence(text);
+    } catch {
+      return { launches: new Map(), results: new Map(), latestByAgent: new Map(), notifications: new Map() };
+    }
+  }
+
+  private async readSubagentMeta(metaPath: string, realRoot: string): Promise<Record<string, unknown> | null> {
+    const text = await this.readBoundedSidecarText(metaPath, realRoot, MAX_SUBAGENT_SIDECAR_BYTES);
+    if (!text) return null;
+    try {
+      const meta = JSON.parse(text) as unknown;
+      return meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async scanSubagentEntries(
+    subagentsDir: string,
+    realRoot: string,
+  ): Promise<Array<{ agentId: string; metaPath?: string }>> {
+    const found = new Map<string, { agentId: string; metaPath?: string }>();
+    const queue: string[] = [subagentsDir];
+    let visitedDirs = 0;
+
+    while (queue.length > 0 && visitedDirs < MAX_SUBAGENT_DETAILS && found.size < MAX_SUBAGENT_DETAILS) {
+      const dir = queue.shift()!;
+      visitedDirs += 1;
+      if (!(await this.isSafeDirectoryWithinRoot(dir, realRoot))) continue;
+      let handle: fs.Dir;
+      try {
+        handle = await fsp.opendir(dir);
+      } catch {
+        continue;
+      }
+      const dirents: fs.Dirent[] = [];
+      try {
+        for await (const dirent of handle) {
+          dirents.push(dirent);
+          if (dirents.length >= MAX_SUBAGENT_DETAILS) break;
+        }
+      } catch {
+        // unreadable directory: keep whatever was read
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+      dirents.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of dirents) {
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          queue.push(full);
+          continue;
+        }
+        const match = entry.isFile() ? /^agent-(.+)\.(meta\.json|jsonl)$/.exec(entry.name) : null;
+        if (!match || !isSafeAgentId(match[1]!)) continue;
+        const agentId = match[1]!;
+        const current = found.get(agentId) ?? { agentId };
+        if (match[2] === "meta.json") current.metaPath = full;
+        found.set(agentId, current);
+        if (found.size >= MAX_SUBAGENT_DETAILS) break;
+      }
+    }
+    return Array.from(found.values());
   }
 
   /** Read and branch-prune a subagent transcript `subagents/agent-<agentId>.jsonl`. */
@@ -3098,6 +3141,174 @@ async function purgeAnchoredDirContents(handle: AnchoredDirHandle): Promise<void
       });
     }
   }
+}
+
+type ParentSubagentLaunch = { index: number; ts?: string };
+type ParentSubagentResult = {
+  index: number;
+  toolUseId: string;
+  ts?: string;
+  agentId?: string;
+  isError: boolean;
+  isAsync: boolean;
+  status?: string;
+};
+type ParentSubagentNotification = { index: number; ts?: string; status: string; summary?: string };
+type ParentSubagentEvidence = {
+  launches: Map<string, ParentSubagentLaunch>;
+  results: Map<string, ParentSubagentResult>;
+  latestByAgent: Map<string, ParentSubagentResult>;
+  notifications: Map<string, ParentSubagentNotification>;
+};
+
+const SUBAGENT_TOOL_NAMES = new Set(["Agent", "Task"]);
+
+function parseParentSubagentEvidence(text: string): ParentSubagentEvidence {
+  const evidence: ParentSubagentEvidence = {
+    launches: new Map(),
+    results: new Map(),
+    latestByAgent: new Map(),
+    notifications: new Map(),
+  };
+  const lines = text.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!line || !(line.includes("tool_use") || line.includes("tool_result") || line.includes("task-notification"))) {
+      continue;
+    }
+    let ev: any;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const ts = typeof ev?.timestamp === "string" ? ev.timestamp : undefined;
+    const content = ev?.message?.content;
+    if (typeof content === "string") {
+      const note = parseTaskNotification(content);
+      if (note) evidence.notifications.set(note.toolUseId, { index, ...(ts ? { ts } : {}), ...note.fields });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "text" && typeof block.text === "string") {
+        const note = parseTaskNotification(block.text);
+        if (note) evidence.notifications.set(note.toolUseId, { index, ...(ts ? { ts } : {}), ...note.fields });
+      } else if (block.type === "tool_use" && SUBAGENT_TOOL_NAMES.has(block.name) && typeof block.id === "string" && block.id) {
+        if (!evidence.launches.has(block.id)) evidence.launches.set(block.id, { index, ...(ts ? { ts } : {}) });
+      } else if (block.type === "tool_result" && typeof block.tool_use_id === "string" && block.tool_use_id) {
+        const toolUseResult = ev.toolUseResult && typeof ev.toolUseResult === "object" ? ev.toolUseResult : {};
+        const resultText = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((x: any) => (typeof x?.text === "string" ? x.text : "")).join("")
+            : "";
+        const rawAgentId = typeof toolUseResult.agentId === "string"
+          ? toolUseResult.agentId
+          : resultText.match(/agentId:\s*([A-Za-z0-9._-]+)/)?.[1];
+        const agentId = rawAgentId && isSafeAgentId(rawAgentId) ? rawAgentId : undefined;
+        const status = typeof toolUseResult.status === "string" ? toolUseResult.status : undefined;
+        const result: ParentSubagentResult = {
+          index,
+          toolUseId: block.tool_use_id,
+          ...(ts ? { ts } : {}),
+          ...(agentId ? { agentId } : {}),
+          isError: block.is_error === true,
+          isAsync: status === "async_launched" || toolUseResult.isAsync === true || /Async agent launched/.test(resultText),
+          ...(status ? { status } : {}),
+        };
+        evidence.results.set(block.tool_use_id, result);
+        if (agentId && evidence.launches.has(block.tool_use_id)) evidence.latestByAgent.set(agentId, result);
+      }
+    }
+  }
+  return evidence;
+}
+
+function parseTaskNotification(text: string): { toolUseId: string; fields: { status: string; summary?: string } } | null {
+  if (!text.includes("<task-notification>")) return null;
+  const field = (name: string) => text.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`))?.[1]?.trim();
+  const toolUseId = field("tool-use-id");
+  const status = field("status");
+  if (!toolUseId || !status) return null;
+  const summary = field("summary");
+  return { toolUseId, fields: { status, ...(summary ? { summary } : {}) } };
+}
+
+function subagentTerminalStatus(raw: string): SubagentStatus {
+  return raw === "killed" ? "cancelled" : subagentStatus(raw);
+}
+
+function buildSubagentInfo(
+  agentId: string,
+  meta: Record<string, unknown> | null,
+  evidence: ParentSubagentEvidence,
+): SubagentInfo & { taskId?: string } {
+  const text = (value: unknown) => (typeof value === "string" && value ? value : undefined);
+  const metaToolUseId = text(meta?.toolUseId) ?? text(meta?.parentToolUseId);
+  const metaLaunch = metaToolUseId ? evidence.launches.get(metaToolUseId) : undefined;
+  const metaResult = metaToolUseId ? evidence.results.get(metaToolUseId) : undefined;
+  const contradicted = metaResult?.agentId !== undefined && metaResult.agentId !== agentId;
+  const latest = evidence.latestByAgent.get(agentId);
+
+  let parentToolUseId: string | undefined;
+  let call: ParentSubagentResult | undefined;
+  let launch: ParentSubagentLaunch | undefined;
+  if (metaToolUseId && !contradicted && metaLaunch && (!latest || metaLaunch.index > latest.index)) {
+    parentToolUseId = metaToolUseId;
+    call = metaResult;
+    launch = metaLaunch;
+  } else if (latest) {
+    parentToolUseId = latest.toolUseId;
+    call = latest;
+    launch = evidence.launches.get(latest.toolUseId);
+  } else if (metaToolUseId && !contradicted) {
+    parentToolUseId = metaToolUseId;
+    call = metaResult;
+    launch = metaLaunch;
+  }
+
+  let status: SubagentStatus = "unknown";
+  let endedAt: string | undefined;
+  let summary: string | undefined;
+  if (call) {
+    if (call.isError) {
+      status = "failed";
+      endedAt = call.ts;
+    } else if (call.isAsync) {
+      const note = evidence.notifications.get(call.toolUseId);
+      if (note && note.index > call.index) {
+        status = subagentTerminalStatus(note.status);
+        endedAt = note.ts;
+        summary = note.summary;
+      } else {
+        status = "running";
+      }
+    } else {
+      const syncStatus = call.status ? subagentTerminalStatus(call.status) : "completed";
+      status = syncStatus === "failed" || syncStatus === "cancelled" ? syncStatus : "completed";
+      endedAt = call.ts;
+    }
+  } else if (!launch && !metaToolUseId && !contradicted && meta?.finished === true) {
+    status = "completed";
+  }
+  if (status === "running" || status === "unknown") endedAt = undefined;
+
+  const description = text(meta?.description);
+  const subagentType = text(meta?.agentType) ?? text(meta?.subagentType);
+  const taskId = text(meta?.taskId);
+  return {
+    agentId,
+    status,
+    ...(parentToolUseId ? { parentToolUseId } : {}),
+    ...(description ? { description } : {}),
+    ...(subagentType ? { subagentType } : {}),
+    ...(taskId ? { taskId } : {}),
+    ...(summary ? { summary } : {}),
+    ...(launch?.ts ? { startedAt: launch.ts } : {}),
+    ...(endedAt ? { endedAt } : {}),
+  };
 }
 
 function isSafeAgentId(agentId: string): boolean {

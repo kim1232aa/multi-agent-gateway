@@ -350,6 +350,19 @@ export interface NoticePayload {
   raw?: unknown;
 }
 
+export type SubagentStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown';
+
+export interface SubagentInfo {
+  agentId: string;
+  parentToolUseId?: string;
+  description?: string;
+  subagentType?: string;
+  status?: SubagentStatus;
+  summary?: string;
+  startedAt?: string;
+  endedAt?: string;
+}
+
 export interface SubagentPayload {
   agentId: string;
   parentToolUseId?: string;
@@ -806,7 +819,8 @@ export interface ProviderAdapter {
   /** 列出该会话的子代理列表(可选)。 */
   listSubagents?(
     sessionId: string,
-  ): Promise<Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>>;
+  ): Promise<SubagentInfo[]>;
+  onSubagentUpdate?(listener: (sessionId: string, subagent: SubagentInfo) => void): () => void;
 
   /** 获取子代理的历史消息(可选)。 */
   getSubagentMessages?(sessionId: string, agentId: string): Promise<Message[]>;

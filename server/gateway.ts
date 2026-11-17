@@ -76,6 +76,8 @@ import {
   type Session,
   type SessionPage,
   type SessionUsage,
+  type SubagentInfo,
+  type SubagentStatus,
   type TurnAttachment,
   type TurnHandle,
 } from './types.js';
@@ -607,6 +609,24 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   };
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
+  const subagentOffs = Object.values(adapters).map((adapter) => adapter.onSubagentUpdate?.((nativeId, child) => {
+    const sid = `${adapter.name}_${nativeId}`;
+    const existing = hub.transcript.currentTasks(sid).find((task) => task.agentId === child.agentId || task.taskId === child.agentId);
+    const status = child.status ?? 'unknown';
+    const state = nextSubagentTaskState(existing?.state, status);
+    const task: TranscriptTask = {
+      taskId: existing?.taskId ?? child.agentId, kind: 'subagent', state,
+      detached: existing?.detached ?? false, agentId: child.agentId,
+      description: child.description ?? existing?.description,
+      parentToolUseId: child.parentToolUseId ?? existing?.parentToolUseId,
+      outputTail: child.summary ?? existing?.outputTail ?? '',
+      startedAt: child.startedAt ?? existing?.startedAt ?? new Date().toISOString(),
+      ...(state !== 'running' ? { endedAt: child.endedAt ?? existing?.endedAt } : {}),
+      ...(state === 'lost' ? { error: SUBAGENT_UNKNOWN_REASON } : {}),
+    };
+    hub.transcript.upsertTask(sid, task);
+    hub.broadcastV262(sid, { type: 'task', session_id: sid, agent_id: 'main', ...toWireTask(task) });
+  })).filter((off): off is () => void => Boolean(off));
   const sessionPageCursors = new Map<string, string>();
   const manifestPathForVersion = options.manifestPath
     ?? (options.staticDir ? path.join(path.resolve(options.staticDir, '..'), 'web-origin-manifest.json') : undefined);
@@ -2336,6 +2356,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     close: () =>
       new Promise((resolveClose) => {
         if (kimiFollowTimer) clearInterval(kimiFollowTimer);
+        for (const off of subagentOffs) off();
         uploadStore.close();
         workspaceStore.close();
         for (const socket of gatewaySockets) socket.destroy();
@@ -2770,34 +2791,98 @@ function toWireTask(t: TranscriptTask): Record<string, unknown> {
   };
 }
 
-async function collectSessionWireTasks(
+const SUBAGENT_UNKNOWN_REASON = 'subagent status unknown: no terminal state observed';
+
+function nextSubagentTaskState(
+  prev: TranscriptTask['state'] | undefined,
+  status: string | undefined,
+): TranscriptTask['state'] {
+  switch (status) {
+    case 'started':
+    case 'running':
+      return 'running';
+    case 'completed':
+      return 'completed';
+    case 'failed':
+      return 'failed';
+    case 'cancelled':
+      return 'killed';
+    default:
+      return prev ?? 'lost';
+  }
+}
+
+function subagentWireOutcome(status: SubagentStatus): Record<string, unknown> {
+  switch (status) {
+    case 'running':
+      return { status: 'running' };
+    case 'completed':
+      return { status: 'ended', outcome: 'completed' };
+    case 'failed':
+      return { status: 'ended', outcome: 'failed' };
+    case 'cancelled':
+      return { status: 'ended', outcome: 'cancelled' };
+    default:
+      return { status: 'ended', outcome: 'lost', state_reason: SUBAGENT_UNKNOWN_REASON };
+  }
+}
+
+function isTerminalWire(item: Record<string, unknown>): boolean {
+  return item.status === 'ended' && item.outcome !== 'lost';
+}
+
+function diskSubagentSupersedes(
+  sub: SubagentInfo,
+  status: SubagentStatus,
+  existing: Record<string, unknown>,
+): boolean {
+  if (status === 'unknown') return false;
+  if (status !== 'running' || !isTerminalWire(existing)) return true;
+  const startedMs = Date.parse(sub.startedAt ?? '');
+  const endedMs = Date.parse(String(existing.ended_at ?? ''));
+  return Number.isFinite(startedMs) && (!Number.isFinite(endedMs) || startedMs > endedMs);
+}
+
+export async function collectSessionWireTasks(
   adapter: ProviderAdapter | null | undefined,
   nativeId: string,
   sid: string,
   hub: SessionHub,
 ): Promise<Array<Record<string, unknown>>> {
   const items = hub.transcript.currentTasks(sid).map(toWireTask);
-  const seenAgentIds = new Set<string>();
-  const seenTaskIds = new Set<string>();
-  for (const item of items) {
-    if (typeof item.task_id === 'string') seenTaskIds.add(item.task_id);
-    if (typeof item.child_agent_id === 'string') seenAgentIds.add(item.child_agent_id);
-  }
+  const byChild = new Map<string, number>();
+  items.forEach((item, index) => {
+    if (typeof item.child_agent_id === 'string') byChild.set(item.child_agent_id, index);
+  });
   if (adapter?.listSubagents) {
     const subs = await adapter.listSubagents(nativeId).catch(() => []);
     for (const sub of subs) {
-      if (!sub?.agentId || seenAgentIds.has(sub.agentId) || seenTaskIds.has(sub.agentId)) continue;
-      seenAgentIds.add(sub.agentId);
-      items.push({
-        task_id: sub.agentId,
+      if (!sub?.agentId) continue;
+      const status: SubagentStatus = sub.status ?? 'unknown';
+      const index = byChild.get(sub.agentId);
+      const existing = index === undefined ? undefined : items[index];
+      if (existing && !diskSubagentSupersedes(sub, status, existing)) continue;
+      const card: Record<string, unknown> = {
+        task_id: existing?.task_id ?? sub.agentId,
         kind: 'subagent',
-        status: 'ended',
-        outcome: 'completed',
-        detached: false,
-        ...(sub.description ? { description: sub.description } : {}),
+        detached: existing?.detached ?? false,
+        ...(sub.description && !existing?.description ? { description: sub.description } : {}),
         child_agent_id: sub.agentId,
-        ...(sub.parentToolUseId ? { parent_tool_call_id: sub.parentToolUseId } : {}),
-      });
+        ...(sub.parentToolUseId && !existing?.parent_tool_call_id ? { parent_tool_call_id: sub.parentToolUseId } : {}),
+        ...(sub.startedAt ? { started_at: sub.startedAt } : {}),
+        ...(sub.endedAt ? { ended_at: sub.endedAt } : {}),
+        ...subagentWireOutcome(status),
+      };
+      if (existing && index !== undefined) {
+        const base: Record<string, unknown> = { ...existing };
+        delete base.outcome;
+        delete base.state_reason;
+        if (status === 'running') delete base.ended_at;
+        items[index] = { ...base, ...card };
+      } else {
+        byChild.set(sub.agentId, items.length);
+        items.push(card);
+      }
     }
   }
   return items;
@@ -6535,13 +6620,7 @@ function consumeEvent(
         }
       }
       const existing = hub.transcript.currentTasks(sid).find((t) => t.taskId === agentId || t.agentId === agentId);
-      const taskState: TranscriptTask['state'] = ev.status === 'failed'
-        ? 'failed'
-        : ev.status === 'cancelled'
-          ? 'killed'
-          : ev.status === 'completed'
-            ? 'completed'
-            : 'running';
+      const taskState = nextSubagentTaskState(existing?.state, ev.status);
       const nextTask: TranscriptTask = {
         taskId: existing?.taskId ?? agentId,
         kind: 'subagent',
@@ -6552,7 +6631,7 @@ function consumeEvent(
         ...(parentToolUseId ?? existing?.parentToolUseId ? { parentToolUseId: parentToolUseId ?? existing?.parentToolUseId } : {}),
         outputTail: p.summary ?? existing?.outputTail ?? '',
         startedAt: existing?.startedAt ?? new Date(ev.timestamp || Date.now()).toISOString(),
-        ...(taskState !== 'running' ? { endedAt: new Date(ev.timestamp || Date.now()).toISOString() } : {}),
+        ...(taskState !== 'running' ? { endedAt: existing?.state === taskState && existing.endedAt ? existing.endedAt : new Date(ev.timestamp || Date.now()).toISOString() } : {}),
         ...(taskState === 'completed' && p.summary ? { resultSummary: p.summary } : existing?.resultSummary ? { resultSummary: existing.resultSummary } : {}),
         ...(taskState === 'failed' && p.summary ? { error: p.summary } : {}),
       };
@@ -6583,13 +6662,15 @@ function consumeEvent(
       const patchDesc = typeof p.patch?.description === 'string' ? p.patch.description : undefined;
       const isSubagent = Boolean(p.subagentType || p.taskType === 'subagent' || existing?.kind === 'subagent');
       const parentToolUseId = p.toolUseId ?? ev.parentToolUseId ?? existing?.parentToolUseId;
-      const taskState: TranscriptTask['state'] = ev.status === 'failed'
-        ? 'failed'
-        : ev.status === 'cancelled'
-          ? 'killed'
-          : ev.status === 'completed'
-            ? 'completed'
-            : 'running';
+      const taskState: TranscriptTask['state'] = isSubagent
+        ? nextSubagentTaskState(existing?.state, ev.status)
+        : ev.status === 'failed'
+          ? 'failed'
+          : ev.status === 'cancelled'
+            ? 'killed'
+            : ev.status === 'completed'
+              ? 'completed'
+              : 'running';
       const nextTask: TranscriptTask = {
         taskId,
         kind: isSubagent ? 'subagent' : existing?.kind ?? 'tool',
@@ -7294,9 +7375,14 @@ function attachGatewayWebSocket(
           sendObj({ type: 'response', request_id: msg.request_id, code: 40001, msg: 'provider mismatch' });
           return;
         }
+        const requestedAgents = Array.isArray(msg.agent_ids) && msg.agent_ids.length > 0
+          ? [...new Set(msg.agent_ids.filter((a): a is string => typeof a === 'string' && a.length > 0))].slice(0, 16)
+          : ['main'];
+        const wantsMain = requestedAgents.includes('main');
+        const childAgentIds = requestedAgents.filter((a) => a !== 'main');
         const adapter = isLocalProvider(socketProvider) ? adapters[socketProvider] : null;
         let history: Message[] | null = null;
-        if (adapter) {
+        if (adapter && wantsMain) {
           try {
             history = await tryHistoryStrictWithDemo(adapter, socketProvider, split.nativeId, demoActive);
           } catch (err) {
@@ -7316,50 +7402,76 @@ function attachGatewayWebSocket(
         sendObj({ type: 'response', request_id: msg.request_id, code: 0, msg: 'success' });
 
         const active = hub.busy.get(sid);
-        if (history && !hub.transcript.hasObservedHistory(sid)) {
-          const historyPrior = active ? filterHistoryPriorToActive(history, active) : history;
-          hub.transcript.observeHistory(sid, historyPrior);
-        }
-        const allTurns = turnsFromHistory(history ?? [], active);
-        const page = sliceV262Turns(allTurns, undefined, 20);
-        sendObj({
-          type: 'turns',
-          session_id: sid,
-          agent_id: 'main',
-          turns: page.turns,
-          has_more: page.has_more,
-        });
-        if (adapter) {
-          emitV262AgentState(hub, adapter, socketProvider, split.nativeId, sid, active ? 'running' : 'idle');
-          emitV262Usage(hub, adapter, socketProvider, split.nativeId, sid);
-          const extUi = (adapter as { getExtensionUiState?: (id: string) => Record<string, unknown> | undefined }).getExtensionUiState?.(split.nativeId);
-          if (extUi) {
-            sendObj({
-              type: 'extension_ui',
-              session_id: sid,
-              agent_id: 'main',
-              ...extUi,
-            });
+        let wireTasks: Array<Record<string, unknown>> = [];
+        if (wantsMain) {
+          if (history && !hub.transcript.hasObservedHistory(sid)) {
+            const historyPrior = active ? filterHistoryPriorToActive(history, active) : history;
+            hub.transcript.observeHistory(sid, historyPrior);
           }
-          const wireTasks = await collectSessionWireTasks(adapter, split.nativeId, sid, hub);
+          const allTurns = turnsFromHistory(history ?? [], active);
+          const page = sliceV262Turns(allTurns, undefined, 20);
           sendObj({
-            type: 'task.list',
+            type: 'turns',
             session_id: sid,
             agent_id: 'main',
-            tasks: wireTasks,
+            turns: page.turns,
+            has_more: page.has_more,
           });
-          const caps = adapter.capabilities();
-          if (caps.goals !== false && adapter.getGoal) {
-            const goal = await adapter.getGoal(split.nativeId).catch(() => null);
+        }
+        if (adapter) {
+          wireTasks = await collectSessionWireTasks(adapter, split.nativeId, sid, hub);
+          if (wantsMain) {
+            emitV262AgentState(hub, adapter, socketProvider, split.nativeId, sid, active ? 'running' : 'idle');
+            emitV262Usage(hub, adapter, socketProvider, split.nativeId, sid);
+            const extUi = (adapter as { getExtensionUiState?: (id: string) => Record<string, unknown> | undefined }).getExtensionUiState?.(split.nativeId);
+            if (extUi) {
+              sendObj({
+                type: 'extension_ui',
+                session_id: sid,
+                agent_id: 'main',
+                ...extUi,
+              });
+            }
             sendObj({
-              type: 'goal',
+              type: 'task.list',
               session_id: sid,
               agent_id: 'main',
-              goal: localGoalToWire(goal, split.nativeId),
+              tasks: wireTasks,
             });
+            const caps = adapter.capabilities();
+            if (caps.goals !== false && adapter.getGoal) {
+              const goal = await adapter.getGoal(split.nativeId).catch(() => null);
+              sendObj({
+                type: 'goal',
+                session_id: sid,
+                agent_id: 'main',
+                goal: localGoalToWire(goal, split.nativeId),
+              });
+            }
           }
         }
-        if (active) {
+        for (const childAgentId of childAgentIds) {
+          const subHistory = adapter?.getSubagentMessages
+            ? await adapter.getSubagentMessages(split.nativeId, childAgentId).catch(() => [])
+            : [];
+          const subPage = sliceV262Turns(turnsFromHistory(subHistory), undefined, 20);
+          const childTask = wireTasks.find((t) => t.child_agent_id === childAgentId || t.task_id === childAgentId);
+          sendObj({
+            type: 'turns',
+            session_id: sid,
+            agent_id: childAgentId,
+            turns: subPage.turns,
+            has_more: subPage.has_more,
+          });
+          sendObj({
+            type: 'agent',
+            session_id: sid,
+            agent_id: childAgentId,
+            status: childTask?.status === 'running' ? 'running' : 'idle',
+            compacting: false,
+          });
+        }
+        if (active && wantsMain) {
           for (const approvalId of active.pendingApprovals.keys()) {
             sendObj(v262PendingApprovalFrame(sid, approvalId, active));
           }
@@ -7371,8 +7483,10 @@ function attachGatewayWebSocket(
       }
       if (msg.type === 'unsubscribe' && typeof msg.session_id === 'string') {
         const sid = msg.session_id;
-        v262Offs.get(sid)?.();
-        v262Offs.delete(sid);
+        if (!Array.isArray(msg.agent_ids) || msg.agent_ids.includes('main')) {
+          v262Offs.get(sid)?.();
+          v262Offs.delete(sid);
+        }
         sendObj({ type: 'response', request_id: msg.request_id, code: 0, msg: 'success' });
         return;
       }

@@ -1487,6 +1487,145 @@ test('normalizeCodexThreadItem normalizes collabAgentToolCall and subAgentActivi
   assert.equal((subActivityItem as any)?.agentId, 'thread-sub-1');
 });
 
+test('subAgentActivity status follows the real kind for started, completed, failed and cancelled', () => {
+  const started = normalizeCodexThreadItem({
+    type: 'SubAgentActivity',
+    id: 'call-1',
+    kind: 'started',
+    agent_thread_id: 'thread-sub-1',
+  } as any) as any;
+  assert.equal(started.agentId, 'thread-sub-1');
+  assert.equal(started.agentStatus, 'running');
+
+  const completed = normalizeCodexThreadItem({
+    type: 'SubAgentActivity',
+    id: 'subagent-completed-1',
+    kind: 'completed',
+    agent_thread_id: 'thread-sub-1',
+  } as any) as any;
+  assert.equal(completed.agentStatus, 'completed');
+
+  const failed = normalizeCodexThreadItem({
+    type: 'subAgentActivity',
+    id: 'act-2',
+    kind: 'failed',
+    agentThreadId: 'thread-sub-2',
+  } as any) as any;
+  assert.equal(failed.agentId, 'thread-sub-2');
+  assert.equal(failed.agentStatus, 'failed');
+
+  const cancelled = normalizeCodexThreadItem({
+    type: 'subAgentActivity',
+    id: 'act-3',
+    kind: 'cancelled',
+    agentThreadId: 'thread-sub-3',
+  } as any) as any;
+  assert.equal(cancelled.agentStatus, 'cancelled');
+});
+
+test('subAgentActivity reports unknown without evidence and prefers an explicit agentId', () => {
+  const noKind = normalizeCodexThreadItem({
+    type: 'SubAgentActivity',
+    id: 'act-4',
+    agent_thread_id: 'thread-sub-4',
+  } as any) as any;
+  assert.equal(noKind.agentId, 'thread-sub-4');
+  assert.equal(noKind.agentStatus, 'unknown');
+
+  const oddKind = normalizeCodexThreadItem({
+    type: 'SubAgentActivity',
+    id: 'act-5',
+    kind: 'paused',
+  } as any) as any;
+  assert.equal(oddKind.agentStatus, 'unknown');
+  assert.equal(oddKind.agentId, undefined);
+
+  const explicit = normalizeCodexThreadItem({
+    type: 'SubAgentActivity',
+    id: 'act-6',
+    kind: 'started',
+    agentId: 'explicit-agent',
+    agent_thread_id: 'thread-sub-6',
+  } as any) as any;
+  assert.equal(explicit.agentId, 'explicit-agent');
+});
+
+test('item/completed wrapping a started SubAgentActivity keeps the child running', () => {
+  const adapter = new CodexAdapter();
+  stubTransport(adapter);
+  const events: CodexEvent[] = [];
+  adapter.onEvent((ev: CodexEvent) => events.push(ev));
+
+  (adapter as any).handleNotification('item/completed', {
+    threadId: 'thread-main',
+    turnId: 'turn-1',
+    item: {
+      type: 'SubAgentActivity',
+      id: 'call-1',
+      kind: 'started',
+      agent_thread_id: 'thread-sub-1',
+    },
+  });
+
+  const completed = events.find((ev) => ev.type === 'item-completed') as any;
+  assert.ok(completed);
+  assert.equal(completed.item.agentId, 'thread-sub-1');
+  assert.equal(completed.item.agentStatus, 'running');
+});
+
+test('listSubagentThreadStates never connects or spawns, and reads one bounded page only when live', async () => {
+  const adapter = new CodexAdapter();
+  let connects = 0;
+  (adapter as any).connect = async () => {
+    connects++;
+  };
+  const calls: Array<{ method: string; params: any }> = [];
+  (adapter as any).request = async (method: string, params: any) => {
+    calls.push({ method, params });
+    return {
+      data: [
+        { id: 'thread-sub-a', parentThreadId: 'thread-main', status: { type: 'active', activeFlags: [] } },
+        { id: 'thread-sub-b', parentThreadId: 'thread-main', status: { type: 'systemError' } },
+        { id: 'thread-sub-c', parentThreadId: 'thread-main', status: { type: 'idle' } },
+        { id: 'thread-sub-d', parentThreadId: 'thread-main', status: { type: 'notLoaded' } },
+        { id: 'thread-sub-e', parentThreadId: 'thread-main' },
+        { id: 'foreign-child', parentThreadId: 'other-parent', status: { type: 'active' } },
+        { id: 'unattributed-child', status: { type: 'active' } },
+      ],
+      nextCursor: 'more',
+    };
+  };
+
+  assert.deepEqual(await adapter.listSubagentThreadStates('thread-main'), []);
+  assert.equal(connects, 0);
+  assert.equal(calls.length, 0);
+
+  (adapter as any).readyPromise = Promise.resolve();
+  (adapter as any).child = { exitCode: null };
+  const states = await adapter.listSubagentThreadStates('thread-main', 500);
+  assert.deepEqual(
+    states.map((s) => [s.threadId, s.status]),
+    [
+      ['thread-sub-a', 'running'],
+      ['thread-sub-b', 'failed'],
+      ['thread-sub-c', 'unknown'],
+      ['thread-sub-d', 'unknown'],
+      ['thread-sub-e', 'unknown'],
+    ],
+  );
+  assert.equal(connects, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, 'thread/list');
+  assert.equal(calls[0].params.parentThreadId, undefined);
+  assert.equal(calls[0].params.useStateDbOnly, true);
+  assert.deepEqual(calls[0].params.sourceKinds, ['subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther']);
+  assert.equal(calls[0].params.limit, 50);
+
+  calls.length = 0;
+  assert.deepEqual(await adapter.listSubagentThreadStates(''), []);
+  assert.equal(calls.length, 0);
+});
+
 test('backgroundTerminals retries via thread/resume on thread not found after recycle', async () => {
   const adapter = new CodexAdapter();
   (adapter as any).connect = async () => undefined;

@@ -63,6 +63,7 @@ export type GrokAcpPromptBlock =
   | Record<string, unknown>;
 
 export type GrokAcpEvent =
+  | { type: 'subagent'; sessionId: string; agentId: string; status: string; description?: string; tokens?: number; raw: Record<string, unknown> }
   | { type: 'message_chunk'; sessionId: string; text: string }
   | { type: 'thought_chunk'; sessionId: string; text: string }
   | {
@@ -810,6 +811,19 @@ export class GrokAcpClient {
     const update = isRecord(p.update) ? p.update : p;
     const kind = String(update.sessionUpdate ?? update.type ?? '');
     switch (kind) {
+      case 'subagent_spawned':
+      case 'subagent_finished': {
+        const agentId = String(update.child_session_id ?? update.subagent_id ?? '');
+        if (!sessionId || !/^[a-zA-Z0-9_-]+$/.test(agentId)) break;
+        this.emit({
+          type: 'subagent', sessionId, agentId,
+          status: typeof update.status === 'string' ? update.status : kind === 'subagent_spawned' ? 'running' : 'unknown',
+          ...(typeof update.description === 'string' ? { description: update.description } : {}),
+          ...(typeof update.tokens_used === 'number' ? { tokens: update.tokens_used } : {}),
+          raw: update,
+        });
+        break;
+      }
       case 'agent_message_chunk': {
         const text = textOfContent(update.content);
         if (text) this.emit({ type: 'message_chunk', sessionId, text });

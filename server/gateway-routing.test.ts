@@ -10,8 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
-import type { ProviderAdapter, ProviderCapabilities, NativeModel, NativeCommand, Session, SessionPage, Message, StartTurnInput, TurnHandle, ApprovalDecision, HistoryQuery, ListSessionsQuery, CreateSessionInput } from './types.js';
-import { activeKimiTier1Names, detectAvailableProviders, executeCodexCommand, formatCodexAccountUsage, parseWireThinkingPatch, renderCodexUsage, SessionHub, skillDto, startGateway } from './gateway.js';
+import type { ProviderAdapter, ProviderCapabilities, NativeModel, NativeCommand, Session, SessionPage, Message, StartTurnInput, TurnHandle, ApprovalDecision, HistoryQuery, ListSessionsQuery, CreateSessionInput, SubagentInfo } from './types.js';
+import type { TranscriptTask } from './local-transcript.js';
+import { activeKimiTier1Names, collectSessionWireTasks, detectAvailableProviders, executeCodexCommand, formatCodexAccountUsage, parseWireThinkingPatch, renderCodexUsage, SessionHub, skillDto, startGateway } from './gateway.js';
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
 
@@ -6412,3 +6413,155 @@ test('review regression: SessionAdmin select-all filters multi workspace.id, dat
   }
 });
 
+test('subagent wire tasks map disk status without spawning or cross-linking parents', async () => {
+  const sid = 'codex_parent-a';
+  const calls: string[] = [];
+  let disk: SubagentInfo[] = [
+    { agentId: 'child-running', parentToolUseId: 'call-a', status: 'running', description: 'run', startedAt: '2026-11-18T01:00:00.000Z' },
+    { agentId: 'child-done', parentToolUseId: 'call-a', status: 'completed', description: 'done', summary: 'ok' },
+    { agentId: 'child-failed', status: 'failed' },
+    { agentId: 'child-cancelled', status: 'cancelled' },
+    { agentId: 'child-unknown', status: 'unknown' },
+    { agentId: 'child-missing' },
+    { agentId: 'child-rerun', status: 'running', startedAt: '2026-11-18T01:00:00.000Z' },
+    { agentId: 'child-live-done', status: 'unknown' },
+    { agentId: 'child-live-running', status: 'unknown' },
+  ];
+  const adapter = {
+    listSubagents: async (nativeId: string): Promise<SubagentInfo[]> => {
+      calls.push(`list:${nativeId}`);
+      return nativeId === 'parent-a' ? disk : [{ agentId: 'other-child', status: 'running' }];
+    },
+    startTurn: async () => {
+      calls.push('startTurn');
+      throw new Error('snapshot must not spawn');
+    },
+  } as unknown as ProviderAdapter;
+  const hub = new SessionHub();
+  const subTask = (taskId: string, state: TranscriptTask['state'], startedAt: string, endedAt?: string): TranscriptTask => ({
+    taskId,
+    kind: 'subagent',
+    state,
+    detached: false,
+    outputTail: '',
+    agentId: taskId,
+    startedAt,
+    ...(endedAt ? { endedAt } : {}),
+  });
+  hub.transcript.upsertTask(sid, subTask('child-done', 'running', '2026-11-18T00:00:00.000Z'));
+  hub.transcript.upsertTask(sid, subTask('child-rerun', 'completed', '2026-11-18T00:00:00.000Z', '2026-11-18T00:30:00.000Z'));
+  hub.transcript.upsertTask(sid, subTask('child-live-done', 'completed', '2026-11-18T00:00:00.000Z', '2026-11-18T00:30:00.000Z'));
+  hub.transcript.upsertTask(sid, subTask('child-live-running', 'running', '2026-11-18T00:00:00.000Z'));
+  hub.transcript.upsertTask('codex_parent-b', subTask('other-child', 'completed', '2026-11-18T00:00:00.000Z', '2026-11-18T00:30:00.000Z'));
+
+  const snapshot = async () => {
+    const items = await collectSessionWireTasks(adapter, 'parent-a', sid, hub);
+    const byChild = new Map<unknown, any>(items.map((item): [unknown, any] => [item.child_agent_id, item]));
+    assert.equal(items.length, byChild.size, 'each child agent yields exactly one card');
+    return byChild;
+  };
+
+  let byChild = await snapshot();
+  assert.equal(byChild.size, 9);
+  assert.deepEqual(calls, ['list:parent-a']);
+  assert.equal(byChild.has('other-child'), false);
+  assert.deepEqual(
+    { status: byChild.get('child-running')!.status, outcome: byChild.get('child-running')!.outcome, parent: byChild.get('child-running')!.parent_tool_call_id },
+    { status: 'running', outcome: undefined, parent: 'call-a' },
+  );
+  assert.deepEqual(
+    { status: byChild.get('child-done')!.status, outcome: byChild.get('child-done')!.outcome },
+    { status: 'ended', outcome: 'completed' },
+  );
+  assert.deepEqual(
+    { status: byChild.get('child-failed')!.status, outcome: byChild.get('child-failed')!.outcome },
+    { status: 'ended', outcome: 'failed' },
+  );
+  assert.deepEqual(
+    { status: byChild.get('child-cancelled')!.status, outcome: byChild.get('child-cancelled')!.outcome },
+    { status: 'ended', outcome: 'cancelled' },
+  );
+  const unknownCard = byChild.get('child-unknown')!;
+  assert.equal(unknownCard.status, 'ended');
+  assert.equal(unknownCard.outcome, 'lost');
+  assert.equal(typeof unknownCard.state_reason, 'string');
+  assert.equal(byChild.get('child-missing')!.status, 'ended');
+  assert.equal(byChild.get('child-missing')!.outcome, 'lost');
+  assert.equal(byChild.get('child-rerun')!.status, 'running');
+  assert.equal(byChild.get('child-rerun')!.outcome, undefined);
+  assert.equal(byChild.get('child-live-done')!.outcome, 'completed');
+  assert.equal(byChild.get('child-live-running')!.status, 'running');
+  assert.equal(byChild.get('child-live-running')!.outcome, undefined);
+
+  disk = disk.map((sub) => sub.agentId === 'child-running' ? { ...sub, status: 'completed', endedAt: '2026-11-18T02:00:00.000Z' } : sub);
+  byChild = await snapshot();
+  assert.equal(byChild.get('child-running')!.status, 'ended');
+  assert.equal(byChild.get('child-running')!.outcome, 'completed');
+  assert.deepEqual(calls, ['list:parent-a', 'list:parent-a']);
+});
+
+test('WS subscribe delivers turns and agent status for requested child agent_ids without breaking main', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-ws-subagent-'));
+  const grok = fakeAdapter('grok');
+  grok.listSubagents = async () => [{ agentId: 'child-1', status: 'completed', description: 'check' }];
+  grok.getSubagentMessages = async (_sid, agentId) => agentId === 'child-1'
+    ? [
+        { id: 'c1', session_id: 'child-1', role: 'user', content: [{ type: 'text', text: 'ping child' }], created_at: '2026-01-01T00:00:01.000Z' },
+        { id: 'c2', session_id: 'child-1', role: 'assistant', content: [{ type: 'text', text: 'pong child' }], created_at: '2026-01-01T00:00:02.000Z' },
+      ]
+    : [];
+  const gateway = await startGateway({
+    port: 0,
+    token: 'subagent-token',
+    kimi: 'off',
+    settingsDir,
+    claude: fakeAdapter('claude') as any,
+    codex: fakeAdapter('codex') as any,
+    grok: grok as any,
+    pi: fakeAdapter('pi') as any,
+    dsh: fakeAdapter('dsh') as any,
+    availableProviders: ['grok'],
+  });
+  let ws: WebSocket | undefined;
+  try {
+    const frames: Array<Record<string, unknown>> = [];
+    await new Promise<void>((resolve, reject) => {
+      ws = new WebSocket(
+        `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=grok`,
+        ['kimi-code.bearer.subagent-token'],
+      );
+      const timer = setTimeout(() => reject(new Error('timeout waiting for child turns')), 4000);
+      ws.onopen = () => {
+        ws?.send(JSON.stringify({
+          type: 'subscribe',
+          request_id: 'sub-1',
+          session_id: 'grok_grok-native',
+          agent_ids: ['main', 'child-1', 'foreign-child'],
+        }));
+      };
+      ws.onmessage = (ev) => {
+        const frame = JSON.parse(String(ev.data)) as Record<string, unknown>;
+        frames.push(frame);
+        if (
+          frames.some((f) => f.type === 'turns' && f.agent_id === 'child-1')
+          && frames.some((f) => f.type === 'agent' && f.agent_id === 'child-1')
+          && frames.some((f) => f.type === 'turns' && f.agent_id === 'foreign-child')
+        ) {
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      ws.onerror = () => { clearTimeout(timer); reject(new Error('ws error')); };
+    });
+    const childTurns = frames.find((f) => f.type === 'turns' && f.agent_id === 'child-1') as { turns?: unknown[] };
+    const foreignTurns = frames.find((f) => f.type === 'turns' && f.agent_id === 'foreign-child') as { turns?: unknown[] };
+    const childAgent = frames.find((f) => f.type === 'agent' && f.agent_id === 'child-1') as { status?: string };
+    assert.equal(childTurns.turns?.length, 1);
+    assert.equal(foreignTurns.turns?.length, 0);
+    assert.equal(childAgent.status, 'idle');
+  } finally {
+    ws?.close();
+    await gateway.close();
+    await rm(settingsDir, { recursive: true, force: true });
+  }
+});

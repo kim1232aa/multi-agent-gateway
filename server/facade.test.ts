@@ -1648,6 +1648,98 @@ test('Codex mapCodexEvents routes subAgentActivity to subagent lifecycle instead
   assert.equal(completed.payload.summary, 'search finished');
 });
 
+test('Codex subAgentActivity started stays running and tool completion does not complete the agent', async (t) => {
+  const adapter = new CodexProviderAdapter();
+  t.after(() => adapter.dispose());
+  adapter.getHistory = async () => [];
+  (adapter as any).inner.startTurn = async () => ({
+    turnId: 'turn-sub-run',
+    events: (async function* () {
+      yield {
+        type: 'item-started',
+        item: { type: 'subAgentActivity', id: 'call-run', kind: 'started', agentThreadId: 'sub-run-1', name: 'worker' },
+      };
+      yield {
+        type: 'item-completed',
+        item: { type: 'subAgentActivity', id: 'call-run', kind: 'started', agentThreadId: 'sub-run-1', name: 'worker' },
+      };
+      yield {
+        type: 'item-completed',
+        item: { type: 'collabAgentToolCall', id: 'call-spawn', tool: 'spawnAgent', status: 'completed', receiverThreadIds: ['sub-run-1'] },
+      };
+    })(),
+  });
+  const handle = await adapter.startTurn({ sessionId: 'parent-run', input: 'go' });
+  const events: any[] = [];
+  for await (const ev of handle.events) events.push(ev);
+
+  const subEvents = events.filter((e) => e.kind === 'subagent' && e.agentId === 'sub-run-1');
+  assert.ok(subEvents.length > 0);
+  assert.ok(subEvents.every((e) => e.status === 'started'));
+  assert.equal((adapter as any).liveSubagents.get('parent-run')?.get('sub-run-1')?.status, 'running');
+  assert.equal((adapter as any).liveSubagents.get('parent-run')?.get('sub-run-1')?.completedAt, undefined);
+  const list = await adapter.listSubagents('parent-run');
+  assert.equal(list.find((s) => s.agentId === 'sub-run-1')?.status, 'running');
+});
+
+test('Codex agentsStates terminal status completes the child and unknown states stay unknown', async (t) => {
+  const adapter = new CodexProviderAdapter();
+  t.after(() => adapter.dispose());
+  (adapter as any).inner.startTurn = async () => ({
+    turnId: 'turn-sub-state',
+    events: (async function* () {
+      yield {
+        type: 'item-completed',
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'call-wait',
+          tool: 'wait',
+          status: 'completed',
+          receiverThreadIds: ['sub-ok', 'sub-err', 'sub-odd'],
+          agentsStates: {
+            'sub-ok': { status: 'completed', message: 'fine' },
+            'sub-err': { status: 'errored', message: 'boom' },
+            'sub-odd': { status: 'mysteryState' },
+          },
+        },
+      };
+    })(),
+  });
+  const handle = await adapter.startTurn({ sessionId: 'parent-state', input: 'wait' });
+  for await (const _ of handle.events) { /* drain */ }
+
+  const byId = new Map((await adapter.listSubagents('parent-state')).map((s) => [s.agentId, s]));
+  assert.equal(byId.get('sub-ok')?.status, 'completed');
+  assert.equal(byId.get('sub-err')?.status, 'failed');
+  assert.equal(byId.get('sub-odd')?.status, 'unknown');
+});
+
+test('Codex wait timeout or tool-only completion never marks a running child completed', async (t) => {
+  const adapter = new CodexProviderAdapter();
+  t.after(() => adapter.dispose());
+  (adapter as any).inner.startTurn = async () => ({
+    turnId: 'turn-sub-timeout',
+    events: (async function* () {
+      yield {
+        type: 'item-completed',
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'call-wait-2',
+          tool: 'wait',
+          status: 'completed',
+          receiverThreadIds: ['sub-slow'],
+          agentsStates: { 'sub-slow': { status: 'running' } },
+        },
+      };
+    })(),
+  });
+  const handle = await adapter.startTurn({ sessionId: 'parent-timeout', input: 'wait' });
+  for await (const _ of handle.events) { /* drain */ }
+
+  const list = await adapter.listSubagents('parent-timeout');
+  assert.equal(list.find((s) => s.agentId === 'sub-slow')?.status, 'running');
+});
+
 test('Codex planMode re-syncs on resume/startTurn and passes model and effective effort', async () => {
   const adapter = new CodexProviderAdapter();
   const collabCalls: Array<{ threadId: string; mode: string; options?: any }> = [];
@@ -1780,6 +1872,69 @@ test('ClaudeProviderAdapter clearCommandsCache invokes inner clearHandshakeCache
   };
   adapter.clearCommandsCache();
   assert.equal(called, true);
+});
+
+test('ClaudeProviderAdapter listSubagents merges live task status over disk and maps unknown to unknown', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const sessionId = 'sess-claude-status';
+  (adapter as any).inner.listSubagentDetails = async () => [
+    { agentId: 'disk-a', parentToolUseId: 'tu-a', description: 'disk a', subagentType: 'Explore', status: 'running' },
+    { agentId: 'disk-b', parentToolUseId: 'tu-b', status: 'running' },
+  ];
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    opts.onEvent({ type: 'task_started', sessionId, taskId: 'task-a', description: 'a', subagentType: 'coder', toolUseId: 'tu-a' });
+    opts.onEvent({ type: 'task_started', sessionId, taskId: 'task-c', description: 'c', subagentType: 'coder', toolUseId: 'tu-c' });
+    opts.onEvent({ type: 'task_notification', sessionId, taskId: 'task-a', status: 'stopped', summary: 'stopped' });
+    opts.onEvent({ type: 'task_notification', sessionId, taskId: 'task-c', status: 'weird-state', summary: '' });
+    opts.onEvent({ type: 'done', sessionId, result: 'ok', isError: false, subtype: 'success', stopReason: 'end_turn' });
+  };
+  const handle = await adapter.startTurn({ sessionId, input: 'run' });
+  for await (const _ of handle.events) { /* drain */ }
+
+  const subs = await adapter.listSubagents(sessionId);
+  const byId = new Map(subs.map((s) => [s.agentId, s]));
+  assert.equal(subs.length, 3);
+  assert.equal(byId.get('disk-a')?.status, 'cancelled');
+  assert.equal(byId.get('disk-b')?.status, 'running');
+  assert.equal(byId.has('task-a'), false);
+  assert.equal(byId.get('disk-a')?.parentToolUseId, 'tu-a');
+  assert.equal(byId.get('task-c')?.status, 'unknown');
+});
+
+test('ClaudeProviderAdapter listSubagents does not duplicate a task reported under both taskId and agentId', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const sessionId = 'sess-claude-dedup';
+  (adapter as any).inner.listSubagentDetails = async () => [
+    { agentId: 'worker9', parentToolUseId: 'tu-9', taskId: 'task-9', status: 'running' },
+  ];
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    opts.onEvent({ type: 'task_started', sessionId, taskId: 'task-9', description: 'nine', subagentType: 'coder', toolUseId: 'tu-9' });
+    opts.onEvent({ type: 'task_notification', sessionId, taskId: 'task-9', status: 'completed', summary: 'done', toolUseId: 'tu-9' });
+    opts.onEvent({ type: 'done', sessionId, result: 'ok', isError: false, subtype: 'success', stopReason: 'end_turn' });
+  };
+  const handle = await adapter.startTurn({ sessionId, input: 'run' });
+  for await (const _ of handle.events) { /* drain */ }
+
+  const subs = await adapter.listSubagents(sessionId);
+  assert.equal(subs.length, 1);
+  assert.equal(subs[0]?.agentId, 'worker9');
+  assert.equal(subs[0]?.status, 'completed');
+});
+
+test('ClaudeProviderAdapter task_notification maps only completed/failed/stopped and never defaults unknown to completed', async () => {
+  const adapter = new ClaudeProviderAdapter();
+  const sessionId = 'sess-claude-notif';
+  (adapter as any).inner.startTurn = async (opts: any) => {
+    opts.onEvent({ type: 'task_started', sessionId, taskId: 'n-1', description: 'x', subagentType: 'coder' });
+    opts.onEvent({ type: 'task_notification', sessionId, taskId: 'n-1', status: 'future-status', summary: '' });
+    opts.onEvent({ type: 'done', sessionId, result: 'ok', isError: false, subtype: 'success', stopReason: 'end_turn' });
+  };
+  const handle = await adapter.startTurn({ sessionId, input: 'run' });
+  const events: any[] = [];
+  for await (const e of handle.events) events.push(e);
+  const sub = events.filter((e) => e.kind === 'subagent').at(-1);
+  assert.notEqual(sub?.status, 'completed');
+  assert.equal(sub?.payload?.status, 'unknown');
 });
 
 test('ClaudeProviderAdapter task_notification without toolUseId falls back to tracked toolUseId or taskId', async () => {

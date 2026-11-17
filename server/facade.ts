@@ -28,6 +28,7 @@ import {
 import { expandCodexSkill, listClaudeCommands, listCodexCommands } from './native-commands.js';
 import { extractSubagentIdFromOutput, findCodexRollout } from './local-transcript.js';
 import { SettingsStore } from './settings-store.js';
+import { readSubagentTail, subagentStatus } from './subagents.js';
 import { supportsUltracode, THINKING_PROFILES } from './thinking-levels.js';
 import {
   ProviderError,
@@ -50,6 +51,8 @@ import {
   type StartTurnInput,
   type SteerInput,
   type StructuredQuestion,
+  type SubagentInfo,
+  type SubagentStatus,
   type TurnAttachment,
   type TurnHandle,
 } from './types.js';
@@ -573,13 +576,13 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private readonly activeThreadTurns = new Set<string>();
   private readonly liveSubagents = new Map<
     string,
-    Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; completedAt?: number }>
+    Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; status: SubagentStatus; completedAt?: number }>
   >();
 
   private pruneLiveSubagents(sessionId?: string): void {
     const now = Date.now();
     const pruneBucket = (
-      bucket: Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; completedAt?: number }>,
+      bucket: Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; status: SubagentStatus; completedAt?: number }>,
     ): void => {
       for (const [id, entry] of bucket) {
         if (
@@ -614,7 +617,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     parentToolUseId?: string,
     description?: string,
     subagentType?: string,
-    completed?: boolean,
+    status?: SubagentStatus,
   ): void {
     if (!agentId || agentId === sessionId) return;
     let bucket = this.liveSubagents.get(sessionId);
@@ -631,13 +634,16 @@ export class CodexProviderAdapter implements ProviderAdapter {
       this.liveSubagents.set(sessionId, bucket);
     }
     const existing = bucket.get(agentId);
+    const nextStatus = status ?? existing?.status ?? 'running';
+    const terminal = nextStatus === 'completed' || nextStatus === 'failed' || nextStatus === 'cancelled';
     bucket.delete(agentId);
     bucket.set(agentId, {
       agentId,
       parentToolUseId: parentToolUseId ?? existing?.parentToolUseId,
       description: description ?? existing?.description,
       subagentType: subagentType ?? existing?.subagentType,
-      completedAt: completed ? Date.now() : (completed === false ? undefined : existing?.completedAt),
+      status: nextStatus,
+      completedAt: terminal ? (existing?.completedAt ?? Date.now()) : undefined,
     });
     this.pruneLiveSubagents(sessionId);
   }
@@ -2054,7 +2060,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
                 resolvedParentToolUseId,
                 typeof item.summary === 'string' ? item.summary : undefined,
                 typeof item.name === 'string' ? item.name : undefined,
-                false,
+                'running',
               );
               yield {
                 kind: 'subagent',
@@ -2083,7 +2089,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
                 (typeof item.tool === 'string' && item.tool) ||
                 (item.type as string);
               if (agentId) {
-                this.recordLiveSubagent(sessionId, agentId, (item.id as string) ?? parentToolUseId, undefined, undefined, false);
+                this.recordLiveSubagent(sessionId, agentId, (item.id as string) ?? parentToolUseId, undefined, undefined, 'running');
               }
               yield {
                 kind: 'tool',
@@ -2149,12 +2155,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
                 resolvedParentToolUseId,
                 typeof item.summary === 'string' ? item.summary : undefined,
                 typeof item.name === 'string' ? item.name : undefined,
-                true,
+                subagentStatus(item.kind ?? item.agentStatus ?? item.status),
               );
-              const st = typeof item.status === 'string' ? item.status : 'completed';
+              const st = subagentStatus(item.kind ?? item.agentStatus ?? item.status);
               yield {
                 kind: 'subagent',
-                status: st === 'failed' ? 'failed' : st === 'cancelled' ? 'cancelled' : 'completed',
+                status: st === 'running' ? 'started' : st === 'unknown' ? 'updated' : st,
                 sessionId,
                 turnId,
                 timestamp: ts,
@@ -2181,7 +2187,23 @@ export class CodexProviderAdapter implements ProviderAdapter {
               let output = extractCodexToolOutput(item) ?? '';
               const resolvedAgentId = agentId ?? extractSubagentIdFromOutput(output);
               if (resolvedAgentId) {
-                this.recordLiveSubagent(sessionId, resolvedAgentId, (item.id as string) ?? parentToolUseId, undefined, undefined, true);
+                this.recordLiveSubagent(sessionId, resolvedAgentId, (item.id as string) ?? parentToolUseId);
+              }
+              const agentStates = item.agentsStates;
+              if (agentStates && typeof agentStates === 'object' && !Array.isArray(agentStates)) {
+                for (const [childId, rawState] of Object.entries(agentStates).slice(0, 200)) {
+                  if (!/^[a-zA-Z0-9_-]+$/.test(childId) || childId === sessionId) continue;
+                  const state = rawState && typeof rawState === 'object' ? rawState as Record<string, unknown> : {};
+                  const childStatus = subagentStatus(state.status);
+                  const previous = this.liveSubagents.get(sessionId)?.get(childId);
+                  const status = childStatus === 'unknown' ? previous?.status ?? 'unknown' : childStatus;
+                  this.recordLiveSubagent(sessionId, childId, previous?.parentToolUseId ?? (item.id as string), undefined, undefined, status);
+                  yield {
+                    kind: 'subagent', status: status === 'running' ? 'started' : status === 'unknown' ? 'updated' : status,
+                    sessionId, turnId, timestamp: ts, agentId: childId,
+                    payload: { agentId: childId, status, summary: typeof state.message === 'string' ? state.message : undefined },
+                  };
+                }
               }
               if (item.type === 'collabAgentToolCall' || name === 'collabAgentToolCall') {
                 if (resolvedAgentId && !output.includes('agent_id:')) {
@@ -2464,72 +2486,64 @@ export class CodexProviderAdapter implements ProviderAdapter {
     }
   }
 
-  async listSubagents(sessionId: string): Promise<Array<{
-    agentId: string;
-    parentToolUseId?: string;
-    description?: string;
-    subagentType?: string;
-  }>> {
+  async listSubagents(sessionId: string): Promise<SubagentInfo[]> {
     this.pruneLiveSubagents(sessionId);
-    const messages = await this.getHistory(sessionId).catch(() => []);
-    const subagentsMap = new Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>();
-
-    for (const liveSub of this.liveSubagents.get(sessionId)?.values() ?? []) {
-      subagentsMap.set(liveSub.agentId, {
-        agentId: liveSub.agentId,
-        ...(liveSub.parentToolUseId ? { parentToolUseId: liveSub.parentToolUseId } : {}),
-        ...(liveSub.description ? { description: liveSub.description } : {}),
-        ...(liveSub.subagentType ? { subagentType: liveSub.subagentType } : {}),
+    const rollout = await this.resolveCodexRolloutPath(sessionId);
+    const subagentsMap = new Map<string, SubagentInfo>();
+    const put = (agentId: unknown, status: SubagentStatus, callId?: string, ts?: string) => {
+      if (typeof agentId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(agentId) || agentId === sessionId) return;
+      if (!subagentsMap.has(agentId) && subagentsMap.size >= 200) return;
+      const previous = subagentsMap.get(agentId);
+      const effective = status === 'unknown' ? previous?.status ?? 'unknown' : status;
+      subagentsMap.set(agentId, {
+        ...previous, agentId, status: effective, subagentType: 'collab',
+        ...(callId ? { parentToolUseId: previous?.parentToolUseId ?? callId } : {}),
+        ...(effective === 'running' ? { startedAt: ts ?? previous?.startedAt, endedAt: undefined }
+          : effective !== 'unknown' ? { endedAt: ts ?? previous?.endedAt } : {}),
+      });
+    };
+    if (rollout) {
+      const text = readSubagentTail(path.dirname(rollout), rollout, 1024 * 1024);
+      for (const line of text.split('\n')) {
+        let entry: any;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const payload = entry?.payload ?? entry;
+        const item = payload?.item ?? payload;
+        if (!item || typeof item !== 'object') continue;
+        const callId = typeof item.call_id === 'string' ? item.call_id : typeof item.id === 'string' ? item.id : undefined;
+        const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
+        if (String(item.type).toLowerCase() === 'subagentactivity') {
+          put(item.agent_thread_id ?? item.agentThreadId ?? item.agentId, subagentStatus(item.kind ?? item.agentStatus), callId, timestamp);
+        } else if (item.type === 'collabAgentToolCall' || item.type === 'collabToolCall') {
+          for (const childId of (Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [item.receiverThreadId]).slice(0, 200)) {
+            put(childId, 'unknown', callId);
+          }
+          if (item.agentsStates && typeof item.agentsStates === 'object') {
+            for (const [childId, state] of Object.entries(item.agentsStates).slice(0, 200)) {
+              put(childId, subagentStatus((state as any)?.status), callId, timestamp);
+            }
+          }
+        } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+          put(extractSubagentIdFromOutput(item.output), 'unknown', callId);
+        }
+      }
+    }
+    for (const child of await this.inner.listSubagentThreadStates(sessionId).catch(() => [])) {
+      put(child.threadId, child.status);
+    }
+    for (const live of this.liveSubagents.get(sessionId)?.values() ?? []) {
+      const disk = subagentsMap.get(live.agentId);
+      const diskEnd = Date.parse(disk?.endedAt ?? '');
+      if (live.status === 'running' && disk?.status !== 'running' && Number.isFinite(diskEnd)) continue;
+      subagentsMap.set(live.agentId, {
+        ...disk, agentId: live.agentId, status: live.status === 'unknown' ? disk?.status ?? 'unknown' : live.status,
+        ...(live.parentToolUseId ? { parentToolUseId: live.parentToolUseId } : {}),
+        ...(live.description ? { description: live.description } : {}),
+        ...(live.subagentType ? { subagentType: live.subagentType } : {}),
+        ...(live.completedAt ? { endedAt: new Date(live.completedAt).toISOString() } : {}),
       });
     }
-    for (const msg of messages) {
-      const meta = msg.metadata;
-      const metaAgentId = (meta?.agent_id as string) ?? (meta?.agentId as string);
-      if (metaAgentId && metaAgentId !== sessionId && !subagentsMap.has(metaAgentId)) {
-        subagentsMap.set(metaAgentId, {
-          agentId: metaAgentId,
-          parentToolUseId: (meta?.parent_tool_use_id as string) ?? (meta?.parentToolUseId as string),
-          description: meta?.description as string | undefined,
-          subagentType: meta?.subagentType as string | undefined,
-        });
-      }
-      for (const part of msg.content) {
-        if (
-          part.type === 'tool_use'
-          && (
-            part.tool_name === 'collabAgentToolCall'
-            || part.tool_name === 'collabToolCall'
-            || part.tool_name === 'spawn_agent'
-            || part.tool_name === 'Agent'
-          )
-        ) {
-          const input = part.input as Record<string, unknown> | undefined;
-          const aId = (input?.receiverThreadId as string)
-            ?? (Array.isArray(input?.receiverThreadIds) ? (input.receiverThreadIds[0] as string) : undefined)
-            ?? extractSubagentIdFromOutput(input);
-          if (aId && aId !== sessionId && !subagentsMap.has(aId)) {
-            subagentsMap.set(aId, {
-              agentId: aId,
-              parentToolUseId: part.tool_call_id,
-              description: (input?.prompt as string) ?? (input?.description as string) ?? (input?.message as string),
-              subagentType: (input?.agent_type as string) ?? (input?.subagentType as string) ?? 'collab',
-            });
-          }
-        }
-        if (part.type === 'tool_result') {
-          const aId = extractSubagentIdFromOutput(part.output ?? part.content)
-            ?? extractSubagentIdFromOutput(part.structured_output ?? part.structuredOutput);
-          if (aId && aId !== sessionId && !subagentsMap.has(aId)) {
-            subagentsMap.set(aId, {
-              agentId: aId,
-              parentToolUseId: part.tool_call_id,
-              subagentType: 'collab',
-            });
-          }
-        }
-      }
-    }
-    return Array.from(subagentsMap.values());
+    return [...subagentsMap.values()].slice(0, 200);
   }
 
   async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {
@@ -2569,14 +2583,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly settings: SettingsStore;
   private readonly liveSubagents = new Map<
     string,
-    Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string; completedAt?: number }>
+    Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string; status: SubagentStatus; startedAt?: number; completedAt?: number }>
   >();
 
   private pruneLiveSubagents(targetSessionId?: string): void {
     const now = Date.now();
     const MAX_ENTRIES_PER_SESSION = 64;
     const TERMINAL_TTL_MS = 5 * 60_000;
-    const pruneList = (list: Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string; completedAt?: number }>) => {
+    const pruneList = (list: Array<{ agentId: string; parentToolUseId?: string; description?: string; subagentType?: string; taskId?: string; status: SubagentStatus; startedAt?: number; completedAt?: number }>) => {
       const filtered = list.filter((item) => !item.completedAt || now - item.completedAt < TERMINAL_TTL_MS);
       if (filtered.length > MAX_ENTRIES_PER_SESSION) {
         return filtered.slice(filtered.length - MAX_ENTRIES_PER_SESSION);
@@ -3001,17 +3015,20 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           if (ev.subagentType || ev.taskType === 'subagent') {
             subagentTasks.add(ev.taskId);
             const liveList = this.liveSubagents.get(effectiveId) ?? [];
-            if (!liveList.some((l) => l.agentId === ev.taskId || l.taskId === ev.taskId)) {
+            const tracked = liveList.find((l) => l.agentId === ev.taskId || l.taskId === ev.taskId);
+            if (tracked) {
+              tracked.status = 'running';
+              tracked.startedAt = ts;
+              tracked.completedAt = undefined;
+              tracked.parentToolUseId = ev.toolUseId ?? tracked.parentToolUseId;
+            } else {
               liveList.push({
-                agentId: ev.taskId,
-                taskId: ev.taskId,
-                parentToolUseId: ev.toolUseId,
-                description: ev.description,
-                subagentType: ev.subagentType,
+                agentId: ev.taskId, taskId: ev.taskId, parentToolUseId: ev.toolUseId,
+                description: ev.description, subagentType: ev.subagentType, status: 'running', startedAt: ts,
               });
-              this.liveSubagents.set(effectiveId, liveList);
-              this.liveSubagents.set(sessionId, liveList);
             }
+            this.liveSubagents.set(effectiveId, liveList);
+            this.liveSubagents.set(sessionId, liveList);
             stream.push({
               kind: 'subagent',
               status: 'started',
@@ -3054,18 +3071,21 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           });
           break;
         case 'task_notification': {
-          const st = ev.status === 'failed' || ev.status === 'error'
-            ? 'failed'
-            : ev.status === 'cancelled'
-              ? 'cancelled'
-              : 'completed';
+          const st: SubagentStatus = ev.status === 'completed'
+            ? 'completed'
+            : ev.status === 'failed' || ev.status === 'error'
+              ? 'failed'
+              : ev.status === 'stopped' || ev.status === 'cancelled' || ev.status === 'killed'
+                ? 'cancelled'
+                : 'unknown';
           const liveList = this.liveSubagents.get(effectiveId) ?? this.liveSubagents.get(sessionId) ?? [];
           const tracked = liveList.find((l) => l.taskId === ev.taskId || l.agentId === ev.taskId);
           const resolvedToolUseId = ev.toolUseId ?? tracked?.parentToolUseId;
           const fallbackParentId = resolvedToolUseId ?? ev.taskId;
+          const streamStatus = st === 'unknown' ? 'updated' : st;
           stream.push({
             kind: 'task',
-            status: st,
+            status: streamStatus,
             sessionId,
             turnId,
             timestamp: ts,
@@ -3084,7 +3104,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           if (wasSubagent) {
             stream.push({
               kind: 'subagent',
-              status: st,
+              status: streamStatus,
               sessionId,
               turnId,
               timestamp: ts,
@@ -3093,13 +3113,14 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
               payload: {
                 agentId: ev.taskId,
                 ...(fallbackParentId ? { parentToolUseId: fallbackParentId } : {}),
-                status: ev.status,
+                status: st,
                 summary: ev.summary,
                 raw: ev,
               },
             });
             if (tracked) {
-              tracked.completedAt = Date.now();
+              tracked.status = st;
+              if (st !== 'unknown') tracked.completedAt = Date.now();
             }
             this.pruneLiveSubagents(effectiveId);
             if (effectiveId !== sessionId) {
@@ -3688,46 +3709,43 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     return this.sessionCwd.get(sessionId);
   }
 
-  async listSubagents(sessionId: string): Promise<Array<{
-    agentId: string;
-    parentToolUseId?: string;
-    description?: string;
-    subagentType?: string;
-  }>> {
+  async listSubagents(sessionId: string): Promise<SubagentInfo[]> {
     const effectiveId = this.resolveEffectiveSessionId(sessionId);
-    const diskDetails: Array<{
-      agentId: string;
-      parentToolUseId?: string;
-      description?: string;
-      subagentType?: string;
-      taskId?: string;
-    }> = typeof (this.inner as any).listSubagentDetails === 'function'
-      ? await (this.inner as any).listSubagentDetails(effectiveId)
-      : (await this.inner.listSubagents(effectiveId)).map((id: string) => ({ agentId: id }));
-
-    const byAgentId = new Map<string, { agentId: string; parentToolUseId?: string; description?: string; subagentType?: string }>();
+    this.pruneLiveSubagents(effectiveId);
+    const diskDetails: Array<SubagentInfo & { taskId?: string }> = typeof this.inner.listSubagentDetails === 'function'
+      ? await this.inner.listSubagentDetails(effectiveId)
+      : (await this.inner.listSubagents(effectiveId)).map((id) => ({ agentId: id, status: 'unknown' }));
+    const byAgentId = new Map<string, SubagentInfo>();
+    const keyOf = new Map<string, string>();
     for (const d of diskDetails) {
-      byAgentId.set(d.agentId, {
-        agentId: d.agentId,
-        ...(d.parentToolUseId ? { parentToolUseId: d.parentToolUseId } : {}),
-        ...(d.description ? { description: d.description } : {}),
-        ...(d.subagentType ? { subagentType: d.subagentType } : {}),
-      });
+      const { taskId, ...info } = d;
+      byAgentId.set(d.agentId, info);
+      keyOf.set(d.agentId, d.agentId);
+      if (taskId) keyOf.set(taskId, d.agentId);
+      if (d.parentToolUseId) keyOf.set(`tool:${d.parentToolUseId}`, d.agentId);
     }
-
     const live = this.liveSubagents.get(effectiveId) ?? this.liveSubagents.get(sessionId) ?? [];
     for (const l of live) {
-      if (!byAgentId.has(l.agentId)) {
-        byAgentId.set(l.agentId, {
-          agentId: l.agentId,
-          ...(l.parentToolUseId ? { parentToolUseId: l.parentToolUseId } : {}),
-          ...(l.description ? { description: l.description } : {}),
-          ...(l.subagentType ? { subagentType: l.subagentType } : {}),
-        });
+      const existingKey = keyOf.get(l.agentId) ?? (l.taskId ? keyOf.get(l.taskId) : undefined)
+        ?? (l.parentToolUseId ? keyOf.get(`tool:${l.parentToolUseId}`) : undefined);
+      const current = existingKey ? byAgentId.get(existingKey) : undefined;
+      const info: SubagentInfo = {
+        ...current, agentId: current?.agentId ?? l.agentId,
+        status: current?.status ?? 'unknown',
+        parentToolUseId: current?.parentToolUseId ?? l.parentToolUseId,
+        description: current?.description ?? l.description,
+        subagentType: current?.subagentType ?? l.subagentType,
+      };
+      const diskTime = Math.max(Date.parse(current?.startedAt ?? '') || 0, Date.parse(current?.endedAt ?? '') || 0);
+      const liveTime = l.completedAt ?? l.startedAt ?? 0;
+      if (l.status !== 'unknown' && (!current || current.status === 'unknown' || liveTime >= diskTime)) {
+        info.status = l.status;
+        info.startedAt = l.startedAt ? new Date(l.startedAt).toISOString() : current?.startedAt;
+        info.endedAt = l.status === 'running' ? undefined : l.completedAt ? new Date(l.completedAt).toISOString() : current?.endedAt;
       }
+      byAgentId.set(info.agentId, info);
     }
-
-    return Array.from(byAgentId.values());
+    return [...byAgentId.values()];
   }
 
   async getSubagentMessages(sessionId: string, agentId: string): Promise<Message[]> {

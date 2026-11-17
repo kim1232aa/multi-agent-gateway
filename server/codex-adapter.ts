@@ -25,6 +25,7 @@ import {
   ProviderError,
   type GranularApprovalDecision,
   type GranularApprovalDetails,
+  type SubagentStatus,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -571,6 +572,13 @@ export function codexFileChangeStats(raw: Record<string, unknown>): { added: num
   return { added, removed };
 }
 
+function codexThreadStatus(value: unknown): SubagentStatus {
+  const type = value && typeof value === 'object' ? (value as { type?: unknown }).type : undefined;
+  if (type === 'active') return 'running';
+  if (type === 'systemError') return 'failed';
+  return 'unknown';
+}
+
 /**
  * Normalize and sanitize a Codex ThreadItem for 0.169.0 / 0.171.0-alpha.5.
  * Returns `null` if a `userMessage` item contained only system-injected tags
@@ -692,10 +700,20 @@ export function normalizeCodexThreadItem(rawItem: CodexThreadItem): CodexThreadI
       }
       break;
     }
-    case 'subAgentActivity': {
-      if (typeof item.agentThreadId === 'string' && !item.agentId) {
-        item.agentId = item.agentThreadId;
-      }
+    case 'subAgentActivity':
+    case 'SubAgentActivity': {
+      const childThreadId = typeof item.agent_thread_id === 'string'
+        ? item.agent_thread_id
+        : typeof item.agentThreadId === 'string'
+          ? item.agentThreadId
+          : undefined;
+      if (childThreadId && !item.agentId) item.agentId = childThreadId;
+      const kind = typeof item.kind === 'string' ? item.kind : undefined;
+      item.agentStatus = kind === 'started' ? 'running'
+        : kind === 'completed' ? 'completed'
+        : kind === 'failed' ? 'failed'
+        : kind === 'cancelled' ? 'cancelled'
+        : 'unknown';
       break;
     }
     case 'plan': {
@@ -2800,6 +2818,24 @@ export class CodexAdapter {
       nextCursor: parsed.nextCursor ?? null,
       backwardsCursor: parsed.backwardsCursor ?? null,
     };
+  }
+
+  async listSubagentThreadStates(
+    parentThreadId: string,
+    limit = 50,
+  ): Promise<Array<{ threadId: string; status: SubagentStatus }>> {
+    if (!parentThreadId || !this.readyPromise || !this.child || this.child.exitCode !== null) return [];
+    const raw = await this.request('thread/list', {
+      sourceKinds: ['subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther'],
+      useStateDbOnly: true,
+      limit: Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 50) : 50,
+      cursor: null,
+    }, 2_000);
+    const parsed = ThreadListResponseSchema.parse(raw);
+    return parsed.data.filter((thread) => thread.parentThreadId === parentThreadId).slice(0, 50).map((thread) => ({
+      threadId: thread.id,
+      status: codexThreadStatus(thread.status),
+    }));
   }
 
   /** Create a new thread (thread/start). Returns the Thread object. */
