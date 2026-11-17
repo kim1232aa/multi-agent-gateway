@@ -555,6 +555,22 @@ export interface NativeModel {
  * - prompt:作为用户 prompt 发送,adapter 层负责展开成实际内容
  *   (如 claude 插件命令的 .md 模板)。
  */
+/**
+ * 一条命令该由谁处理、怎么处理。参照 Ovis 的 "forms, not just names"：
+ * 名字相同不代表行为相同，形态才决定前端和后端的分派。
+ */
+export type NativeCommandForm =
+  /** 前端本地动作（/new /clear 等），无需后端。 */
+  | 'client'
+  /** 网关拦截，映射到 CLI 的 RPC/ACP 方法（compact/fork/undo/permissions…）。 */
+  | 'gateway'
+  /** 原样发给 CLI；CLI 自己展开执行（Claude 的多数命令、Pi 的扩展命令）。 */
+  | 'cli'
+  /** 只能在该 CLI 的交互终端里跑（picker/panel），Web 端无对应读法。 */
+  | 'terminal'
+  /** 目录里有，但本版本未核实行为。 */
+  | 'unknown';
+
 export interface NativeCommand {
   name: string;
   description: string;
@@ -568,6 +584,12 @@ export interface NativeCommand {
   scope?: string;
   /** 仅交互 TUI / 终端风格命令（如 Claude `terminal_slash_commands`），Web 菜单隐藏。 */
   terminalOnly?: boolean;
+  /** 见 NativeCommandForm；未标注时由 kind/terminalOnly 推导。 */
+  form?: NativeCommandForm;
+  /** 目录钉子：本行依据的 CLI 版本。版本不符时 verified=false。 */
+  pinnedVersion?: string;
+  /** 实际运行的 CLI 版本是否与 pinnedVersion 一致（无钉子则为 undefined）。 */
+  verified?: boolean;
   /** Markdown frontmatter 解析出的允许工具列表。 */
   allowedTools?: string[];
   /** Markdown frontmatter 指定的模型覆盖。 */

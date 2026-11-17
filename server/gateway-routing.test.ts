@@ -157,9 +157,12 @@ test('falls back to Kimi for native global routes and keeps non-Kimi config loca
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(envelope({ upstream: true, path: url.pathname }));
   }));
+  // Isolated settings: a provider added through the UI must never change what this test sees.
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-upstream-'));
   const gateway = await startGateway({
     port: 0,
     token: 'gateway-token',
+    settingsDir,
     kimi: { upstream: upstream.url, token: 'upstream-token' },
     codex: fakeAdapter('codex') as any,
     claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
@@ -269,6 +272,7 @@ test('falls back to Kimi for native global routes and keeps non-Kimi config loca
   } finally {
     await gateway.close();
     await upstream.close();
+    await rm(settingsDir, { recursive: true, force: true });
   }
 });
 
@@ -2668,9 +2672,11 @@ test('keeps a running turn visible when the first history fetch fails but a late
 test('surfaces provider DTO catalog errors instead of faking an empty list', async () => {
   const claude = fakeAdapter('claude');
   claude.listModels = async () => { throw new Error('handshake failed'); };
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-catalog-err-'));
   const gateway = await startGateway({
     port: 0,
     token: 'gateway-token',
+    settingsDir,
     kimi: 'off',
     codex: fakeAdapter('codex') as any,
     claude: claude as any, grok: fakeAdapter('grok') as any,
@@ -2687,6 +2693,7 @@ test('surfaces provider DTO catalog errors instead of faking an empty list', asy
     assert.match(body.msg ?? '', /handshake failed/);
   } finally {
     await gateway.close();
+    await rm(settingsDir, { recursive: true, force: true });
   }
 });
 
@@ -2824,6 +2831,40 @@ test('codex login routes delegate to the CLI (device code + poll + logout)', asy
     const claudeLogin = await call('POST', '/oauth/login?provider=claude', {});
     assert.equal(claudeLogin.status, 501);
     assert.match(claudeLogin.body.msg, /claude auth login/);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('a terminal-form command is refused with guidance instead of reaching the model', async () => {
+  const claude = fakeAdapter('claude') as any;
+  let turns = 0;
+  const original = claude.startTurn;
+  claude.startTurn = async (input: StartTurnInput) => { turns += 1; return original(input); };
+  claude.listCommands = async () => [
+    { name: 'doctor', description: 'Check install health', kind: 'prompt', form: 'terminal', pinnedVersion: '2.1.325' },
+    { name: 'compact', description: 'Compact', kind: 'prompt', form: 'gateway' },
+  ];
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions/claude_native/prompts?provider=claude`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: '/doctor' }] }),
+    });
+    const body = (await response.json()) as { code?: number; msg?: string };
+    assert.equal(response.status, 400);
+    assert.match(body.msg ?? '', /只能在 claude 自己的交互终端里运行/);
+    assert.equal(turns, 0, 'the turn must never start');
   } finally {
     await gateway.close();
   }

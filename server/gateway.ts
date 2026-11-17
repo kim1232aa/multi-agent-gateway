@@ -68,6 +68,7 @@ import {
   type GranularApprovalDetails,
   type Message,
   type NativeCommand,
+  type NativeCommandForm,
   type NativeModel,
   type ProviderAdapter,
   type ProviderCapabilities,
@@ -2463,7 +2464,11 @@ async function nativeProviderDto(
 ): Promise<Record<string, unknown>> {
   const overridden = store.activeId(provider) !== undefined;
   // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
-  const models = overridden ? [] : (adapter.listModels ? await adapter.listModels() : []);
+  // 注意:即便网关有注入供应商也照样探测一次,否则 CLI 坏掉会被"注入成功"掩盖。
+  const models = adapter.listModels ? await adapter.listModels().catch((err) => {
+    if (overridden) return [] as NativeModel[];
+    throw err;
+  }) : [];
   return {
     id: provider,
     type: provider,
@@ -2977,6 +2982,10 @@ export function skillDto(command: NativeCommand, cwd?: string): Record<string, u
     ...(source === 'project' && cwd ? { workspace_dir: cwd } : {}),
     type: 'prompt',
     accepts_input: command.acceptsInput !== false,
+    // 形态与版本钉子:前端据此决定直接发送 / 交给网关 / 在终端跑,而不是自己猜。
+    ...(command.form ? { form: command.form } : {}),
+    ...(command.pinnedVersion ? { pinned_version: command.pinnedVersion } : {}),
+    ...(command.verified !== undefined ? { verified: command.verified } : {}),
     ...(command.argumentHint ? { argument_hint: command.argumentHint } : {}),
     ...(aliases && aliases.length > 0 ? { aliases } : {}),
     disable_model_invocation: false,
@@ -2992,6 +3001,7 @@ export async function adapterSkills(
   const cwd = cwdOverride ?? (sessionId ? adapter.getCwd?.(sessionId) : undefined);
   const caps = adapter.capabilities?.() ?? ({} as ProviderCapabilities);
   const tier1Names = activeKimiTier1Names(caps);
+  const provider = adapter.name;
 
   if (adapter.listSkills) {
     const skills = await adapter.listSkills(sessionId, cwd).catch(() => []);
@@ -3030,6 +3040,7 @@ export async function adapterSkills(
   }
   if (adapter.listCommands) {
     const commands = await adapter.listCommands(sessionId, cwd).catch(() => [] as NativeCommand[]);
+    const actualVersion = providerCliVersion(provider);
     for (const command of commands) {
       if (
         command.kind !== 'prompt'
@@ -3039,7 +3050,7 @@ export async function adapterSkills(
       }
       const rawName = command.name;
       const bareName = rawName.startsWith('skill:') ? rawName.slice(6) : rawName;
-      const dto = skillDto(command, cwd);
+      const dto = skillDto(withActualVersion(command, provider, actualVersion), cwd);
       const dedupeKey = `${dto.source === 'builtin' ? 'cmd' : 'skill'}:${bareName}`;
       if (
         tier1Names.has(bareName)
@@ -3052,6 +3063,33 @@ export async function adapterSkills(
     }
   }
   return [...byName.values()];
+}
+
+/** 一条命令在目录里的形态；命令不在目录里返回 undefined。 */
+async function commandFormFromCatalog(
+  adapter: ProviderAdapter,
+  nativeId: string,
+  name: string,
+): Promise<NativeCommandForm | undefined> {
+  if (!adapter.listCommands) return undefined;
+  const commands = await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[]);
+  const bare = name.replace(/^\//, '');
+  const hit = commands.find((c) => c.name === bare || c.name === `skill:${bare}`);
+  if (hit?.form) return hit.form;
+  if (hit?.terminalOnly === true) return 'terminal';
+  return undefined;
+}
+
+/** 实际运行的 CLI 版本（适配器自报优先），用于把目录行标成已验证/未验证。 */
+function providerCliVersion(provider: ProviderName): string | undefined {
+  const override = process.env[`GATEWAY_${provider.toUpperCase()}_VERSION`];
+  return override?.trim() || undefined;
+}
+
+/** 用实际版本重算 verified；没有版本信息时保持 undefined（不假装已验证）。 */
+function withActualVersion(command: NativeCommand, provider: ProviderName, actual: string | undefined): NativeCommand {
+  if (!command.pinnedVersion || !actual) return command;
+  return { ...command, verified: actual === command.pinnedVersion || actual.startsWith(`${command.pinnedVersion}.`) };
 }
 
 function normalizeWorkspaceRoot(root: string): string {
@@ -4100,6 +4138,19 @@ async function submitPrompt(
   const cmd = isLocalProvider(provider)
     ? /^\/(\S+)\s*([\s\S]*)$/.exec(text.trim())
     : null;
+  // 形态优先：命令目录里标成 terminal 的，一律在网关给出说明，不发给 CLI，
+  // 也不当成普通 prompt 送进模型（否则会得到一句莫名其妙的自答）。
+  if (cmd && isLocalProvider(provider)) {
+    const form = await commandFormFromCatalog(adapter, nativeId, cmd[1]);
+    if (form === 'terminal') {
+      throw new ProviderError(
+        'unsupported',
+        `/${cmd[1]} 只能在 ${provider} 自己的交互终端里运行（它会打开需要按键的面板或选择器），Web 端没有对应读法。`
+        + '可以输入 /help 查看网页支持的命令，或在该 CLI 的终端里执行这一条。',
+        400,
+      );
+    }
+  }
   if (cmd && provider === 'codex' && codexGatewayCommandNames().has(cmd[1])) {
     if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
     const [, name, rawArgs] = cmd;

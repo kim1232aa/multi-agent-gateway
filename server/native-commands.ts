@@ -21,7 +21,68 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import type { NativeCommand } from './types.js';
+import type { NativeCommand, NativeCommandForm } from './types.js';
+
+// ---------------------------------------------------------------------------
+// 命令形态（form）：与 Ovis 的 "catalog describes forms, not just names" 对齐。
+// 名字相同不代表行为相同；形态决定前端与网关各自该做什么，避免三处各自猜。
+// ---------------------------------------------------------------------------
+
+/** 本机实测各 CLI 的目录钉子版本；CLI 版本变化时这些行标为未核实。 */
+export const COMMAND_PINS = {
+  claude: '2.1.325',
+  codex: '0.169.0',
+  grok: '1.0.77',
+  pi: '1.5.2',
+  dsh: '0.2.2-rc.1',
+} as const;
+
+export type PinnableProvider = keyof typeof COMMAND_PINS;
+
+/** 给一条命令补 form / pinnedVersion / verified；已有的 form 不覆盖。 */
+export function withForm(
+  command: NativeCommand,
+  form: NativeCommandForm,
+  provider?: PinnableProvider,
+  actualVersion?: string,
+): NativeCommand {
+  const pin = provider ? COMMAND_PINS[provider] : undefined;
+  return {
+    ...command,
+    form: command.form ?? form,
+    ...(pin ? { pinnedVersion: pin } : {}),
+    ...(pin && actualVersion ? { verified: actualVersion === pin || actualVersion.startsWith(`${pin}.`) } : {}),
+  };
+}
+
+/**
+ * 客户端命令的形态恒为 client；终端的恒为 terminal。
+ * 其余按命令本来的处理方判定：网关拦截集合 → gateway；来自 CLI 自己目录或扩展的 → cli。
+ * 兜底为 cli：发给 CLI 由它自己展开，不认识的它会明确报错——这比静默当成聊天消息好。
+ * `unknown` 留给来源显式标注（例如目录探测失败）。
+ */
+export function classifyCommand(
+  command: NativeCommand,
+  gatewayNames: ReadonlySet<string>,
+): NativeCommandForm {
+  if (command.terminalOnly === true) return 'terminal';
+  if (command.kind === 'client') return 'client';
+  if (gatewayNames.has(command.name)) return 'gateway';
+  if (command.source === 'extension' || command.source === 'prompt') return 'cli';
+  if (command.builtin === true) return 'cli';
+  if (command.path) return 'cli';
+  return 'cli';
+}
+
+/** 深拷贝并统一补形态；`actualVersion` 给出时顺带算 verified。 */
+export function applyForms(
+  commands: NativeCommand[],
+  gatewayNames: ReadonlySet<string>,
+  provider: PinnableProvider,
+  actualVersion?: string,
+): NativeCommand[] {
+  return commands.map((c) => withForm({ ...c }, classifyCommand(c, gatewayNames), provider, actualVersion));
+}
 
 // ---------------------------------------------------------------------------
 // client 命令:web UI 本地动作(前端 handleCommand 已能实现)
@@ -115,7 +176,7 @@ export function listCodexCommands(
       ...(s.scope ? { scope: s.scope } : {}),
     });
   }
-  return out;
+  return applyForms(out, codexGatewayCommandNames(), 'codex');
 }
 
 function tokenizeSkillArgs(argText: string): string[] {
@@ -367,7 +428,7 @@ export function listGrokCommands(
       ...(s.scope ? { scope: s.scope } : {}),
     });
   }
-  return [...byName.values()];
+  return applyForms([...byName.values()], grokGatewayCommandNames(), 'grok');
 }
 
 /**
@@ -524,7 +585,7 @@ export function listPiCommands(
       ...(scope ? { scope } : {}),
     });
   }
-  return out;
+  return applyForms(out, piGatewayCommandNames(), 'pi');
 }
 
 // ---------------------------------------------------------------------------
@@ -669,7 +730,7 @@ export function listClaudeCommands(
       ...(gw.argumentHint ? { argumentHint: gw.argumentHint } : {}),
     });
   }
-  return [...clientCommands(), ...prompts];
+  return applyForms([...clientCommands(), ...prompts], claudeGatewayCommandNames(), 'claude');
 }
 
 export interface DiscoverClaudeDiskCommandsOptions {
@@ -1009,7 +1070,7 @@ export function listDshCommands(
       ...(s.scope ? { scope: s.scope } : {}),
     });
   }
-  return out;
+  return applyForms(out, dshGatewayCommandNames(), 'dsh');
 }
 
 export function expandDshSkill(

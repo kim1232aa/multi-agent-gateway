@@ -1855,6 +1855,94 @@
   });
   if (document.documentElement) providersPanelObserver.observe(document.documentElement, { childList: true, subtree: true });
 
+  // -- 命令形态守卫 ----------------------------------------------------------
+  // 后端的命令目录带 form（client / gateway / cli / terminal / unknown）。
+  // terminal 形态的命令只能在 CLI 的交互终端里跑，直接当 prompt 发出去只会得到
+  // 一句“不支持”或静默失败；在这里拦下并给出可执行的替代做法。
+  var commandForms = Object.create(null); // provider -> { name: { form, pinnedVersion, verified } }
+
+  function rememberCommandForms(provider, items) {
+    if (!provider || !Array.isArray(items)) return;
+    var map = commandForms[provider] || (commandForms[provider] = Object.create(null));
+    for (var i = 0; i < items.length; i += 1) {
+      var item = items[i];
+      if (!item || typeof item.name !== 'string') continue;
+      var name = item.name.replace(/^\//, '').toLowerCase();
+      map[name] = {
+        form: typeof item.form === 'string' ? item.form : '',
+        pinnedVersion: typeof item.pinned_version === 'string' ? item.pinned_version : '',
+        verified: item.verified === true,
+      };
+    }
+  }
+
+  function commandFormOf(provider, name) {
+    var map = commandForms[provider];
+    return map ? map[String(name).replace(/^\//, '').toLowerCase()] : undefined;
+  }
+
+  function noticeForTerminalCommand(provider, name) {
+    var label = provider.charAt(0).toUpperCase() + provider.slice(1);
+    return '`/' + name + '` 只能在 ' + label
+      + ' 自己的交互终端里运行（它会打开需要按键操作的面板或选择器），Web 端没有对应的读法，因此没有发送。'
+      + '\n\n可以改用：网页支持的命令（输入 `/help` 查看），或在该 CLI 的终端里执行这一条。';
+  }
+
+  function showComposerNotice(text) {
+    if (!document.querySelector || typeof document.createElement !== 'function') return;
+    var host = document.querySelector('.composer') || document.querySelector('.empty-composer');
+    if (!host || !host.parentElement) return;
+    var box = document.querySelector('.multi-agent-cmd-notice');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'multi-agent-cmd-notice';
+      host.parentElement.insertBefore(box, host);
+    }
+    box.textContent = text;
+    clearTimeout(box.__hideTimer);
+    box.__hideTimer = setTimeout(function () {
+      try { box.remove(); } catch (_) {}
+    }, 12000);
+  }
+
+  /** 发送前的形态判定：返回 true 表示已拦下（不该作为普通 prompt 发送）。 */
+  function blockTerminalCommand(bodyText) {
+    var provider = selectedProvider();
+    if (provider === 'kimi' || typeof bodyText !== 'string' || bodyText.indexOf('/') === -1) return false;
+    var match = bodyText.match(/^\s{0,200}?\/([A-Za-z0-9_:-]+)/);
+    if (!match && bodyText.charAt(0) === '{') {
+      try {
+        var body = JSON.parse(bodyText);
+        var args = body && typeof body.args === 'string' ? body.args : '';
+        match = args.match(/^\s*\/?([A-Za-z0-9_:-]+)/);
+      } catch (_) { match = null; }
+    }
+    if (!match) return false;
+    var entry = commandFormOf(provider, match[1]);
+    if (!entry || entry.form !== 'terminal') return false;
+    showComposerNotice(noticeForTerminalCommand(provider, match[1]));
+    return true;
+  }
+
+  // 命令目录随会话/CLI 切换刷新；只缓存，不阻塞请求。
+  var originalFetchForCommands = window.fetch;
+  window.fetch = function (input, init) {
+    var url = rewriteApiUrl(input);
+    var isCommands = /\/sessions\/[^/]+\/skills$/.test(url.pathname) || /\/api\/v1\/commands$/.test(url.pathname);
+    var result = originalFetchForCommands.call(this, input, init);
+    if (isCommands && typeof result.then === 'function') {
+      var provider = selectedProvider();
+      result.then(function (res) {
+        if (!res || !res.ok || typeof res.clone !== 'function') return null;
+        return res.clone().json().then(function (body) {
+          rememberCommandForms(provider, (body && body.data && body.data.items) || (body && body.items));
+          return null;
+        }).catch(function () { return null; });
+      }).catch(function () {});
+    }
+    return result;
+  };
+
   var observer = new MutationObserver(function (records) {
     if (records.some(mutationAffectsUi)) scheduleSyncUi();
   });
