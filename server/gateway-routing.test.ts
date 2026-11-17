@@ -326,6 +326,11 @@ test('uses provider-native cursors for non-Kimi session pagination', async () =>
 });
 
 test('builds local workspaces across all provider-native pages', async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'mag-ws-pages-'));
+  const olderDir = join(scratchDir, 'older');
+  const newerDir = join(scratchDir, 'newer');
+  await mkdir(olderDir, { recursive: true });
+  await mkdir(newerDir, { recursive: true });
   const codex = fakeAdapter('codex');
   const calls: ListSessionsQuery[] = [];
   const makeSession = (id: string, cwd: string): Session => ({
@@ -341,8 +346,8 @@ test('builds local workspaces across all provider-native pages', async () => {
   codex.list = async (query: ListSessionsQuery = {}): Promise<SessionPage> => {
     calls.push({ ...query });
     return query.cursor === 'workspace-page-2'
-      ? { items: [makeSession('older', '/tmp/older')] }
-      : { items: [makeSession('newer', '/tmp/newer')], next_cursor: 'workspace-page-2' };
+      ? { items: [makeSession('older', olderDir)] }
+      : { items: [makeSession('newer', newerDir)], next_cursor: 'workspace-page-2' };
   };
   const gateway = await startGateway({
     port: 0,
@@ -358,11 +363,12 @@ test('builds local workspaces across all provider-native pages', async () => {
       headers: { authorization: 'Bearer gateway-token' },
     });
     const roots = (await response.json() as any).data.items.map((workspace: any) => workspace.root).sort();
-    assert.deepEqual(roots, ['/tmp/newer', '/tmp/older']);
+    assert.deepEqual(roots, [newerDir, olderDir].sort());
     assert.equal(calls.some((query) => query.cursor === 'workspace-page-2'), true);
     assert.equal(calls.some((query) => query.limit === 500), false);
   } finally {
     await gateway.close();
+    await rm(scratchDir, { recursive: true, force: true });
   }
 });
 
@@ -3061,6 +3067,13 @@ test('GET grok session status fills max_context_tokens from grok window when usa
 });
 
 test('GET /api/v2/sessions?view=by_workspace returns groups for local providers', async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'mag-ws-v2-'));
+  const dirA = join(scratchDir, 'a');
+  const dirB = join(scratchDir, 'b');
+  const dirC = join(scratchDir, 'c');
+  await mkdir(dirA, { recursive: true });
+  await mkdir(dirB, { recursive: true });
+  await mkdir(dirC, { recursive: true });
   const grok = fakeAdapter('grok');
   grok.list = async () => ({
     items: [
@@ -3071,7 +3084,7 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
         created_at: '2026-08-24T01:00:00.000Z',
         updated_at: '2026-08-24T03:00:00.000Z',
         busy: false,
-        metadata: { cwd: '/tmp/a' },
+        metadata: { cwd: dirA },
         extras: { last_prompt: 'new in a' },
         provider: 'grok',
       },
@@ -3082,7 +3095,7 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
         created_at: '2026-08-23T01:00:00.000Z',
         updated_at: '2026-08-23T03:00:00.000Z',
         busy: false,
-        metadata: { cwd: '/tmp/a' },
+        metadata: { cwd: dirA },
         extras: { last_prompt: 'old in a' },
         provider: 'grok',
       },
@@ -3093,7 +3106,7 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
         created_at: '2026-08-24T02:00:00.000Z',
         updated_at: '2026-08-24T02:00:00.000Z',
         busy: false,
-        metadata: { cwd: '/tmp/b' },
+        metadata: { cwd: dirB },
         extras: { last_prompt: 'in b' },
         provider: 'grok',
       },
@@ -3104,7 +3117,7 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
         created_at: '2026-08-24T04:00:00.000Z',
         updated_at: '2026-08-24T04:00:00.000Z',
         busy: false,
-        metadata: { cwd: '/tmp/c' },
+        metadata: { cwd: dirC },
         provider: 'grok',
       },
     ],
@@ -3131,11 +3144,11 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
     assert.equal(data.groups.length, 2);
     assert.equal(data.total, 2);
     assert.equal(data.has_more, false);
-    assert.equal(data.groups[0].workspace.cwd, '/tmp/a');
+    assert.equal(data.groups[0].workspace.cwd, dirA);
     assert.equal(data.groups[0].sessions.length, 1);
     assert.equal(data.groups[0].sessions[0].id, 'grok_g-new');
     assert.equal(data.groups[0].total, 2);
-    assert.equal(data.groups[1].workspace.cwd, '/tmp/b');
+    assert.equal(data.groups[1].workspace.cwd, dirB);
     assert.equal(data.groups[1].sessions[0].id, 'grok_g-b');
 
     const empty = fakeAdapter('codex');
@@ -3171,6 +3184,7 @@ test('GET /api/v2/sessions?view=by_workspace returns groups for local providers'
     assert.equal(flatData.groups, undefined);
   } finally {
     await gateway.close();
+    await rm(scratchDir, { recursive: true, force: true });
   }
 });
 
@@ -3442,6 +3456,11 @@ test('rejects tower mode for all local providers and allows Grok compact/goal wh
 });
 
 test('by_workspace fetches all pages beyond 100 sessions and prompts:steer retains attachments', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-m15-steer-'));
+  const wsDirA = join(settingsDir, 'ws-a');
+  const wsDirB = join(settingsDir, 'ws-b');
+  await mkdir(wsDirA, { recursive: true });
+  await mkdir(wsDirB, { recursive: true });
   const codex = fakeAdapter('codex');
   const allItems: Session[] = Array.from({ length: 115 }, (_, idx) => ({
     id: `c-${idx}`,
@@ -3450,7 +3469,7 @@ test('by_workspace fetches all pages beyond 100 sessions and prompts:steer retai
     created_at: new Date(idx * 1000).toISOString(),
     updated_at: new Date(1_700_000_000_000 + idx * 1000).toISOString(),
     busy: false,
-    metadata: { cwd: idx % 2 === 0 ? '/tmp/ws-a' : '/tmp/ws-b' },
+    metadata: { cwd: idx % 2 === 0 ? wsDirA : wsDirB },
     provider: 'codex',
   }));
   codex.list = async (query: ListSessionsQuery = {}): Promise<SessionPage> => {
@@ -3478,7 +3497,6 @@ test('by_workspace fetches all pages beyond 100 sessions and prompts:steer retai
     steers.push({ text, attachments });
   };
 
-  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-m15-steer-'));
   const gateway = await startGateway({
     port: 0,
     token: 'gateway-token',
@@ -5017,6 +5035,7 @@ test('gateway filters empty (session) placeholders, dedupes :activate skill chip
   const prevXdg = process.env.XDG_CONFIG_HOME;
   const cfgRoot = await mkdtemp(join(tmpdir(), 'gw-pi-advisor-xdg-'));
   process.env.XDG_CONFIG_HOME = cfgRoot;
+  await mkdir(join(cfgRoot, 'real'), { recursive: true });
 
   const pi = fakeAdapter('pi') as any;
   const piPrompts: string[] = [];
@@ -5066,7 +5085,7 @@ test('gateway filters empty (session) placeholders, dedupes :activate skill chip
         updated_at: '2026-11-15T00:00:00.000Z',
         busy: false,
         extras: { last_prompt: '' },
-        metadata: { cwd: '/tmp/empty' },
+        metadata: { cwd: join(cfgRoot, 'empty') },
         provider: 'grok',
       },
       {
@@ -5077,7 +5096,7 @@ test('gateway filters empty (session) placeholders, dedupes :activate skill chip
         updated_at: '2026-11-15T00:01:00.000Z',
         busy: false,
         extras: { last_prompt: 'Real Chat' },
-        metadata: { cwd: '/tmp/real' },
+        metadata: { cwd: join(cfgRoot, 'real') },
         provider: 'grok',
       },
     ],
@@ -5952,4 +5971,219 @@ test('review regression: steer during active turn and non-disk-flushing provider
   }
 });
 
+test('review regression: changing the workspace primary keeps the old root inside the same stored workspace', async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'mag-ws-primary-keep-'));
+  const rootA = join(scratchDir, 'root-a');
+  const rootB = join(scratchDir, 'root-b');
+  const rootC = join(scratchDir, 'root-c');
+  for (const dir of [rootA, rootB, rootC]) await mkdir(dir, { recursive: true });
+  const codex = fakeAdapter('codex');
+  const session = (id: string, cwd: string): Session => ({
+    id, workspace_id: '', title: id,
+    created_at: '2026-11-17T01:00:00.000Z', updated_at: '2026-11-17T02:00:00.000Z',
+    busy: false, metadata: { cwd }, extras: { last_prompt: `prompt ${id}` }, provider: 'codex',
+  });
+  codex.list = async () => ({ items: [session('sa', rootA), session('sb', rootB), session('sc', rootC)] });
+  const fixture = await reviewRegressionFixture({ adapters: { codex } });
+  try {
+    const created = ((await (await fixture.request('/workspaces?provider=codex', 'POST', {
+      root: rootA, name: 'Project', additional_dirs: [rootB, rootC],
+    })).json()) as any).data;
+    const primary = await fixture.request(`/workspaces/${encodeURIComponent(created.id)}/primary?provider=codex`, 'POST', { path: rootB });
+    assert.equal(primary.status, 200);
+
+    const items = ((await (await fixture.request('/workspaces?provider=codex')).json()) as any).data.items as any[];
+    const ids = items.map((w) => w.id);
+    assert.equal(new Set(ids).size, ids.length, `workspace ids must be unique: ${ids.join(', ')}`);
+    assert.equal(items.length, 1, 'all three roots belong to the one stored workspace');
+    assert.equal(items[0].root, rootB);
+    assert.deepEqual([...items[0].additional_dirs].sort(), [rootA, rootC].sort());
+    assert.equal(items[0].session_count, 3);
+
+    const groups = ((await (await fetch(`${fixture.gateway.url}/api/v2/sessions?provider=codex&view=by_workspace`, {
+      headers: { authorization: 'Bearer review-token' },
+    })).json()) as any).data.groups as any[];
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0].workspace.id, created.id);
+    assert.equal(groups[0].workspace.cwd, rootB, 'the group uses the current primary root');
+    assert.equal(groups[0].total, 3);
+  } finally {
+    await fixture.close();
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+test('review regression: SessionAdmin meta.archived=all returns open and archived sessions together', async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'mag-archived-all-'));
+  const codex = fakeAdapter('codex');
+  const session = (id: string, updated: string, archived: boolean): Session => ({
+    id, workspace_id: '', title: id,
+    created_at: '2026-11-17T01:00:00.000Z', updated_at: updated,
+    busy: false, archived, metadata: { cwd: scratchDir }, extras: { last_prompt: `prompt ${id}` }, provider: 'codex',
+  });
+  codex.list = async (query: ListSessionsQuery = {}): Promise<SessionPage> => {
+    const all = [
+      session('open-new', '2026-11-17T05:00:00.000Z', false),
+      session('done-mid', '2026-11-17T04:00:00.000Z', true),
+      session('open-old', '2026-11-17T03:00:00.000Z', false),
+    ];
+    return { items: query.archived === true ? all.filter((s) => s.archived) : all };
+  };
+  const fixture = await reviewRegressionFixture({ adapters: { codex } });
+  try {
+    const get = async (query: string) => ((await (await fetch(`${fixture.gateway.url}/api/v2/sessions?provider=codex&${query}`, {
+      headers: { authorization: 'Bearer review-token' },
+    })).json()) as any).data;
+    const all = await get('meta.archived=all&page=1&page_size=20');
+    assert.equal(all.total, 3);
+    assert.deepEqual(all.items.map((s: any) => s.id), ['codex_open-new', 'codex_done-mid', 'codex_open-old']);
+    const open = await get('meta.archived=false&page=1&page_size=20');
+    assert.deepEqual(open.items.map((s: any) => s.id), ['codex_open-new', 'codex_open-old']);
+    const done = await get('meta.archived=true&page=1&page_size=20');
+    assert.deepEqual(done.items.map((s: any) => s.id), ['codex_done-mid']);
+  } finally {
+    await fixture.close();
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+test('review regression: a missing session directory is stat-ed once per workspace listing, not once per session', async () => {
+  const missing = join(tmpdir(), 'mag-missing-dir-' + Date.now());
+  const grok = fakeAdapter('grok');
+  grok.list = async () => ({
+    items: Array.from({ length: 6 }, (_, idx): Session => ({
+      id: `m-${idx}`, workspace_id: '', title: `m-${idx}`,
+      created_at: '2026-11-17T01:00:00.000Z', updated_at: '2026-11-17T02:00:00.000Z',
+      busy: false, metadata: { cwd: missing }, extras: { last_prompt: 'hello' }, provider: 'grok',
+    })),
+  });
+  const fixture = await reviewRegressionFixture({ adapters: { grok } });
+  const originalStatSync = fs.statSync;
+  let probes = 0;
+  try {
+    Object.defineProperty(fs, 'statSync', { value: (target: unknown, ...args: unknown[]) => {
+      if (String(target) === missing) probes += 1;
+      return (originalStatSync as any)(target, ...args);
+    } });
+    syncBuiltinESMExports();
+    const response = await fixture.request('/workspaces?provider=grok');
+    assert.equal(response.status, 200);
+    assert.equal(((await response.json()) as any).data.items.length, 0);
+    assert.equal(probes, 1, `expected 1 stat for the missing directory across 6 sessions, got ${probes}`);
+  } finally {
+    Object.defineProperty(fs, 'statSync', { value: originalStatSync });
+    syncBuiltinESMExports();
+    await fixture.close();
+  }
+});
+
+test('review regression: nested model ids and flags in DSH profile config are not treated as plugins', async () => {
+  const dshHome = await mkdtemp(join(tmpdir(), 'mag-dsh-nested-'));
+  const acpDir = join(dshHome, 'profiles', 'acp');
+  await mkdir(acpDir, { recursive: true });
+  const { readDshAcpProfile } = await import('./gateway.js');
+  try {
+    await writeFile(join(acpDir, 'cordis.patch.yml'), [
+      '  - id: llm-pi-ai',
+      '    config:',
+      '      models:',
+      '        - id: private-model-name',
+      '          disabled: true',
+      '        - id: another-model',
+      '  - id: acp',
+      '    config:',
+      '      disabled: true',
+      '  - id: off-plugin',
+      '    disabled: true',
+      '  - id: plugin-b',
+      '',
+    ].join('\n'));
+    assert.deepEqual(readDshAcpProfile(dshHome).patchPlugins, ['llm-pi-ai', 'acp', 'plugin-b']);
+  } finally {
+    await rm(dshHome, { recursive: true, force: true });
+  }
+});
+
+test('review regression: v2 flat sidebar pagination follows the provider cursor without fetching every page', async () => {
+  const codex = fakeAdapter('codex');
+  const calls: ListSessionsQuery[] = [];
+  codex.list = async (query: ListSessionsQuery = {}) => {
+    calls.push({ ...query });
+    const index = query.cursor === 'native-second-page' ? 2 : 1;
+    return {
+      items: [{
+        id: `side-${index}`, workspace_id: '', title: `sidebar ${index}`,
+        created_at: '2026-11-17T01:00:00.000Z', updated_at: '2026-11-17T02:00:00.000Z',
+        busy: false, metadata: { cwd: '/tmp' }, extras: { last_prompt: `sidebar ${index}` }, provider: 'codex' as const,
+      }],
+      ...(index === 1 ? { next_cursor: 'native-second-page' } : {}),
+    };
+  };
+  const fixture = await reviewRegressionFixture({ adapters: { codex } });
+  try {
+    calls.length = 0;
+    const get = async (suffix: string) => {
+      const response = await fetch(`${fixture.gateway.url}/api/v2/sessions?provider=codex&page_size=1&include=git${suffix}`, {
+        headers: { authorization: 'Bearer review-token' },
+      });
+      assert.equal(response.status, 200);
+      return ((await response.json()) as any).data;
+    };
+    const first = await get('');
+    assert.deepEqual(first.items.map((item: any) => item.id), ['codex_side-1']);
+    assert.equal(first.has_more, true);
+    assert.equal(calls.length, 1);
+    const second = await get(`&page_token=${encodeURIComponent(first.next_page_token)}`);
+    assert.deepEqual(second.items.map((item: any) => item.id), ['codex_side-2']);
+    assert.equal(second.has_more, false);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1]?.cursor, 'native-second-page');
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('review regression: SessionAdmin select-all filters multi workspace.id, dates, meta.archived=all and projects fields=id,archived', async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'mag-sa-selectall-'));
+  const dirA = join(scratchDir, 'dir-a');
+  const dirB = join(scratchDir, 'dir-b');
+  const dirC = join(scratchDir, 'dir-c');
+  for (const d of [dirA, dirB, dirC]) await mkdir(d, { recursive: true });
+  const codex = fakeAdapter('codex');
+  const mk = (id: string, cwd: string, updated: string, archived: boolean): Session => ({
+    id, workspace_id: '', title: id, created_at: updated, updated_at: updated, busy: false, archived,
+    metadata: { cwd }, extras: { last_prompt: id }, provider: 'codex',
+  });
+  const all = [
+    mk('a-in', dirA, '2026-11-17T10:00:00.000Z', false),
+    mk('b-in-arch', dirB, '2026-11-17T08:00:00.000Z', true),
+    mk('c-wrong-ws', dirC, '2026-11-17T09:00:00.000Z', false),
+    mk('a-too-old', dirA, '2026-11-15T00:00:00.000Z', false),
+  ];
+  codex.list = async (q: ListSessionsQuery = {}): Promise<SessionPage> => ({
+    items: q.archived === true ? all.filter((x) => x.archived) : all.filter((x) => !x.archived),
+  });
+  const fixture = await reviewRegressionFixture({ adapters: { codex } });
+  try {
+    const wsA = ((await (await fixture.request('/workspaces?provider=codex', 'POST', { root: dirA, name: 'A' })).json()) as any).data;
+    const wsB = ((await (await fixture.request('/workspaces?provider=codex', 'POST', { root: dirB, name: 'B' })).json()) as any).data;
+    const after = Date.parse('2026-11-17T00:00:00.000Z');
+    const before = Date.parse('2026-11-17T23:59:59.000Z');
+    const qs = `provider=codex&meta.archived=all&workspace.id=${encodeURIComponent(wsA.id)}&workspace.id=${encodeURIComponent(wsB.id)}&meta.updated_after=${after}&meta.updated_before=${before}&fields=id,archived&page_size=1`;
+    const p1 = ((await (await fetch(`${fixture.gateway.url}/api/v2/sessions?${qs}`, {
+      headers: { authorization: 'Bearer review-token' },
+    })).json()) as any).data;
+    assert.equal(p1.total, 2);
+    assert.equal(p1.has_more, true);
+    assert.deepEqual(p1.items, [{ id: 'codex_a-in', archived: false }]);
+    const p2 = ((await (await fetch(`${fixture.gateway.url}/api/v2/sessions?${qs}&page_token=${encodeURIComponent(p1.next_page_token)}`, {
+      headers: { authorization: 'Bearer review-token' },
+    })).json()) as any).data;
+    assert.equal(p2.has_more, false);
+    assert.deepEqual(p2.items, [{ id: 'codex_b-in-arch', archived: true }]);
+  } finally {
+    await fixture.close();
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+});
 

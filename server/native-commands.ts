@@ -974,10 +974,10 @@ export interface DshGatewayCommand extends NativeCommand {
 }
 
 const DSH_GATEWAY_COMMANDS: DshGatewayCommand[] = [
-  { name: 'status', description: 'Show DSH session model, permission, and usage', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'status', description: 'Show DSH session model, ACP channel limitations, and active plugins', kind: 'prompt', takesArgs: false, builtin: true },
   { name: 'diff', description: 'Show git diff for uncommitted changes in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
-  { name: 'skills', description: 'List available DSH skills in this workspace', kind: 'prompt', takesArgs: false, builtin: true },
-  { name: 'help', description: 'Show available Web UI commands for DSH', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'skills', description: 'List active DSH plugins and bundles from ACP profile', kind: 'prompt', takesArgs: false, builtin: true },
+  { name: 'help', description: 'Show available Web UI commands and DSH ACP channel capabilities', kind: 'prompt', takesArgs: false, builtin: true },
 ];
 
 export function dshGatewayCommandNames(): Set<string> {

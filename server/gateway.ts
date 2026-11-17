@@ -16,7 +16,7 @@ import { createConnection } from 'node:net';
 import { randomUUID, createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { Duplex } from 'node:stream';
 import * as fsp from 'node:fs/promises';
-import { accessSync, constants as fsConstants, existsSync, readFileSync } from 'node:fs';
+import { accessSync, constants as fsConstants, existsSync, readFileSync, statSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { loadWebShell, type WebShell } from './web-assets.js';
@@ -821,30 +821,157 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     const provider: ProviderName | undefined = providerParam && isProviderName(providerParam) ? providerParam : undefined;
 
     if (url.pathname === '/api/v2/sessions' && req.method === 'GET') {
-      const archived = url.searchParams.get('meta.archived') === 'true';
+      const archivedParam = url.searchParams.get('meta.archived');
+      const archivedAll = archivedParam === 'all';
+      const archivedOnly = archivedParam === 'true';
       const view = url.searchParams.get('view');
-      const v1 = new URL(url.href);
-      // 侧栏 load 走 view=by_workspace,不带 page_size;分组需要全量会话,不能在 100 条处截断。
-      v1.searchParams.set('page_size', view === 'by_workspace' ? '500' : (url.searchParams.get('page_size') || '50'));
-      if (archived) v1.searchParams.set('archived_only', 'true');
-      const pageToken = url.searchParams.get('page_token');
-      if (pageToken) v1.searchParams.set('before_id', pageToken);
-      const data = await listSessions(
-        adapters,
-        kimiFetch,
-        v1,
-        provider,
-        (sid) => hub.busy.has(sid),
-        sessionPageCursors,
-        demoActive,
-        view === 'by_workspace',
-        workspaceStore,
+      const pageParam = url.searchParams.get('page');
+      const page = pageParam ? Math.max(1, Number(pageParam) || 1) : undefined;
+      const fieldsParam = (url.searchParams.get('fields') ?? '').trim();
+      const maxPageSize = fieldsParam ? 10_000 : 100;
+      const pageSize = Math.min(
+        maxPageSize,
+        Math.max(1, Number(url.searchParams.get('page_size') ?? (view === 'by_workspace' ? 500 : 50)) || 50),
       );
-      const items = ((data.items ?? []) as Record<string, unknown>[]).map((item) => sessionV2Dto(item, Boolean(item.busy)));
-      if (view === 'by_workspace') {
-        return ok(res, sessionGroupsV2(items, url), requestId);
+      const filterWsIds = new Set(url.searchParams.getAll('workspace.id').filter(Boolean));
+      const updatedAfter = parseV2TimestampBound(url.searchParams.get('meta.updated_after'));
+      const updatedBefore = parseV2TimestampBound(url.searchParams.get('meta.updated_before'));
+      const activityStatuses = new Set(url.searchParams.getAll('activity.status').filter(Boolean));
+      const sortParam = url.searchParams.get('sort') ?? '';
+      const hasV2Filters =
+        filterWsIds.size > 0 ||
+        updatedAfter !== undefined ||
+        updatedBefore !== undefined ||
+        activityStatuses.size > 0 ||
+        Boolean(fieldsParam) ||
+        Boolean(sortParam && sortParam !== 'meta.updated_at_desc');
+      const isPageMode = page !== undefined;
+      const fetchAll = view === 'by_workspace' || isPageMode || archivedAll || hasV2Filters;
+      const pageToken = url.searchParams.get('page_token');
+
+      let rawItems: Record<string, unknown>[];
+      let upstreamHasMore = false;
+      if (archivedAll) {
+        const v1Open = new URL(url.href);
+        v1Open.searchParams.set('page_size', '500');
+        v1Open.searchParams.delete('archived_only');
+        v1Open.searchParams.delete('before_id');
+        const v1Archived = new URL(url.href);
+        v1Archived.searchParams.set('page_size', '500');
+        v1Archived.searchParams.set('archived_only', 'true');
+        v1Archived.searchParams.delete('before_id');
+        const [openData, archivedData] = await Promise.all([
+          listSessions(adapters, kimiFetch, v1Open, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive, true, workspaceStore),
+          listSessions(adapters, kimiFetch, v1Archived, provider, (sid) => hub.busy.has(sid), sessionPageCursors, demoActive, true, workspaceStore),
+        ]);
+        const byId = new Map<string, Record<string, unknown>>();
+        for (const item of [...((openData.items ?? []) as Record<string, unknown>[]), ...((archivedData.items ?? []) as Record<string, unknown>[])]) {
+          const sid = String(item.id ?? '');
+          if (sid && !byId.has(sid)) byId.set(sid, item);
+        }
+        rawItems = [...byId.values()];
+      } else {
+        const v1 = new URL(url.href);
+        // 侧栏 load 走 view=by_workspace 或分页/过滤模式走全量抓取后内存切片
+        v1.searchParams.set('page_size', fetchAll ? '500' : String(pageSize));
+        if (archivedOnly) v1.searchParams.set('archived_only', 'true');
+        if (pageToken && !fetchAll) v1.searchParams.set('before_id', pageToken);
+        const data = await listSessions(
+          adapters,
+          kimiFetch,
+          v1,
+          provider,
+          (sid) => hub.busy.has(sid),
+          sessionPageCursors,
+          demoActive,
+          fetchAll,
+          workspaceStore,
+        );
+        rawItems = (data.items ?? []) as Record<string, unknown>[];
+        upstreamHasMore = Boolean(data.has_more);
       }
-      return ok(res, { items, has_more: Boolean(data.has_more), next_page_token: data.has_more ? String(items[items.length - 1]?.id ?? '') : null }, requestId);
+
+      let allItems = rawItems.map((item) => sessionV2Dto(item, Boolean(item.busy)));
+      if (filterWsIds.size > 0) {
+        allItems = allItems.filter((it) => filterWsIds.has(String((it.workspace as { id?: string } | undefined)?.id ?? '')));
+      }
+      if (archivedParam === 'false') {
+        allItems = allItems.filter((it) => (it.meta as { archived?: boolean } | undefined)?.archived !== true);
+      }
+      if (updatedAfter !== undefined) {
+        allItems = allItems.filter((it) => Number((it.meta as { updated_at?: number } | undefined)?.updated_at ?? 0) >= updatedAfter);
+      }
+      if (updatedBefore !== undefined) {
+        allItems = allItems.filter((it) => Number((it.meta as { updated_at?: number } | undefined)?.updated_at ?? 0) <= updatedBefore);
+      }
+      if (activityStatuses.size > 0) {
+        allItems = allItems.filter((it) => activityStatuses.has(String((it.activity as { status?: string } | undefined)?.status ?? '')));
+      }
+      if (fetchAll) {
+        const field = sortParam.startsWith('meta.created_at') ? 'created_at' : 'updated_at';
+        const asc = sortParam.endsWith('_asc');
+        allItems.sort((a, b) => {
+          const av = Number((a.meta as Record<string, unknown> | undefined)?.[field] ?? 0);
+          const bv = Number((b.meta as Record<string, unknown> | undefined)?.[field] ?? 0);
+          return asc ? av - bv : bv - av;
+        });
+      }
+
+      if (view === 'by_workspace') {
+        const wsData = (await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore).catch(() => null)) as
+          | { items?: Record<string, unknown>[] }
+          | null;
+        if (wsData) {
+          const validIds = new Set<string>();
+          const validRoots = new Map<string, string>();
+          const primaryRoots = new Map<string, string>();
+          for (const w of wsData.items ?? []) {
+            const wid = String(w.id ?? '');
+            const wroot = typeof w.root === 'string' ? w.root : '';
+            if (wid) validIds.add(wid);
+            if (wroot) {
+              const normRoot = normalizeWorkspaceRoot(wroot) || wroot;
+              validRoots.set(normRoot, wid);
+              primaryRoots.set(wid, wroot);
+            }
+            if (Array.isArray(w.additional_dirs)) {
+              for (const d of w.additional_dirs) {
+                if (typeof d === 'string' && d.trim()) {
+                  const normD = normalizeWorkspaceRoot(d) || d;
+                  validRoots.set(normD, wid);
+                }
+              }
+            }
+          }
+          return ok(res, sessionGroupsV2(allItems, url, validIds, validRoots, primaryRoots), requestId);
+        }
+        return ok(res, sessionGroupsV2(allItems, url), requestId);
+      }
+
+      const total = allItems.length;
+      let pagedItems = allItems;
+      let hasMore = upstreamHasMore;
+      if (isPageMode) {
+        const start = (page - 1) * pageSize;
+        pagedItems = allItems.slice(start, start + pageSize);
+        hasMore = start + pageSize < total;
+      } else if (fetchAll) {
+        let start = 0;
+        if (pageToken) {
+          const idx = allItems.findIndex((it) => String(it.id) === pageToken);
+          start = idx === -1 ? total : idx + 1;
+        }
+        pagedItems = allItems.slice(start, start + pageSize);
+        hasMore = start + pageSize < total;
+      }
+
+      const outItems = fieldsParam ? pagedItems.map((it) => projectV2Fields(it, fieldsParam)) : pagedItems;
+      return ok(res, {
+        items: outItems,
+        total,
+        has_more: hasMore,
+        next_page_token: hasMore ? String(pagedItems[pagedItems.length - 1]?.id ?? '') : null,
+      }, requestId);
     }
 
     // 会话管理页批量归档/恢复。claude/codex/grok/pi 走本地 adapter;kimi 走上游。
@@ -1121,9 +1248,19 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const root = typeof body.path === 'string' && body.path.trim()
         ? body.path.trim()
         : (typeof hit?.root === 'string' ? hit.root : '');
-      const existingDirs = Array.isArray(hit?.additional_dirs)
-        ? hit.additional_dirs.filter((d): d is string => typeof d === 'string' && d.trim().length > 0 && d !== root)
-        : [];
+      const previousRoot = typeof hit?.root === 'string' ? hit.root : '';
+      const rootNorm = normalizeWorkspaceRoot(root) || root;
+      const keptDirs = new Map<string, string>();
+      for (const dir of [
+        ...(Array.isArray(hit?.additional_dirs) ? hit.additional_dirs : []),
+        ...(previousRoot ? [previousRoot] : []),
+      ]) {
+        if (typeof dir !== 'string' || !dir.trim()) continue;
+        const norm = normalizeWorkspaceRoot(dir) || dir;
+        if (norm === rootNorm || keptDirs.has(norm)) continue;
+        keptDirs.set(norm, dir);
+      }
+      const existingDirs = [...keptDirs.values()];
       const nextName = typeof hit?.name === 'string' ? hit.name : undefined;
       const dto: Record<string, unknown> = hit
         ? {
@@ -2721,6 +2858,50 @@ function upsertStoredWorkspace(
   store.set(provider, record.id, JSON.stringify(record));
 }
 
+function buildStoredWorkspaceIdMap(
+  store: SettingsStore | undefined,
+  provider?: ProviderName,
+): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!store) return map;
+  const targets: LocalProviderName[] = provider && isLocalProvider(provider)
+    ? [provider]
+    : [...LOCAL_PROVIDERS];
+  for (const p of targets) {
+    for (const stored of readStoredWorkspaces(store, p)) {
+      const normRoot = normalizeWorkspaceRoot(stored.root) || stored.root;
+      if (normRoot) map.set(normRoot, stored.id);
+      for (const d of stored.additional_dirs ?? []) {
+        const normD = normalizeWorkspaceRoot(d) || d;
+        if (normD) map.set(normD, stored.id);
+      }
+    }
+  }
+  return map;
+}
+
+const DIR_PROBE_TTL_MS = 5_000;
+const dirProbeCache = new Map<string, { exists: boolean; at: number }>();
+
+function isExistingDir(dirPath: unknown): boolean {
+  if (!dirPath || typeof dirPath !== 'string') return false;
+  const now = Date.now();
+  const hit = dirProbeCache.get(dirPath);
+  if (hit && now - hit.at < DIR_PROBE_TTL_MS) return hit.exists;
+  let exists = false;
+  try {
+    exists = statSync(dirPath).isDirectory();
+  } catch {
+    exists = false;
+  }
+  if (dirProbeCache.size >= 2048) {
+    const oldest = dirProbeCache.keys().next().value;
+    if (oldest !== undefined) dirProbeCache.delete(oldest);
+  }
+  dirProbeCache.set(dirPath, { exists, at: now });
+  return exists;
+}
+
 function workspaceDto(root: string, name?: string, opts?: WorkspaceDtoOptions): Record<string, unknown> {
   const normalized = normalizeWorkspaceRoot(root) || root;
   const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
@@ -2792,6 +2973,7 @@ async function listWorkspaces(
     : isLocalProvider(provider)
       ? [provider]
       : [];
+  const dirToOwner = new Map<string, string>();
   for (const p of targets) {
     for (const stored of readStoredWorkspaces(workspaceStore, p)) {
       const norm = normalizeWorkspaceRoot(stored.root) || stored.root;
@@ -2805,6 +2987,11 @@ async function listWorkspaces(
         });
         dto.id = stored.id;
         roots.set(norm, dto);
+      }
+      if (!dirToOwner.has(norm)) dirToOwner.set(norm, norm);
+      for (const extra of stored.additional_dirs ?? []) {
+        const extraNorm = normalizeWorkspaceRoot(extra) || extra;
+        if (extraNorm && !dirToOwner.has(extraNorm)) dirToOwner.set(extraNorm, norm);
       }
     }
     const adapter = adapters[p];
@@ -2820,8 +3007,15 @@ async function listWorkspaces(
     for (const session of sessions) {
       const cwd = session.metadata.cwd;
       const norm = normalizeWorkspaceRoot(cwd) || cwd;
-      if (!roots.has(norm)) roots.set(norm, workspaceDto(cwd));
-      counts.set(norm, (counts.get(norm) ?? 0) + 1);
+      const ownerNorm = dirToOwner.get(norm) ?? norm;
+      if (!roots.has(ownerNorm)) {
+        if (isExistingDir(cwd)) {
+          roots.set(ownerNorm, workspaceDto(cwd));
+        }
+      }
+      if (roots.has(ownerNorm)) {
+        counts.set(ownerNorm, (counts.get(ownerNorm) ?? 0) + 1);
+      }
     }
     for (const [norm, count] of counts) {
       const workspace = roots.get(norm);
@@ -2833,16 +3027,26 @@ async function listWorkspaces(
   return { items: [...roots.values()] };
 }
 
-function sessionDto(s: Session, model?: string, usage?: SessionUsage, busy?: boolean): Record<string, unknown> {
+function sessionDto(
+  s: Session,
+  model?: string,
+  usage?: SessionUsage,
+  busy?: boolean,
+  storedWsIdMap?: Map<string, string>,
+): Record<string, unknown> {
   // facade 的 Session.busy 是硬编码 false(适配器默认不跟踪网关 live turn 状态);
   // 真值只能从网关 hub(turn 登记处)拿,调用方有 hub 就传 busy 覆盖——否则
   // 进行中的会话刷新后月亮熄灭、前端误判 turn 结束(审查实测)。
   const isBusy = busy ?? s.busy;
+  const cwd = s.metadata?.cwd ? String(s.metadata.cwd) : undefined;
+  const normCwd = cwd ? (normalizeWorkspaceRoot(cwd) || cwd) : undefined;
+  const storedId = normCwd && storedWsIdMap ? storedWsIdMap.get(normCwd) : undefined;
+  const wsId = storedId ?? (cwd ? (workspaceDto(cwd).id as string) : s.workspace_id);
   return {
     id: prefixedId(s.provider, s.id),
-    // workspace_id 必须与 listWorkspaces 的 workspaceDto 同一规则生成,
-    // 否则前端把会话挂不到聚合工作区树上(facade 内部另有一套 id 规则,在此覆盖)。
-    workspace_id: s.metadata?.cwd ? (workspaceDto(String(s.metadata.cwd)).id as string) : s.workspace_id,
+    // workspace_id 优先按 normalized cwd 关联存储项目 ID(防换 primary 根后 ID 漂移导致分组被吞),
+    // 隐式项目则按 workspaceDto 规则生成,确保与 listWorkspaces 一致。
+    workspace_id: wsId,
     title: s.title,
     last_prompt: typeof s.extras?.last_prompt === 'string' ? s.extras.last_prompt : '',
     created_at: s.created_at,
@@ -2875,7 +3079,13 @@ function isEmptyPlaceholderSession(item: Record<string, unknown>, busy: boolean)
  * 0.38+ 侧栏 load 调 listSessionGroupsV2: GET /api/v2/sessions?view=by_workspace,
  * 解包 `groups` 再 `[...Ie.groups]`。Kimi 无 provider 仍走 shouldProxyToKimi,本函数服务本地 provider。
  */
-function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<string, unknown> {
+function sessionGroupsV2(
+  items: Record<string, unknown>[],
+  url: URL,
+  validWorkspaceIds?: Set<string>,
+  validRoots?: Map<string, string>,
+  primaryRoots?: Map<string, string>,
+): Record<string, unknown> {
   const groupPageSize = Math.min(100, Math.max(1, Number(url.searchParams.get('group.page_size') ?? 5) || 5));
   const hasPrompt = url.searchParams.get('meta.has_prompt') === 'true';
   const excludeEmpty = url.searchParams.get('exclude_empty') === 'true';
@@ -2889,11 +3099,24 @@ function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<str
     const workspace = item.workspace && typeof item.workspace === 'object'
       ? item.workspace as Record<string, unknown>
       : {};
-    const id = String(workspace.id ?? '');
+    let id = String(workspace.id ?? '');
     const cwd = typeof workspace.cwd === 'string' ? workspace.cwd : '';
+    const normCwd = cwd ? (normalizeWorkspaceRoot(cwd) || cwd) : '';
+
+    if (validRoots && normCwd && validRoots.has(normCwd)) {
+      id = validRoots.get(normCwd)!;
+      workspace.id = id;
+    }
+
+    if (validWorkspaceIds) {
+      if (id && !validWorkspaceIds.has(id)) continue;
+      if (!id && normCwd && validRoots && !validRoots.has(normCwd)) continue;
+    } else if (cwd && !isExistingDir(cwd)) {
+      continue;
+    }
     const key = id || cwd;
     if (!key) continue;
-    const bucket = buckets.get(key) ?? { workspace: { id, cwd }, sessions: [] };
+    const bucket = buckets.get(key) ?? { workspace: { id, cwd: primaryRoots?.get(id) ?? cwd }, sessions: [] };
     bucket.sessions.push(item);
     buckets.set(key, bucket);
   }
@@ -2915,6 +3138,27 @@ function sessionGroupsV2(items: Record<string, unknown>[], url: URL): Record<str
     return bu - au;
   });
   return { groups, total: groups.length, has_more: false, next_page_token: null };
+}
+
+function parseV2TimestampBound(raw: string | null): number | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  const num = Number(raw);
+  if (Number.isFinite(num)) return num;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function projectV2Fields(item: Record<string, unknown>, fieldsCsv: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const meta = (item.meta && typeof item.meta === 'object') ? item.meta as Record<string, unknown> : {};
+  for (const rawField of fieldsCsv.split(',')) {
+    const f = rawField.trim();
+    if (!f) continue;
+    if (f === 'archived') out.archived = Boolean(meta.archived);
+    else if (f in item) out[f] = item[f];
+    else if (f in meta) out[f] = meta[f];
+  }
+  return out;
 }
 
 function sessionV2Dto(item: Record<string, unknown>, busy: boolean): Record<string, unknown> {
@@ -2992,12 +3236,14 @@ async function listSessions(
       allItems = archivedOnly
         ? allItems.filter((session) => session.archived === true)
         : allItems.filter((session) => session.archived !== true);
+      const storedWsIdMap = buildStoredWorkspaceIdMap(workspaceStore, provider);
       const localItems = allItems
         .map((session) => sessionDto(
           session,
           adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
           adapter.getUsage?.(session.id),
           busyOf(prefixedId(provider, session.id)),
+          storedWsIdMap,
         ))
         .filter((dto) => !excludeEmpty || !isEmptyPlaceholderSession(dto, Boolean(dto.busy)));
       return { items: localItems, has_more: false };
@@ -3041,12 +3287,14 @@ async function listSessions(
     } else {
       page = { ...page, items: page.items.filter((session) => session.archived !== true) };
     }
+    const storedWsIdMap = buildStoredWorkspaceIdMap(workspaceStore, provider);
     const localItems = page.items
       .map((session) => sessionDto(
         session,
         adapter.getModel?.(session.id) ?? getDemoModel(provider, session.id),
         adapter.getUsage?.(session.id),
         busyOf(prefixedId(provider, session.id)),
+        storedWsIdMap,
       ))
       .filter((dto) => !excludeEmpty || !isEmptyPlaceholderSession(dto, Boolean(dto.busy)));
     if (page.next_cursor && page.items.length > 0) {
@@ -3102,6 +3350,7 @@ async function listSessions(
       console.error(`[gateway] listSessions: ${p}.list 失败:`, err instanceof Error ? err.message : err);
       return [] as Session[];
     });
+    const storedMap = buildStoredWorkspaceIdMap(workspaceStore, p);
     for (const s of mergeDemoSessions(p, pageItems, demoActive)) {
       if (archivedOnly ? s.archived !== true : s.archived === true) continue;
       if (workspaceId) {
@@ -3109,7 +3358,7 @@ async function listSessions(
         const cwd = typeof s.metadata?.cwd === 'string' ? String(s.metadata.cwd) : '';
         if (normalizeWorkspaceRoot(cwd) !== rootNorm) continue;
       }
-      const dto = sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id)));
+      const dto = sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id)), storedMap);
       if (excludeEmpty && isEmptyPlaceholderSession(dto, Boolean(dto.busy))) continue;
       items.push(dto);
     }
@@ -4938,9 +5187,9 @@ async function executeDshCommand(
     case 'diff':
       return renderRepoDiffCommand(adapter, nativeId);
     case 'skills':
-      return renderProviderSkills(adapter, 'dsh', nativeId);
+      return renderDshSkills(adapter, nativeId);
     case 'help':
-      return renderProviderHelp(adapter, 'dsh', nativeId);
+      return renderDshHelp(adapter, nativeId);
     default:
       throw new ProviderError('invalid_request', `unknown gateway command /${name}`, 400);
   }
@@ -5139,21 +5388,205 @@ function renderPiStatus(adapter: ProviderAdapter, nativeId: string): string {
   return lines.join('\n');
 }
 
+export interface DshAcpProfileInfo {
+  bundles: string[];
+  dependencies: string[];
+  patchPlugins: string[];
+}
+
+function stripYamlComment(rawLine: string): string {
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < rawLine.length; i += 1) {
+    const ch = rawLine[i];
+    if (quote) {
+      if (quote === '"' && ch === '\\') { i += 1; continue; }
+      if (quote === "'" && ch === "'" && rawLine[i + 1] === "'") { i += 1; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '#' && (i === 0 || /\s/.test(rawLine[i - 1]!))) {
+      return rawLine.slice(0, i);
+    }
+  }
+  return rawLine;
+}
+
+function unquoteYamlScalar(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2) {
+    const q = trimmed[0];
+    if ((q === '"' || q === "'") && trimmed[trimmed.length - 1] === q) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+export function readDshAcpProfile(dshHomeOverride?: string): DshAcpProfileInfo {
+  const dshHome = dshHomeOverride || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const acpDir = path.join(dshHome, 'profiles', 'acp');
+  const pkgPath = path.join(acpDir, 'package.json');
+  const patchPath = path.join(acpDir, 'cordis.patch.yml');
+
+  const bundles: string[] = [];
+  const dependencies: string[] = [];
+  const patchPlugins: string[] = [];
+
+  try {
+    if (existsSync(pkgPath)) {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      if (Array.isArray(pkg.dsh?.profile?.bundles)) {
+        for (const b of pkg.dsh.profile.bundles) {
+          if (typeof b === 'string' && b.trim()) bundles.push(b.trim());
+        }
+      }
+      if (pkg.dependencies && typeof pkg.dependencies === 'object') {
+        for (const dep of Object.keys(pkg.dependencies)) {
+          if (dep.trim()) dependencies.push(dep.trim());
+        }
+      }
+    }
+  } catch {
+    // 安静降级
+  }
+
+  try {
+    if (existsSync(patchPath)) {
+      const content = readFileSync(patchPath, 'utf8');
+      const lines = content.split('\n');
+      const pluginEnabled = new Map<string, boolean>();
+      let currentId: string | null = null;
+      let currentEnabled = true;
+      let currentFieldIndent = -1;
+      let waitingIdIndent = -1;
+      let listIndent: number | undefined;
+
+      const commit = (): void => {
+        if (currentId) pluginEnabled.set(currentId, currentEnabled);
+        currentId = null;
+        currentEnabled = true;
+        currentFieldIndent = -1;
+      };
+
+      for (const rawLine of lines) {
+        const line = stripYamlComment(rawLine).replace(/\r$/, '');
+        if (!line.trim()) continue;
+        const listItem = line.match(/^(\s*)-(?:\s|$)/);
+        if (listItem) {
+          const indent = listItem[1]!.length;
+          listIndent ??= indent;
+          if (indent !== listIndent) continue;
+        }
+
+        const dashId = line.match(/^(\s*-\s+)id:\s*(.+)$/);
+        if (dashId) {
+          commit();
+          waitingIdIndent = -1;
+          const rawId = unquoteYamlScalar(dashId[2]!);
+          const cleanId = rawId.replace(/^~/, '');
+          if (cleanId) {
+            currentId = cleanId;
+            currentEnabled = !rawId.startsWith('~');
+            currentFieldIndent = dashId[1]!.length;
+          }
+          continue;
+        }
+
+        const bareDash = line.match(/^(\s*)-\s*$/);
+        if (bareDash) {
+          commit();
+          waitingIdIndent = bareDash[1]!.length;
+          continue;
+        }
+
+        const otherTop = line.match(/^(\s*)-\s+/);
+        if (otherTop) {
+          commit();
+          waitingIdIndent = -1;
+          continue;
+        }
+
+        const indent = line.match(/^(\s*)/)![1]!.length;
+        if (waitingIdIndent >= 0 && indent > waitingIdIndent) {
+          const idLine = line.match(/^\s+id:\s*(.+)$/);
+          if (idLine) {
+            const rawId = unquoteYamlScalar(idLine[1]!);
+            const cleanId = rawId.replace(/^~/, '');
+            if (cleanId) {
+              currentId = cleanId;
+              currentEnabled = !rawId.startsWith('~');
+              currentFieldIndent = indent;
+            }
+            waitingIdIndent = -1;
+            continue;
+          }
+        }
+
+        if (!currentId || indent !== currentFieldIndent) continue;
+        const kv = line.match(/^\s+(disabled|enabled):\s*(.+)$/);
+        if (!kv) continue;
+        const key = kv[1]!;
+        const val = unquoteYamlScalar(kv[2]!).toLowerCase();
+        if (key === 'disabled') {
+          if (val === 'true' || val === '1' || val === 'yes' || val.startsWith('!!js')) currentEnabled = false;
+          else if (val === 'false' || val === '0' || val === 'no') currentEnabled = true;
+        } else if (key === 'enabled') {
+          if (val === 'false' || val === '0' || val === 'no') currentEnabled = false;
+          else if (val === 'true' || val === '1' || val === 'yes') currentEnabled = true;
+        }
+      }
+      commit();
+
+      for (const [id, enabled] of pluginEnabled) {
+        if (enabled) patchPlugins.push(id);
+      }
+    }
+  } catch {
+    // 安静降级
+  }
+
+  return { bundles, dependencies, patchPlugins };
+}
+
 function renderDshStatus(adapter: ProviderAdapter, nativeId: string): string {
   const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
   const permission = adapter.getPermission?.(nativeId) ?? 'default';
   const plan = adapter.getPlanMode?.(nativeId) === true;
   const usage = adapter.getUsage?.(nativeId);
   const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : dshStatusContextFallback();
+  const profileInfo = readDshAcpProfile();
   const lines = [
     '⚙ DSH 会话状态',
+    '· 通道: ACP 通道 (dsh --profile acp)',
     `· 模型: ${model}`,
     `· 权限: ${permission}${plan ? ' · Plan 模式: 开启' : ''}`,
+    '· 能力限制: 当前 DSH ACP 实现未暴露原生命令通道与模式切换（modes），/plan、/goal、/compact、/undo、/fork 等不可用',
   ];
   if (usage) {
     const pct = limit > 0 ? ((usage.context_tokens / limit) * 100).toFixed(1) : '0.0';
     lines.push(`· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`);
     lines.push(`· 累计用量: input ${usage.input_tokens.toLocaleString()} · output ${usage.output_tokens.toLocaleString()}`);
+  }
+  const allDeclared = [
+    ...profileInfo.bundles,
+    ...profileInfo.dependencies,
+    ...profileInfo.patchPlugins,
+  ];
+  if (allDeclared.length > 0) {
+    lines.push('· ACP Profile 配置项（配置声明，非运行时状态）:');
+    if (profileInfo.bundles.length > 0) {
+      lines.push(`  - Bundles (package.json): ${profileInfo.bundles.join(', ')}`);
+    }
+    if (profileInfo.dependencies.length > 0) {
+      lines.push(`  - Dependencies (package.json): ${profileInfo.dependencies.join(', ')}`);
+    }
+    if (profileInfo.patchPlugins.length > 0) {
+      lines.push(`  - 补丁声明 (cordis.patch.yml): ${profileInfo.patchPlugins.join(', ')}`);
+    }
+  } else {
+    lines.push('· ACP Profile 配置项: 未检测到 profile 配置文件');
   }
   return lines.join('\n');
 }
@@ -5265,6 +5698,57 @@ async function renderProviderSkills(
     lines.push(`- \`/${name}${hint}\`${desc ? ` — ${desc}` : ''}`);
   }
   if (skills.length > 60) lines.push(`- …共 ${skills.length} 项`);
+  return lines.join('\n');
+}
+
+async function renderDshHelp(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+  const cmds = adapter.listCommands ? await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[]) : [];
+  const runnable = cmds.filter((c) => !c.terminalOnly);
+  const lines = [
+    '### dsh Web UI 可用命令',
+    'ℹ 通道说明: DSH 当前走 ACP 通道 (dsh --profile acp)，而非完整原生 Web。',
+    '当前 DSH ACP 实现未暴露原生命令通道，不支持模式切换 (modes)、上下文压缩 (/compact)、目标模式 (/goal)、计划模式 (/plan)、会话分叉 (/fork) 或撤销 (/undo)。',
+    '',
+    `当前支持网关代执行的基础辅助命令（共 ${runnable.length} 项）：`,
+  ];
+  for (const c of runnable.slice(0, 50)) {
+    const hint = c.argumentHint ? ` ${c.argumentHint}` : '';
+    const aliasText = c.aliases && c.aliases.length > 0 ? `（别名: ${c.aliases.map((a) => `/${a}`).join(', ')}）` : '';
+    const desc = c.description.replace(/\s+/g, ' ').slice(0, 90);
+    lines.push(`- \`/${c.name}${hint}\` ${aliasText}— ${desc}`);
+  }
+  return lines.join('\n');
+}
+
+async function renderDshSkills(adapter: ProviderAdapter, nativeId: string): Promise<string> {
+  const skills = await adapterSkills(adapter, nativeId);
+  const profileInfo = readDshAcpProfile();
+  const lines = [`### dsh 可用命令与技能`];
+  for (const item of skills.slice(0, 60)) {
+    const name = String(item.name ?? '');
+    const hint = typeof item.argument_hint === 'string' && item.argument_hint ? ` ${item.argument_hint}` : '';
+    const desc = String(item.description ?? '').replace(/\s+/g, ' ').slice(0, 100);
+    lines.push(`- \`/${name}${hint}\`${desc ? ` — ${desc}` : ''}`);
+  }
+  const allDeclared = [
+    ...profileInfo.bundles,
+    ...profileInfo.dependencies,
+    ...profileInfo.patchPlugins,
+  ];
+  if (allDeclared.length > 0) {
+    lines.push('· ACP Profile 配置项（配置声明，非运行时状态）:');
+    if (profileInfo.bundles.length > 0) {
+      lines.push(`  - Bundles (package.json): ${profileInfo.bundles.join(', ')}`);
+    }
+    if (profileInfo.dependencies.length > 0) {
+      lines.push(`  - Dependencies (package.json): ${profileInfo.dependencies.join(', ')}`);
+    }
+    if (profileInfo.patchPlugins.length > 0) {
+      lines.push(`  - 补丁声明 (cordis.patch.yml): ${profileInfo.patchPlugins.join(', ')}`);
+    }
+  } else {
+    lines.push('· ACP Profile 配置项: 未检测到 profile 配置文件');
+  }
   return lines.join('\n');
 }
 
