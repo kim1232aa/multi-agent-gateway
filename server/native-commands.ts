@@ -701,6 +701,8 @@ export function listClaudeCommands(
 ): NativeCommand[] {
   const skip = new Set(['model', 'new', 'clear']);
   const terminalSlashSet = new Set<string>(terminalSlashCommands);
+  // 网关已经用官方 control 通道实现了的命令,CLI 目录里的 terminalOnly 标记不再生效。
+  const gatewayImplemented = new Set(CLAUDE_GATEWAY_COMMANDS.map((c) => c.name));
   const prompts: NativeCommand[] = cliCatalog
     .filter((c) => !skip.has(c.name))
     .map((c) => {
@@ -709,9 +711,11 @@ export function listClaudeCommands(
       const aliases = Array.isArray(c.aliases)
         ? c.aliases.filter((a): a is string => typeof a === 'string' && a.length > 0)
         : undefined;
-      const terminalOnly = c.terminalOnly === true
+      const terminalOnly = !gatewayImplemented.has(c.name) && (
+        c.terminalOnly === true
         || CLAUDE_TUI_ONLY_COMMANDS.has(c.name)
-        || terminalSlashSet.has(c.name);
+        || terminalSlashSet.has(c.name)
+      );
       return {
         name: c.name,
         description: c.description,

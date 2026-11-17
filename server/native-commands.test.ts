@@ -78,5 +78,8 @@ test('real catalogs carry forms; terminal-only rows stay out of the web catalog'
   // fast 同样改为网关命令。
   assert.equal(claude.find((c) => c.name === 'color')?.form, 'gateway');
   assert.equal(claude.find((c) => c.name === 'fast')?.form, 'gateway');
+  // CLI 目录若把实现过的命令标成 terminalOnly,网关实现优先。
+  const overridden = listClaudeCommands([{ name: 'fast', description: 'Toggle fast mode', terminalOnly: true }], ['fast']);
+  assert.equal(overridden.find((c) => c.name === 'fast')?.form, 'gateway');
   assert.ok(claude.every((c) => c.pinnedVersion === COMMAND_PINS.claude));
 });
