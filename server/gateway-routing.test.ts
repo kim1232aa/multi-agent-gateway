@@ -6096,9 +6096,14 @@ test('review regression: nested model ids and flags in DSH profile config are no
       '  - id: off-plugin',
       '    disabled: true',
       '  - id: plugin-b',
+      '  - id: expr-off',
+      "    disabled: !!js '!ctx.get(''profileContext'')'",
       '',
     ].join('\n'));
     assert.deepEqual(readDshAcpProfile(dshHome).patchPlugins, ['llm-pi-ai', 'acp', 'plugin-b']);
+    // cordis-plugin-loader 只认 disabled 字段;id 前的 ~ 没有禁用语义,按字面 id 处理。
+    await writeFile(join(acpDir, 'cordis.patch.yml'), '- id: ~tilde\n- id: on\n  disabled: false\n');
+    assert.deepEqual(readDshAcpProfile(dshHome).patchPlugins, ['~tilde', 'on']);
   } finally {
     await rm(dshHome, { recursive: true, force: true });
   }

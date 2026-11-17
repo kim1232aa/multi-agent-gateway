@@ -2510,3 +2510,53 @@ test('review regression: duplicate prompt texts keep their ids when compaction d
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('grok acp: x.ai/exit_plan_mode parks as a question and answers with native verdicts', () => {
+  const client = new GrokAcpClient({ grokBin: '/nonexistent/grok' });
+  const sent: Array<{ id: unknown; result: unknown }> = [];
+  (client as any).respond = (id: unknown, result: unknown) => sent.push({ id, result });
+  const events: any[] = [];
+  client.onEvent((ev) => events.push(ev));
+
+  (client as any).handleServerRequest(7, '_x.ai/exit_plan_mode', {
+    sessionId: 's1',
+    toolCallId: 'call-plan-1',
+    planContent: '1. edit a.ts\n2. run tests',
+  });
+  const q = events.find((e) => e.type === 'question_request');
+  assert.ok(q, 'exit_plan_mode must surface as a question');
+  assert.equal(q.questionId, 'call-plan-1');
+  assert.ok(q.prompt.includes('1. edit a.ts'));
+  assert.deepEqual(q.questions[0].options.map((o: any) => o.id), ['approved', 'cancelled', 'abandoned']);
+
+  assert.equal(client.resolveQuestion('call-plan-1', { exit_plan_mode: ['approved'] }), true);
+  assert.deepEqual(sent.at(-1), { id: 7, result: { outcome: 'approved' } });
+
+  (client as any).handleServerRequest(8, 'x.ai/exit_plan_mode', { sessionId: 's1', planContent: null });
+  assert.equal(client.resolveQuestion('8', '放弃计划'), true);
+  assert.deepEqual(sent.at(-1), { id: 8, result: { outcome: 'abandoned' } });
+
+  (client as any).handleServerRequest(9, 'x.ai/exit_plan_mode', { sessionId: 's1' });
+  assert.equal(client.cancelQuestion('9'), true);
+  assert.deepEqual(sent.at(-1), { id: 9, result: { outcome: 'cancelled' } });
+});
+
+test('grok acp: ask_user_question answers are keyed by question text only (StringOrVec)', () => {
+  const client = new GrokAcpClient({ grokBin: '/nonexistent/grok' });
+  const sent: Array<{ id: unknown; result: any }> = [];
+  (client as any).respond = (id: unknown, result: unknown) => sent.push({ id, result });
+  (client as any).handleServerRequest('r1', '_x.ai/ask_user_question', {
+    sessionId: 's1',
+    toolCallId: 'call-q',
+    questions: [
+      { question: 'Colour?', options: [{ label: 'Red' }, { label: 'Blue' }], multiSelect: false },
+      { question: 'Extras?', options: [{ label: 'Logo' }, { label: 'Icon' }], multiSelect: true },
+    ],
+  });
+  assert.equal(client.resolveQuestion('call-q', { q_0: ['Red'], q_1: ['Logo', 'Icon'] }), true);
+  assert.deepEqual(sent.at(-1)?.result, {
+    outcome: 'accepted',
+    answers: { 'Colour?': 'Red', 'Extras?': ['Logo', 'Icon'] },
+    annotations: {},
+  });
+});

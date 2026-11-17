@@ -1726,7 +1726,10 @@ test('review regression: item/fileChange/patchUpdated emits incremental diff eve
       turnId: 'turn-1',
       itemId: 'item-1',
       changes: [
-        { path: 'src/a.ts', kind: 'modify', diff: '--- a\n+++ b\n@@\n-x\n+y' },
+        { path: 'src/a.ts', kind: { type: 'update', move_path: null }, diff: '@@ -1,2 +1,2 @@\n-x\n+y\n ctx' },
+        { path: 'src/new.ts', kind: { type: 'add' }, diff: 'one\ntwo\n' },
+        { path: 'src/old.ts', kind: { type: 'delete' }, diff: 'gone\n' },
+        { path: 'src/b.ts', kind: { type: 'update', move_path: 'src/c.ts' }, diff: '@@ -1 +1 @@\n-a\n+b' },
       ],
     });
     const patch = events.find((ev) => ev.type === 'patch-updated');
@@ -1735,9 +1738,16 @@ test('review regression: item/fileChange/patchUpdated emits incremental diff eve
       assert.equal(patch.threadId, 'th');
       assert.equal(patch.turnId, 'turn-1');
       assert.equal(patch.itemId, 'item-1');
-      assert.equal(patch.changes.length, 1);
-      assert.equal(patch.changes[0]?.path, 'src/a.ts');
-      assert.equal(patch.changes[0]?.diff, '--- a\n+++ b\n@@\n-x\n+y');
+      assert.equal(patch.changes.length, 4);
+      assert.deepEqual(
+        patch.changes.map((c) => [c.path, c.kind, c.added, c.removed, c.movePath]),
+        [
+          ['src/a.ts', 'update', 1, 1, undefined],
+          ['src/new.ts', 'add', 2, 0, undefined],
+          ['src/old.ts', 'delete', 0, 1, undefined],
+          ['src/b.ts', 'update', 1, 1, 'src/c.ts'],
+        ],
+      );
     }
   } finally {
     (adapter as any).handleProcessExit(null, 1, null);
@@ -1784,15 +1794,25 @@ test('review regression: history fileChange items render as unified diff output'
     status: 'completed',
     call_id: 'call-fc',
     changes: [
-      { path: 'src/a.ts', kind: 'modify', diff: '--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-x\n+y' },
-      { path: 'src/new.ts', kind: 'add', diff: '+++ b/src/new.ts\n@@ -0,0 +1 @@\n+hello' },
+      { path: 'src/a.ts', kind: { type: 'update', move_path: null }, diff: '@@ -1 +1 @@\n-x\n+y' },
+      { path: 'src/new.ts', kind: { type: 'add' }, diff: 'hello\nworld\n' },
+      { path: 'src/old.ts', kind: { type: 'delete' }, diff: 'bye\n' },
     ],
   });
   assert.ok(item);
   const out = item.output ?? item.result;
   assert.equal(typeof out, 'string');
   const text = out as string;
-  assert.ok(text.includes('diff --git a/src/a.ts b/src/a.ts'), `unified diff header missing: ${text.slice(0, 120)}`);
-  assert.ok(text.includes('diff --git a/src/new.ts b/src/new.ts'));
-  assert.ok(text.includes('+hello'));
+  assert.ok(
+    text.includes('diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-x\n+y'),
+    `update diff wrong: ${text.slice(0, 200)}`,
+  );
+  assert.ok(
+    text.includes('new file mode 100644\n--- /dev/null\n+++ b/src/new.ts\n@@ -0,0 +1,2 @@\n+hello\n+world'),
+    `add diff wrong: ${text}`,
+  );
+  assert.ok(
+    text.includes('deleted file mode 100644\n--- a/src/old.ts\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-bye'),
+    `delete diff wrong: ${text}`,
+  );
 });

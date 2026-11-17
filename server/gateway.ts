@@ -391,6 +391,8 @@ interface ActiveTurn {
   v262ThinkingStartedAt?: number;
   v262Items: Array<Record<string, unknown>>;
   v262ItemMap: Map<string, Record<string, unknown>>;
+  /** codex patchUpdated 快照去重:itemId -> 已播报的文件清单。 */
+  patchSnapshots?: Map<string, string>;
 }
 
 /** 排队中的 prompt(busy 时提交;对齐 kap-server 的 queued 语义)。 */
@@ -5485,10 +5487,9 @@ export function readDshAcpProfile(dshHomeOverride?: string): DshAcpProfileInfo {
           commit();
           waitingIdIndent = -1;
           const rawId = unquoteYamlScalar(dashId[2]!);
-          const cleanId = rawId.replace(/^~/, '');
-          if (cleanId) {
-            currentId = cleanId;
-            currentEnabled = !rawId.startsWith('~');
+          if (rawId) {
+            currentId = rawId;
+            currentEnabled = true;
             currentFieldIndent = dashId[1]!.length;
           }
           continue;
@@ -5513,10 +5514,9 @@ export function readDshAcpProfile(dshHomeOverride?: string): DshAcpProfileInfo {
           const idLine = line.match(/^\s+id:\s*(.+)$/);
           if (idLine) {
             const rawId = unquoteYamlScalar(idLine[1]!);
-            const cleanId = rawId.replace(/^~/, '');
-            if (cleanId) {
-              currentId = cleanId;
-              currentEnabled = !rawId.startsWith('~');
+            if (rawId) {
+              currentId = rawId;
+              currentEnabled = true;
               currentFieldIndent = indent;
             }
             waitingIdIndent = -1;
@@ -6360,8 +6360,13 @@ function consumeEvent(
   } else if (ev.kind === 'diff') {
     // codex: turn 进行中的文件改动增量(patchUpdated)与终态 diff(diffUpdated)。
     // delta 只推轻量文件清单;updated 落最终 diff 文本。
-    const p = ev.payload as { diff?: string; files?: string[] } | undefined;
+    const p = ev.payload as { diff?: string; files?: string[]; itemId?: string } | undefined;
     if (ev.status === 'delta' && Array.isArray(p?.files) && p.files.length > 0) {
+      const names = p.files.map((f) => f.replace(/ \(\+\d+\/-\d+\)$/, '')).join('\n');
+      const key = p.itemId ?? '';
+      turn.patchSnapshots ??= new Map();
+      if (turn.patchSnapshots.get(key) === names) return;
+      turn.patchSnapshots.set(key, names);
       const sep = turn.assistantText ? '\n\n' : '';
       emitAssistantDeltaText(`${sep}⚙ 文件改动中: ${p.files.join(', ')}`, turn, emit, ensureStep, sid, hub);
     } else if (ev.status === 'updated' && typeof p?.diff === 'string' && p.diff.trim()) {

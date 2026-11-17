@@ -512,6 +512,66 @@ export function extractCodexReasoningSummary(item: Record<string, unknown>): str
 }
 
 /**
+ * `FileUpdateChange.kind` is the tagged object `PatchChangeKind`
+ * (`{type:"add"}` / `{type:"delete"}` / `{type:"update", move_path}`), see
+ * codex-rs/app-server-protocol v2 schema.
+ */
+export function codexPatchKind(raw: unknown): { type: 'add' | 'delete' | 'update'; movePath?: string } {
+  const k = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+  const t = k ? k.type : raw;
+  if (t === 'add' || t === 'delete') return { type: t };
+  const movePath = k && typeof k.move_path === 'string' && k.move_path ? k.move_path : undefined;
+  return movePath ? { type: 'update', movePath } : { type: 'update' };
+}
+
+function prefixLines(text: string, sign: '+' | '-'): string {
+  if (!text) return '';
+  const lines = text.replace(/\n$/, '').split('\n');
+  return lines.map((l) => `${sign}${l}`).join('\n');
+}
+
+/**
+ * Codex puts the full file content in `diff` for add/delete and a unified diff
+ * (hunks only) for update (codex-rs/tui app_server_approval_conversions.rs).
+ */
+export function codexFileChangeToUnifiedDiff(raw: Record<string, unknown> | null | undefined): string | null {
+  if (!raw || typeof raw.path !== 'string') return null;
+  const p = raw.path;
+  const body = typeof raw.diff === 'string' ? raw.diff : '';
+  const kind = codexPatchKind(raw.kind);
+  if (kind.type === 'add') {
+    const n = body ? body.replace(/\n$/, '').split('\n').length : 0;
+    return `diff --git a/${p} b/${p}\nnew file mode 100644\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,${n} @@\n${prefixLines(body, '+')}`;
+  }
+  if (kind.type === 'delete') {
+    const n = body ? body.replace(/\n$/, '').split('\n').length : 0;
+    return `diff --git a/${p} b/${p}\ndeleted file mode 100644\n--- a/${p}\n+++ /dev/null\n@@ -1,${n} +0,0 @@\n${prefixLines(body, '-')}`;
+  }
+  const to = kind.movePath ?? p;
+  const hasHeaders = /^--- /m.test(body) && /^\+\+\+ /m.test(body);
+  const headers = hasHeaders ? '' : `--- a/${p}\n+++ b/${to}\n`;
+  return `diff --git a/${p} b/${to}\n${headers}${body}`;
+}
+
+/** Count added/removed lines for one change (content lines for add/delete, hunk lines for update). */
+export function codexFileChangeStats(raw: Record<string, unknown>): { added: number; removed: number } {
+  const body = typeof raw.diff === 'string' ? raw.diff : '';
+  const kind = codexPatchKind(raw.kind);
+  if (!body) return { added: 0, removed: 0 };
+  const lineCount = body.replace(/\n$/, '').split('\n').length;
+  if (kind.type === 'add') return { added: lineCount, removed: 0 };
+  if (kind.type === 'delete') return { added: 0, removed: lineCount };
+  let added = 0;
+  let removed = 0;
+  for (const line of body.split('\n')) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) added++;
+    else if (line.startsWith('-')) removed++;
+  }
+  return { added, removed };
+}
+
+/**
  * Normalize and sanitize a Codex ThreadItem for 0.169.0 / 0.171.0-alpha.5.
  * Returns `null` if a `userMessage` item contained only system-injected tags
  * (`<INSTRUCTIONS>`, `<environment_context>`, `<turn_aborted>`) and is now empty.
@@ -560,17 +620,8 @@ export function normalizeCodexThreadItem(rawItem: CodexThreadItem): CodexThreadI
       if (Array.isArray(item.changes) && item.changes.length > 0 && !item.output && !item.result) {
         const blocks: string[] = [];
         for (const raw of item.changes as Array<Record<string, unknown>>) {
-          if (!raw || typeof raw.path !== 'string') continue;
-          const diffText = typeof raw.diff === 'string' ? raw.diff : '';
-          const kind = typeof raw.kind === 'string' ? raw.kind : 'modify';
-          const p = raw.path;
-          if (kind === 'add') {
-            blocks.push(`diff --git a/${p} b/${p}\nnew file mode 100644\n${diffText}`);
-          } else if (kind === 'delete') {
-            blocks.push(`diff --git a/${p} b/${p}\ndeleted file mode 100644\n${diffText}`);
-          } else {
-            blocks.push(`diff --git a/${p} b/${p}\n${diffText}`);
-          }
+          const block = codexFileChangeToUnifiedDiff(raw);
+          if (block) blocks.push(block);
         }
         if (blocks.length > 0) item.output = blocks.join('\n');
       }
@@ -741,12 +792,22 @@ export type CodexEvent =
     }
   | { type: 'diff-updated'; threadId: string; turnId: string; diff: string }
   | {
-      /** turn 进行中的文件改动增量(item/fileChange/patchUpdated),早于终态 diff。 */
+      /**
+       * item/fileChange/patchUpdated:模型写 patch 过程中的完整快照(非增量,需开启
+       * features.apply_patch_streaming_events;上游约 500ms 节流)。
+       */
       type: 'patch-updated';
       threadId: string;
       turnId: string;
       itemId: string;
-      changes: Array<{ path: string; kind?: string; diff: string }>;
+      changes: Array<{
+        path: string;
+        kind: 'add' | 'delete' | 'update';
+        movePath?: string;
+        diff: string;
+        added: number;
+        removed: number;
+      }>;
     }
   | { type: 'item-started'; threadId: string; turnId: string; item: CodexThreadItem }
   | { type: 'item-completed'; threadId: string; turnId: string; item: CodexThreadItem }
@@ -2298,11 +2359,18 @@ export class CodexAdapter {
         ) {
           const changes = (p.changes as Array<Record<string, unknown>>)
             .filter((c) => c && typeof c.path === 'string' && typeof c.diff === 'string')
-            .map((c) => ({
-              path: String(c.path),
-              ...(typeof c.kind === 'string' ? { kind: c.kind } : {}),
-              diff: String(c.diff),
-            }));
+            .map((c) => {
+              const kind = codexPatchKind(c.kind);
+              const stats = codexFileChangeStats(c);
+              return {
+                path: String(c.path),
+                kind: kind.type,
+                ...(kind.movePath ? { movePath: kind.movePath } : {}),
+                diff: String(c.diff),
+                added: stats.added,
+                removed: stats.removed,
+              };
+            });
           this.emit({
             type: 'patch-updated',
             threadId: p.threadId,

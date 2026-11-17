@@ -148,6 +148,21 @@ export interface PendingQuestion {
   options: string[];
   questions: StructuredQuestion[];
   rawQuestions: unknown[];
+  /** 'plan_approval' = x.ai/exit_plan_mode,回包形状与 ask_user_question 不同。 */
+  kind?: 'question' | 'plan_approval';
+}
+
+const EXIT_PLAN_QUESTION = 'Grok 请求退出计划模式并开始实施';
+const EXIT_PLAN_OPTIONS: Array<{ outcome: 'approved' | 'cancelled' | 'abandoned'; label: string; description: string }> = [
+  { outcome: 'approved', label: '批准并实施', description: '在本轮继续实施计划' },
+  { outcome: 'cancelled', label: '继续规划', description: '留在计划模式,让 Grok 修改计划' },
+  { outcome: 'abandoned', label: '放弃计划', description: '退出计划模式并结束本轮' },
+];
+
+function exitPlanOutcome(answer: string | Record<string, string[]>): 'approved' | 'cancelled' | 'abandoned' {
+  const picked = typeof answer === 'string' ? answer : Object.values(answer).flat()[0] ?? '';
+  const hit = EXIT_PLAN_OPTIONS.find((o) => o.outcome === picked || o.label === picked);
+  return hit ? hit.outcome : 'cancelled';
 }
 
 const INIT_PARAMS = {
@@ -483,8 +498,12 @@ export class GrokAcpClient {
     if (parked.id === undefined) {
       throw new Error(`Cannot answer notification-only question '${questionId}': missing request id`);
     }
+    if (parked.kind === 'plan_approval') {
+      this.respond(parked.id, { outcome: exitPlanOutcome(answer) });
+      return true;
+    }
     const answers = buildQuestionAnswersMap(parked, answer);
-    this.respond(parked.id, { outcome: 'accepted', answers });
+    this.respond(parked.id, { outcome: 'accepted', answers, annotations: {} });
     return true;
   }
 
@@ -726,6 +745,51 @@ export class GrokAcpClient {
         options: normalized.options,
         questions: normalized.questions,
         rawQuestions: normalized.rawQuestions,
+      });
+      return;
+    }
+    if (method === '_x.ai/exit_plan_mode' || method === 'x.ai/exit_plan_mode') {
+      // grok-build PendingKind::PlanApproval:阻塞式反向请求,回 {outcome: approved|cancelled|abandoned}。
+      const p = (params ?? {}) as Record<string, unknown>;
+      const sessionId = String(p.sessionId ?? p.session_id ?? '');
+      const toolCallId =
+        typeof p.toolCallId === 'string' ? p.toolCallId : typeof p.tool_call_id === 'string' ? p.tool_call_id : undefined;
+      const input = isRecord(p.input) ? p.input : {};
+      const plan = String(p.planContent ?? p.plan ?? input.plan ?? '').trim();
+      const questionId = toolCallId || String(id);
+      const question = plan ? `${EXIT_PLAN_QUESTION}\n\n${plan}` : EXIT_PLAN_QUESTION;
+      const questions: StructuredQuestion[] = [
+        {
+          id: 'exit_plan_mode',
+          question,
+          header: 'Plan',
+          options: EXIT_PLAN_OPTIONS.map((o) => ({ id: o.outcome, label: o.label, description: o.description })),
+        },
+      ];
+      const parked: PendingQuestion = {
+        id,
+        questionId,
+        sessionId,
+        toolCallId,
+        prompt: question,
+        options: EXIT_PLAN_OPTIONS.map((o) => o.label),
+        questions,
+        rawQuestions: questions,
+        kind: 'plan_approval',
+      };
+      this.questions.set(questionId, parked);
+      this.questions.set(String(id), parked);
+      if (toolCallId) this.questions.set(toolCallId, parked);
+      this.emit({
+        type: 'question_request',
+        sessionId,
+        questionId,
+        requestId: id,
+        toolCallId,
+        prompt: question,
+        options: parked.options,
+        questions,
+        rawQuestions: questions,
       });
       return;
     }
@@ -1270,24 +1334,19 @@ function buildQuestionAnswersMap(
   parked: PendingQuestion,
   answer: string | Record<string, string[]>,
 ): Record<string, string | string[]> {
+  // grok-build AskUserQuestionExtResponse::Accepted: answers 以问题原文为键,
+  // 值为 StringOrVec;多塞 id 键会被当成额外问题回显给模型。
   const out: Record<string, string | string[]> = {};
   if (typeof answer === 'string') {
     const first = parked.questions[0];
-    const key = first?.question || first?.id || 'q_0';
-    out[key] = answer;
-    if (first?.id && first.id !== key) out[first.id] = [answer];
+    out[first?.question || first?.id || 'q_0'] = answer;
     return out;
   }
   for (const [k, vals] of Object.entries(answer)) {
     const arr = Array.isArray(vals) ? vals.map(String) : [String(vals)];
     const matched = parked.questions.find((q, idx) => q.id === k || `q_${idx}` === k || q.question === k);
-    if (matched) {
-      const value: string | string[] = matched.multiSelect ? arr : (arr[0] ?? '');
-      if (matched.question) out[matched.question] = value;
-      out[matched.id] = arr;
-    } else {
-      out[k] = arr.length === 1 ? arr[0] : arr;
-    }
+    const key = matched?.question || matched?.id || k;
+    out[key] = matched?.multiSelect || (!matched && arr.length > 1) ? arr : (arr[0] ?? '');
   }
   return out;
 }

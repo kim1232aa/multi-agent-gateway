@@ -2330,12 +2330,11 @@ export class CodexProviderAdapter implements ProviderAdapter {
           };
           break;
         case 'patch-updated': {
-          // turn 进行中的文件改动增量(item/fileChange/patchUpdated):
-          // 汇总成"文件 + 行数增减"摘要,前端在终态 diff 到来前不再是黑盒。
+          // item/fileChange/patchUpdated 是同一 item 的完整快照,只汇总"文件 + 行数增减",
+          // 由下游按 itemId 去重,终态 diff 仍以 turn/diff/updated 为准。
           const files = ev.changes.map((c) => {
-            const m = /^\+\d+(?:,\d+)?/m.exec(c.diff ?? '');
-            const d = /^-\d+(?:,-\d+)?/m.exec(c.diff ?? '');
-            return `${c.path}${m || d ? ` (+${m ? m[0].slice(1) : 0}/-${d ? d[0].slice(1) : 0})` : ''}`;
+            const label = c.movePath ? `${c.path} → ${c.movePath}` : c.path;
+            return `${label} (+${c.added}/-${c.removed})`;
           });
           yield {
             kind: 'diff',
@@ -2343,7 +2342,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             sessionId,
             turnId: ev.turnId,
             timestamp: ts,
-            payload: { diff: ev.changes.map((c) => c.diff).join('\n'), files, raw: ev },
+            payload: { itemId: ev.itemId, files },
           };
           break;
         }
