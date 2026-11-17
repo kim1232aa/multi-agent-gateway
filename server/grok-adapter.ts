@@ -402,8 +402,9 @@ export class GrokAdapter {
     }
     const rewind = effectiveRewind(updates, points);
 
+    const chatEntries = parseJsonl(chatText);
     const messages: GrokHistoryMessage[] = [];
-    for (const entry of parseJsonl(chatText)) {
+    for (const entry of chatEntries) {
       const mapped = mapHistoryEntry(entry);
       if (!mapped) continue;
       const timestamp = pickString(entry.timestamp);
@@ -412,15 +413,26 @@ export class GrokAdapter {
     }
     applyRewind(messages, rewind);
 
+    const isCompacted = chatEntries.some((e) => typeof e.synthetic_reason === 'string' && e.synthetic_reason.startsWith('compaction'))
+      || updates.some((u) => {
+        const s = String(updateOf(u).sessionUpdate ?? '');
+        return s === 'auto_compact_completed' || s === 'compaction_checkpoint';
+      });
+
+    let updateTimeline: GrokHistoryMessage[] | undefined;
+    const timelineFromUpdates = (): GrokHistoryMessage[] => (updateTimeline ??= historyFromUpdates(updates, rewind));
+
     if (messages.length === 0 && updates.length > 0) {
-      messages.push(...historyFromUpdates(updates, rewind));
+      messages.push(...timelineFromUpdates());
+    } else if (isCompacted && updates.length > 0) {
+      const fromUpdates = timelineFromUpdates();
+      if (fromUpdates.length > 0) {
+        const merged = mergeCompactedHistory(messages, fromUpdates);
+        messages.splice(0, messages.length, ...merged);
+      }
     }
 
-    const { createdAt, updatedAt } = readSessionTimes(dir);
-    const missing = messages.filter((m) => !m.timestamp);
-    for (let i = 0; i < missing.length; i++) {
-      missing[i].timestamp = interpolateIso(createdAt, updatedAt, i, missing.length);
-    }
+    applySessionTimestamps(dir, messages, updates.length > 0 ? timelineFromUpdates() : null);
     return messages;
   }
 
@@ -759,12 +771,14 @@ export class GrokAdapter {
     const points = parseJsonl(readTailNoFollow(pointsPath, MAX_SMALL_FILE_BYTES));
     const chatEntries = parseJsonl(readTailNoFollow(chatPath, MAX_SESSION_FILE_TAIL_BYTES));
     const userTurns = chatEntries.filter((entry) => entry.type === 'user' && mapHistoryEntry(entry) !== null).length;
-    const promptIndexes = updates
-      .map((entry) => updateOf(entry))
-      .filter((update) => String(update.sessionUpdate ?? update.type ?? '') === 'user_message_chunk')
-      .map((update) => promptIndexOf(update))
-      .filter((index): index is number => index !== undefined);
-    const totalPrompts = Math.max(userTurns, promptIndexes.length, points.length);
+    const promptIndexes = new Set<number>();
+    for (const entry of updates) {
+      const update = updateOf(entry);
+      if (String(update.sessionUpdate ?? update.type ?? '') !== 'user_message_chunk') continue;
+      const index = promptIndexOf(update);
+      if (index !== undefined) promptIndexes.add(index);
+    }
+    const totalPrompts = Math.max(userTurns, promptIndexes.size, points.length);
     if (totalPrompts === 0) {
       throw new ProviderError('invalid_request', 'grok-adapter: session has no turns to roll back', 400);
     }
@@ -1146,7 +1160,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
     const storageId = this.storageSessionId(sessionId);
     const history = await this.inner.getHistory(storageId);
-    return history.map((m, index) => {
+    const occurrenceTracker = new Map<string, number>();
+    return history.map((m) => {
       const content: Message['content'] = m.blocks && m.blocks.length > 0
         ? m.blocks.map((b) => {
             if (b.type === 'thinking') return { type: 'thinking' as const, thinking: b.text };
@@ -1164,11 +1179,38 @@ export class GrokProviderAdapter implements ProviderAdapter {
             return { type: 'text' as const, text: b.text };
           })
         : [{ type: 'text' as const, text: m.text }];
-      return {
-        id: `msg_${createHash('sha256')
-          .update(JSON.stringify([sessionId, index, m.role, m.timestamp ?? '', m.text]))
+
+      const toolBlock = m.blocks?.find((b) => b.type === 'tool_use' || b.type === 'tool_result');
+      let id: string;
+      if (toolBlock) {
+        if (toolBlock.type === 'tool_use') {
+          id = `msg_${createHash('sha256')
+            .update(JSON.stringify([sessionId, 'tool_use', toolBlock.id, toolBlock.name]))
+            .digest('hex')
+            .slice(0, 24)}`;
+        } else {
+          id = `msg_${createHash('sha256')
+            .update(JSON.stringify([sessionId, 'tool_result', toolBlock.tool_use_id]))
+            .digest('hex')
+            .slice(0, 24)}`;
+        }
+      } else {
+        const blockDigest = m.blocks?.map((b) => {
+          if (b.type === 'thinking') return `thinking:${b.text.slice(0, 64)}`;
+          if (b.type === 'text') return `text:${b.text.slice(0, 64)}`;
+          return b.type;
+        }) ?? [];
+        const contentKey = JSON.stringify([m.role, m.text, blockDigest]);
+        const occ = occurrenceTracker.get(contentKey) ?? 0;
+        occurrenceTracker.set(contentKey, occ + 1);
+        id = `msg_${createHash('sha256')
+          .update(JSON.stringify([sessionId, m.role, m.text, blockDigest, occ]))
           .digest('hex')
-          .slice(0, 24)}`,
+          .slice(0, 24)}`;
+      }
+
+      return {
+        id,
         session_id: sessionId,
         role: content.length > 0 && content.every((part) => part.type === 'tool_result') ? 'tool' : m.role,
         content: content as MessageContentPart[],
@@ -2628,32 +2670,96 @@ function applyRewind(messages: GrokHistoryMessage[], target: number | undefined)
   messages.splice(cutAt);
 }
 
-/** Reconstruct a transcript from ACP updates when chat_history.jsonl is absent. */
+function extractUpdateTimestamp(entry: Record<string, unknown>, update: Record<string, unknown>): string | undefined {
+  const meta = (isRecord(entry.params) && isRecord(entry.params._meta))
+    ? entry.params._meta
+    : (isRecord(update._meta) ? update._meta : undefined);
+  const ms = typeof meta?.agentTimestampMs === 'number' && Number.isFinite(meta.agentTimestampMs)
+    ? meta.agentTimestampMs
+    : typeof meta?.streamStartMs === 'number' && Number.isFinite(meta.streamStartMs)
+      ? meta.streamStartMs
+      : typeof meta?.turnStartMs === 'number' && Number.isFinite(meta.turnStartMs)
+        ? meta.turnStartMs
+        : typeof entry.timestamp === 'number' && Number.isFinite(entry.timestamp)
+          ? (entry.timestamp > 1e11 ? entry.timestamp : entry.timestamp * 1000)
+          : typeof update.timestamp === 'number' && Number.isFinite(update.timestamp)
+            ? (update.timestamp > 1e11 ? update.timestamp : update.timestamp * 1000)
+            : undefined;
+  if (ms !== undefined && ms > 0) {
+    try {
+      return new Date(ms).toISOString();
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function extractToolUpdateText(update: Record<string, unknown>): string {
+  if (update.content !== undefined) {
+    const text = textOfContent(update.content).trim();
+    if (text) return text;
+  }
+  const raw = update.rawOutput;
+  if (typeof raw === 'string') return raw;
+  if (isRecord(raw)) {
+    if (typeof raw.output_for_prompt === 'string') return raw.output_for_prompt;
+    if (typeof raw.content === 'string') return raw.content;
+    if (typeof raw.output === 'string') return raw.output;
+    if (isRecord(raw.Content) && typeof raw.Content.content === 'string') {
+      return raw.Content.content;
+    }
+    if (Array.isArray(raw.output)) {
+      if (raw.output.every((b) => typeof b === 'number')) {
+        return Buffer.from(raw.output as number[]).toString('utf8');
+      }
+    }
+  }
+  return toolResultText(raw);
+}
+
+/** Reconstruct a transcript from ACP updates when chat_history.jsonl is absent or compacted. */
 function historyFromUpdates(
   updates: Array<Record<string, unknown>>,
-  _rewindTarget: number | undefined,
+  rewindTarget: number | undefined,
 ): GrokHistoryMessage[] {
   const messages: GrokHistoryMessage[] = [];
   let userTurns = 0;
-  const flush = (role: GrokHistoryMessage['role'], text: string): void => {
+  const toolResultIndices = new Map<string, number>();
+
+  const flush = (role: GrokHistoryMessage['role'], text: string, ts?: string): void => {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed && role !== 'user') return;
     const last = messages[messages.length - 1];
-    if (role === 'assistant' && last && last.role === 'assistant') {
+    if (role === 'assistant' && last && last.role === 'assistant' && (last.blocks ?? []).every((b) => b.type === 'text')) {
       last.text += trimmed;
-      last.blocks = [...(last.blocks ?? []), { type: 'text', text: trimmed }];
+      if (trimmed) {
+        last.blocks = [...(last.blocks ?? []), { type: 'text', text: trimmed }];
+      }
+      if (!last.timestamp && ts) last.timestamp = ts;
       return;
     }
-    messages.push({ role, text: trimmed, blocks: [{ type: 'text', text: trimmed }] });
+    messages.push({
+      role,
+      text: trimmed,
+      blocks: [{ type: 'text', text: trimmed }],
+      ...(ts ? { timestamp: ts } : {}),
+    });
   };
   let pending = '';
+  let pendingChunks: string[] = [];
   let pendingRole: 'user' | 'assistant' | null = null;
   let pendingPromptIndex: number | undefined;
+  let pendingTimestamp: string | undefined;
   const commit = (): void => {
-    if (pendingRole) flush(pendingRole, pending);
+    if (pendingRole) {
+      flush(pendingRole, pendingRole === 'user' ? dropReplayedChunks(pendingChunks).join('') : pending, pendingTimestamp);
+    }
     pending = '';
+    pendingChunks = [];
     pendingRole = null;
     pendingPromptIndex = undefined;
+    pendingTimestamp = undefined;
   };
   for (const entry of updates) {
     const update = updateOf(entry);
@@ -2669,6 +2775,7 @@ function historyFromUpdates(
       continue;
     }
     if (kind === 'user_message_chunk') {
+      const ts = extractUpdateTimestamp(entry, update);
       const index = promptIndexOf(update);
       if (pendingRole && (pendingRole !== 'user' || index === undefined || index !== pendingPromptIndex)) {
         commit();
@@ -2677,41 +2784,276 @@ function historyFromUpdates(
       else if (index >= userTurns) userTurns = index + 1;
       pendingRole = 'user';
       pendingPromptIndex = index;
-      pending += textOfContent(update.content);
+      if (!pendingTimestamp && ts) pendingTimestamp = ts;
+      pendingChunks.push(textOfContent(update.content));
       continue;
     }
     if (kind === 'agent_message_chunk') {
+      const ts = extractUpdateTimestamp(entry, update);
       if (pendingRole && pendingRole !== 'assistant') commit();
       pendingRole = 'assistant';
+      if (!pendingTimestamp && ts) pendingTimestamp = ts;
       pending += textOfContent(update.content);
       continue;
     }
     if (kind === 'agent_thought_chunk') {
       commit();
+      const ts = extractUpdateTimestamp(entry, update);
       const text = textOfContent(update.content).trim();
-      if (text) messages.push({ role: 'assistant', text: '', blocks: [{ type: 'thinking', text }] });
+      if (text) {
+        messages.push({
+          role: 'assistant',
+          text: '',
+          blocks: [{ type: 'thinking', text }],
+          ...(ts ? { timestamp: ts } : {}),
+        });
+      }
       continue;
     }
     if (kind === 'tool_call') {
       commit();
+      const ts = extractUpdateTimestamp(entry, update);
       const id = String(update.toolCallId ?? update.id ?? '');
       const name = String(update.title ?? update.toolName ?? 'tool');
       messages.push({
         role: 'assistant',
         text: '',
         blocks: [{ type: 'tool_use', id, name, input: update.rawInput ?? update.input ?? {} }],
+        ...(ts ? { timestamp: ts } : {}),
       });
+      continue;
+    }
+    if (kind === 'tool_call_update') {
+      commit();
+      const id = String(update.toolCallId ?? update.id ?? '');
+      if (
+        update.status === 'completed' ||
+        update.status === 'failed' ||
+        update.status === 'error' ||
+        update.rawOutput !== undefined ||
+        (Array.isArray(update.content) && update.content.length > 0)
+      ) {
+        const ts = extractUpdateTimestamp(entry, update);
+        const text = extractToolUpdateText(update);
+        const isError = update.status === 'failed' || update.status === 'error' || update.is_error === true || update.isError === true;
+        const existingIdx = toolResultIndices.get(id);
+        if (existingIdx !== undefined && messages[existingIdx]) {
+          const existing = messages[existingIdx];
+          const block = existing.blocks?.find((b) => b.type === 'tool_result' && b.tool_use_id === id);
+          if (block && block.type === 'tool_result') {
+            if (text) block.content = text;
+            if (isError) block.is_error = true;
+          }
+          if (ts && !existing.timestamp) existing.timestamp = ts;
+        } else {
+          const msg: GrokHistoryMessage = {
+            role: 'tool',
+            text: '',
+            blocks: [{
+              type: 'tool_result',
+              tool_use_id: id,
+              content: text,
+              ...(isError ? { is_error: true } : {}),
+            }],
+            ...(ts ? { timestamp: ts } : {}),
+          };
+          toolResultIndices.set(id, messages.length);
+          messages.push(msg);
+        }
+      }
+      continue;
     }
   }
   commit();
+  if (typeof rewindTarget === 'number' && Number.isFinite(rewindTarget)) {
+    applyRewind(messages, rewindTarget);
+  }
   return messages;
+}
+
+/**
+ * The CLI re-emits the complete user message for a prompt index (echo on submit,
+ * then again when the turn starts). A chunk sequence that is the same run twice
+ * is one message, while distinct streamed pieces are still concatenated.
+ */
+function dropReplayedChunks(chunks: string[]): string[] {
+  const n = chunks.length;
+  if (n < 2 || n % 2 !== 0) return chunks;
+  const half = n / 2;
+  for (let i = 0; i < half; i++) {
+    if (chunks[i] !== chunks[i + half]) return chunks;
+  }
+  const first = chunks.slice(0, half);
+  return first.join('').trim() ? first : chunks;
 }
 
 function textOfContent(content: unknown): string {
   if (typeof content === 'string') return content;
-  if (isRecord(content) && typeof content.text === 'string') return content.text;
+  if (isRecord(content)) {
+    if (typeof content.text === 'string') return content.text;
+    if (content.content !== undefined) return textOfContent(content.content);
+  }
   if (Array.isArray(content)) return content.map((part) => textOfContent(part)).join('');
   return '';
+}
+
+function messageMatches(a: GrokHistoryMessage, b: GrokHistoryMessage): boolean {
+  if (a.role !== b.role) return false;
+  const aRes = a.blocks?.find((x) => x.type === 'tool_result');
+  const bRes = b.blocks?.find((x) => x.type === 'tool_result');
+  if (aRes || bRes) {
+    return aRes?.type === 'tool_result' && bRes?.type === 'tool_result' && aRes.tool_use_id === bRes.tool_use_id;
+  }
+  const aUse = a.blocks?.find((x) => x.type === 'tool_use');
+  const bUse = b.blocks?.find((x) => x.type === 'tool_use');
+  if (aUse || bUse) {
+    return aUse?.type === 'tool_use' && bUse?.type === 'tool_use'
+      && aUse.id === bUse.id && (aUse.id !== '' || aUse.name === bUse.name);
+  }
+  const aThink = a.blocks?.find((x) => x.type === 'thinking');
+  const bThink = b.blocks?.find((x) => x.type === 'thinking');
+  if (aThink || bThink) {
+    return aThink?.type === 'thinking' && bThink?.type === 'thinking' && aThink.text.trim() === bThink.text.trim();
+  }
+  const aText = a.text.trim();
+  const bText = b.text.trim();
+  if (aText !== bText) return false;
+  return aText.length > 0 || a.role === 'user';
+}
+
+function mergeCompactedHistory(
+  chatMessages: GrokHistoryMessage[],
+  updateMessages: GrokHistoryMessage[],
+): GrokHistoryMessage[] {
+  if (chatMessages.length === 0) return updateMessages;
+  if (updateMessages.length === 0) return chatMessages;
+
+  const matches: Array<{ chatIdx: number; updateIdx: number }> = [];
+  let uScan = 0;
+  for (let cIdx = 0; cIdx < chatMessages.length; cIdx++) {
+    const c = chatMessages[cIdx];
+    for (let uIdx = uScan; uIdx < updateMessages.length; uIdx++) {
+      const u = updateMessages[uIdx];
+      if (c && u && messageMatches(c, u)) {
+        matches.push({ chatIdx: cIdx, updateIdx: uIdx });
+        uScan = uIdx + 1;
+        break;
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return [...updateMessages, ...chatMessages];
+  }
+
+  const firstMatch = matches[0];
+  const lastMatch = matches[matches.length - 1];
+
+  const headFromChat = chatMessages.slice(0, firstMatch.chatIdx);
+  const headFromUpdates = updateMessages.slice(0, firstMatch.updateIdx);
+
+  const middle: GrokHistoryMessage[] = [];
+  let lastU = firstMatch.updateIdx;
+  let lastC = firstMatch.chatIdx;
+
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    if (m.updateIdx > lastU) {
+      middle.push(...updateMessages.slice(lastU, m.updateIdx));
+    }
+    if (m.chatIdx > lastC) {
+      for (let c = lastC; c < m.chatIdx; c++) {
+        const chatMsg = chatMessages[c];
+        if (chatMsg && !middle.some((existing) => messageMatches(existing, chatMsg))) {
+          middle.push(chatMsg);
+        }
+      }
+    }
+    const matchedMsg = { ...chatMessages[m.chatIdx] };
+    if (!matchedMsg.timestamp && updateMessages[m.updateIdx]?.timestamp) {
+      matchedMsg.timestamp = updateMessages[m.updateIdx].timestamp;
+    }
+    middle.push(matchedMsg);
+    lastU = m.updateIdx + 1;
+    lastC = m.chatIdx + 1;
+  }
+
+  const tailFromUpdates = updateMessages.slice(lastMatch.updateIdx + 1);
+  const tailFromChat = chatMessages.slice(lastMatch.chatIdx + 1);
+
+  const tail: GrokHistoryMessage[] = [];
+  for (const u of tailFromUpdates) {
+    tail.push(u);
+  }
+  for (const c of tailFromChat) {
+    if (!tail.some((existing) => messageMatches(existing, c))) {
+      tail.push(c);
+    }
+  }
+
+  return [...headFromChat, ...headFromUpdates, ...middle, ...tail];
+}
+
+function applySessionTimestamps(
+  dir: string,
+  messages: GrokHistoryMessage[],
+  updateMessages: GrokHistoryMessage[] | null,
+): void {
+  if (updateMessages && updateMessages.length > 0) {
+    let uIdx = 0;
+    for (const m of messages) {
+      if (m.timestamp) continue;
+      for (let j = uIdx; j < updateMessages.length; j++) {
+        const cand = updateMessages[j];
+        if (cand && cand !== m && cand.timestamp && messageMatches(m, cand)) {
+          m.timestamp = cand.timestamp;
+          uIdx = j + 1;
+          break;
+        }
+      }
+    }
+  }
+
+  const { createdAt, updatedAt } = readSessionTimes(dir);
+  if (!updateMessages) {
+    const missing = messages.filter((m) => !m.timestamp);
+    for (let i = 0; i < missing.length; i++) {
+      missing[i].timestamp = interpolateIso(createdAt, updatedAt, i, missing.length);
+    }
+    return;
+  }
+  fillMissingTimestamps(messages, createdAt, updatedAt);
+}
+
+/** Spread runs of un-timestamped messages evenly between their neighbouring anchors, never backwards. */
+function fillMissingTimestamps(messages: GrokHistoryMessage[], createdAt: string, updatedAt: string): void {
+  const n = messages.length;
+  let i = 0;
+  while (i < n) {
+    if (messages[i].timestamp) {
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (j < n && !messages[j].timestamp) j += 1;
+    const loIso = i > 0 ? messages[i - 1].timestamp : createdAt;
+    const hiIso = j < n ? messages[j].timestamp : updatedAt;
+    const lo = Date.parse(loIso ?? '');
+    const hi = Date.parse(hiIso ?? '');
+    const count = j - i;
+    for (let k = 0; k < count; k++) {
+      let ms: number;
+      if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) ms = lo + ((hi - lo) * (k + 1)) / (count + 1);
+      else if (Number.isFinite(lo)) ms = lo + k + 1;
+      else if (Number.isFinite(hi)) ms = hi - (count - k);
+      else {
+        messages[i + k].timestamp = loIso || hiIso || '';
+        continue;
+      }
+      messages[i + k].timestamp = new Date(Math.round(ms)).toISOString();
+    }
+    i = j;
+  }
 }
 
 interface PromptFile {
@@ -2966,12 +3308,13 @@ function mapHistoryEntry(entry: any): GrokHistoryMessage | null {
     const content = entry.content ?? entry.message?.content;
     if (type === 'user' && (entry.synthetic_reason || isGrokBannerText(extractText(content)))) {
       const query = unwrapUserQuery(extractText(content));
-      if (!query) return null;
+      if (query === null) return null;
       return { role: 'user', text: query, blocks: [{ type: 'text', text: query }] };
     }
     if (typeof content === 'string' && content) {
+      const hasUserQuery = type === 'user' && /<user_query>[\s\S]*?<\/user_query>/.test(content);
       const text = type === 'user' ? normalizeGrokUserText(content) : content;
-      if (text) blocks.push({ type: 'text', text });
+      if (text || hasUserQuery) blocks.push({ type: 'text', text });
     }
     if (Array.isArray(content)) {
       for (const block of content) {
@@ -2989,9 +3332,10 @@ function mapHistoryEntry(entry: any): GrokHistoryMessage | null {
             content: toolResultText(b.content),
             ...(b.is_error === true ? { is_error: true } : {}),
           });
-        } else if (b.type === 'text' && typeof b.text === 'string' && b.text) {
+        } else if (b.type === 'text' && typeof b.text === 'string') {
+          const hasUserQuery = type === 'user' && /<user_query>[\s\S]*?<\/user_query>/.test(b.text);
           const text = type === 'user' ? normalizeGrokUserText(b.text) : b.text;
-          if (text) {
+          if (text || hasUserQuery) {
             blocks.push({ type: 'text', text });
           }
         }
@@ -3007,12 +3351,16 @@ function mapHistoryEntry(entry: any): GrokHistoryMessage | null {
       }
     }
     const rawText = extractText(content);
+    const hasUserQuery = type === 'user' && /<user_query>[\s\S]*?<\/user_query>/.test(rawText);
     const blockText = blocks
       .filter((b): b is Extract<typeof b, { type: 'text' }> => b.type === 'text')
       .map((b) => b.text)
       .join('');
     const text = blockText.trim() || (type === 'user' ? normalizeGrokUserText(rawText) : rawText);
-    if (!text && blocks.length === 0) return null;
+    if (!text && blocks.length === 0 && !hasUserQuery) return null;
+    if (hasUserQuery && blocks.length === 0) {
+      blocks.push({ type: 'text', text: '' });
+    }
     const role: GrokHistoryMessage['role'] =
       blocks.length > 0 && blocks.every((b) => b.type === 'tool_result') ? 'tool' : type;
     return {
@@ -3195,8 +3543,8 @@ function isGrokBannerText(text: string): boolean {
 
 function unwrapUserQuery(text: string): string | null {
   const match = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/.exec(text);
-  const query = match?.[1]?.trim();
-  return query || null;
+  if (!match) return null;
+  return match[1].trim();
 }
 
 function normalizeGrokUserText(raw: string): string {

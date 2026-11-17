@@ -2114,3 +2114,399 @@ test('review regression: group escalation delivers SIGKILL when group survives l
     await adapter.dispose();
   }
 });
+
+test('review regression: compacted session merges pre-compaction updates and unique post-compaction chat tail', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-compact-merge-'));
+  const sessionsDir = join(base, 'sessions');
+  const sessionId = '01a1de65-a11b-7d81-b7d0-9a3f7eb03d8b';
+  try {
+    const encoded = encodeURIComponent('/home/pi');
+    const dir = join(sessionsDir, encoded, sessionId);
+    await mkdir(dir, { recursive: true });
+    // chat_history.jsonl has post-compaction Turn 1 and a new Turn 2 tail unique to chat
+    await writeFile(join(dir, 'chat_history.jsonl'), [
+      JSON.stringify({ type: 'system', content: 'You are Grok' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_info>rules</user_info>' }], synthetic_reason: 'compaction_meta' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\nTurn 1 prompt\n</user_query>' }] }),
+      JSON.stringify({ type: 'assistant', content: 'Turn 1 reply' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\nTurn 2 unique tail prompt\n</user_query>' }] }),
+      JSON.stringify({ type: 'assistant', content: 'Turn 2 unique tail reply' }),
+    ].join('\n') + '\n');
+    // updates.jsonl has pre-compaction Turn 0 and Turn 1
+    await writeFile(join(dir, 'updates.jsonl'), [
+      JSON.stringify({ timestamp: 1794732571, method: 'session/update', params: { sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Turn 0 prompt' } } } }),
+      JSON.stringify({ timestamp: 1794732603, method: 'session/update', params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Turn 0 reply' } } } }),
+      JSON.stringify({ timestamp: 1794732603, method: '_x.ai/session/update', params: { sessionId, update: { sessionUpdate: 'turn_completed' } } }),
+      JSON.stringify({ timestamp: 1794732700, method: 'session/update', params: { sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Turn 1 prompt' } } } }),
+      JSON.stringify({ timestamp: 1794732705, method: 'session/update', params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Turn 1 reply' } } } }),
+      JSON.stringify({ timestamp: 1794732705, method: '_x.ai/session/update', params: { sessionId, update: { sessionUpdate: 'turn_completed' } } }),
+      JSON.stringify({ timestamp: 1794732710, method: 'session/update', params: { sessionId, update: { sessionUpdate: 'auto_compact_completed' } } }),
+    ].join('\n') + '\n');
+
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const history = await adapter.getHistory(sessionId);
+    const userPrompts = history.filter(m => m.role === 'user').map(m => m.content.map((c: any) => c.text).join(''));
+    assert.ok(userPrompts.some(p => p.includes('Turn 0 prompt')), 'expected pre-compaction Turn 0 from updates');
+    assert.ok(userPrompts.some(p => p.includes('Turn 1 prompt')), 'expected overlapping Turn 1');
+    assert.ok(userPrompts.some(p => p.includes('Turn 2 unique tail prompt')), 'expected post-compaction unique Turn 2 tail from chat not to be dropped');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: historyFromUpdates aggregates tool_call_update by callId and retains latest output snapshot', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-tool-agg-'));
+  const sessionsDir = join(base, 'sessions');
+  const sessionId = '01a1de87-1f93-7b02-b088-72941185c930';
+  try {
+    const encoded = encodeURIComponent('/tmp/proj');
+    const dir = join(sessionsDir, encoded, sessionId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'updates.jsonl'), [
+      JSON.stringify({ timestamp: 1794734759, params: { sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'run tool' } } } }),
+      JSON.stringify({ timestamp: 1794734760, params: { sessionId, update: { sessionUpdate: 'tool_call', toolCallId: 'call_agg_1', title: 'run_cmd', rawInput: { cmd: 'ls' } } } }),
+      // in_progress update with output snapshot
+      JSON.stringify({ timestamp: 1794734761, params: { sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call_agg_1', status: 'in_progress', rawOutput: 'snapshot stdout line 1\n' } } }),
+      // completed update that omits output
+      JSON.stringify({ timestamp: 1794734762, params: { sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: 'call_agg_1', status: 'completed' } } }),
+      JSON.stringify({ timestamp: 1794734763, params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } } } }),
+    ].join('\n') + '\n');
+
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const history = await adapter.getHistory(sessionId);
+    const toolResults = history.filter(m => m.role === 'tool');
+    assert.equal(toolResults.length, 1, `expected exactly 1 tool result message, got ${toolResults.length}`);
+    const part = toolResults[0]?.content.find((p: any) => p.type === 'tool_result') as any;
+    assert.ok(part, 'expected tool_result block');
+    assert.equal(part.tool_call_id, 'call_agg_1');
+    assert.equal(part.output, 'snapshot stdout line 1\n', 'expected latest snapshot output to be retained');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: session timestamps match in sequence across chunks and maintain monotonic order', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-mono-ts-'));
+  const sessionsDir = join(base, 'sessions');
+  const sessionId = '33333333-3333-4333-8333-333333333333';
+  const t0 = 1794732571000; // 2026-11-15T08:49:31.000Z
+  const t1 = 1794732573000;
+  const t2 = 1794732576000;
+  const t3 = 1794732600000;
+  const t4 = 1794732602000;
+  const t5 = 1794732606000;
+  try {
+    const encoded = encodeURIComponent('/tmp/proj');
+    const dir = join(sessionsDir, encoded, sessionId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'summary.json'), JSON.stringify({
+      info: { id: sessionId, cwd: '/tmp/proj' },
+      created_at: new Date(t0).toISOString(),
+      updated_at: new Date(t5).toISOString(),
+    }));
+    await writeFile(join(dir, 'chat_history.jsonl'), [
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'turn 0 question' }] }),
+      JSON.stringify({ type: 'assistant', content: 'turn 0 answer chunk A chunk B' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'turn 1 question' }] }),
+      JSON.stringify({ type: 'assistant', content: 'turn 1 answer chunk C chunk D' }),
+    ].join('\n') + '\n');
+    await writeFile(join(dir, 'updates.jsonl'), [
+      JSON.stringify({ timestamp: Math.floor(t0/1000), params: { sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'turn 0 question' } }, _meta: { agentTimestampMs: t0 } } }),
+      JSON.stringify({ timestamp: Math.floor(t1/1000), params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'turn 0 answer chunk A ' } }, _meta: { agentTimestampMs: t1 } } }),
+      JSON.stringify({ timestamp: Math.floor(t2/1000), params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'chunk B' } }, _meta: { agentTimestampMs: t2 } } }),
+      JSON.stringify({ timestamp: Math.floor(t2/1000), params: { sessionId, update: { sessionUpdate: 'turn_completed' } } }),
+      JSON.stringify({ timestamp: Math.floor(t3/1000), params: { sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'turn 1 question' } }, _meta: { agentTimestampMs: t3 } } }),
+      JSON.stringify({ timestamp: Math.floor(t4/1000), params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'turn 1 answer chunk C ' } }, _meta: { agentTimestampMs: t4 } } }),
+      JSON.stringify({ timestamp: Math.floor(t5/1000), params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'chunk D' } }, _meta: { agentTimestampMs: t5 } } }),
+      JSON.stringify({ timestamp: Math.floor(t5/1000), params: { sessionId, update: { sessionUpdate: 'turn_completed' } } }),
+    ].join('\n') + '\n');
+
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const history = await adapter.getHistory(sessionId);
+    assert.equal(history.length, 4);
+    assert.equal(history[0]?.created_at, new Date(t0).toISOString());
+    assert.equal(history[1]?.created_at, new Date(t1).toISOString());
+    assert.equal(history[2]?.created_at, new Date(t3).toISOString());
+    assert.equal(history[3]?.created_at, new Date(t4).toISOString());
+    for (let i = 1; i < history.length; i++) {
+      assert.ok(Date.parse(history[i]?.created_at ?? '') >= Date.parse(history[i - 1]?.created_at ?? ''), 'timestamps must be monotonic');
+    }
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: message IDs remain stable across message appending and session compaction', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-stable-id-'));
+  const sessionsDir = join(base, 'sessions');
+  const sessionId = '44444444-4444-4444-8444-444444444444';
+  try {
+    const encoded = encodeURIComponent('/tmp/proj');
+    const dir = join(sessionsDir, encoded, sessionId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'summary.json'), JSON.stringify({
+      info: { id: sessionId, cwd: '/tmp/proj' },
+      created_at: '2026-08-16T00:00:00.000Z',
+      updated_at: '2026-08-16T01:00:00.000Z',
+    }));
+    await writeFile(join(dir, 'chat_history.jsonl'), [
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'first prompt' }] }),
+      JSON.stringify({ type: 'assistant', content: 'first answer' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'second prompt' }] }),
+      JSON.stringify({ type: 'assistant', content: 'second answer' }),
+    ].join('\n') + '\n');
+
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const initialHistory = await adapter.getHistory(sessionId);
+    assert.equal(initialHistory.length, 4);
+    const idSecondUser = initialHistory[2]?.id;
+    const idSecondAsst = initialHistory[3]?.id;
+
+    // Append a third turn
+    await writeFile(join(dir, 'chat_history.jsonl'), [
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'first prompt' }] }),
+      JSON.stringify({ type: 'assistant', content: 'first answer' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'second prompt' }] }),
+      JSON.stringify({ type: 'assistant', content: 'second answer' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'third prompt' }] }),
+      JSON.stringify({ type: 'assistant', content: 'third answer' }),
+    ].join('\n') + '\n');
+
+    const extendedHistory = await adapter.getHistory(sessionId);
+    assert.equal(extendedHistory.length, 6);
+    assert.equal(extendedHistory[2]?.id, idSecondUser, 'id of second user must be stable after append');
+    assert.equal(extendedHistory[3]?.id, idSecondAsst, 'id of second asst must be stable after append');
+
+    // Simulate compaction where chat_history.jsonl now only contains second turn onwards with compaction marker
+    await writeFile(join(dir, 'chat_history.jsonl'), [
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'rules' }], synthetic_reason: 'compaction_meta' }),
+      JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'second prompt' }] }),
+      JSON.stringify({ type: 'assistant', content: 'second answer' }),
+    ].join('\n') + '\n');
+
+    const compactedHistory = await adapter.getHistory(sessionId);
+    const compactedSecondUser = compactedHistory.find(m => m.role === 'user' && m.content.some((c: any) => c.text === 'second prompt'));
+    const compactedSecondAsst = compactedHistory.find(m => m.role === 'assistant' && m.content.some((c: any) => c.text === 'second answer'));
+    assert.ok(compactedSecondUser, 'expected second user message');
+    assert.ok(compactedSecondAsst, 'expected second asst message');
+    assert.equal(compactedSecondUser?.id, idSecondUser, 'id must not depend on array index changing from 2 to 0 after compaction');
+    assert.equal(compactedSecondAsst?.id, idSecondAsst, 'id must not depend on array index changing after compaction');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: historyFromUpdates preserves explicit empty user turns', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-empty-up-'));
+  const sessionsDir = join(base, 'sessions');
+  const sessionId = '55555555-5555-4555-8555-555555555555';
+  try {
+    const encoded = encodeURIComponent('/tmp/proj');
+    const dir = join(sessionsDir, encoded, sessionId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'updates.jsonl'), [
+      JSON.stringify({ timestamp: 1794734759, params: { sessionId, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '' } } } }),
+      JSON.stringify({ timestamp: 1794734760, params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'How can I help you today?' } } } }),
+      JSON.stringify({ timestamp: 1794734761, params: { sessionId, update: { sessionUpdate: 'turn_completed' } } }),
+    ].join('\n') + '\n');
+
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const history = await adapter.getHistory(sessionId);
+    assert.equal(history.length, 2, `expected 2 messages, got ${history.length}`);
+    assert.equal(history[0]?.role, 'user');
+    assert.deepEqual(history[0]?.content, [{ type: 'text', text: '' }]);
+    assert.equal(history[1]?.role, 'assistant');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+
+function acpRow(sessionId: string, update: Record<string, unknown>, ms?: number): string {
+  return JSON.stringify({
+    method: 'session/update',
+    params: { sessionId, update, ...(ms !== undefined ? { _meta: { agentTimestampMs: ms } } : {}) },
+  });
+}
+
+test('review regression: compacted merge never pairs empty-text messages of different kinds', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-merge-empty-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '66666666-6666-4666-8666-666666666666';
+  const t0 = Date.parse('2026-08-16T06:21:00.000Z');
+  try {
+    await seedSession(sessionsDir, sid, {
+      'chat_history.jsonl': [
+        JSON.stringify({ type: 'user', synthetic_reason: 'compaction_meta', content: [{ type: 'text', text: 'This session is being continued from a previous conversation.' }] }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\nsecond\n</user_query>' }] }),
+        JSON.stringify({ type: 'assistant', content: '', tool_calls: [{ id: 'call_b', name: 'run_cmd', arguments: '{"cmd":"ls"}' }] }),
+        JSON.stringify({ type: 'tool_result', tool_call_id: 'call_b', content: 'out-b' }),
+        JSON.stringify({ type: 'assistant', content: 'answer b' }),
+      ].join('\n') + '\n',
+      'updates.jsonl': [
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'first' }, _meta: { promptIndex: 0 } }, t0),
+        acpRow(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thought a' } }, t0 + 1000),
+        acpRow(sid, { sessionUpdate: 'tool_call', toolCallId: 'call_a', title: 'run_cmd', rawInput: { cmd: 'pwd' } }, t0 + 2000),
+        acpRow(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'call_a', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'out-a' } }] }, t0 + 3000),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer a' } }, t0 + 4000),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }, t0 + 4000),
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'second' }, _meta: { promptIndex: 1 } }, t0 + 10000),
+        acpRow(sid, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thought b' } }, t0 + 11000),
+        acpRow(sid, { sessionUpdate: 'tool_call', toolCallId: 'call_b', title: 'run_cmd', rawInput: { cmd: 'ls' } }, t0 + 12000),
+        acpRow(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'call_b', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'out-b' } }] }, t0 + 13000),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'answer b' } }, t0 + 14000),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }, t0 + 14000),
+        acpRow(sid, { sessionUpdate: 'auto_compact_completed' }, t0 + 20000),
+      ].join('\n') + '\n',
+    });
+    const history = await new GrokProviderAdapter({ sessionsDir }).getHistory(sid);
+    const parts = history.flatMap((m) => m.content);
+    assert.deepEqual(parts.filter((p) => p.type === 'tool_use').map((p: any) => p.tool_call_id), ['call_a', 'call_b']);
+    assert.deepEqual(parts.filter((p) => p.type === 'tool_result').map((p: any) => p.tool_call_id), ['call_a', 'call_b']);
+    assert.deepEqual(parts.filter((p) => p.type === 'thinking').map((p: any) => p.thinking), ['thought a', 'thought b']);
+    assert.deepEqual(
+      history.filter((m) => m.role === 'user').map((m) => m.content.map((p: any) => p.text).join('')),
+      ['first', 'second'],
+    );
+    assert.equal(new Set(history.map((m) => m.id)).size, history.length, 'message ids must be unique');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: messages missing from updates get interpolated, strictly increasing timestamps', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-ts-interp-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '88888888-8888-4888-8888-888888888888';
+  const createdMs = Date.parse('2026-08-16T06:20:33.000Z');
+  const t1 = createdMs + 1000;
+  const t2 = createdMs + 2000;
+  const updatedMs = createdMs + 62_000;
+  try {
+    const dir = await seedSession(sessionsDir, sid, {
+      'chat_history.jsonl': [
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'q1' }] }),
+        JSON.stringify({ type: 'assistant', content: 'a1' }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: 'q2' }] }),
+        JSON.stringify({ type: 'assistant', content: 'a2' }),
+      ].join('\n') + '\n',
+      'updates.jsonl': [
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'q1' } }, t1),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a1' } }, t2),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }, t2),
+      ].join('\n') + '\n',
+    });
+    await writeFile(join(dir, 'summary.json'), JSON.stringify({
+      info: { id: sid, cwd: '/tmp/work' },
+      created_at: new Date(createdMs).toISOString(),
+      updated_at: new Date(updatedMs).toISOString(),
+    }));
+    const history = await new GrokProviderAdapter({ sessionsDir }).getHistory(sid);
+    const ms = history.map((m) => Date.parse(m.created_at));
+    assert.equal(ms[0], t1);
+    assert.equal(ms[1], t2);
+    assert.ok(ms[2]! > ms[1]!, `q2 must be later than a1: ${ms.join(',')}`);
+    assert.ok(ms[3]! > ms[2]!, `a2 must be later than q2: ${ms.join(',')}`);
+    assert.ok(ms[3]! <= updatedMs, 'interpolated timestamps stay inside the session window');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: a replayed identical user chunk for the same promptIndex is not appended twice', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-user-replay-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '99999999-9999-4999-8999-999999999999';
+  try {
+    await seedSession(sessionsDir, sid, {
+      'updates.jsonl': [
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '你是什么模型 你有什么工具' }, _meta: { promptIndex: 0 } }, 1794732571919),
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '你是什么模型 你有什么工具' }, _meta: { promptIndex: 0 } }, 1794732584774),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '我是 Grok' } }, 1794732603000),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }, 1794732603000),
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'ab' }, _meta: { promptIndex: 1 } }, 1794732700000),
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'cd' }, _meta: { promptIndex: 1 } }, 1794732700100),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } }, 1794732710000),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }, 1794732710000),
+      ].join('\n') + '\n',
+    });
+    const history = await new GrokProviderAdapter({ sessionsDir }).getHistory(sid);
+    const users = history.filter((m) => m.role === 'user').map((m) => m.content.map((p: any) => p.text).join(''));
+    assert.deepEqual(users, ['你是什么模型 你有什么工具', 'abcd']);
+    assert.equal(Date.parse(history[0]!.created_at), 1794732571919, 'the first chunk timestamp wins');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: rollback counts distinct prompt indexes, not replayed user chunks', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-rollback-replay-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '77777777-7777-4777-8777-777777777777';
+  try {
+    await seedSession(sessionsDir, sid, {
+      'chat_history.jsonl': [
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\np0\n</user_query>' }] }),
+        JSON.stringify({ type: 'assistant', content: 'r0' }),
+        JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\np1\n</user_query>' }] }),
+        JSON.stringify({ type: 'assistant', content: 'r1' }),
+      ].join('\n') + '\n',
+      'updates.jsonl': [
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'p0' }, _meta: { promptIndex: 0 } }),
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'p0' }, _meta: { promptIndex: 0 } }),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'r0' } }),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }),
+        acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'p1' }, _meta: { promptIndex: 1 } }),
+        acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'r1' } }),
+        acpRow(sid, { sessionUpdate: 'turn_completed' }),
+      ].join('\n') + '\n',
+      'rewind_points.jsonl': JSON.stringify({ prompt_index: 0 }) + '\n' + JSON.stringify({ prompt_index: 1 }) + '\n',
+    });
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    await adapter.rollback(sid, 1);
+    const marker = (await readFile(join(sessionsDir, encodeURIComponent('/tmp/work'), sid, 'updates.jsonl'), 'utf8'))
+      .trim().split('\n').pop() ?? '';
+    assert.equal(JSON.parse(marker).params.update.target_prompt_index, 1);
+    const after = await adapter.getHistory(sid);
+    assert.deepEqual(after.flatMap((m) => m.content).map((p: any) => p.text), ['p0', 'r0']);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: duplicate prompt texts keep their ids when compaction drops the head of chat_history', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-dup-id-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  try {
+    const turn = (n: number) => [
+      acpRow(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'ok' }, _meta: { promptIndex: n } }, 1794732000000 + n * 10_000),
+      acpRow(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } }, 1794732001000 + n * 10_000),
+      acpRow(sid, { sessionUpdate: 'turn_completed' }, 1794732001000 + n * 10_000),
+    ];
+    const userQuery = JSON.stringify({ type: 'user', content: [{ type: 'text', text: '<user_query>\nok\n</user_query>' }] });
+    const reply = JSON.stringify({ type: 'assistant', content: 'done' });
+    const dir = await seedSession(sessionsDir, sid, {
+      'chat_history.jsonl': [userQuery, reply, userQuery, reply, userQuery, reply].join('\n') + '\n',
+      'updates.jsonl': [...turn(0), ...turn(1), ...turn(2)].join('\n') + '\n',
+    });
+    const adapter = new GrokProviderAdapter({ sessionsDir });
+    const before = (await adapter.getHistory(sid)).map((m) => m.id);
+    assert.equal(before.length, 6);
+    assert.equal(new Set(before).size, 6);
+
+    await writeFile(join(dir, 'chat_history.jsonl'), [
+      JSON.stringify({ type: 'user', synthetic_reason: 'compaction_meta', content: [{ type: 'text', text: 'summary' }] }),
+      userQuery,
+      reply,
+    ].join('\n') + '\n');
+    await writeFile(join(dir, 'updates.jsonl'), [
+      ...turn(0), ...turn(1), ...turn(2),
+      acpRow(sid, { sessionUpdate: 'auto_compact_completed' }, 1794732100000),
+    ].join('\n') + '\n');
+    const after = (await adapter.getHistory(sid)).map((m) => m.id);
+    assert.deepEqual(after, before);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
