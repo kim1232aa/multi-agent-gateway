@@ -2120,7 +2120,7 @@ test('review regression: compacted session merges pre-compaction updates and uni
   const sessionsDir = join(base, 'sessions');
   const sessionId = '01a1de65-a11b-7d81-b7d0-9a3f7eb03d8b';
   try {
-    const encoded = encodeURIComponent('/home/pi');
+    const encoded = encodeURIComponent('/work');
     const dir = join(sessionsDir, encoded, sessionId);
     await mkdir(dir, { recursive: true });
     // chat_history.jsonl has post-compaction Turn 1 and a new Turn 2 tail unique to chat

@@ -4778,8 +4778,8 @@ test('Pi skills strip skill: prefix in /skills and format /skill: in :activate, 
   };
 
   pi.listSkills = async () => [
-    { name: 'skill:commit', description: 'Commit git changes', path: '/home/pi/.pi/skills/commit/SKILL.md', scope: 'user' },
-    { name: 'push', description: 'Push to remote', path: '/home/pi/.pi/skills/push/SKILL.md', scope: 'project' },
+    { name: 'skill:commit', description: 'Commit git changes', path: '/work/.pi/skills/commit/SKILL.md', scope: 'user' },
+    { name: 'push', description: 'Push to remote', path: '/work/.pi/skills/push/SKILL.md', scope: 'project' },
   ];
 
   pi.listCommands = async () => [

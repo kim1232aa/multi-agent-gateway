@@ -32,7 +32,8 @@ import {
 } from './pi-adapter.js';
 import { ProviderError, type GatewayEvent } from './types.js';
 
-const REAL_PI_BIN = '/home/pi/.local/bin/pi';
+/** Real-CLI tests run only when PI_REAL_BIN names a binary; never assume the author's home. */
+const REAL_PI_BIN = process.env.PI_REAL_BIN ?? '';
 
 async function drainEvents(handle: { events: AsyncIterable<GatewayEvent> }): Promise<GatewayEvent[]> {
   const out: GatewayEvent[] = [];
@@ -1398,7 +1399,7 @@ test('16 MiB tail-windowed O_NOFOLLOW active-branch JSONL history reader', async
   }
 });
 
-test('real isolated pi --mode rpc smoke verification against local pi 1.5.2', async () => {
+test('real isolated pi --mode rpc smoke verification against local pi 1.5.2', { skip: !REAL_PI_BIN && 'set PI_REAL_BIN to a pi binary' }, async () => {
   const base = await mkdtemp(join(tmpdir(), 'pi-real-smoke-'));
   const agentDir = join(base, 'agent');
   const sessionsDir = join(agentDir, 'sessions');

@@ -1,12 +1,23 @@
 /**
  * Production-ready Screenshot Generation Script for All Supported CLIs.
+ *
+ * Paths are resolved from the environment so anyone can run it:
+ *   GATEWAY_URL   e.g. http://127.0.0.1:58629 (default)
+ *   GATEWAY_TOKEN gateway token; read from $GATEWAY_SETTINGS_DIR/gateway.token when unset
+ *   CHROME_PATH   browser binary (WSL default: the Windows Chrome install)
+ *   OUT_DIR       output directory (default: <repo>/docs/images)
  */
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const CHROME_PATH = '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe';
-const CDP_PORT = 9350;
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const CHROME_PATH = process.env.CHROME_PATH ?? '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe';
+const CDP_PORT = Number(process.env.CDP_PORT ?? 9350);
+const GATEWAY_URL = (process.env.GATEWAY_URL ?? 'http://127.0.0.1:58629').replace(/\/+$/, '');
+const SETTINGS_DIR = process.env.GATEWAY_SETTINGS_DIR ?? path.join(os.homedir(), '.config', 'multi-agent-gateway');
 
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -75,9 +86,9 @@ class Cdp {
 }
 
 async function main() {
-  const tokenFile = '/home/pi/.config/multi-agent-gateway/gateway.token';
-  const token = fs.readFileSync(tokenFile, 'utf8').trim();
-  const baseUrl = `http://127.0.0.1:58629/#token=${token}`;
+  const token = process.env.GATEWAY_TOKEN?.trim()
+    || fs.readFileSync(path.join(SETTINGS_DIR, 'gateway.token'), 'utf8').trim();
+  const baseUrl = `${GATEWAY_URL}/#token=${token}`;
 
   const chrome = spawn(
     CHROME_PATH,
@@ -112,7 +123,7 @@ async function main() {
   await cdp.connect();
   await cdp.send('Page.enable');
 
-  const outDir = '/home/pi/github/multi-agent-gateway/docs/images';
+  const outDir = process.env.OUT_DIR ?? path.join(repoRoot, 'docs', 'images');
   if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
   const dismissModal = async () => {
