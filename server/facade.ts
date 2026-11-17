@@ -199,6 +199,20 @@ function isCodexToolItemError(item: Record<string, unknown>): boolean {
     || Boolean(item.error);
 }
 
+function extractCodexTurnId(entry: any, it: any): string | undefined {
+  return (
+    (typeof it?.internal_chat_message_metadata_passthrough?.turn_id === 'string' && it.internal_chat_message_metadata_passthrough.turn_id) ||
+    (typeof it?.turn_id === 'string' && it.turn_id) ||
+    (typeof it?.turnId === 'string' && it.turnId) ||
+    (typeof entry?.payload?.turn_id === 'string' && entry.payload.turn_id) ||
+    (typeof entry?.payload?.turnId === 'string' && entry.payload.turnId) ||
+    (typeof entry?.payload?.turn_attribution?.turn_id === 'string' && entry.payload.turn_attribution.turn_id) ||
+    (typeof entry?.payload?.root_turn_id === 'string' && entry.payload.root_turn_id) ||
+    (typeof entry?.turn_id === 'string' && entry.turn_id) ||
+    undefined
+  );
+}
+
 function normalizeCodexQuestions(raw: unknown): {
   prompt: string;
   options: string[];
@@ -635,12 +649,57 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private static readonly HISTORY_CACHE_TTL_MS = 5 * 60_000;
   private historyCache = new Map<string, { key: string; p: Promise<Message[]>; ts: number }>();
 
+  private static readonly MAX_ROLLOUT_CACHE_ENTRIES = 64;
+  private static readonly ROLLOUT_CACHE_TTL_MS = 5 * 60_000;
+  private rolloutParsedCache = new Map<string, { key: string; p: Promise<Message[]>; ts: number }>();
+
+  /** 优先复用 inner.locateRollout / getCachedRolloutPath(O(1)),未命中回退 findCodexRollout 递归扫描。 */
+  private async resolveCodexRolloutPath(sessionId: string): Promise<string | null> {
+    try {
+      if (typeof (this.inner as any).locateRollout === 'function') {
+        const found = await (this.inner as any).locateRollout(sessionId, findCodexRollout);
+        if (found) return found;
+      }
+      if (typeof (this.inner as any).getCachedRolloutPath === 'function') {
+        const cached = (this.inner as any).getCachedRolloutPath(sessionId);
+        if (cached) return cached;
+      }
+    } catch {
+      // duck typing 降级
+    }
+    return findCodexRollout(sessionId).catch(() => null);
+  }
+
+  /** 带 mtime+size 缓存和 inflight coalesce 解析 rollout,避免活跃历史每次重复扫描和解析 16MiB。 */
+  private async getCachedRolloutHistory(rolloutPath: string, sessionId: string, size: number, mtimeMs: number): Promise<Message[]> {
+    const key = `${rolloutPath}:${mtimeMs}:${size}`;
+    const now = Date.now();
+    const hit = this.rolloutParsedCache.get(sessionId);
+    if (hit && hit.key === key && now - hit.ts < CodexProviderAdapter.ROLLOUT_CACHE_TTL_MS) {
+      this.rolloutParsedCache.delete(sessionId);
+      this.rolloutParsedCache.set(sessionId, hit);
+      return hit.p;
+    }
+    const p = this.readCodexRolloutHistory(rolloutPath, sessionId, size);
+    if (this.rolloutParsedCache.has(sessionId)) {
+      this.rolloutParsedCache.delete(sessionId);
+    } else if (this.rolloutParsedCache.size >= CodexProviderAdapter.MAX_ROLLOUT_CACHE_ENTRIES) {
+      const oldest = this.rolloutParsedCache.keys().next().value;
+      if (oldest !== undefined) this.rolloutParsedCache.delete(oldest);
+    }
+    this.rolloutParsedCache.set(sessionId, { key, p, ts: now });
+    p.catch(() => {
+      if (this.rolloutParsedCache.get(sessionId)?.p === p) this.rolloutParsedCache.delete(sessionId);
+    });
+    return p;
+  }
+
   async getHistory(sessionId: string, _query: HistoryQuery = {}): Promise<Message[]> {
     const isLive =
       this.activeThreadTurns.has(sessionId) ||
       (typeof (this.inner as any).findActiveTurnId === 'function' &&
         Boolean((this.inner as any).findActiveTurnId(sessionId)));
-    const rollout = !isLive ? await findCodexRollout(sessionId) : null;
+    const rollout = !isLive ? await this.resolveCodexRolloutPath(sessionId) : null;
     const stat = rollout ? await fsp.stat(rollout).catch(() => null) : null;
     if (!rollout || !stat) return this.readCodexHistory(sessionId); // 未落盘新线程或有进行中 turn,走 readCodexHistory
     const key = `${stat.mtimeMs}:${stat.size}`;
@@ -652,7 +711,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
       return hit.p;
     }
     const p = (async () => {
-      const parsed = await this.readCodexRolloutHistory(rollout, sessionId, stat.size);
+      const parsed = await this.getCachedRolloutHistory(rollout, sessionId, stat.size, stat.mtimeMs);
       if (parsed.length > 0) return parsed;
       return this.readCodexHistory(sessionId);
     })();
@@ -711,7 +770,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const seenToolResults = new Set<string>();
     const toolMetaByCallId = new Map<string, { agentId?: string; callMsg?: Message; resultMsg?: Message }>();
     let lastAssistantMsg: Message | null = null;
-    let lastUserText: string | null = null;
+    let currentTurnId: string | null = null;
+    let pendingUserMsg: { msg: Message; turnId?: string; text: string; isResponseItem: boolean } | null = null;
     let lastReasoningText: string | null = null;
 
     const attachAgentToCall = (callId: string, agentId: string): void => {
@@ -765,6 +825,13 @@ export class CodexProviderAdapter implements ProviderAdapter {
           || p.type === 'token_count'
           || p.type === 'thread_settings_applied'
         ) {
+          if (p.type === 'task_started' || p.type === 'task_complete') {
+            const boundaryTurnId = extractCodexTurnId(entry, p);
+            if (boundaryTurnId && boundaryTurnId !== currentTurnId) {
+              currentTurnId = boundaryTurnId;
+            }
+            pendingUserMsg = null;
+          }
           continue;
         } else {
           it = p;
@@ -773,6 +840,12 @@ export class CodexProviderAdapter implements ProviderAdapter {
         it = entry.payload as Record<string, unknown>;
       } else {
         it = entry as Record<string, unknown>;
+      }
+
+      const entryTurnId = extractCodexTurnId(entry, it);
+      if (entryTurnId && entryTurnId !== currentTurnId) {
+        currentTurnId = entryTurnId;
+        pendingUserMsg = null;
       }
 
       const rawType = (typeof it.type === 'string'
@@ -802,26 +875,65 @@ export class CodexProviderAdapter implements ProviderAdapter {
         if (!userText && typeof it.message === 'string') userText = it.message;
         userText = stripCodexSystemTags(userText).trim();
         if (!userText) continue;
-        // Deduplicate response_item:message(user) vs event_msg:item_completed(UserMessage)
-        if (lastUserText === userText) {
-          if (itemId) seenItemIds.add(itemId);
-          continue;
+
+        const isUserMessageEvent = normType === 'usermessage' || normType === 'user_message';
+        const msgTurnId = entryTurnId || currentTurnId;
+
+        // 同一 turn 内的用户提问 pair 识别 (禁止跨 turn 关联)
+        let isMatchingPair = false;
+        if (pendingUserMsg && pendingUserMsg.text === userText) {
+          if (pendingUserMsg.turnId && msgTurnId) {
+            isMatchingPair = (pendingUserMsg.turnId === msgTurnId);
+          } else {
+            // 无边界场景 (缺少 turnId): 在当前未切换 turn 的上下文内视为同 pair
+            isMatchingPair = true;
+          }
         }
+
+        if (isMatchingPair && pendingUserMsg) {
+          if (isUserMessageEvent && pendingUserMsg.isResponseItem) {
+            // 用 UserMessage 原生 UUID 替换先前的 response_item id
+            if (itemId) {
+              pendingUserMsg.msg.id = itemId;
+              seenItemIds.add(itemId);
+            }
+            if (msgTurnId && !pendingUserMsg.msg.metadata?.turnId) {
+              pendingUserMsg.msg.metadata = { ...(pendingUserMsg.msg.metadata ?? {}), turnId: msgTurnId };
+            }
+            pendingUserMsg = null;
+            continue;
+          }
+          if (!isUserMessageEvent && !pendingUserMsg.isResponseItem) {
+            if (itemId) seenItemIds.add(itemId);
+            pendingUserMsg = null;
+            continue;
+          }
+        }
+
+        const msgId = itemId ?? `msg_${randomUUID()}`;
         if (itemId) seenItemIds.add(itemId);
-        lastUserText = userText;
-        messages.push({
-          id: itemId ?? `msg_${randomUUID()}`,
+        const userMsg: Message = {
+          id: msgId,
           session_id: sessionId,
           role: 'user',
           content: [{ type: 'text', text: userText }],
           created_at: createdAt,
-        });
+          ...(msgTurnId ? { metadata: { turnId: msgTurnId } } : {}),
+        };
+        messages.push(userMsg);
+        pendingUserMsg = {
+          msg: userMsg,
+          turnId: msgTurnId ?? undefined,
+          text: userText,
+          isResponseItem: !isUserMessageEvent,
+        };
         lastAssistantMsg = null;
         continue;
       }
 
       // Assistant messages (AgentMessage / agent_message / response_item message role=assistant)
       if (normType === 'agentmessage' || normType === 'agent_message' || (normType === 'message' && it.role === 'assistant')) {
+        pendingUserMsg = null;
         let agentText = typeof it.text === 'string' ? it.text : typeof it.message === 'string' ? it.message : '';
         if (!agentText && Array.isArray(it.content)) {
           agentText = it.content
@@ -942,6 +1054,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
           try { parsedArgs = JSON.parse(parsedArgs); } catch { /* keep string */ }
         }
         const linked = toolMetaByCallId.get(callId);
+        const callTurnId = entryTurnId || currentTurnId;
         const callMsg: Message = {
           id: `${callId}_call`,
           session_id: sessionId,
@@ -953,7 +1066,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
             input: parsedArgs,
           })],
           created_at: createdAt,
-          ...(linked?.agentId ? { metadata: { agent_id: linked.agentId, agentId: linked.agentId } } : {}),
+          metadata: {
+            ...(linked?.agentId ? { agent_id: linked.agentId, agentId: linked.agentId } : {}),
+            ...(callTurnId ? { turnId: callTurnId } : {}),
+          },
         };
         toolMetaByCallId.set(callId, { ...linked, callMsg });
         messages.push(callMsg);
@@ -974,6 +1090,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
         if (linked?.agentId && !outText.includes('agent_id:')) {
           outText = outText ? `agent_id: ${linked.agentId}\n${outText}` : `agent_id: ${linked.agentId}`;
         }
+        const resTurnId = entryTurnId || currentTurnId;
         const resultMsg: Message = {
           id: `${callId}_result`,
           session_id: sessionId,
@@ -985,7 +1102,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
             is_error: isCodexToolItemError(it),
           })],
           created_at: createdAt,
-          ...(linked?.agentId ? { metadata: { agent_id: linked.agentId, agentId: linked.agentId } } : {}),
+          metadata: {
+            ...(linked?.agentId ? { agent_id: linked.agentId, agentId: linked.agentId } : {}),
+            ...(resTurnId ? { turnId: resTurnId } : {}),
+          },
         };
         toolMetaByCallId.set(callId, { ...linked, resultMsg });
         messages.push(resultMsg);
@@ -1109,7 +1229,56 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private async readCodexHistory(sessionId: string): Promise<Message[]> {
     const turns = await this.inner.getHistory(sessionId);
     const messages: Message[] = [];
+
+    // 预取 rollout 并按 callId+partType 筛选出在线缺失的工具消息;位置由 rollout 里的相邻消息锚定。
+    let rolloutOrder: Message[] = [];
+    const missingTools = new Map<Message, string | undefined>();
+    try {
+      const rollout = await this.resolveCodexRolloutPath(sessionId);
+      if (rollout) {
+        const stat = await fsp.stat(rollout).catch(() => null);
+        if (stat && stat.size > 0) {
+          const rolloutMessages = await this.getCachedRolloutHistory(rollout, sessionId, stat.size, stat.mtimeMs);
+
+          // 收集在线已有的工具部件: callId:tool_use / callId:tool_result
+          const existingParts = new Set<string>();
+          for (const turn of turns) {
+            for (const item of (turn as { items?: unknown[] }).items ?? []) {
+              const it = item as Record<string, unknown>;
+              const callId = (it.call_id as string) ?? (it.id as string);
+              const type = it.type as string;
+              if (callId && (type === 'custom_tool_call' || isCodexToolItem(type))) {
+                existingParts.add(`${callId}:tool_use`);
+                if (extractCodexToolOutput(it) !== null || extractCodexStructuredOutput(it) !== undefined) {
+                  existingParts.add(`${callId}:tool_result`);
+                }
+              }
+            }
+          }
+
+          rolloutOrder = rolloutMessages;
+          for (const msg of rolloutMessages) {
+            const part = msg.content[0];
+            if (part && (part.type === 'tool_use' || part.type === 'tool_result') && part.tool_call_id) {
+              const partKey = `${part.tool_call_id}:${part.type}`;
+              if (!existingParts.has(partKey)) {
+                existingParts.add(partKey);
+                const tId = (msg.metadata?.turnId as string) || (msg.metadata?.turn_id as string);
+                missingTools.set(msg, tId || undefined);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // rollout 预取安全降级
+    }
+
+    const turnRanges = new Map<string, { start: number; end: number }>();
     for (const turn of turns) {
+      const turnId = (turn as any).id;
+      const turnStart = messages.length;
+
       for (const item of (turn as { items?: unknown[] }).items ?? []) {
         const it = item as Record<string, unknown>;
         const type = it.type as string;
@@ -1124,6 +1293,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             role: 'user',
             content: [{ type: 'text', text: extractCodexText(it) }],
             created_at: createdAt,
+            metadata: { turnId },
           });
         } else if (type === 'agentMessage') {
           const phase = typeof it.phase === 'string' ? it.phase : undefined;
@@ -1133,7 +1303,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
             role: 'assistant',
             content: [{ type: 'text', text: (it.text as string) ?? '' }],
             created_at: createdAt,
-            ...(phase ? { metadata: { phase } } : {}),
+            metadata: { ...(phase ? { phase } : {}), turnId },
           });
         } else if (type === 'reasoning') {
           const summary =
@@ -1330,8 +1500,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
           }
         }
       }
+      if (typeof turnId === 'string' && turnId) turnRanges.set(turnId, { start: turnStart, end: messages.length });
     }
-    return messages;
+
+    return mergeRolloutToolsIntoHistory(messages, rolloutOrder, missingTools, turnRanges);
   }
 
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
@@ -1501,6 +1673,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   async setArchived(sessionId: string, archived: boolean): Promise<void> {
     await this.inner.setArchived(sessionId, archived);
+    this.rolloutParsedCache.delete(sessionId);
     if (archived) {
       this.historyCache.delete(sessionId);
       this.liveSubagents.delete(sessionId);
@@ -1515,6 +1688,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
   async delete(sessionId: string): Promise<void> {
     await this.inner.deleteThread(sessionId);
     this.historyCache.delete(sessionId);
+    this.rolloutParsedCache.delete(sessionId);
     this.liveSubagents.delete(sessionId);
     this.renames.delete(sessionId);
     this.threadCwd.delete(sessionId);
@@ -1750,6 +1924,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
    *  预热拉起的常驻进程在网关退出后成孤儿)。 */
   async dispose(): Promise<void> {
     this.historyCache.clear();
+    this.rolloutParsedCache.clear();
     this.liveSubagents.clear();
     this.renames.clear();
     this.threadCwd.clear();
@@ -3587,6 +3762,97 @@ function extractCodexText(item: Record<string, unknown>): string {
       .join('');
   }
   return (item.text as string) ?? '';
+}
+
+function codexAnchorKey(msg: Message): string | null {
+  const part = msg.content[0];
+  if (!part) return null;
+  const squash = (text: unknown): string => (typeof text === 'string' ? text : '').replace(/\s+/g, ' ').trim();
+  if (part.type === 'text') return `${msg.role}:text:${squash(part.text)}`;
+  if (part.type === 'thinking') return `${msg.role}:thinking:${squash((part as { thinking?: unknown }).thinking)}`;
+  return null;
+}
+
+/**
+ * The live thread only knows some tool calls; the rollout file knows them all and is the source of truth
+ * for ordering. Each tool the live thread lacks is attached right after the nearest preceding rollout
+ * message the live thread also has (matched by id, tool call id, or text, never moving backwards). Tools
+ * of a known turn stay inside that turn; tools of an unknown turn keep their rollout position, and tools
+ * with no anchor at all go to the end instead of being dropped.
+ */
+function mergeRolloutToolsIntoHistory(
+  base: Message[],
+  rolloutOrder: Message[],
+  missingTools: Map<Message, string | undefined>,
+  turnRanges: Map<string, { start: number; end: number }>,
+): Message[] {
+  if (missingTools.size === 0) return base;
+  const byId = new Map<string, number>();
+  const byToolPart = new Map<string, number>();
+  const byKey = new Map<string, number[]>();
+  base.forEach((msg, index) => {
+    if (!byId.has(msg.id)) byId.set(msg.id, index);
+    const part = msg.content[0];
+    if (part && (part.type === 'tool_use' || part.type === 'tool_result') && part.tool_call_id) {
+      const key = `${part.tool_call_id}:${part.type}`;
+      if (!byToolPart.has(key)) byToolPart.set(key, index);
+    }
+    const anchorKey = codexAnchorKey(msg);
+    if (anchorKey) {
+      const list = byKey.get(anchorKey);
+      if (list) list.push(index);
+      else byKey.set(anchorKey, [index]);
+    }
+  });
+  const locate = (msg: Message, after: number): number => {
+    const part = msg.content[0];
+    if (part && (part.type === 'tool_use' || part.type === 'tool_result') && part.tool_call_id) {
+      return byToolPart.get(`${part.tool_call_id}:${part.type}`) ?? -1;
+    }
+    const byIdHit = byId.get(msg.id);
+    if (byIdHit !== undefined) return byIdHit;
+    const anchorKey = codexAnchorKey(msg);
+    if (anchorKey) return byKey.get(anchorKey)?.find((index) => index > after) ?? -1;
+    return -1;
+  };
+
+  const insertions = new Map<number, Message[]>();
+  const place = (after: number, msg: Message): void => {
+    const list = insertions.get(after);
+    if (list) list.push(msg);
+    else insertions.set(after, [msg]);
+  };
+  let last = -1;
+  for (const msg of rolloutOrder) {
+    if (!missingTools.has(msg)) {
+      const hit = locate(msg, last);
+      if (hit > last) last = hit;
+      continue;
+    }
+    const turnId = missingTools.get(msg);
+    const range = turnId ? turnRanges.get(turnId) : undefined;
+    let after: number;
+    if (range) {
+      if (last < range.start) {
+        after = range.end > range.start && base[range.start]?.role === 'user' ? range.start : range.start - 1;
+      } else {
+        after = Math.min(last, range.end - 1);
+      }
+    } else {
+      after = last >= 0 ? last : base.length - 1;
+    }
+    place(after, msg);
+  }
+
+  const merged: Message[] = [];
+  const head = insertions.get(-1);
+  if (head) merged.push(...head);
+  base.forEach((msg, index) => {
+    merged.push(msg);
+    const inserted = insertions.get(index);
+    if (inserted) merged.push(...inserted);
+  });
+  return merged;
 }
 
 function isoFromCodexTime(value: unknown): string {

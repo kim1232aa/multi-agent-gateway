@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -182,11 +182,17 @@ test('lists only top-level Claude sessions and paginates without merging duplica
     await mkdir(join(projectDir, ids[0], 'subagents'), { recursive: true });
     for (let index = 0; index < ids.length; index += 1) {
       const file = join(projectDir, `${ids[index]}.jsonl`);
-      await writeFile(file, JSON.stringify({
-        type: 'ai-title',
-        aiTitle: 'duplicate title',
-        cwd: '/tmp/project',
-      }) + '\n');
+      await writeFile(file, [
+        JSON.stringify({
+          type: 'ai-title',
+          aiTitle: 'duplicate title',
+          cwd: '/tmp/project',
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'hello' },
+        }),
+      ].join('\n') + '\n');
       const stamp = new Date(`2026-01-01T00:00:0${index + 1}.000Z`);
       await utimes(file, stamp, stamp);
     }
@@ -219,11 +225,17 @@ test('archives Claude sessions via sidecar settings and filters Done lists', asy
   try {
     await mkdir(projectDir, { recursive: true });
     for (const [id, title] of [[openId, 'still open'], [doneId, 'mark done']] as const) {
-      await writeFile(join(projectDir, `${id}.jsonl`), JSON.stringify({
-        type: 'ai-title',
-        aiTitle: title,
-        cwd: '/tmp/project',
-      }) + '\n');
+      await writeFile(join(projectDir, `${id}.jsonl`), [
+        JSON.stringify({
+          type: 'ai-title',
+          aiTitle: title,
+          cwd: '/tmp/project',
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: title },
+        }),
+      ].join('\n') + '\n');
     }
 
     const adapter = new ClaudeProviderAdapter({ projectsDir, settingsPath });
@@ -1836,3 +1848,568 @@ test('Codex subAgentActivity does not forge parentToolUseId from item.id and ret
   assert.equal((adapter as any).syncedPlanThreads.has('plan-retry-sess'), true);
 });
 
+test('review regression: Codex online and offline history message ids match and preserve repeated prompts', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-codex-id-align-'));
+  const codexHome = join(base, '.codex');
+  const sessionId = 'codex-id-regression-session';
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '15');
+  const rolloutFile = join(sessionDir, `rollout-2026-11-15T10-00-00-${sessionId}.jsonl`);
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      rolloutFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'msg_01a1de64-user-1',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'hello' }],
+            internal_chat_message_metadata_passthrough: {
+              turn_id: 'turn-1',
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            turn_id: 'turn-1',
+            item: {
+              type: 'UserMessage',
+              id: '01a1de64-user-1-native',
+              content: [{ type: 'text', text: 'hello' }],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'msg_resp_1',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hi there' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'msg_01a1de65-user-2',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'hello' }],
+            internal_chat_message_metadata_passthrough: {
+              turn_id: 'turn-2',
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            turn_id: 'turn-2',
+            item: {
+              type: 'UserMessage',
+              id: '01a1de65-user-2-native',
+              content: [{ type: 'text', text: 'hello' }],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'msg_resp_2',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Hello again!' }],
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new CodexProviderAdapter();
+    (adapter as any).inner.getHistory = async () => [
+      {
+        id: 'turn-1',
+        items: [
+          { type: 'userMessage', id: '01a1de64-user-1-native', content: [{ type: 'text', text: 'hello' }] },
+          { type: 'agentMessage', id: 'msg_resp_1', text: 'Hi there' },
+        ],
+      },
+      {
+        id: 'turn-2',
+        items: [
+          { type: 'userMessage', id: '01a1de65-user-2-native', content: [{ type: 'text', text: 'hello' }] },
+          { type: 'agentMessage', id: 'msg_resp_2', text: 'Hello again!' },
+        ],
+      },
+    ];
+
+    const fileStat = await stat(rolloutFile);
+    const offlineHistory = await (adapter as any).readCodexRolloutHistory(rolloutFile, sessionId, fileStat.size);
+    const onlineHistory = await (adapter as any).readCodexHistory(sessionId);
+
+    assert.equal(offlineHistory.length, 4, 'offline history must keep repeated user prompt in turn 2');
+    assert.equal(offlineHistory[0]?.role, 'user');
+    assert.equal(offlineHistory[1]?.role, 'assistant');
+    assert.equal(offlineHistory[2]?.role, 'user');
+    assert.equal(offlineHistory[3]?.role, 'assistant');
+
+    assert.equal(offlineHistory[0]?.id, '01a1de64-user-1-native');
+    assert.equal(onlineHistory[0]?.id, '01a1de64-user-1-native');
+    assert.equal(offlineHistory[2]?.id, '01a1de65-user-2-native');
+    assert.equal(onlineHistory[2]?.id, '01a1de65-user-2-native');
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: Codex online readCodexHistory includes custom_tool_call exec tools from rollout', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-codex-exec-tool-'));
+  const codexHome = join(base, '.codex');
+  const sessionId = 'codex-exec-tool-session';
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '15');
+  const rolloutFile = join(sessionDir, `rollout-2026-11-15T10-00-00-${sessionId}.jsonl`);
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      rolloutFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'msg_user_1',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'run check' }],
+            internal_chat_message_metadata_passthrough: { turn_id: 'turn-exec-1' },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            turn_id: 'turn-exec-1',
+            item: {
+              type: 'UserMessage',
+              id: 'user-msg-exec-1',
+              content: [{ type: 'text', text: 'run check' }],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            id: 'fc_call_exec_123',
+            call_id: 'call_exec_123',
+            name: 'exec',
+            input: 'console.log("running check")',
+            internal_chat_message_metadata_passthrough: {
+              turn_id: 'turn-exec-1',
+              create_time: 1794742150.97,
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            id: 'ctco_exec_123',
+            call_id: 'call_exec_123',
+            output: [{ type: 'input_text', text: 'check passed' }],
+            internal_chat_message_metadata_passthrough: {
+              turn_id: 'turn-exec-1',
+              create_time: 1794742151.11,
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            turn_id: 'turn-exec-1',
+            item: {
+              type: 'AgentMessage',
+              id: 'msg_resp_exec_1',
+              text: 'Check completed successfully',
+            },
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new CodexProviderAdapter();
+    (adapter as any).inner.getHistory = async () => [
+      {
+        id: 'turn-exec-1',
+        items: [
+          { type: 'userMessage', id: 'user-msg-exec-1', content: [{ type: 'text', text: 'run check' }] },
+          { type: 'agentMessage', id: 'msg_resp_exec_1', text: 'Check completed successfully' },
+        ],
+      },
+    ];
+
+    const onlineHistory = await (adapter as any).readCodexHistory(sessionId);
+
+    const toolCallMsg = onlineHistory.find((m: any) => m.content[0]?.type === 'tool_use' && m.content[0]?.tool_name === 'exec');
+    const toolResultMsg = onlineHistory.find((m: any) => m.content[0]?.type === 'tool_result' && m.content[0]?.tool_call_id === 'call_exec_123');
+
+    assert.ok(toolCallMsg, 'online history must include custom_tool_call exec call message');
+    assert.ok(toolResultMsg, 'online history must include custom_tool_call exec result message');
+    assert.equal(toolCallMsg?.id, 'call_exec_123_call');
+    assert.equal(toolResultMsg?.id, 'call_exec_123_result');
+    assert.equal((toolCallMsg?.content[0] as any)?.input, 'console.log("running check")');
+    assert.match(String((toolResultMsg?.content[0] as any)?.output), /check passed/);
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: tool interleaving within turn does not break user message pairing', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-codex-tool-interleave-'));
+  const codexHome = join(base, '.codex');
+  const sessionId = 'codex-interleave-session';
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '15');
+  const rolloutFile = join(sessionDir, `rollout-2026-11-15T10-00-00-${sessionId}.jsonl`);
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    // Fixture: 同一 turn 内，用户提问后紧接着有 reasoning 和 tool_call，随后才到达 event_msg UserMessage
+    await writeFile(
+      rolloutFile,
+      [
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'task_started', turn_attribution: { turn_id: 'turn-interleave-1' } },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            id: 'msg_interleave_early',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'interleaved check' }],
+            internal_chat_message_metadata_passthrough: { turn_id: 'turn-interleave-1' },
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            id: 'fc_interleave_tool',
+            call_id: 'call_interleave_tool',
+            name: 'exec',
+            input: 'probe()',
+            internal_chat_message_metadata_passthrough: { turn_id: 'turn-interleave-1' },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            turn_id: 'turn-interleave-1',
+            item: {
+              type: 'UserMessage',
+              id: '01a1de-interleave-native-id',
+              content: [{ type: 'text', text: 'interleaved check' }],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'turn-interleave-1' },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new CodexProviderAdapter();
+    const fileStat = await stat(rolloutFile);
+    const history = await (adapter as any).readCodexRolloutHistory(rolloutFile, sessionId, fileStat.size);
+
+    // 用户消息必须仅有 1 条，且其 ID 必须成功升级为 UserMessage 原生 UUID，不能被工具事件打断
+    const userMsgs = history.filter((m: any) => m.role === 'user');
+    assert.equal(userMsgs.length, 1, 'interleaved tool must not cause duplicate user messages');
+    assert.equal(userMsgs[0]?.id, '01a1de-interleave-native-id', 'interleaved UserMessage must update id to native UUID');
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: online rollout merge preserves turn order and separates callId+partType', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-codex-turn-order-'));
+  const codexHome = join(base, '.codex');
+  const sessionId = 'codex-turn-order-session';
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '15');
+  const rolloutFile = join(sessionDir, `rollout-2026-11-15T10-00-00-${sessionId}.jsonl`);
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    // Fixture: rollout 中含有 call_split 的 tool_use 和 tool_result
+    await writeFile(
+      rolloutFile,
+      [
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call',
+            id: 'fc_split_1',
+            call_id: 'call_split_1',
+            name: 'exec',
+            input: 'cmd1',
+            internal_chat_message_metadata_passthrough: { turn_id: 'turn-order-1' },
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'custom_tool_call_output',
+            id: 'ctco_split_1',
+            call_id: 'call_split_1',
+            output: [{ type: 'input_text', text: 'out1' }],
+            internal_chat_message_metadata_passthrough: { turn_id: 'turn-order-1' },
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const adapter = new CodexProviderAdapter();
+    // 在线数据中：该 turn 已经有 tool_use（比如来自某 RPC），但缺少 tool_result；
+    // 并且 agentMessage 没有 timestamp（created_at: undefined）
+    (adapter as any).inner.getHistory = async () => [
+      {
+        id: 'turn-order-1',
+        items: [
+          { type: 'userMessage', id: 'u-ord-1', content: [{ type: 'text', text: 'do it' }] },
+          { type: 'custom_tool_call', id: 'call_split_1', name: 'exec', input: 'cmd1' },
+          // 注意：没有 tool_result，且 agentMessage 缺少 created_at
+          { type: 'agentMessage', id: 'msg-agent-ord-1', text: 'All done!' },
+        ],
+      },
+    ];
+
+    const onlineHistory = await (adapter as any).readCodexHistory(sessionId);
+
+    // 1. 验证按 callId + partType 独立补齐：在线已有 tool_use 时，缺失的 tool_result 仍能成功补齐
+    const resultMsg = onlineHistory.find((m: any) => m.content[0]?.type === 'tool_result' && m.content[0]?.tool_call_id === 'call_split_1');
+    assert.ok(resultMsg, 'missing tool_result must be supplemented when tool_use already exists in online items');
+
+    // 2. 验证消息顺序：在该 turn 内，agentMessage 必须排在工具调用及工具结果之后，不能因为缺少 timestamp 串到工具前面
+    const agentIdx = onlineHistory.findIndex((m: any) => m.id === 'msg-agent-ord-1');
+    const toolCallIdx = onlineHistory.findIndex((m: any) => m.content[0]?.type === 'tool_use' && m.content[0]?.tool_call_id === 'call_split_1');
+    const toolResIdx = onlineHistory.findIndex((m: any) => m.content[0]?.type === 'tool_result' && m.content[0]?.tool_call_id === 'call_split_1');
+
+    assert.ok(toolCallIdx >= 0 && toolResIdx >= 0 && agentIdx >= 0);
+    assert.ok(toolCallIdx < agentIdx, 'agent message must stay AFTER tool_use');
+    assert.ok(toolResIdx < agentIdx, 'agent message must stay AFTER tool_result');
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: active history reuses rollout cache and inner locateRollout without repeated parsing', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'multi-agent-codex-cache-reuse-'));
+  const codexHome = join(base, '.codex');
+  const sessionId = 'codex-cache-reuse-session';
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '15');
+  const rolloutFile = join(sessionDir, `rollout-2026-11-15T10-00-00-${sessionId}.jsonl`);
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      rolloutFile,
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-cache-1',
+          item: { type: 'UserMessage', id: 'u-cache-1', content: [{ type: 'text', text: 'hi' }] },
+        },
+      }) + '\n',
+    );
+
+    const adapter = new CodexProviderAdapter();
+    let locateCalls = 0;
+    (adapter as any).inner.locateRollout = async (id: string) => {
+      locateCalls += 1;
+      return rolloutFile;
+    };
+    (adapter as any).inner.getHistory = async () => [
+      { id: 'turn-cache-1', items: [{ type: 'userMessage', id: 'u-cache-1', content: [{ type: 'text', text: 'hi' }] }] },
+    ];
+
+    let parseCalls = 0;
+    const origParse = (adapter as any).readCodexRolloutHistory.bind(adapter);
+    (adapter as any).readCodexRolloutHistory = async (...args: any[]) => {
+      parseCalls += 1;
+      return origParse(...args);
+    };
+
+    await (adapter as any).readCodexHistory(sessionId);
+    assert.equal(locateCalls, 1);
+    assert.equal(parseCalls, 1);
+
+    await (adapter as any).readCodexHistory(sessionId);
+    assert.equal(locateCalls, 2);
+    assert.equal(parseCalls, 1, 'repeated active history read on same mtime+size must reuse parsed cache');
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+
+
+
+async function withCodexRollout<T>(
+  tag: string,
+  sessionId: string,
+  rolloutLines: unknown[],
+  onlineTurns: unknown[],
+  run: (adapter: any) => Promise<T>,
+): Promise<T> {
+  const base = await mkdtemp(join(tmpdir(), `multi-agent-codex-${tag}-`));
+  const codexHome = join(base, '.codex');
+  const sessionDir = join(codexHome, 'sessions', '2026', '11', '17');
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(sessionDir, `rollout-2026-11-17T10-00-00-${sessionId}.jsonl`),
+      rolloutLines.map((l) => JSON.stringify(l)).join('\n') + '\n',
+    );
+    const adapter = new CodexProviderAdapter() as any;
+    adapter.inner.getHistory = async () => onlineTurns;
+    return await run(adapter);
+  } finally {
+    if (prevCodexHome !== undefined) process.env.CODEX_HOME = prevCodexHome;
+    else delete process.env.CODEX_HOME;
+    await rm(base, { recursive: true, force: true });
+  }
+}
+
+const describeCodexParts = (history: any[]): string[] =>
+  history.map((m) => {
+    const part = m.content[0];
+    if (part.type === 'text') return `${m.role}:${part.text}`;
+    if (part.type === 'tool_use') return `use:${part.tool_call_id}`;
+    if (part.type === 'tool_result') return `result:${part.tool_call_id}`;
+    return `${m.role}:${part.type}`;
+  });
+
+test('review regression: rollout tools land between two agent messages of the same turn by timestamp', async () => {
+  const sid = 'codex-between-messages';
+  const call = (id: string, ts: string) => ({
+    timestamp: ts,
+    type: 'response_item',
+    payload: { type: 'custom_tool_call', call_id: id, name: 'exec', input: 'ls', internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' } },
+  });
+  const out = (id: string, ts: string) => ({
+    timestamp: ts,
+    type: 'response_item',
+    payload: { type: 'custom_tool_call_output', call_id: id, output: [{ type: 'input_text', text: 'a.txt' }], internal_chat_message_metadata_passthrough: { turn_id: 'turn-1' } },
+  });
+  const history = await withCodexRollout<any[]>(
+    'between',
+    sid,
+    [
+      {
+        timestamp: '2026-11-17T10:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'UserMessage', id: 'u1', content: [{ type: 'text', text: '找文件' }] } },
+      },
+      {
+        timestamp: '2026-11-17T10:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'AgentMessage', id: 'a1', text: '先找文件' } },
+      },
+      call('call_x', '2026-11-17T10:00:03.000Z'),
+      out('call_x', '2026-11-17T10:00:04.000Z'),
+      {
+        timestamp: '2026-11-17T10:00:05.000Z',
+        type: 'event_msg',
+        payload: { type: 'item_completed', turn_id: 'turn-1', item: { type: 'AgentMessage', id: 'a2', text: '结果如下' } },
+      },
+    ],
+    [{
+      id: 'turn-1',
+      items: [
+        { type: 'userMessage', id: 'u1', createdAt: '2026-11-17T10:00:01.000Z', content: [{ type: 'text', text: '找文件' }] },
+        { type: 'agentMessage', id: 'a1', createdAt: '2026-11-17T10:00:02.000Z', text: '先找文件' },
+        { type: 'agentMessage', id: 'a2', createdAt: '2026-11-17T10:00:05.000Z', text: '结果如下' },
+      ],
+    }],
+    (adapter) => adapter.readCodexHistory(sid),
+  );
+  assert.deepEqual(describeCodexParts(history), ['user:找文件', 'assistant:先找文件', 'use:call_x', 'result:call_x', 'assistant:结果如下']);
+});
+
+test('review regression: rollout tools whose turn id is unknown online are kept, not dropped', async () => {
+  const sid = 'codex-turn-id-mismatch';
+  const history = await withCodexRollout<any[]>(
+    'mismatch',
+    sid,
+    [
+      {
+        timestamp: '2026-11-17T10:00:03.000Z',
+        type: 'response_item',
+        payload: { type: 'custom_tool_call', call_id: 'call_y', name: 'exec', input: 'ls', internal_chat_message_metadata_passthrough: { turn_id: 'rollout-turn' } },
+      },
+      {
+        timestamp: '2026-11-17T10:00:04.000Z',
+        type: 'response_item',
+        payload: { type: 'custom_tool_call_output', call_id: 'call_y', output: 'out', internal_chat_message_metadata_passthrough: { turn_id: 'rollout-turn' } },
+      },
+    ],
+    [{
+      id: 'online-turn',
+      items: [
+        { type: 'userMessage', id: 'u2', createdAt: '2026-11-17T10:00:01.000Z', content: [{ type: 'text', text: 'go' }] },
+        { type: 'agentMessage', id: 'a2', createdAt: '2026-11-17T10:00:05.000Z', text: 'done' },
+      ],
+    }],
+    (adapter) => adapter.readCodexHistory(sid),
+  );
+  const parts = describeCodexParts(history);
+  assert.ok(parts.includes('use:call_y') && parts.includes('result:call_y'), `tools must survive: ${parts.join(' | ')}`);
+  assert.deepEqual(parts.filter((p) => !p.includes('call_y')), ['user:go', 'assistant:done']);
+});
+
+test('review regression: delete, archive and dispose drop the parsed rollout cache entry', async () => {
+  const adapter = new CodexProviderAdapter() as any;
+  adapter.inner.deleteThread = async () => undefined;
+  adapter.inner.setArchived = async () => undefined;
+  const seed = (id: string) => adapter.rolloutParsedCache.set(id, { key: '1:1', p: Promise.resolve([]), ts: Date.now() });
+  seed('s-delete');
+  await adapter.delete('s-delete');
+  assert.equal(adapter.rolloutParsedCache.has('s-delete'), false, 'delete must clear the rollout cache');
+  seed('s-archive');
+  await adapter.setArchived('s-archive', true);
+  assert.equal(adapter.rolloutParsedCache.has('s-archive'), false, 'archive must clear the rollout cache');
+  seed('s-dispose');
+  await adapter.dispose().catch(() => undefined);
+  assert.equal(adapter.rolloutParsedCache.size, 0, 'dispose must clear the rollout cache');
+});
