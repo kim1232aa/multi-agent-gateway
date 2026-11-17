@@ -618,7 +618,6 @@ const CLAUDE_TUI_ONLY_COMMANDS = new Set([
   'quit',
   'btw',
   'theme',
-  'color',
   'focus',
   'keybindings',
   'stickers',
@@ -667,6 +666,18 @@ const CLAUDE_GATEWAY_COMMANDS: Array<{
     argumentHint: '[manual|auto|yolo]',
   },
   { name: 'tasks', description: 'Show background tasks status for this session', takesArgs: false },
+  {
+    name: 'fast',
+    description: 'Toggle fast mode (applies to the running session and future turns)',
+    takesArgs: true,
+    argumentHint: '[on|off]',
+  },
+  {
+    name: 'color',
+    description: 'Set the prompt bar color for this session',
+    takesArgs: true,
+    argumentHint: '[red|blue|green|yellow|purple|orange|pink|cyan|default]',
+  },
   { name: 'help', description: 'Show available Web UI commands for Claude', takesArgs: false },
 ];
 

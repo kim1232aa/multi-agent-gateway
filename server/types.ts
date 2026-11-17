@@ -710,6 +710,18 @@ export interface ProviderAdapter {
   /** 当前生效的会话级 thinking 档位(未设置返回 undefined)。 */
   getThinking?(sessionId: string): string | undefined;
 
+  /** 会话级快速模式(claude --fast 的等价物;优先同步到运行中的 turn)。 */
+  setFastMode?(sessionId: string, on: boolean): Promise<void>;
+
+  /** 当前快速模式状态(未设置返回 undefined)。 */
+  getFastMode?(sessionId: string): boolean | undefined;
+
+  /** 会话级提示栏颜色(claude /color;仅影响该 CLI 自己的视觉)。 */
+  setColor?(sessionId: string, color: string): Promise<void>;
+
+  /** 当前颜色(未设置返回 undefined)。 */
+  getColor?(sessionId: string): string | undefined;
+
   /** 会话改名(内存态,应用到后续 list 的标题;进程重启后回落原生标题)。 */
   rename?(sessionId: string, title: string): Promise<void>;
 

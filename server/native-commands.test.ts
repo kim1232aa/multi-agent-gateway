@@ -74,5 +74,9 @@ test('real catalogs carry forms; terminal-only rows stay out of the web catalog'
   );
   assert.equal(claude.find((c) => c.name === 'doctor')?.form, 'terminal');
   assert.equal(claude.find((c) => c.name === 'compact')?.form, 'cli');
+  // color 走网关的 apply_flag_settings(官方 control 通道),不再是终端独占;
+  // fast 同样改为网关命令。
+  assert.equal(claude.find((c) => c.name === 'color')?.form, 'gateway');
+  assert.equal(claude.find((c) => c.name === 'fast')?.form, 'gateway');
   assert.ok(claude.every((c) => c.pinnedVersion === COMMAND_PINS.claude));
 });

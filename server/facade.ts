@@ -2874,6 +2874,15 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const permissionMode = this.settings.getBoolean('plan', sessionId)
       ? 'plan'
       : claudePermissionMode(this.settings.getString('permission', sessionId));
+    // fast / color 无对应启动 flag,只能经 --settings 注入;否则活 turn 结束后下一轮丢失。
+    const flagSettings: Record<string, unknown> = {};
+    const fastMode = this.settings.getString('fastMode', sessionId)
+      ?? this.settings.getString('fastMode', '__default__');
+    if (fastMode === 'on' || fastMode === 'off') flagSettings.fastMode = fastMode === 'on';
+    const color = this.settings.getString('color', sessionId)
+      ?? this.settings.getString('color', '__default__');
+    if (color) flagSettings.color = color;
+    const turnSettings = Object.keys(flagSettings).length > 0 ? flagSettings : undefined;
     const turnId = randomUUID();
     const stream = new EventStream<GatewayEvent>();
     const subagentTasks = new Set<string>();
@@ -3351,7 +3360,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     const contentBlocks =
       blocks.length > 0 ? [...blocks, ...(prompt.trim() ? [{ type: 'text', text: prompt }] : [])] : undefined;
     void this.inner
-      .startTurn({ sessionId: effectiveId, prompt, cwd, isNew, model, effort, permissionMode, contentBlocks, onEvent: emit })
+      .startTurn({ sessionId: effectiveId, prompt, cwd, isNew, model, effort, permissionMode, contentBlocks, ...(turnSettings ? { settings: turnSettings } : {}), onEvent: emit })
       .catch((err: unknown) => {
         stream.push({
           kind: 'turn',
@@ -3477,6 +3486,37 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   getThinking(sessionId: string): string | undefined {
     return this.settings.getString('thinking', sessionId)
       ?? this.settings.getString('thinking', '__default__');
+  }
+
+  async setFastMode(sessionId: string, on: boolean): Promise<void> {
+    this.settings.set('fastMode', sessionId, on ? 'on' : 'off');
+    // 与 permission 同策略:持久化后尽力同步到活 turn;CLI 拒绝(模型不支持/未 opt-in)
+    // 只影响当前轮,下一轮由 --settings 注入生效。
+    if (sessionId === '__default__') return;
+    await this.inner
+      .applyFlagSettings(this.resolveEffectiveSessionId(sessionId), { fastMode: on })
+      .catch(() => undefined);
+  }
+
+  getFastMode(sessionId: string): boolean | undefined {
+    const raw = this.settings.getString('fastMode', sessionId)
+      ?? this.settings.getString('fastMode', '__default__');
+    if (raw === 'on') return true;
+    if (raw === 'off') return false;
+    return undefined;
+  }
+
+  async setColor(sessionId: string, color: string): Promise<void> {
+    this.settings.set('color', sessionId, color);
+    if (sessionId === '__default__') return;
+    await this.inner
+      .applyFlagSettings(this.resolveEffectiveSessionId(sessionId), { color })
+      .catch(() => undefined);
+  }
+
+  getColor(sessionId: string): string | undefined {
+    return this.settings.getString('color', sessionId)
+      ?? this.settings.getString('color', '__default__');
   }
 
   async setPermission(sessionId: string, mode: string): Promise<void> {

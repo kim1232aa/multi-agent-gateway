@@ -5598,6 +5598,9 @@ async function executeDshCommand(
   }
 }
 
+/** claude /color 支持的提示栏颜色(与 CLI 的 /color 取值一致)。 */
+const CLAUDE_PROMPT_COLORS = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'pink', 'cyan', 'default'];
+
 async function executeClaudeCommand(
   adapter: ProviderAdapter,
   nativeId: string,
@@ -5628,6 +5631,33 @@ async function executeClaudeCommand(
       if (!adapter.setPermission) throw new ProviderError('unsupported', 'claude 权限切换不可用', 400);
       await adapter.setPermission(nativeId, arg);
       return `✓ 已将 Claude 权限模式设为: ${arg}`;
+    }
+    case 'fast': {
+      const arg = argsText.trim().toLowerCase();
+      const cur = adapter.getFastMode?.(nativeId);
+      const curText = cur === undefined ? '默认(跟随 CLI 配置)' : cur ? 'on' : 'off';
+      if (!arg) {
+        return `当前 fast 模式: ${curText}\n用法: /fast <on|off>`;
+      }
+      if (arg !== 'on' && arg !== 'off') {
+        return `不支持的取值: ${arg}\n可选值: on | off`;
+      }
+      if (!adapter.setFastMode) throw new ProviderError('unsupported', 'claude fast 模式切换不可用', 400);
+      await adapter.setFastMode(nativeId, arg === 'on');
+      return `✓ fast 模式已设为: ${arg}\n（进行中的回合会尝试立即同步；若 CLI 或模型不支持，下一轮生效）`;
+    }
+    case 'color': {
+      const arg = argsText.trim().toLowerCase();
+      const cur = adapter.getColor?.(nativeId) ?? 'default';
+      if (!arg) {
+        return `当前提示栏颜色: ${cur}\n用法: /color <${CLAUDE_PROMPT_COLORS.join('|')}>`;
+      }
+      if (!CLAUDE_PROMPT_COLORS.includes(arg)) {
+        return `不支持的颜色: ${arg}\n可选值: ${CLAUDE_PROMPT_COLORS.join(' | ')}`;
+      }
+      if (!adapter.setColor) throw new ProviderError('unsupported', 'claude 颜色设置不可用', 400);
+      await adapter.setColor(nativeId, arg);
+      return `✓ 提示栏颜色已设为: ${arg}`;
     }
     case 'tasks':
       return '当前会话无挂起的后台任务；运行中的子代理与工具进度会直接显示在对话消息卡片中。';
