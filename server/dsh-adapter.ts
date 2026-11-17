@@ -418,7 +418,9 @@ export class DshAdapter {
 
   private parseSessionFile(sessionFile: string, sessionId: string, stats: fs.Stats): CachedSessionFile {
     const buf = fs.readFileSync(sessionFile);
-    const raw = zlib.zstdDecompressSync(buf).toString('utf8');
+    // CLI 正在追加写入时尾部帧不完整;按 flush 语义解出已落盘部分,
+    // 否则整条会话会在发送期间被判为不存在(侧栏 404)。
+    const raw = zlib.zstdDecompressSync(buf, { finishFlush: zlib.constants.ZSTD_e_flush }).toString('utf8');
     const lines = raw.trim().split('\n').filter(Boolean);
 
     let header: any = null;
