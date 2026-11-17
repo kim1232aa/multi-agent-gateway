@@ -3072,12 +3072,19 @@ async function commandFormFromCatalog(
   name: string,
 ): Promise<NativeCommandForm | undefined> {
   if (!adapter.listCommands) return undefined;
-  const commands = await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[]);
   const bare = name.replace(/^\//, '');
-  const hit = commands.find((c) => c.name === bare || c.name === `skill:${bare}`);
-  if (hit?.form) return hit.form;
-  if (hit?.terminalOnly === true) return 'terminal';
-  return undefined;
+  const lookup = (commands: NativeCommand[]): NativeCommandForm | undefined => {
+    const hit = commands.find((c) => c.name === bare || c.name === `skill:${bare}`);
+    if (hit?.form) return hit.form;
+    return hit?.terminalOnly === true ? 'terminal' : undefined;
+  };
+  // 会话级目录可能因为 cwd 解析失败而为空(历史会话/尚未落盘的会话);
+  // 那就回退到全局目录——形态是命令本身的属性,不随会话变化。
+  const bySession = await adapter.listCommands(nativeId).catch(() => [] as NativeCommand[]);
+  const fromSession = lookup(bySession);
+  if (fromSession) return fromSession;
+  const global = await adapter.listCommands(undefined).catch(() => [] as NativeCommand[]);
+  return lookup(global);
 }
 
 /** 实际运行的 CLI 版本（适配器自报优先），用于把目录行标成已验证/未验证。 */

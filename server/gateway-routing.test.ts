@@ -2870,6 +2870,46 @@ test('a terminal-form command is refused with guidance instead of reaching the m
   }
 });
 
+test('a terminal-form command is found even when the per-session catalog is empty', async () => {
+  const claude = fakeAdapter('claude') as any;
+  // Historical sessions often cannot resolve a cwd, so the session-scoped call returns nothing.
+  claude.listCommands = async (sessionId?: string) => (sessionId
+    ? []
+    : [
+        { name: 'color', description: 'Set the prompt bar color', kind: 'prompt', form: 'terminal' },
+        { name: 'help', description: 'Help', kind: 'prompt', form: 'gateway' },
+      ]);
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir: await mkdtemp(join(tmpdir(), 'multi-agent-form-fallback-')),
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  try {
+    const blocked = await fetch(`${gateway.url}/api/v1/sessions/claude_native/prompts?provider=claude`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: '/color' }] }),
+    });
+    assert.equal(blocked.status, 400);
+    assert.match(((await blocked.json()) as any).msg, /交互终端/);
+
+    const allowed = await fetch(`${gateway.url}/api/v1/sessions/claude_native/prompts?provider=claude`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: '/help' }] }),
+    });
+    assert.equal(allowed.status, 200);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('rejects unsupported Claude goal routes and profile controls', async () => {
   const gateway = await startGateway({
     port: 0,
