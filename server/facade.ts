@@ -28,6 +28,7 @@ import {
 import { expandCodexSkill, listClaudeCommands, listCodexCommands } from './native-commands.js';
 import { extractSubagentIdFromOutput, findCodexRollout } from './local-transcript.js';
 import { SettingsStore } from './settings-store.js';
+import { supportsUltracode, THINKING_PROFILES } from './thinking-levels.js';
 import {
   ProviderError,
   type ApprovalDecision,
@@ -3500,6 +3501,18 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   async listModels(): Promise<NativeModel[]> {
     const builtin = await this.inner.listBuiltinModels();
+    // 握手回包里已有 claude_code_version;这里顺手触发一次目录读取以填充版本缓存。
+    const claudeCliVersion = this.inner.claudeVersion?.();
+    // 档位表只在模型自己报了档位、或 CLI 版本与钉子一致时才作为兜底；
+    // 两者都没有时留空——不替 CLI 编一套它没声明的档位。
+    const pinMatches = Boolean(
+      claudeCliVersion && claudeCliVersion.startsWith(THINKING_PROFILES.claude.pinnedVersion),
+    );
+    const effortProfile = {
+      efforts: (pinMatches ? THINKING_PROFILES.claude.levels : []) as readonly string[],
+      verified: pinMatches,
+      ultracode: supportsUltracode('claude', claudeCliVersion),
+    };
     const seen = new Set<string>();
     const out: NativeModel[] = [];
     for (const model of builtin) {
@@ -3537,6 +3550,10 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         capabilities: caps,
         ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
         ...(defaultEffort ? { default_effort: defaultEffort } : {}),
+        // 档位表按 CLI 版本钉住；ultracode 自 2.1.284 起是独立开关，不是档位。
+        ...(effortProfile.efforts.length ? { support_efforts: [...effortProfile.efforts] } : {}),
+        ...(effortProfile.verified !== undefined ? { efforts_verified: effortProfile.verified } : {}),
+        ...(effortProfile.ultracode !== undefined ? { supports_ultracode: effortProfile.ultracode } : {}),
         ...(model.supportsAdaptiveThinking !== undefined
           ? { supportsAdaptiveThinking: model.supportsAdaptiveThinking }
           : {}),

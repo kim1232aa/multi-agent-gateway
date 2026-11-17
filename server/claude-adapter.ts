@@ -22,6 +22,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { FsError, openBound, type OpenBoundOptions } from "./fs-local.js";
 import { discoverClaudeDiskCommands } from "./native-commands.js";
+import { effortArgument, ultracodeSettings } from "./thinking-levels.js";
 import { ProviderError } from "./types.js";
 
 /** 会话列表扫描文件头/尾的窗口大小。 */
@@ -671,6 +672,24 @@ export class ClaudeAdapter {
   }
 
   private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private versionCache: string | undefined;
+
+  /**
+   * Claude CLI 版本,来自 initialize 握手回包的 `claude_code_version`(不额外起进程),
+   * 可用 CLAUDE_VERSION 覆盖。拿不到就返回 undefined——档位表与 ultracode 按"未核实"处理。
+   */
+  claudeVersion(): string | undefined {
+    const override = this.env.CLAUDE_VERSION ?? process.env.CLAUDE_VERSION;
+    if (override?.trim()) return override.trim();
+    if (this.versionCache) return this.versionCache;
+    const cached = this.handshakeCache.get("");
+    const raw = (cached?.response as { claude_code_version?: unknown } | undefined)?.claude_code_version;
+    if (typeof raw === "string") {
+      const match = raw.match(/\d+\.\d+\.\d+/);
+      if (match) this.versionCache = match[0];
+    }
+    return this.versionCache;
+  }
 
   private childEnv(): NodeJS.ProcessEnv {
     return buildClaudeChildEnv({ ...this.env, ...(this.injection?.().env ?? {}) }, this.explicitConfigDir);
@@ -1484,14 +1503,20 @@ export class ClaudeAdapter {
     validateCliArg("permission_mode", permissionMode);
 
     if (model) args.push("--model", model);
-    if (effort && effort !== "auto" && effort !== "on") {
-      args.push("--effort", effort);
+    // ultracode 不是档位(2.1.284 起是独立开关):绝不当 --effort 传。
+    const effortArg = effortArgument("claude", effort);
+    if (effortArg) {
+      args.push("--effort", effortArg);
     }
     if (permissionMode) args.push("--permission-mode", permissionMode);
     if (opts.maxThinkingTokens !== undefined) {
       args.push("--max-thinking-tokens", String(opts.maxThinkingTokens));
     }
-    args.push(...this.settingsArgs(opts.settings));
+    const ultracode = ultracodeSettings("claude", effort, this.claudeVersion());
+    const merged = ultracode
+      ? { ...(opts.settings ?? {}), ...ultracode }
+      : opts.settings;
+    args.push(...this.settingsArgs(merged));
 
     const child = spawn(this.claudeBin, args, {
       cwd,

@@ -2263,7 +2263,12 @@ rl.on('close', () => process.exit(0));
         onEvent: () => {},
       });
 
-      const lines = (await readFile(log, 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+      // The adapter probes `--version` once (to pin the effort table); that is not a turn.
+      const lines = (await readFile(log, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+        .filter((args: string[]) => !args.includes('--version'));
       assert.equal(lines.length, 3);
 
       const autoArgs: string[] = lines[0];
@@ -2623,7 +2628,12 @@ rl.on('close', () => process.exit(0));
       const forked = await adapter.forkSession('123e4567-e89b-12d3-a456-426614174000', base);
       assert.equal(forked.sessionId, 'forked-session-id-4567');
 
-      const lines = (await readFile(log, 'utf8')).trim().split('\n').map((l) => JSON.parse(l));
+      // The adapter also probes `--version` once to pin its effort table; that is not a session.
+      const lines = (await readFile(log, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+        .filter((args: string[]) => !args.includes('--version'));
       assert.equal(lines.length, 3);
 
       const probeArgs: string[] = lines[0];
