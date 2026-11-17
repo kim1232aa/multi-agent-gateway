@@ -28,6 +28,8 @@ test('passes Codex source kinds to thread/list', async () => {
 
   assert.equal(request?.method, 'thread/list');
   assert.deepEqual(request?.params.sourceKinds, ['cli']);
+  // 必须显式 [] 才能跨 provider 列出历史会话(自定义 model_provider 下否则为空)。
+  assert.deepEqual(request?.params.modelProviders, []);
 });
 
 test('CodexProviderAdapter lists cli, vscode and app-server threads', async () => {
@@ -1263,13 +1265,15 @@ test('supports positional skill argument substitution, Claude conversation_reset
     for await (const _ of h2.events) { /* drain */ }
     assert.deepEqual(startedIds, ['orig-id', 'new-cli-id']);
 
-    // listClaudeCommands classifies all terminalSlashCommands as terminalOnly & includes Web UI commands
+    // listClaudeCommands 把 terminalSlashCommands 标成 terminalOnly，但网关已实现的命令优先
     const catalog = listClaudeCommands([
       { name: 'doctor', description: 'Doctor', builtin: true },
       { name: 'color', description: 'Color', builtin: true },
     ], ['doctor', 'color']);
     assert.equal(catalog.find((c) => c.name === 'doctor')?.terminalOnly, true);
-    assert.equal(catalog.find((c) => c.name === 'color')?.terminalOnly, true);
+    // color 由网关经 apply_flag_settings 实现，CLI 的 terminalOnly 不再生效
+    assert.equal(catalog.find((c) => c.name === 'color')?.terminalOnly, undefined);
+    assert.equal(catalog.find((c) => c.name === 'color')?.form, 'gateway');
     assert.ok(catalog.some((c) => c.name === 'help'));
     assert.ok(catalog.some((c) => c.name === 'diff'));
   } finally {
@@ -1980,7 +1984,7 @@ test('ClaudeProviderAdapter task_notification without toolUseId falls back to tr
   assert.equal(subCompleted.payload.summary, 'subtask complete');
 });
 
-test('listClaudeCommands classifies all terminalSlashCommands as terminalOnly: true and includes fast in TUI commands', () => {
+test('listClaudeCommands classifies terminalSlashCommands as terminalOnly but lets gateway commands win', () => {
   const catalog = listClaudeCommands(
     [
       { name: 'doctor', description: 'Doctor diagnostic' },
@@ -1993,7 +1997,9 @@ test('listClaudeCommands classifies all terminalSlashCommands as terminalOnly: t
 
   assert.equal(catalog.find((c) => c.name === 'doctor')?.terminalOnly, true);
   assert.equal(catalog.find((c) => c.name === 'reload-plugins')?.terminalOnly, true);
-  assert.equal(catalog.find((c) => c.name === 'fast')?.terminalOnly, true);
+  // fast 已由网关通过 apply_flag_settings 实现,不再受 CLI 的 terminalOnly 标记约束。
+  assert.equal(catalog.find((c) => c.name === 'fast')?.terminalOnly, undefined);
+  assert.equal(catalog.find((c) => c.name === 'fast')?.form, 'gateway');
   assert.equal(catalog.find((c) => c.name === 'normal-cmd')?.terminalOnly, undefined);
 });
 

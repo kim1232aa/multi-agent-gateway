@@ -2812,6 +2812,10 @@ export class CodexAdapter {
       archived: options.archived ?? null,
       searchTerm: options.searchTerm ?? null,
       sourceKinds: options.sourceKinds ?? null,
+      // 显式 `[]` = 所有 provider。不传时服务端只按当前配置的 provider 过滤:
+      // 网关注入自定义 model_provider 后,历史 rollout 记录的是 provider *name*,
+      // 与配置键不匹配,整个会话列表会被过滤成空。
+      modelProviders: [],
     });
     const parsed = ThreadListResponseSchema.parse(raw);
     return {

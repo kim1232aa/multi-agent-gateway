@@ -24,12 +24,17 @@ async function loadShim(pathname = '/', options: { readyState?: string; querySel
     observe() {}
     disconnect() {}
   }
+  const docListeners: Record<string, (event: any) => void> = {};
   const documentObject: any = {
     readyState: options.readyState ?? 'loading',
     documentElement: {},
     querySelector: options.querySelector ?? (() => null),
     querySelectorAll: options.querySelectorAll ?? (() => []),
     createElement: () => ({}),
+    // boot.js 在加载时就会注册 document 级 click 监听(原生配置行只读提示);
+    // 缺这个方法会让整个脚本抛错,连无关用例一起失败。
+    addEventListener: (name: string, fn: (event: any) => void) => { docListeners[name] = fn; },
+    removeEventListener: (name: string) => { delete docListeners[name]; },
   };
   const windowObject: any = {
     location,
