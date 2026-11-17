@@ -2974,3 +2974,306 @@ test('review regression: same-cwd metadata commands reuse the live session', asy
     await rm(base, { recursive: true, force: true });
   }
 });
+
+test('review regression: head reader skips long system prompt lines to extract first user prompt and does not pick failed tail prompt as title', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-head-long-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '22222222-2222-4222-8222-222222222222';
+  const adapter = new PiProviderAdapter({ sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    const systemPayload = 'System prompt tools '.repeat(5 * 1024); // ~100 KB
+    const intermediateFiller = 'Intermediate conversation data '.repeat(12 * 1024); // ~360 KB filler
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'model_change', model: 'gpt-5' }),
+      JSON.stringify({ type: 'thinking_level_change', thinkingLevel: 'high' }),
+      JSON.stringify({ type: 'custom', customType: 'init' }),
+      JSON.stringify({ type: 'message', id: 's1', message: { role: 'system', content: systemPayload } }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: '搜下现在什么有什么比较好的建站程序' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'WordPress and Discuz' }] } }),
+      JSON.stringify({ type: 'message', id: 'a_mid', message: { role: 'assistant', content: [{ type: 'text', text: intermediateFiller }] } }),
+      JSON.stringify({ type: 'message', id: 'u2', message: { role: 'user', content: [{ type: 'text', text: '//aaddvviissoorr' }] } }),
+      JSON.stringify({ type: 'message', id: 'a2', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '401 "API key required for remote API access"' } }),
+    ].join('\n') + '\n');
+
+    const innerSummary = (await (adapter as any).inner.list()).find((s: any) => s.sessionId === sid);
+    assert.ok(innerSummary);
+    assert.equal(innerSummary.firstUserPrompt, '搜下现在什么有什么比较好的建站程序');
+    assert.equal(innerSummary.lastPrompt, undefined, 'unknown lastPrompt across unscanned gap must be undefined, not first prompt');
+
+    const list = await adapter.list({ cwd: base });
+    assert.equal(list.items.length, 1);
+    const item = list.items[0]!;
+    assert.equal(item.title, '搜下现在什么有什么比较好的建站程序');
+    assert.notEqual(item.title, '//aaddvviissoorr');
+    assert.notEqual(item.extras?.last_prompt, '//aaddvviissoorr');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: failed turn with empty reply or error does not overwrite last valid prompt', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-failed-turn-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '33333333-3333-4333-8333-333333333333';
+  const adapter = new PiProviderAdapter({ sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: '首条有效提问' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '回复1' }] } }),
+      JSON.stringify({ type: 'message', id: 'u2', message: { role: 'user', content: [{ type: 'text', text: '中间有效提问' }] } }),
+      JSON.stringify({ type: 'message', id: 'a2', message: { role: 'assistant', content: [{ type: 'text', text: '回复2' }] } }),
+      JSON.stringify({ type: 'message', id: 'u3', message: { role: 'user', content: [{ type: 'text', text: '末尾失败提问' }] } }),
+      JSON.stringify({ type: 'message', id: 'a3', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '500 internal error' } }),
+    ].join('\n') + '\n');
+
+    const list = await adapter.list({ cwd: base });
+    assert.equal(list.items.length, 1);
+    const item = list.items[0]!;
+    assert.equal(item.title, '首条有效提问');
+    assert.equal(item.extras?.last_prompt, '中间有效提问');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: large session file with no user message in tail window preserves title and leaves lastPrompt undefined', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-large-tail-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '44444444-4444-4444-8444-444444444444';
+  const adapter = new PiProviderAdapter({ sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    const systemPayload = 'System tools '.repeat(5 * 1024); // ~65 KB
+    const tailFiller = 'Tool output data line '.repeat(20 * 1024); // ~440 KB of tail content
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 's1', message: { role: 'system', content: systemPayload } }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: '大文件头部首条提问' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '初始回复' }] } }),
+      JSON.stringify({ type: 'message', id: 'a2', message: { role: 'assistant', content: [{ type: 'text', text: tailFiller }] } }),
+    ].join('\n') + '\n');
+
+    const innerSummary = (await (adapter as any).inner.list()).find((s: any) => s.sessionId === sid);
+    assert.ok(innerSummary);
+    assert.equal(innerSummary.firstUserPrompt, '大文件头部首条提问');
+    assert.equal(innerSummary.lastPrompt, undefined, 'tail with no user messages must leave lastPrompt undefined');
+
+    const list = await adapter.list({ cwd: base });
+    assert.equal(list.items.length, 1);
+    const item = list.items[0]!;
+    assert.equal(item.title, '大文件头部首条提问');
+    assert.equal(item.extras?.last_prompt, '大文件头部首条提问');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: thinking content strips ANSI escape sequences while preserving text and Thinking label', async () => {
+  const sid = '55555555-5555-4555-8555-555555555555';
+  const entry = {
+    type: 'message',
+    id: 'm1',
+    timestamp: '2026-11-15T00:00:00.000Z',
+    message: {
+      role: 'assistant',
+      content: [
+        {
+          type: 'thinking',
+          thinking: '\x1b[38;2;136;88;228mThinking:\x1b[39m \x1b[38;2;135;145;156mInitial focus is on CMS platforms.\x1b[39m',
+        },
+        {
+          type: 'text',
+          text: 'Here is the answer.',
+        },
+      ],
+    },
+  };
+  const mapped = parsePiSessionEntry(entry, sid);
+  assert.ok(mapped && !Array.isArray(mapped));
+  const thinkingPart = mapped.content?.find((p) => p.type === 'thinking');
+  assert.ok(thinkingPart && 'thinking' in thinkingPart);
+  assert.equal(/\x1b/.test(thinkingPart.thinking as string), false);
+  assert.equal(thinkingPart.thinking, 'Thinking: Initial focus is on CMS platforms.');
+});
+
+test('review regression: session_info with empty name clears title and falls back to first prompt', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-session-info-clear-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '66666666-6666-4666-8666-666666666666';
+  const adapter = new PiProviderAdapter({ sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: '首条真实提问' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '答复1' }] } }),
+      JSON.stringify({ type: 'session_info', name: '临时旧标题' }),
+      JSON.stringify({ type: 'session_info', name: '' }),
+    ].join('\n') + '\n');
+
+    const list = await adapter.list({ cwd: base });
+    assert.equal(list.items.length, 1);
+    assert.equal(list.items[0]!.title, '首条真实提问');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: intermediate tool use followed by terminal error fails the entire turn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-tool-error-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '77777777-7777-4777-8777-777777777777';
+  const adapter = new PiProviderAdapter({ sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: '首条提问成功' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '答复成功' }] } }),
+      JSON.stringify({ type: 'message', id: 'u2', message: { role: 'user', content: [{ type: 'text', text: '带有工具但最终失败的提问' }] } }),
+      JSON.stringify({ type: 'message', id: 'a2_tool', message: { role: 'assistant', content: [{ type: 'toolCall', id: 'call_1', name: 'bash', arguments: {} }] } }),
+      JSON.stringify({ type: 'message', id: 't2', message: { role: 'toolResult', toolCallId: 'call_1', content: 'output' } }),
+      JSON.stringify({ type: 'message', id: 'a2_err', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '500 service unavailable' } }),
+    ].join('\n') + '\n');
+
+    const innerSummary = (await (adapter as any).inner.list()).find((s: any) => s.sessionId === sid);
+    assert.ok(innerSummary);
+    assert.equal(innerSummary.firstUserPrompt, '首条提问成功');
+    assert.equal(innerSummary.lastPrompt, '首条提问成功');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: summary bounds prompt lengths and cache tracks dev, ino, ctime', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-cache-meta-'));
+  const sessionsDir = join(base, 'sessions');
+  const sid = '88888888-8888-4888-8888-888888888888';
+  const adapter = new PiProviderAdapter({ sessionsDir, env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  try {
+    const dir = join(sessionsDir, encodePiCwdDir(base));
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`);
+    const hugePrompt = '用户长提示词 '.repeat(500); // ~3500 字符
+    await writeFile(file, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: hugePrompt }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '完成' }] } }),
+    ].join('\n') + '\n');
+
+    const summary1 = (await (adapter as any).inner.list()).find((s: any) => s.sessionId === sid);
+    assert.ok(summary1);
+    assert.ok(summary1.firstUserPrompt.length <= 300, `prompt length ${summary1.firstUserPrompt.length} must be <= 300`);
+    assert.ok(summary1.lastPrompt.length <= 300, `lastPrompt length ${summary1.lastPrompt.length} must be <= 300`);
+
+    // Replace file with different inode (same length, different prompt)
+    const fileTmp = `${file}.tmp`;
+    await writeFile(fileTmp, [
+      JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd: base }),
+      JSON.stringify({ type: 'message', id: 'u1', message: { role: 'user', content: [{ type: 'text', text: '新内容提问换inode' }] } }),
+      JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: '完成' }] } }),
+    ].join('\n') + '\n');
+    await rm(file);
+    const { rename } = await import('node:fs/promises');
+    await rename(fileTmp, file);
+
+    const summary2 = (await (adapter as any).inner.list()).find((s: any) => s.sessionId === sid);
+    assert.ok(summary2);
+    assert.equal(summary2.firstUserPrompt, '新内容提问换inode');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+
+
+async function writePiSummaryFixture(base: string, sid: string, lines: string[]): Promise<void> {
+  const dir = join(base, 'sessions', encodePiCwdDir(base));
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `2026-11-15T00-00-00-000Z_${sid}.jsonl`), lines.join('\n') + '\n');
+}
+
+function piMsg(id: string, role: 'user' | 'assistant', content: unknown, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({ type: 'message', id, message: { role, content, ...extra } });
+}
+
+const PI_HEADER = (sid: string, cwd: string): string =>
+  JSON.stringify({ type: 'session', version: 3, id: sid, timestamp: '2026-11-15T00:00:00.000Z', cwd });
+
+test('review regression: an empty tail session_info clears the head name while a non-empty tail name still wins', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-name-'));
+  const adapter = new PiProviderAdapter({ sessionsDir: join(base, 'sessions'), env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  const sidA = 'cccccccc-1111-4111-8111-cccccccccccc';
+  const sidB = 'dddddddd-1111-4111-8111-dddddddddddd';
+  try {
+    const pad = piMsg('pad', 'assistant', [{ type: 'text', text: 'y'.repeat(700 * 1024) }]);
+    await writePiSummaryFixture(base, sidA, [
+      PI_HEADER(sidA, base),
+      JSON.stringify({ type: 'session_info', id: 'n1', name: '头部真名' }),
+      piMsg('u1', 'user', [{ type: 'text', text: '首问A' }]),
+      piMsg('a1', 'assistant', [{ type: 'text', text: '答A' }]),
+      pad,
+      JSON.stringify({ type: 'session_info', id: 'n2', name: '' }),
+      piMsg('u2', 'user', [{ type: 'text', text: '尾问A' }]),
+      piMsg('a2', 'assistant', [{ type: 'text', text: '尾答A' }]),
+    ]);
+    await writePiSummaryFixture(base, sidB, [
+      PI_HEADER(sidB, base),
+      JSON.stringify({ type: 'session_info', id: 'n1', name: '头部旧名' }),
+      piMsg('u1', 'user', [{ type: 'text', text: '首问B' }]),
+      piMsg('a1', 'assistant', [{ type: 'text', text: '答B' }]),
+      pad,
+      JSON.stringify({ type: 'session_info', id: 'n2', name: '尾部新名' }),
+      piMsg('u2', 'user', [{ type: 'text', text: '尾问B' }]),
+      piMsg('a2', 'assistant', [{ type: 'text', text: '尾答B' }]),
+    ]);
+    const list = await adapter.list({ cwd: base });
+    const byId = new Map(list.items.map((s) => [s.id, s]));
+    assert.equal(byId.get(sidA)?.title, '首问A', 'empty tail session_info clears the head name');
+    assert.equal(byId.get(sidB)?.title, '尾部新名');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test('review regression: an unconfirmed recent prompt falls back to the first prompt, never to the rename', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-review-last-prompt-'));
+  const adapter = new PiProviderAdapter({ sessionsDir: join(base, 'sessions'), env: { HOME: base, PI_CODING_AGENT_DIR: base } });
+  const sid = 'eeeeeeee-1111-4111-8111-eeeeeeeeeeee';
+  try {
+    await writePiSummaryFixture(base, sid, [
+      PI_HEADER(sid, base),
+      piMsg('u1', 'user', [{ type: 'text', text: '真正的首问' }]),
+      piMsg('a1', 'assistant', [{ type: 'text', text: '答' }]),
+      JSON.stringify({ type: 'session_info', id: 'n1', name: '用户改的名字' }),
+      piMsg('pad', 'assistant', [{ type: 'text', text: 'y'.repeat(700 * 1024) }]),
+    ]);
+    const list = await adapter.list({ cwd: base });
+    assert.equal(list.items[0]!.title, '用户改的名字');
+    assert.equal(list.items[0]!.extras?.last_prompt, '真正的首问');
+  } finally {
+    await adapter.dispose();
+    await rm(base, { recursive: true, force: true });
+  }
+});

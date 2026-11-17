@@ -180,6 +180,7 @@ export interface PiSessionSummary {
   updatedAt: string;
   parentSession?: string;
   firstUserPrompt?: string;
+  lastPrompt?: string;
 }
 
 export interface PiAdapterOptions {
@@ -4554,7 +4555,9 @@ export class PiProviderAdapter implements ProviderAdapter {
       busy: this.inner.isBusy(s.sessionId),
       archived,
       extras: {
-        last_prompt: s.firstUserPrompt || (this.renames.get(s.sessionId) ?? this.inner.getCachedSessionName(s.sessionId) ?? s.title ?? ''),
+        // The official sidebar drops sessions whose last_prompt is empty (meta.has_prompt=true), so an
+        // unconfirmed recent prompt is stood in for by the first prompt rather than by the rename.
+        last_prompt: s.lastPrompt || s.firstUserPrompt || (this.renames.get(s.sessionId) ?? this.inner.getCachedSessionName(s.sessionId) ?? s.title ?? ''),
         ...(s.parentSession ? { parent_session: s.parentSession } : {}),
       },
       metadata: { cwd: s.cwd },
@@ -5204,86 +5207,293 @@ async function readPiSessionHeader(
   }
 }
 
+interface PiSummaryCacheEntry {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  summary: PiSessionSummary;
+}
+
+const piSummaryCache = new Map<string, PiSummaryCacheEntry>();
+
+class PiTurnTracker {
+  firstValidPrompt = '';
+  firstAnyPrompt = '';
+  lastValidPrompt = '';
+  lastAnyPrompt = '';
+
+  private currentPrompt = '';
+  private currentTurnSuccess = false;
+  private currentTurnFailed = false;
+
+  onUser(text: string): void {
+    this.commitCurrentTurn();
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const truncated = trimmed.slice(0, 300);
+    if (!this.firstAnyPrompt) this.firstAnyPrompt = truncated;
+    this.lastAnyPrompt = truncated;
+    this.currentPrompt = truncated;
+    this.currentTurnSuccess = false;
+    this.currentTurnFailed = false;
+  }
+
+  onAssistant(msg: Record<string, unknown>): void {
+    if (!this.currentPrompt) return;
+    if (this.isError(msg)) {
+      this.currentTurnFailed = true;
+      this.currentTurnSuccess = false;
+      return;
+    }
+    // Tool calls do not count as final success; only final text/thinking content does
+    if (this.hasFinalContent(msg)) {
+      if (!this.currentTurnFailed) {
+        this.currentTurnSuccess = true;
+      }
+    }
+  }
+
+  get hasValidPrompt(): boolean {
+    return Boolean(this.firstValidPrompt || (this.currentPrompt && this.currentTurnSuccess && !this.currentTurnFailed));
+  }
+
+  finish(): void {
+    this.commitCurrentTurn();
+  }
+
+  private commitCurrentTurn(): void {
+    if (this.currentPrompt && this.currentTurnSuccess && !this.currentTurnFailed) {
+      if (!this.firstValidPrompt) {
+        this.firstValidPrompt = this.currentPrompt;
+      }
+      this.lastValidPrompt = this.currentPrompt;
+    }
+    this.currentPrompt = '';
+    this.currentTurnSuccess = false;
+    this.currentTurnFailed = false;
+  }
+
+  private isError(msg: Record<string, unknown>): boolean {
+    if (msg.stopReason === 'error' || msg.stopReason === 'aborted') return true;
+    if (typeof msg.errorMessage === 'string' && msg.errorMessage.trim().length > 0) return true;
+    if (isRecord(msg.error)) return true;
+    const content = msg.content;
+    if (Array.isArray(content) && content.length === 0) return true;
+    return false;
+  }
+
+  private hasFinalContent(msg: Record<string, unknown>): boolean {
+    const content = msg.content;
+    if (typeof content === 'string') return content.trim().length > 0;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (!isRecord(part)) continue;
+        if (part.type === 'text' && typeof part.text === 'string' && part.text.trim().length > 0) {
+          return true;
+        }
+        if (part.type === 'thinking' && typeof part.thinking === 'string' && part.thinking.trim().length > 0) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+}
+
+const SUMMARY_HEAD_MAX_SCAN_BYTES = 1024 * 1024;
+const SUMMARY_READ_CHUNK_BYTES = 64 * 1024;
+
 async function summarizePiSessionFile(filePath: string, realRoot: string): Promise<PiSessionSummary | null> {
   try {
-    const header = await readPiSessionHeader(filePath, realRoot);
-    if (!header) return null;
-
     const { fh, stat } = await openFileNoFollowVerified(filePath, realRoot);
-    let headText = '';
-    let tailText = '';
+    let summary: PiSessionSummary | null = null;
     try {
+      const cached = piSummaryCache.get(filePath);
+      if (
+        cached &&
+        cached.dev === stat.dev &&
+        cached.ino === stat.ino &&
+        cached.size === stat.size &&
+        cached.mtimeMs === stat.mtimeMs &&
+        cached.ctimeMs === stat.ctimeMs
+      ) {
+        return { ...cached.summary };
+      }
+
       const size = stat.size;
-      const headLen = Math.min(size, SUMMARY_HEAD_BYTES);
-      if (headLen > 0) {
-        const hb = Buffer.allocUnsafe(headLen);
-        const { bytesRead } = await fh.read(hb, 0, headLen, 0);
-        headText = hb.subarray(0, bytesRead).toString('utf8');
-      }
-      if (size > SUMMARY_HEAD_BYTES) {
-        const tailStart = Math.max(0, size - SUMMARY_TAIL_BYTES);
-        const tailLen = size - tailStart;
-        const tb = Buffer.allocUnsafe(tailLen);
-        const { bytesRead } = await fh.read(tb, 0, tailLen, tailStart);
-        let tailSlice = tb.subarray(0, bytesRead);
-        if (tailStart > 0) {
-          const nl = tailSlice.indexOf(0x0a);
-          tailSlice = nl >= 0 ? tailSlice.subarray(nl + 1) : Buffer.alloc(0);
-        }
-        tailText = tailSlice.toString('utf8');
-      }
-    } finally {
-      await fh.close().catch(() => undefined);
-    }
+      let header: { id: string; cwd?: string; timestamp?: string; parentSession?: string } | null = null;
+      let headSessionName = '';
+      let tailSessionName: string | undefined;
+      let lastTimestamp = stat.mtime.toISOString();
 
-    let firstUserPrompt = '';
-    let sessionName = '';
-    let lastTimestamp = header.timestamp || stat.mtime.toISOString();
-
-    const scanChunk = (chunk: string, isTail: boolean): void => {
-      const framer = new JsonlLineFramer();
-      for (const line of [...framer.push(chunk), ...framer.flush()]) {
-        let entry: unknown;
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue;
+      const parseEntry = (
+        entry: Record<string, unknown>,
+        tracker: PiTurnTracker,
+        isTail = false,
+      ): void => {
+        if (entry.type === 'session') {
+          if (typeof entry.id === 'string' && entry.id) {
+            header = {
+              id: entry.id,
+              cwd: typeof entry.cwd === 'string' ? entry.cwd : undefined,
+              timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : undefined,
+              parentSession: typeof entry.parentSession === 'string' ? entry.parentSession : undefined,
+            };
+            if (header.timestamp) lastTimestamp = header.timestamp;
+          }
+          return;
         }
-        if (!isRecord(entry) || entry.type === 'session') continue;
         if (typeof entry.timestamp === 'string' && entry.timestamp) {
           lastTimestamp = entry.timestamp;
         }
         if (entry.type === 'session_info') {
-          const name = typeof entry.name === 'string' ? entry.name.trim() : '';
-          if (name || isTail) sessionName = name;
-        } else if (entry.type === 'message' && isRecord(entry.message)) {
-          if (entry.message.role === 'user' && !firstUserPrompt) {
+          if (typeof entry.name === 'string') {
+            const trimmed = entry.name.trim();
+            if (isTail) tailSessionName = trimmed;
+            else headSessionName = trimmed;
+          }
+          return;
+        }
+        if (entry.type === 'message' && isRecord(entry.message)) {
+          const role = entry.message.role;
+          if (role === 'user') {
             const text = extractMessageText(entry.message.content);
-            if (text) firstUserPrompt = text;
+            if (text) tracker.onUser(text);
+          } else if (role === 'assistant') {
+            tracker.onAssistant(entry.message);
           }
         }
+      };
+
+      const headTracker = new PiTurnTracker();
+      const headFramer = new JsonlLineFramer();
+      let headPos = 0;
+      let hasGap = false;
+
+      const maxHeadScan = Math.min(size, SUMMARY_HEAD_MAX_SCAN_BYTES);
+      while (headPos < maxHeadScan) {
+        const toRead = Math.min(maxHeadScan - headPos, SUMMARY_READ_CHUNK_BYTES);
+        const buf = Buffer.allocUnsafe(toRead);
+        const { bytesRead } = await fh.read(buf, 0, toRead, headPos);
+        headPos += bytesRead;
+        if (bytesRead === 0) break;
+        for (const line of headFramer.push(buf.subarray(0, bytesRead))) {
+          let entry: unknown;
+          try { entry = JSON.parse(line); } catch { continue; }
+          if (isRecord(entry)) parseEntry(entry, headTracker, false);
+        }
+        if (headTracker.hasValidPrompt && header && size > SUMMARY_TAIL_BYTES) {
+          break;
+        }
       }
-    };
 
-    scanChunk(headText, false);
-    if (tailText) scanChunk(tailText, true);
+      let tailTracker: PiTurnTracker | null = null;
+      if (size > headPos) {
+        const tailStartCandidate = Math.max(0, size - SUMMARY_TAIL_BYTES);
+        if (tailStartCandidate > headPos) {
+          hasGap = true;
+          for (const line of headFramer.flush()) {
+            let entry: unknown;
+            try { entry = JSON.parse(line); } catch { continue; }
+            if (isRecord(entry)) parseEntry(entry, headTracker, false);
+          }
+          headTracker.finish();
 
-    const cwd = header.cwd || path.dirname(filePath);
-    const title = (sessionName || firstUserPrompt || `Pi ${header.id.slice(0, 8)}`)
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 120);
+          const tailLen = size - tailStartCandidate;
+          const tb = Buffer.allocUnsafe(tailLen);
+          const { bytesRead } = await fh.read(tb, 0, tailLen, tailStartCandidate);
+          let tailSlice = tb.subarray(0, bytesRead);
+          const nl = tailSlice.indexOf(0x0a);
+          tailSlice = nl >= 0 ? tailSlice.subarray(nl + 1) : Buffer.alloc(0);
 
-    return {
-      sessionId: header.id,
-      sessionFile: filePath,
-      title,
-      cwd,
-      createdAt: header.timestamp || stat.birthtime.toISOString(),
-      updatedAt: lastTimestamp,
-      ...(firstUserPrompt ? { firstUserPrompt } : {}),
-      ...(header.parentSession ? { parentSession: header.parentSession } : {}),
-    };
+          tailTracker = new PiTurnTracker();
+          const tailFramer = new JsonlLineFramer();
+          for (const line of [...tailFramer.push(tailSlice), ...tailFramer.flush()]) {
+            let entry: unknown;
+            try { entry = JSON.parse(line); } catch { continue; }
+            if (isRecord(entry)) parseEntry(entry, tailTracker, true);
+          }
+          tailTracker.finish();
+        } else {
+          while (headPos < size) {
+            const toRead = Math.min(size - headPos, SUMMARY_READ_CHUNK_BYTES);
+            const buf = Buffer.allocUnsafe(toRead);
+            const { bytesRead } = await fh.read(buf, 0, toRead, headPos);
+            headPos += bytesRead;
+            if (bytesRead === 0) break;
+            for (const line of headFramer.push(buf.subarray(0, bytesRead))) {
+              let entry: unknown;
+              try { entry = JSON.parse(line); } catch { continue; }
+              if (isRecord(entry)) parseEntry(entry, headTracker, false);
+            }
+          }
+          for (const line of headFramer.flush()) {
+            let entry: unknown;
+            try { entry = JSON.parse(line); } catch { continue; }
+            if (isRecord(entry)) parseEntry(entry, headTracker, false);
+          }
+          headTracker.finish();
+        }
+      } else {
+        for (const line of headFramer.flush()) {
+          let entry: unknown;
+          try { entry = JSON.parse(line); } catch { continue; }
+          if (isRecord(entry)) parseEntry(entry, headTracker, false);
+        }
+        headTracker.finish();
+      }
+
+      if (!header) {
+        header = await readPiSessionHeader(filePath, realRoot);
+        if (!header) return null;
+      }
+
+      const cwd = header.cwd || path.dirname(filePath);
+      const sessionName = tailSessionName ?? headSessionName;
+      const effectiveFirstPrompt = headTracker.firstValidPrompt || headTracker.firstAnyPrompt || '';
+
+      let effectiveLastPrompt: string | undefined;
+      if (tailTracker?.lastValidPrompt) {
+        effectiveLastPrompt = tailTracker.lastValidPrompt;
+      } else if (!hasGap && headTracker.lastValidPrompt) {
+        effectiveLastPrompt = headTracker.lastValidPrompt;
+      }
+
+      const title = (sessionName || effectiveFirstPrompt || `Pi ${header.id.slice(0, 8)}`)
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120);
+
+      summary = {
+        sessionId: header.id,
+        sessionFile: filePath,
+        title,
+        cwd,
+        createdAt: header.timestamp || stat.birthtime.toISOString(),
+        updatedAt: lastTimestamp,
+        ...(effectiveFirstPrompt ? { firstUserPrompt: effectiveFirstPrompt } : {}),
+        ...(effectiveLastPrompt ? { lastPrompt: effectiveLastPrompt } : {}),
+        ...(header.parentSession ? { parentSession: header.parentSession } : {}),
+      };
+
+      piSummaryCache.set(filePath, {
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
+        summary,
+      });
+      if (piSummaryCache.size > 2048) {
+        const firstKey = piSummaryCache.keys().next().value;
+        if (firstKey) piSummaryCache.delete(firstKey);
+      }
+      return summary;
+    } finally {
+      await fh.close().catch(() => undefined);
+    }
   } catch {
     return null;
   }
@@ -5312,6 +5522,7 @@ async function safeUnlinkWithinRoot(realRoot: string, targetPath: string): Promi
       throw new ProviderError('invalid_request', `Refusing to delete non-regular or outside-root file: ${targetPath}`, 400);
     }
     await fsp.unlink(anchor.anchoredPath);
+    piSummaryCache.delete(targetPath);
   } catch (err) {
     if (err instanceof ProviderError) throw err;
     const code = (err as NodeJS.ErrnoException)?.code;
@@ -5503,6 +5714,13 @@ export function mapPiHistoryEntry(
 
 export const parsePiSessionEntry = mapPiHistoryEntry;
 
+function stripThinkingAnsi(text: string): string {
+  return text
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/\x1b\].*?(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-Z\\-_]/g, '');
+}
+
 function mapPiContentToGateway(raw: unknown, allowAssistantBlocks: boolean): MessageContentPart[] {
   if (typeof raw === 'string') {
     return raw ? [{ type: 'text', text: raw }] : [];
@@ -5516,7 +5734,10 @@ function mapPiContentToGateway(raw: unknown, allowAssistantBlocks: boolean): Mes
     } else if (block.type === 'image' && typeof block.data === 'string' && typeof block.mimeType === 'string') {
       parts.push({ type: 'image', mimeType: block.mimeType, data: block.data });
     } else if (allowAssistantBlocks && block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim()) {
-      parts.push({ type: 'thinking', thinking: block.thinking });
+      const cleaned = stripThinkingAnsi(block.thinking);
+      if (cleaned) {
+        parts.push({ type: 'thinking', thinking: cleaned });
+      }
     } else if (allowAssistantBlocks && block.type === 'toolCall' && typeof block.id === 'string' && typeof block.name === 'string') {
       parts.push({
         type: 'tool_use',
