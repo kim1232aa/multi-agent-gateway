@@ -709,10 +709,11 @@ export function normalizeCodexThreadItem(rawItem: CodexThreadItem): CodexThreadI
           : undefined;
       if (childThreadId && !item.agentId) item.agentId = childThreadId;
       const kind = typeof item.kind === 'string' ? item.kind : undefined;
-      item.agentStatus = kind === 'started' ? 'running'
+      // SubAgentActivityKind 枚举为 started/interacted/interrupted/completed:
+      // interacted 是运行中交互,归为 running;interrupted 映射 cancelled。
+      item.agentStatus = kind === 'started' || kind === 'interacted' ? 'running'
         : kind === 'completed' ? 'completed'
-        : kind === 'failed' ? 'failed'
-        : kind === 'cancelled' ? 'cancelled'
+        : kind === 'interrupted' ? 'cancelled'
         : 'unknown';
       break;
     }

@@ -1487,7 +1487,7 @@ test('normalizeCodexThreadItem normalizes collabAgentToolCall and subAgentActivi
   assert.equal((subActivityItem as any)?.agentId, 'thread-sub-1');
 });
 
-test('subAgentActivity status follows the real kind for started, completed, failed and cancelled', () => {
+test('subAgentActivity status follows the real kind: started/interacted run, interrupted cancels, completed completes', () => {
   const started = normalizeCodexThreadItem({
     type: 'SubAgentActivity',
     id: 'call-1',
@@ -1497,6 +1497,14 @@ test('subAgentActivity status follows the real kind for started, completed, fail
   assert.equal(started.agentId, 'thread-sub-1');
   assert.equal(started.agentStatus, 'running');
 
+  const interacted = normalizeCodexThreadItem({
+    type: 'SubAgentActivity',
+    id: 'call-1b',
+    kind: 'interacted',
+    agent_thread_id: 'thread-sub-1',
+  } as any) as any;
+  assert.equal(interacted.agentStatus, 'running');
+
   const completed = normalizeCodexThreadItem({
     type: 'SubAgentActivity',
     id: 'subagent-completed-1',
@@ -1505,22 +1513,13 @@ test('subAgentActivity status follows the real kind for started, completed, fail
   } as any) as any;
   assert.equal(completed.agentStatus, 'completed');
 
-  const failed = normalizeCodexThreadItem({
-    type: 'subAgentActivity',
-    id: 'act-2',
-    kind: 'failed',
-    agentThreadId: 'thread-sub-2',
-  } as any) as any;
-  assert.equal(failed.agentId, 'thread-sub-2');
-  assert.equal(failed.agentStatus, 'failed');
-
-  const cancelled = normalizeCodexThreadItem({
+  const interrupted = normalizeCodexThreadItem({
     type: 'subAgentActivity',
     id: 'act-3',
-    kind: 'cancelled',
+    kind: 'interrupted',
     agentThreadId: 'thread-sub-3',
   } as any) as any;
-  assert.equal(cancelled.agentStatus, 'cancelled');
+  assert.equal(interrupted.agentStatus, 'cancelled');
 });
 
 test('subAgentActivity reports unknown without evidence and prefers an explicit agentId', () => {

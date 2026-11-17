@@ -3286,9 +3286,20 @@ function buildSubagentInfo(
         status = "running";
       }
     } else {
-      const syncStatus = call.status ? subagentTerminalStatus(call.status) : "completed";
-      status = syncStatus === "failed" || syncStatus === "cancelled" ? syncStatus : "completed";
-      endedAt = call.ts;
+      // 同步结果:is_error 是原生终态证据;显式 status 只认终态,
+      // 出现非终态(running 等)时保持 running,不默认 completed。
+      if (call.isError) {
+        status = "failed";
+      } else if (call.status) {
+        const syncStatus = subagentTerminalStatus(call.status);
+        status = syncStatus === "failed" || syncStatus === "cancelled" ? syncStatus
+          : syncStatus === "completed" ? "completed"
+          : "running";
+        if (status !== "running") endedAt = call.ts;
+      } else {
+        status = "completed";
+        endedAt = call.ts;
+      }
     }
   } else if (!launch && !metaToolUseId && !contradicted && meta?.finished === true) {
     status = "completed";

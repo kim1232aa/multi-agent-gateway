@@ -634,7 +634,10 @@ export class CodexProviderAdapter implements ProviderAdapter {
       this.liveSubagents.set(sessionId, bucket);
     }
     const existing = bucket.get(agentId);
-    const nextStatus = status ?? existing?.status ?? 'running';
+    // 显式 unknown(如 agentsStates 里的未知状态)不覆盖既有 running;其余按传入状态。
+    const nextStatus = status === 'unknown'
+      ? existing?.status ?? 'unknown'
+      : status ?? existing?.status ?? 'running';
     const terminal = nextStatus === 'completed' || nextStatus === 'failed' || nextStatus === 'cancelled';
     bucket.delete(agentId);
     bucket.set(agentId, {
@@ -2155,9 +2158,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
                 resolvedParentToolUseId,
                 typeof item.summary === 'string' ? item.summary : undefined,
                 typeof item.name === 'string' ? item.name : undefined,
-                subagentStatus(item.kind ?? item.agentStatus ?? item.status),
+                subagentStatus(item.agentStatus ?? item.kind ?? item.status),
               );
-              const st = subagentStatus(item.kind ?? item.agentStatus ?? item.status);
+              const st = subagentStatus(item.agentStatus ?? item.kind ?? item.status);
               yield {
                 kind: 'subagent',
                 status: st === 'running' ? 'started' : st === 'unknown' ? 'updated' : st,
@@ -2185,7 +2188,13 @@ export class CodexProviderAdapter implements ProviderAdapter {
                 (typeof item.tool === 'string' && item.tool) ||
                 (item.type as string);
               let output = extractCodexToolOutput(item) ?? '';
-              const resolvedAgentId = agentId ?? extractSubagentIdFromOutput(output);
+              // 只信任原生标注的子代理调用;普通工具输出里的 "agent_id:" 只是文本,
+              // 会把无关线程当成子代理并放行其历史读取。
+              const subagentSpawnTool = name === 'spawnAgent' || name === 'collabAgentToolCall'
+                || name === 'sendInput' || name === 'resumeAgent' || name === 'closeAgent';
+              const resolvedAgentId = subagentSpawnTool
+                ? (agentId ?? (receiverThreadIds ?? [])[0])
+                : agentId;
               if (resolvedAgentId) {
                 this.recordLiveSubagent(sessionId, resolvedAgentId, (item.id as string) ?? parentToolUseId);
               }
@@ -2514,29 +2523,34 @@ export class CodexProviderAdapter implements ProviderAdapter {
         const timestamp = typeof entry.timestamp === 'string' ? entry.timestamp : undefined;
         if (String(item.type).toLowerCase() === 'subagentactivity') {
           put(item.agent_thread_id ?? item.agentThreadId ?? item.agentId, subagentStatus(item.kind ?? item.agentStatus), callId, timestamp);
-        } else if (item.type === 'collabAgentToolCall' || item.type === 'collabToolCall') {
-          for (const childId of (Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [item.receiverThreadId]).slice(0, 200)) {
-            put(childId, 'unknown', callId);
-          }
+        } else if (item.type === 'spawnAgent' || item.type === 'collabAgentToolCall' || item.type === 'collabToolCall') {
+          const children = (Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [item.receiverThreadId]).slice(0, 200);
+          for (const childId of children) put(childId, 'unknown', callId);
           if (item.agentsStates && typeof item.agentsStates === 'object') {
             for (const [childId, state] of Object.entries(item.agentsStates).slice(0, 200)) {
               put(childId, subagentStatus((state as any)?.status), callId, timestamp);
             }
           }
-        } else if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
-          put(extractSubagentIdFromOutput(item.output), 'unknown', callId);
         }
       }
     }
+    const nativeStates = new Map<string, SubagentStatus>();
     for (const child of await this.inner.listSubagentThreadStates(sessionId).catch(() => [])) {
+      nativeStates.set(child.threadId, child.status);
       put(child.threadId, child.status);
     }
     for (const live of this.liveSubagents.get(sessionId)?.values() ?? []) {
       const disk = subagentsMap.get(live.agentId);
       const diskEnd = Date.parse(disk?.endedAt ?? '');
       if (live.status === 'running' && disk?.status !== 'running' && Number.isFinite(diskEnd)) continue;
+      // 原生 app-server 报告的子线程状态优先于本进程内攒下的 live 状态:
+      // live 的 running 只说明"没见过结束",systemError 是原生观测到的终态。
+      const nativeChild = nativeStates.get(live.agentId);
+      const status = nativeChild && nativeChild !== 'unknown' && nativeChild !== 'running'
+        ? nativeChild
+        : live.status === 'unknown' ? disk?.status ?? 'unknown' : live.status;
       subagentsMap.set(live.agentId, {
-        ...disk, agentId: live.agentId, status: live.status === 'unknown' ? disk?.status ?? 'unknown' : live.status,
+        ...disk, agentId: live.agentId, status,
         ...(live.parentToolUseId ? { parentToolUseId: live.parentToolUseId } : {}),
         ...(live.description ? { description: live.description } : {}),
         ...(live.subagentType ? { subagentType: live.subagentType } : {}),

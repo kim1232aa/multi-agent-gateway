@@ -988,6 +988,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly subagentListeners = new Set<(sessionId: string, subagent: SubagentInfo) => void>();
   private static readonly MAX_LIVE_SUBAGENTS_PER_PARENT = 200;
   private static readonly MAX_LIVE_SUBAGENT_PARENTS = 64;
+  /** running 状态最多保护 ACP 进程这么久;超过后视为 unknown,不再阻止空闲回收。 */
+  private static readonly SUBAGENT_RUNNING_TTL_MS = 30 * 60_000;
   private lastCliModels?: { defaultModel?: string; models: string[] };
 
   private clearToolSnapshots(sessionId: string, turnId?: string): void {
@@ -1072,9 +1074,15 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   private isAcpBusy(): boolean {
     if (this.acpTurns.size > 0 || this.acpConnecting.size > 0) return true;
+    const now = Date.now();
     for (const children of this.subagentLive.values()) {
       for (const live of children.values()) {
-        if (live.info.status === 'running') return true;
+        // running 只是"没见过结束事件";超过 TTL 后不再阻止空闲回收,
+        // 否则一条丢失的 subagent_finished 会让 ACP 进程永远不被回收。
+        if (live.info.status !== 'running') continue;
+        if (now - live.updatedAt <= GrokProviderAdapter.SUBAGENT_RUNNING_TTL_MS) return true;
+        live.info = { ...live.info, status: 'unknown' };
+        live.updatedAt = now;
       }
     }
     for (const client of this.acpClients.values()) {
