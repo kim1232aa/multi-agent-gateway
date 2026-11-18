@@ -1,5 +1,5 @@
 /**
- * CodexAdapter — wraps `codex app-server` (Codex CLI 0.147.x–0.152.1, JSON-RPC over
+ * CodexAdapter — wraps `codex app-server` (Codex CLI 0.169.0, JSON-RPC over
  * newline-delimited stdio) behind a ProviderAdapter-shaped interface so the
  * gateway can treat Codex like any other provider.
  *
@@ -16,7 +16,8 @@
  *   streaming via item/* and turn/* notifications, turn/interrupt to abort.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { parseModelRef, type CliProviders } from './provider-store.js';
 import * as readline from 'node:readline';
 import { z } from 'zod';
 import * as fs from 'node:fs';
@@ -930,8 +931,7 @@ export interface CodexAdapterOptions {
   args?: string[];
   /** Environment overrides for the child process. */
   env?: NodeJS.ProcessEnv;
-  /** Gateway-managed provider overrides, read at every spawn (args go after `app-server`). */
-  injection?: () => { args: string[]; env: Record<string, string> };
+  providers?: CliProviders;
   /** clientInfo sent during initialize. */
   clientInfo?: { name: string; title?: string; version: string };
   /** Timeout for individual JSON-RPC requests (ms). Default 120_000. */
@@ -998,6 +998,7 @@ export interface ThreadItemsListOptions {
 export interface ThreadStartOptions {
   cwd?: string;
   model?: string;
+  modelProvider?: string;
   serviceTier?: string | null;
   approvalPolicy?: 'untrusted' | 'on-request' | 'never' | Record<string, unknown>;
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
@@ -1174,6 +1175,142 @@ export class CodexAdapter {
   private threadServiceTiers = new Map<string, string | null>();
   private threadCwds = new Map<string, string>();
   private configModelCache: string | null = null;
+  private providerFingerprint: string | undefined;
+  private providerRecyclePending = false;
+  private providerRestart: Promise<void> | undefined;
+  private recyclingChild: Promise<void> | undefined;
+  private readonly secrets = new Set<string>();
+
+  private redact(text: string): string {
+    for (const secret of this.secrets) if (secret) text = text.split(secret).join('[REDACTED]');
+    return text;
+  }
+
+  private restartForProviders(): Promise<void> {
+    if (this.providerRestart) return this.providerRestart;
+    const child = this.child;
+    this.providerRestart = (async () => {
+      if (child && child.exitCode === null) {
+        await new Promise<void>((resolve) => {
+          child.once('exit', () => resolve());
+          this.terminateChild();
+        });
+      }
+      if (this.closed) throw new Error('CodexAdapter is closed');
+      this.readyPromise = null;
+      this.readyPromise = this.doConnect().catch((err) => { this.readyPromise = null; throw err; });
+      await this.readyPromise;
+    })().finally(() => { this.providerRestart = undefined; });
+    return this.providerRestart;
+  }
+  private readonly threadProviders = new Map<string, string>();
+  private readonly threadAliases = new Map<string, string>();
+  private readonly draftOptions = new Map<string, ThreadStartOptions>();
+  private debugModelsCache: Promise<Map<string, number>> | undefined;
+
+  nativeThreadId(id: string): string | undefined {
+    return this.threadAliases.get(id);
+  }
+
+  private actualThreadId(id: string): string {
+    return this.threadAliases.get(id) ?? id;
+  }
+
+  resolveModel(id: string): { model: string; modelProvider?: string } {
+    const ref = parseModelRef(id);
+    if (!ref) return { model: id };
+    const modelProvider = this.opts.providers?.cliProviderId(ref.key);
+    if (!this.opts.providers?.provider(ref.key) || !modelProvider) {
+      throw new ProviderError('invalid_request', '所选模型的供应商不在当前目录中，请刷新模型目录后重试。', 400);
+    }
+    return { model: ref.model, modelProvider };
+  }
+
+  restoreThreadAliases(aliases: Record<string, string>): void {
+    for (const [logical, actual] of Object.entries(aliases)) this.threadAliases.set(logical, actual);
+  }
+
+  private adoptDraft(threadId: string, replacementId: string): void {
+    const actual = this.actualThreadId(replacementId);
+    for (const map of [this.threadModels, this.threadProviders, this.threadCwds, this.threadEfforts,
+      this.threadServiceTiers, this.rolloutPathCache, this.unpersistedThreads, this.draftOptions] as Array<Map<string, any>>) {
+      const value = map.get(replacementId);
+      map.delete(threadId);
+      map.delete(replacementId);
+      if (value !== undefined) map.set(threadId, value);
+    }
+    this.liveThreads.delete(replacementId);
+    this.liveThreads.add(threadId);
+    this.threadAliases.set(threadId, actual);
+  }
+
+  async setModel(threadId: string, id: string): Promise<string | undefined> {
+    if (!id.trim()) throw new ProviderError('invalid_request', '模型不能为空。', 400);
+    const selected = this.resolveModel(id);
+    if (threadId === '__default__') return;
+    await this.connect();
+    this.requireCurrentProviders();
+    if (this.findActiveTurnId(threadId)) throw new ProviderError('busy', '请等待当前 Codex 回合结束后再切换模型。', 409);
+    let current = this.threadProviders.get(threadId);
+    if (!current) {
+      try {
+        const raw = await this.request('thread/read', { threadId, includeTurns: false });
+        current = ThreadReadResponseSchema.parse(raw).thread.modelProvider ?? undefined;
+      } catch {
+        current = (await this.resume(threadId)).modelProvider ?? undefined;
+      }
+      if (current) this.threadProviders.set(threadId, current);
+    }
+    let target = selected.modelProvider;
+    if (!target) {
+      const raw = await this.request('config/read', {}) as { config?: { model_provider?: string } };
+      target = raw.config?.model_provider ?? 'openai';
+    }
+    if (!current) throw new ProviderError('invalid_request', '无法确认该 Codex 线程的供应商，未切换模型。', 400);
+    if (current !== target) {
+      const draft = this.draftOptions.get(threadId);
+      const persisted = draft ? Boolean(await this.locateRollout(threadId)) : true;
+      if (!draft || persisted) {
+        throw new ProviderError('invalid_request', 'Codex 已有会话不能跨供应商切换，请新建会话或使用 /fork。', 400);
+      }
+      const replacement = await this.create({ ...draft, ...selected, modelProvider: target });
+      this.adoptDraft(threadId, replacement.id);
+      return this.actualThreadId(threadId);
+    }
+    if (this.draftOptions.has(threadId)) {
+      this.threadModels.set(threadId, selected.model);
+      this.draftOptions.set(threadId, { ...this.draftOptions.get(threadId), ...selected, modelProvider: target });
+    } else {
+      if (!this.liveThreads.has(threadId)) {
+        await this.resume(threadId, { model: selected.model, modelProvider: target });
+      }
+      this.threadModels.set(threadId, selected.model);
+    }
+    return this.threadAliases.get(threadId);
+  }
+
+  async modelContextWindows(): Promise<Map<string, number>> {
+    if (!this.debugModelsCache) {
+      const bin = this.opts.codexPath ?? process.env.CODEX_PATH ?? process.env.CODEX_BIN ?? 'codex';
+      this.debugModelsCache = new Promise<Map<string, number>>((resolve) => {
+        execFile(bin, ['debug', 'models'], { timeout: 10_000, maxBuffer: 16 * 1024 * 1024,
+          env: { ...process.env, ...this.opts.env }, killSignal: 'SIGKILL' }, (err, stdout) => {
+          const out = new Map<string, number>();
+          if (!err) {
+            try {
+              const data = JSON.parse(stdout) as { models?: Array<{ slug?: string; context_window?: number }> };
+              for (const m of data.models ?? []) {
+                if (m.slug && typeof m.context_window === 'number' && m.context_window > 0) out.set(m.slug, m.context_window);
+              }
+            } catch { /* unknown context is omitted */ }
+          }
+          resolve(out);
+        });
+      });
+    }
+    return this.debugModelsCache;
+  }
+
   private skillsDirty = false;
   private skillsVersion = 0;
   private readyPromise: Promise<void> | null = null;
@@ -1211,6 +1348,17 @@ export class CodexAdapter {
   /** Spawn `codex app-server` and run the initialize handshake. Idempotent. */
   connect(): Promise<void> {
     if (this.closed) return Promise.reject(new Error('CodexAdapter is closed'));
+    const print = this.opts.providers?.fingerprint();
+    if (this.providerRestart) return this.providerRestart;
+    if (this.recyclingChild) return this.recyclingChild.then(() => this.connect());
+    if (this.readyPromise && print !== this.providerFingerprint) {
+      this.providerRecyclePending = true;
+      if (this.pendingClient.size || this.pendingServer.size || this.turnQueues.size || this.activeCompacts.size) {
+        this.scheduleRecycleWhenIdle();
+        return this.readyPromise;
+      }
+      return this.restartForProviders();
+    }
     if (this.readyPromise) return this.readyPromise;
     this.readyPromise = this.doConnect().catch((err) => {
       this.readyPromise = null;
@@ -1219,9 +1367,19 @@ export class CodexAdapter {
     return this.readyPromise;
   }
 
+  private requireCurrentProviders(): void {
+    if (this.readyPromise && this.opts.providers?.fingerprint() !== this.providerFingerprint) {
+      throw new ProviderError('busy', '供应商目录已更新，请等待当前回合结束后重试。', 409);
+    }
+  }
+
   private async doConnect(): Promise<void> {
     const bin = this.opts.codexPath ?? process.env.CODEX_PATH ?? process.env.CODEX_BIN ?? 'codex';
-    const injected = this.opts.injection?.() ?? { args: [], env: {} };
+    const injected = this.opts.providers?.injection() ?? { args: [], env: {} };
+    this.secrets.clear();
+    for (const value of Object.values(injected.env)) if (value) this.secrets.add(value);
+    this.providerFingerprint = this.opts.providers?.fingerprint();
+    this.providerRecyclePending = false;
     const args = ['app-server', ...(this.opts.args ?? []), ...injected.args];
     const inheritedEnv = Object.fromEntries(
       Object.entries(process.env).filter(([key]) => !/^GATEWAY_/i.test(key)),
@@ -1236,8 +1394,9 @@ export class CodexAdapter {
     this.child.stderr?.on('data', (chunk: Buffer) => {
       for (const line of chunk.toString('utf8').split(/\r?\n/)) {
         if (!line.trim()) continue;
-        this.opts.onStderr?.(line);
-        this.emit({ type: 'log', line });
+        const safeLine = this.redact(line);
+        this.opts.onStderr?.(safeLine);
+        this.emit({ type: 'log', line: safeLine });
       }
     });
     this.rl = readline.createInterface({ input: this.child.stdout! });
@@ -1378,6 +1537,9 @@ export class CodexAdapter {
   }
 
   private request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
+    if (params && typeof params === 'object' && typeof (params as any).threadId === 'string') {
+      params = { ...params, threadId: this.actualThreadId((params as any).threadId) };
+    }
     const budget = timeoutMs ?? this.opts.requestTimeoutMs;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -1410,8 +1572,24 @@ export class CodexAdapter {
     try {
       msg = JSON.parse(line);
     } catch {
-      this.emit({ type: 'log', line: `[non-json stdout] ${line}` });
+      this.emit({ type: 'log', line: `[non-json stdout] ${this.redact(line)}` });
       return;
+    }
+    if (this.threadAliases.size > 0 || [...this.secrets].some((secret) => line.includes(secret))) {
+      const hasSecrets = (): boolean => [...this.secrets].some((secret) => line.includes(secret));
+      const logicalId = (id: string): string => [...this.threadAliases].find(([, actual]) => actual === id)?.[0] ?? id;
+      const remap = (value: unknown, thread = false): void => {
+        if (Array.isArray(value)) { for (const row of value) remap(row, thread); return; }
+        if (!value || typeof value !== 'object') return;
+        const row = value as Record<string, unknown>;
+        for (const [key, item] of Object.entries(row)) {
+          if (typeof item === 'string') {
+            const remapped = key === 'threadId' || key === 'parentThreadId' || (key === 'id' && thread) ? logicalId(item) : item;
+            row[key] = hasSecrets() ? this.redact(remapped) : remapped;
+          } else remap(item, key === 'thread' || (key === 'data' && this.pendingClient.get(msg.id as CodexRequestId)?.method === 'thread/list'));
+        }
+      };
+      remap(msg);
     }
     const id = msg.id as CodexRequestId | undefined;
     const method = msg.method as string | undefined;
@@ -2581,7 +2759,7 @@ export class CodexAdapter {
     this.liveThreads.clear();
     this.seenTurnStarts.clear();
     // 未落盘线程随进程蒸发,保护记录一并清掉(它们已不可恢复)。
-    this.unpersistedThreads.clear();
+    if (!this.providerRecyclePending) this.unpersistedThreads.clear();
     // config/read 的模型缓存属于旧进程语境,重连后必须重读。
     this.configModelCache = null;
     if (this.readyPromise) {
@@ -2598,11 +2776,14 @@ export class CodexAdapter {
 
   /** Provider config changed: restart app-server as soon as it is idle so the next spawn picks it up. */
   recycleSoon(): void {
+    this.providerRecyclePending = true;
     this.recycleIfIdle();
   }
 
   private scheduleRecycleWhenIdle(): void {
-    const grace = this.opts.recycleGraceMs;
+    const grace = this.providerRecyclePending
+      ? Math.min(this.opts.recycleGraceMs > 0 ? this.opts.recycleGraceMs : 200, 1_000)
+      : this.opts.recycleGraceMs;
     if (grace <= 0 || this.closed || !this.child) return;
     if (this.recycleTimer) clearTimeout(this.recycleTimer);
     this.recycleTimer = setTimeout(() => {
@@ -2621,7 +2802,7 @@ export class CodexAdapter {
   private stallProbeInflight = false;
 
   private recycleIfIdle(): void {
-    if (this.closed || !this.child || this.child.exitCode !== null) return;
+    if (this.closed || this.recyclingChild || !this.child || this.child.exitCode !== null) return;
     this.expireStaleParkedRequests();
     // pendingServer(parked 审批/提问)也算 busy:审批是 turn 中段的反向请求,
     // 用户在斟酌的 60s 里进程被回收,审批会静默蒸发。
@@ -2634,7 +2815,7 @@ export class CodexAdapter {
       // turn 流长期静默:可能 app-server  wedge(实测:rollout 已写
       // task_complete,但 turn/completed 始终不上线,写者锁被一直占着,
       // CLI resume 被拒)。探活区分"慢但活着"与"卡死"。
-      if (this.turnQueues.size > 0 && Date.now() - this.lastTurnActivityAt > CodexAdapter.TURN_STALL_MS) {
+      if (!this.providerRecyclePending && this.turnQueues.size > 0 && Date.now() - this.lastTurnActivityAt > CodexAdapter.TURN_STALL_MS) {
         void this.probeStalledTurn().catch((err) => {
           this.emit({ type: 'log', line: `stall probe failed: ${err}` });
         });
@@ -2740,7 +2921,7 @@ export class CodexAdapter {
       } catch { /* fall through */ }
       this.rolloutPathCache.delete(threadId);
     }
-    const found = await fallback(threadId);
+    const found = await fallback(this.actualThreadId(threadId));
     if (found) this.rolloutPathCache.set(threadId, found);
     return found;
   }
@@ -2748,15 +2929,18 @@ export class CodexAdapter {
   /** 未落盘线程保护 + 杀进程;文件检查是异步的,单独拆出来。 */
   private async guardUnpersistedThenKill(): Promise<void> {
     const now = Date.now();
+    const child = this.child;
     for (const [id, createdAt] of this.unpersistedThreads) {
       if (now - createdAt > CodexAdapter.UNPERSISTED_PROTECT_MS) {
         this.unpersistedThreads.delete(id); // 废弃草稿,放弃保护
+        this.draftOptions.delete(id);
       } else if (await this.locateRollout(id)) {
         this.unpersistedThreads.delete(id); // 首个 turn 已落盘
+        this.draftOptions.delete(id);
       }
     }
     this.expireStaleParkedRequests(now);
-    if (this.closed || !this.child || this.child.exitCode !== null) return;
+    if (this.closed || this.recyclingChild || !this.child || this.child !== child || this.child.exitCode !== null) return;
     // await 窗口内可能来了新请求:杀之前按与 recycleIfIdle 相同的口径重检,
     // 否则在飞请求会被无谓杀掉(虽能 reject 兜底,但用户看到的是偶发失败)。
     const busy =
@@ -2768,7 +2952,7 @@ export class CodexAdapter {
       this.scheduleRecycleWhenIdle();
       return;
     }
-    if (this.unpersistedThreads.size > 0) {
+    if (this.unpersistedThreads.size > 0 && !this.providerRecyclePending) {
       // 有新建未落盘的线程,回收会让它蒸发;顺延。
       this.scheduleRecycleWhenIdle();
       return;
@@ -2780,7 +2964,12 @@ export class CodexAdapter {
   /** 杀 app-server:SIGTERM,3s 不退升级 SIGKILL(close 的同款兜底,回收/wedge 共用)。 */
   private terminateChild(): void {
     const child = this.child;
-    if (!child || child.exitCode !== null) return;
+    if (!child || child.exitCode !== null || this.recyclingChild) return;
+    if (typeof child.once === 'function') {
+      this.recyclingChild = new Promise<void>((resolve) => {
+        child.once('exit', () => { this.recyclingChild = undefined; resolve(); });
+      });
+    }
     child.kill('SIGTERM');
     if (this.recycleKillTimer) clearTimeout(this.recycleKillTimer);
     this.recycleKillTimer = setTimeout(() => {
@@ -2813,8 +3002,7 @@ export class CodexAdapter {
       searchTerm: options.searchTerm ?? null,
       sourceKinds: options.sourceKinds ?? null,
       // 显式 `[]` = 所有 provider。不传时服务端只按当前配置的 provider 过滤:
-      // 网关注入自定义 model_provider 后,历史 rollout 记录的是 provider *name*,
-      // 与配置键不匹配,整个会话列表会被过滤成空。
+      // 所以必须保留此过滤条件以列出全部供应商的历史会话。
       modelProviders: [],
     });
     const parsed = ThreadListResponseSchema.parse(raw);
@@ -2845,10 +3033,15 @@ export class CodexAdapter {
 
   /** Create a new thread (thread/start). Returns the Thread object. */
   async create(options: ThreadStartOptions = {}): Promise<CodexThread> {
+    const id = options.model ?? this.opts.providers?.defaultModelRef();
+    const selected = id ? this.resolveModel(id) : {};
+    options = { ...options, ...selected };
     await this.connect();
+    this.requireCurrentProviders();
     const raw = await this.request('thread/start', {
       cwd: options.cwd ?? null,
       model: options.model ?? null,
+      ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}),
       ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
       approvalPolicy: options.approvalPolicy ?? null,
       sandbox: options.sandbox ?? null,
@@ -2865,6 +3058,8 @@ export class CodexAdapter {
     if (thread.path) this.rolloutPathCache.set(thread.id, thread.path);
     this.liveThreads.add(thread.id);
     this.unpersistedThreads.set(thread.id, Date.now());
+    this.draftOptions.set(thread.id, options);
+    if (thread.modelProvider ?? options.modelProvider) this.threadProviders.set(thread.id, (thread.modelProvider ?? options.modelProvider)!);
     const effectiveModel = options.model ?? parsed.model ?? thread.model ?? undefined;
     if (effectiveModel) this.threadModels.set(thread.id, effectiveModel);
     if (options.serviceTier !== undefined || parsed.serviceTier !== undefined) {
@@ -2878,6 +3073,8 @@ export class CodexAdapter {
 
   /** Resume an existing thread (thread/resume) so turns can be sent to it. */
   async resume(threadId: string, options: ThreadStartOptions = {}): Promise<CodexThread> {
+    const selected = options.model ? this.resolveModel(options.model) : {};
+    options = { ...options, ...selected };
     await this.connect();
     let raw: unknown;
     try {
@@ -2885,6 +3082,7 @@ export class CodexAdapter {
         threadId,
         cwd: options.cwd ?? null,
         model: options.model ?? null,
+        ...(options.modelProvider ? { modelProvider: options.modelProvider } : {}),
         ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
         approvalPolicy: options.approvalPolicy ?? null,
         sandbox: options.sandbox ?? null,
@@ -2909,6 +3107,7 @@ export class CodexAdapter {
     }
     const parsed = ThreadResumeResponseSchema.parse(raw);
     const thread = parsed.thread;
+    if (thread.modelProvider) this.threadProviders.set(threadId, thread.modelProvider);
     if (thread.path) this.rolloutPathCache.set(threadId, thread.path);
     this.liveThreads.add(threadId);
     const effectiveModel = options.model ?? parsed.model ?? thread.model ?? undefined;
@@ -2928,6 +3127,12 @@ export class CodexAdapter {
    */
   private async ensureLive(threadId: string): Promise<void> {
     if (this.liveThreads.has(threadId)) return;
+    const draft = this.draftOptions.get(threadId);
+    if (draft && !(await this.locateRollout(threadId))) {
+      const replacement = await this.create(draft);
+      this.adoptDraft(threadId, replacement.id);
+      return;
+    }
     await this.resume(threadId);
   }
 
@@ -3172,7 +3377,18 @@ export class CodexAdapter {
     options: TurnStartOptions = {},
   ): Promise<CodexTurnHandle> {
     await this.connect();
-    if (options.model) this.threadModels.set(threadId, options.model);
+    this.requireCurrentProviders();
+    const desiredModel = options.model ?? (this.draftOptions.has(threadId) ? this.opts.providers?.defaultModelRef() : undefined);
+    if (desiredModel) {
+      options = { ...options, model: desiredModel };
+    }
+    if (options.model) {
+      const selected = this.resolveModel(options.model);
+      if (selected.modelProvider && this.threadProviders.get(threadId) !== selected.modelProvider) {
+        await this.setModel(threadId, options.model);
+      }
+      options = { ...options, model: selected.model };
+    }
     if (options.effort) this.threadEfforts.set(threadId, options.effort);
     if (options.serviceTier !== undefined) this.threadServiceTiers.set(threadId, options.serviceTier);
     if (options.cwd) this.threadCwds.set(threadId, options.cwd);
@@ -3198,6 +3414,8 @@ export class CodexAdapter {
       });
       return TurnStartResponseSchema.parse(raw).turn;
     });
+    this.draftOptions.delete(threadId);
+    if (options.model) this.threadModels.set(threadId, options.model);
     const key = `${threadId}:${turn.id}`;
     const queue = new TurnEventQueue();
     this.turnQueues.set(key, queue);
@@ -3403,6 +3621,10 @@ export class CodexAdapter {
     this.threadEfforts.delete(threadId);
     this.threadServiceTiers.delete(threadId);
     this.threadCwds.delete(threadId);
+    this.threadProviders.delete(threadId);
+    this.threadAliases.delete(threadId);
+    this.draftOptions.delete(threadId);
+    this.rolloutPathCache.delete(threadId);
   }
 
   /** 持久改名(thread/name/set;schema 里的 thread/setName 已实测不存在)。 */
@@ -3810,7 +4032,7 @@ export class CodexAdapter {
     options?: { model?: string; reasoningEffort?: string | null; developerInstructions?: string | null },
   ): Promise<void> {
     await this.connect();
-    const model = options?.model ?? (await this.effectiveModel(threadId));
+    const model = options?.model ? this.resolveModel(options.model).model : (await this.effectiveModel(threadId));
     const reasoningEffort =
       options?.reasoningEffort !== undefined
         ? options.reasoningEffort
@@ -3828,7 +4050,7 @@ export class CodexAdapter {
         },
       }),
     );
-    if (options?.model) this.threadModels.set(threadId, options.model);
+    if (options?.model) this.threadModels.set(threadId, model);
     if (options?.reasoningEffort !== undefined) {
       if (options.reasoningEffort) this.threadEfforts.set(threadId, options.reasoningEffort);
       else this.threadEfforts.delete(threadId);

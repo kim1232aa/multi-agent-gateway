@@ -42,7 +42,16 @@ import {
   piUnsupportedTuiCommandNames,
 } from './native-commands.js';
 import { fsDiff, fsGitStatus, fsGrep, fsList, fsRead, fsRepoDiff, fsSearch } from './fs-local.js';
-import { ProviderStore, ProviderStoreError, SUPPORTED_TYPES, type InjectedProvider } from './provider-store.js';
+import {
+  encodeModelRef,
+  type KimiProviderSource,
+  parseModelRef,
+  ProviderStore,
+  ProviderStoreError,
+  SUPPORTED_TYPES,
+  type CatalogProvider,
+  type InjectedProvider,
+} from './provider-store.js';
 import {
   buildLocalTranscriptPage,
   extractSubagentIdFromOutput,
@@ -122,6 +131,8 @@ export interface GatewayOptions {
    * 在选择器里,避免用户点了才发现不存在)。测试可显式覆盖。
    */
   availableProviders?: ProviderName[];
+  /** 复用 Kimi Code 已配置的供应商(只读,`kimi provider list --json`);不传 = 不复用。 */
+  kimiProviders?: KimiProviderSource | null;
 }
 
 /** 探测本机实际安装的 provider:只做一次 fs 检查,不起进程(开销)。 */
@@ -249,18 +260,13 @@ function kimiDemoAdapter(): ProviderAdapter {
   };
 }
 
+/** A context window we actually know (finite, positive); anything else is reported as 0 = unknown. */
+function knownContextLimit(value: number | undefined | null): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
 function isLocalProvider(value: string | null | undefined): value is LocalProviderName {
   return value === 'claude' || value === 'codex' || value === 'grok' || value === 'pi' || value === 'dsh';
-}
-
-/** Official grok-4.6 / grok-4.5 window (https://docs.x.ai/developers/models/grok-4.6). */
-function grokStatusContextFallback(): number {
-  return 500_000;
-}
-
-/** Official DeepSeek V3 / R1 context window (128K). */
-function dshStatusContextFallback(): number {
-  return 131_072;
 }
 
 function prefixedId(provider: ProviderName, nativeId: string): string {
@@ -557,23 +563,26 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const dshRecycleGraceMs = process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS !== undefined
     ? Number(process.env.GATEWAY_DSH_IDLE_TIMEOUT_MS)
     : undefined;
-  const providerStore = new ProviderStore(settingsDir);
+  // Kimi 的供应商只读复用(`kimi provider list --json`),由入口(index.ts)显式传入;
+  // 不传则不读本机 Kimi 配置(测试、嵌入场景)。
+  const providerStore = new ProviderStore(settingsDir, { kimi: options.kimiProviders ?? null });
+  await providerStore.ready(8_000);
   providerStore.syncLaunchFiles();
   const adapters: Record<LocalProviderName, ProviderAdapter> = {
     codex: options.codex ?? new CodexProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.codex.json'),
-      injection: () => providerStore.injectionFor('codex'),
+      providers: providerStore.forCli('codex'),
       ...(codexRecycleGraceMs !== undefined && Number.isFinite(codexRecycleGraceMs) ? { recycleGraceMs: codexRecycleGraceMs } : {}),
     }),
     claude: options.claude ?? new ClaudeProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.claude.json'),
       claudeBin: process.env.CLAUDE_BIN,
-      injection: () => providerStore.injectionFor('claude'),
+      providers: providerStore.forCli('claude'),
     }),
     grok: options.grok ?? new GrokProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.grok.json'),
       grokBin: process.env.GROK_BIN,
-      injection: () => providerStore.injectionFor('grok'),
+      providers: providerStore.forCli('grok'),
       ...(Number.isFinite(grokRecycleGraceMs) ? { recycleGraceMs: grokRecycleGraceMs } : {}),
     }),
     pi: options.pi ?? (() => {
@@ -592,8 +601,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       return new PiProviderAdapter({
         settingsPath: path.join(settingsDir, 'session-settings.pi.json'),
         piBin: process.env.PI_BIN,
-        injection: () => providerStore.injectionFor('pi'),
-        injectedDefaultModel: () => providerStore.activeModelId('pi'),
+        providers: providerStore.forCli('pi'),
         ...(piRecycleGraceMs !== undefined && Number.isFinite(piRecycleGraceMs) ? { recycleGraceMs: piRecycleGraceMs } : {}),
         ...(piMaxLiveProcesses !== undefined && Number.isFinite(piMaxLiveProcesses) ? { maxLiveProcesses: piMaxLiveProcesses } : {}),
         ...(piMaxSessionFileBytes !== undefined && Number.isFinite(piMaxSessionFileBytes) ? { maxSessionFileBytes: piMaxSessionFileBytes } : {}),
@@ -603,10 +611,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     dsh: options.dsh ?? new DshProviderAdapter({
       settingsPath: path.join(settingsDir, 'session-settings.dsh.json'),
       dshBin: process.env.DSH_BIN,
-      injection: () => providerStore.injectionFor('dsh'),
+      providers: providerStore.forCli('dsh'),
       ...(dshRecycleGraceMs !== undefined && Number.isFinite(dshRecycleGraceMs) ? { recycleGraceMs: dshRecycleGraceMs } : {}),
     }),
   };
+  // 供应商目录变化(网关增删改、Kimi config.toml 改动)时通知对应 CLI 适配器重建目录/空闲进程。
+  const providerStoreOff = providerStore.onChange((cli) => { void notifyProviderChanged(adapters[cli]); });
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
   const subagentOffs = Object.values(adapters).map((adapter) => adapter.onSubagentUpdate?.((nativeId, child) => {
@@ -1213,7 +1223,6 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     if (isLocalProvider(provider) && sub === '/providers' && req.method === 'POST') {
       const body = (await readBody(req)) as Record<string, unknown>;
       const saved = runProviderStore(() => providerStore.upsert(provider, body));
-      await notifyProviderChanged(adapters[provider]);
       return ok(res, injectedProviderDto(provider, saved, providerStore), requestId);
     }
     const singleProviderMatch = /^\/providers\/([^/:]+)$/.exec(sub);
@@ -1221,26 +1230,29 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const p = decodeURIComponent(singleProviderMatch[1]);
       if (isLocalProvider(provider)) {
         const injected = providerStore.get(provider, p);
+        const fromKimi = injected ? undefined : providerStore.provider(provider, p);
         if (req.method === 'GET') {
           if (injected) return ok(res, injectedProviderDto(provider, injected, providerStore), requestId);
+          if (fromKimi?.source === 'kimi') return ok(res, kimiCatalogProviderDto(provider, fromKimi, providerStore), requestId);
           if (p === provider) return ok(res, await nativeProviderDto(provider, adapters[provider], providerStore), requestId);
           return fail(res, 404, 40401, 'provider not found', requestId);
         }
         if (req.method === 'PUT' || req.method === 'DELETE') {
           if (!injected) {
+            const readOnly = p === provider || fromKimi?.source === 'kimi';
             const msg = p === provider
               ? `${provider} 的原生配置由 ${provider} CLI 自己管理，网关只读；如需改用第三方中转，请"添加供应商"（只在网关启动 ${provider} 时注入，不改 CLI 配置文件）`
-              : 'provider not found';
-            return fail(res, p === provider ? 403 : 404, p === provider ? 40301 : 40401, msg, requestId);
+              : fromKimi?.source === 'kimi'
+                ? `${p} 来自 Kimi Code 自己的配置，网关只读复用；请在 Kimi 里修改（kimi provider ...），改完这里自动同步`
+                : 'provider not found';
+            return fail(res, readOnly ? 403 : 404, readOnly ? 40301 : 40401, msg, requestId);
           }
           if (req.method === 'DELETE') {
             runProviderStore(() => providerStore.remove(provider, p));
-            await notifyProviderChanged(adapters[provider]);
             return ok(res, {}, requestId);
           }
           const body = (await readBody(req)) as Record<string, unknown>;
           const saved = runProviderStore(() => providerStore.upsert(provider, body, p));
-          await notifyProviderChanged(adapters[provider]);
           return ok(res, { provider: injectedProviderDto(provider, saved, providerStore) }, requestId);
         }
       } else if (req.method === 'GET' && isLocalProvider(p)) {
@@ -1950,16 +1962,10 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
       if (tail === '/status' && req.method === 'GET') {
         const usage = adapter.getUsage?.(nativeId);
-        let contextLimit = usage?.context_limit ?? 0;
+        let contextLimit = knownContextLimit(usage?.context_limit);
         const model = adapter.getModel?.(nativeId) ?? getDemoModel(sp, nativeId) ?? '';
         if (contextLimit <= 0 && sp === 'claude') {
           if (model) contextLimit = claudeContextWindow(model);
-        }
-        if (contextLimit <= 0 && sp === 'grok') {
-          contextLimit = grokStatusContextFallback();
-        }
-        if (contextLimit <= 0 && sp === 'dsh') {
-          contextLimit = dshStatusContextFallback();
         }
         const contextUnavailable = usage?.context_unavailable === true;
         const extUi = (adapter as { getExtensionUiState?: (id: string) => unknown }).getExtensionUiState?.(nativeId);
@@ -2357,6 +2363,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       new Promise((resolveClose) => {
         if (kimiFollowTimer) clearInterval(kimiFollowTimer);
         for (const off of subagentOffs) off();
+        providerStoreOff();
         uploadStore.close();
         workspaceStore.close();
         for (const socket of gatewaySockets) socket.destroy();
@@ -2486,10 +2493,12 @@ async function nativeProviderDto(
   const overridden = store.activeId(provider) !== undefined;
   // listModels 失败如实抛出(500),不伪装成空目录——与 /models 行为一致。
   // 注意:即便网关有注入供应商也照样探测一次,否则 CLI 坏掉会被"注入成功"掩盖。
-  const models = adapter.listModels ? await adapter.listModels().catch((err) => {
+  const listed = adapter.listModels ? await adapter.listModels().catch((err) => {
     if (overridden) return [] as NativeModel[];
     throw err;
   }) : [];
+  // listModels 也带目录模型(`@key:model`);原生行只列 CLI 自己的。
+  const models = listed.filter((m) => !parseModelRef(m.model));
   return {
     id: provider,
     type: provider,
@@ -2522,13 +2531,36 @@ function injectedProviderDto(
   };
 }
 
+/** A provider reused from Kimi Code's own config: listed and selectable, never editable here. */
+function kimiCatalogProviderDto(
+  provider: LocalProviderName,
+  entry: CatalogProvider,
+  store: ProviderStore,
+): Record<string, unknown> {
+  return {
+    id: entry.key,
+    type: entry.type,
+    base_url: entry.base_url,
+    default_model: entry.default_model ?? entry.models[0]?.model ?? '',
+    has_api_key: true,
+    status: store.activeId(provider) === entry.key ? 'connected' : 'inactive',
+    models: entry.models.map((m) => m.model),
+    native: false,
+    read_only: true,
+    source: 'kimi',
+  };
+}
+
 async function providerList(
   provider: LocalProviderName,
   adapter: ProviderAdapter,
   store: ProviderStore,
 ): Promise<Record<string, unknown>[]> {
   const injected = store.list(provider).map((p) => injectedProviderDto(provider, p, store));
-  return [await nativeProviderDto(provider, adapter, store), ...injected];
+  const fromKimi = store.catalog(provider)
+    .filter((p) => p.source === 'kimi')
+    .map((p) => kimiCatalogProviderDto(provider, p, store));
+  return [await nativeProviderDto(provider, adapter, store), ...injected, ...fromKimi];
 }
 
 interface CodexLoginCapable {
@@ -2975,16 +3007,16 @@ async function providerConfigView(
   const requestedThinking = patch.thinking !== undefined ? parseWireThinkingPatch(patch.thinking, provider, selectedModel) : undefined;
   if (requestedThinking && adapter.setThinking) await adapter.setThinking('__default__', requestedThinking);
   const wireThinking = toWireThinkingConfig(adapter.getThinking?.('__default__'));
+  // 适配器的 listModels 已包含目录模型(`@<key>:<model>`),这里只做形状转换,不再二次合并。
   const modelMap: Record<string, Record<string, unknown>> = {};
   for (const model of models) {
     const dto = wireModelDto(model);
+    const ref = parseModelRef(model.model);
     modelMap[model.model] = {
-      provider,
+      provider: ref ? ref.key : provider,
       model: model.model,
       displayName: model.display_name ?? model.model,
-      ...(typeof model.max_context_size === 'number' && model.max_context_size > 0
-        ? { maxContextSize: model.max_context_size }
-        : {}),
+      ...(typeof dto.max_context_size === 'number' ? { maxContextSize: dto.max_context_size } : {}),
       ...(Array.isArray(dto.capabilities) ? { capabilities: dto.capabilities } : {}),
       ...(Array.isArray(dto.support_efforts) ? { supportEfforts: dto.support_efforts } : {}),
       ...(typeof dto.default_effort === 'string' ? { defaultEffort: dto.default_effort } : {}),
@@ -2997,24 +3029,15 @@ async function providerConfigView(
       has_api_key: true,
     },
   };
-  for (const injected of store.list(provider)) {
-    providers[injected.id] = {
-      type: injected.type,
-      base_url: injected.base_url,
-      default_model: injected.default_model ?? injected.models[0]?.model ?? '',
-      has_api_key: store.hasKey(provider, injected.id),
+  for (const entry of store.catalog(provider)) {
+    const ref = (m: string) => encodeModelRef(entry.key, m);
+    providers[entry.key] = {
+      type: entry.type,
+      base_url: entry.base_url,
+      default_model: ref(entry.default_model ?? entry.models[0]?.model ?? ''),
+      has_api_key: entry.source === 'kimi' ? true : store.hasKey(provider, entry.id),
+      ...(entry.source === 'kimi' ? { read_only: true, source: 'kimi' } : {}),
     };
-    for (const m of injected.models) {
-      const key = `${injected.id}/${m.model}`;
-      if (modelMap[key]) continue;
-      modelMap[key] = {
-        provider: injected.id,
-        model: m.model,
-        displayName: m.display_name ?? m.model,
-        ...(m.max_context_size ? { maxContextSize: m.max_context_size } : {}),
-        ...(m.capabilities ? { capabilities: m.capabilities } : {}),
-      };
-    }
   }
   const { thinking: _kimiThinking, ...restBase } = base;
   return {
@@ -3447,10 +3470,12 @@ function sessionDto(
     archived: s.archived ?? false,
     metadata: { ...s.metadata, provider: s.provider },
     agent_config: { model: model ?? '' },
-    usage: usage ?? {
-      input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
-      total_cost_usd: 0, context_tokens: 0, context_limit: 0, turn_count: 0,
-    },
+    usage: usage
+      ? { ...usage, context_limit: knownContextLimit(usage.context_limit) }
+      : {
+          input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
+          total_cost_usd: 0, context_tokens: 0, context_limit: 0, turn_count: 0,
+        },
     permission_rules: [],
     message_count: 0,
     last_seq: 0,
@@ -3810,6 +3835,15 @@ async function createLocalSession(
   if (createCfg?.model && adapter.setModel) await adapter.setModel(session.id, createCfg.model);
   if (typeof createCfg?.thinking === 'string' && adapter.setThinking) {
     await adapter.setThinking(session.id, createCfg.thinking);
+  } else if (createCfg?.model && adapter.setThinking && adapter.listModels) {
+    // 前端没显式选档位时,composer 显示的是该模型的 default_effort(Kimi 的 E0());
+    // 不同步的话 CLI 会沿用上一次的档位,显示与实际不一致。
+    const picked = (await adapter.listModels().catch(() => [] as NativeModel[]))
+      .find((m) => m.model === createCfg.model);
+    const effort = picked?.default_effort;
+    if (effort && picked?.support_efforts?.includes(effort)) {
+      await adapter.setThinking(session.id, effort).catch(() => undefined);
+    }
   }
   if (typeof createCfg?.permission_mode === 'string' && adapter.setPermission) {
     await adapter.setPermission(session.id, createCfg.permission_mode);
@@ -4584,14 +4618,16 @@ async function driveTurn(
 
   // 后台消费事件流:累积文本 + 广播 WS + 清理忙态。
   void (async () => {
-    let reason: 'completed' | 'failed' = 'completed';
+    let reason: 'completed' | 'failed' | 'cancelled' = 'completed';
     let turnError: string | undefined;
     let turnTruncated = false;
     try {
       for await (const ev of handle.events) {
-        if (hub.busy.get(sid) !== turn) break;
+        if (hub.busy.get(sid) !== turn || turn.cancelled) break;
         if (ev.kind === 'turn') {
-          if (ev.status === 'failed' || ev.status === 'cancelled') {
+          if (ev.status === 'cancelled') {
+            reason = 'cancelled';
+          } else if (ev.status === 'failed') {
             reason = 'failed';
             const errText = (ev.payload as { error?: string } | undefined)?.error;
             if (typeof errText === 'string' && errText) turnError = errText;
@@ -4606,6 +4642,8 @@ async function driveTurn(
       reason = 'failed';
       turnError = err instanceof Error ? err.message : String(err);
     } finally {
+      // abortTurn() 或后继 turn 已接管终态时立即退出，不得再补发步骤闭合或空回退文本。
+      if (turn.cancelled || hub.busy.get(sid) !== turn) return;
       if (turnTruncated) {
         const truncMsg = '⚠ 模型输出达到 token 上限已截断。';
         emitAssistantDeltaText(turn.assistantText ? `\n\n${truncMsg}` : truncMsg, turn, emit, ensureStep, sid, hub);
@@ -4623,13 +4661,17 @@ async function driveTurn(
         emitAssistantDeltaText(fallbackMsg, turn, emit, ensureStep, sid, hub);
         completeStep('completed');
       }
-      if (hub.busy.get(sid) === turn) {
+      if (hub.busy.get(sid) === turn && !turn.cancelled) {
         hub.busy.delete(sid);
         const durationMs = Date.now() - startedAt;
         turn.transcript?.end(reason, durationMs);
-        hub.transcript.finishPrompt(sid, promptId, reason);
+        hub.transcript.finishPrompt(sid, promptId, reason === 'cancelled' ? 'aborted' : reason);
         emit('turn.ended', { turnId: 0, reason, durationMs });
-        emit('prompt.completed', { promptId, reason });
+        if (reason === 'cancelled') {
+          emit('prompt.aborted', { promptId, abortedAt: new Date().toISOString() });
+        } else {
+          emit('prompt.completed', { promptId, reason });
+        }
         const pending = turn.pendingApprovals.size > 0 ? 'approval' : turn.pendingQuestions.size > 0 ? 'question' : 'none';
         emit('event.session.work_changed', { busy: false, main_turn_active: false, pending_interaction: pending, last_turn_reason: reason });
         hub.broadcastV262(sid, {
@@ -4642,7 +4684,7 @@ async function driveTurn(
             turn_number: turn.v262Ordinal + 1,
             kind: 'agent',
             status: 'ended',
-            outcome: reason === 'failed' ? 'failed' : 'completed',
+            outcome: reason === 'failed' ? 'failed' : reason === 'cancelled' ? 'interrupted' : 'completed',
             duration_ms: durationMs,
             started_at: createdAt,
             ended_at: new Date().toISOString(),
@@ -4654,7 +4696,7 @@ async function driveTurn(
         emitV262AgentState(hub, adapter, provider, nativeId, sid, 'idle');
         emitV262Usage(hub, adapter, provider, nativeId, sid);
         drainQueue(adapter, provider, nativeId, hub, demoActive, uploadStore);
-        onSettled?.(reason);
+        onSettled?.(reason === 'completed' ? 'completed' : 'failed');
       }
     }
   })();
@@ -5461,7 +5503,7 @@ async function executeGrokCommand(
         'Grok 用量',
         `· input: ${usage.input_tokens}`,
         `· output: ${usage.output_tokens}`,
-        `· context: ${usage.context_tokens}/${usage.context_limit || grokContextWindowSafe()}`,
+        `· context: ${usage.context_tokens}${usage.context_limit > 0 ? `/${usage.context_limit}` : '(上限未知)'}`,
       ].join('\n');
     }
     case 'diff':
@@ -5673,10 +5715,6 @@ async function executeClaudeCommand(
   }
 }
 
-function grokContextWindowSafe(): number {
-  return 500_000;
-}
-
 async function renderCodexStatus(adapter: ProviderAdapter, nativeId: string): Promise<string> {
   const model = adapter.getModel?.(nativeId) ?? '(provider 默认)';
   const thinking = adapter.getThinking?.(nativeId);
@@ -5790,15 +5828,16 @@ function renderGrokStatus(adapter: ProviderAdapter, nativeId: string): string {
   const permission = adapter.getPermission?.(nativeId) ?? 'default';
   const plan = adapter.getPlanMode?.(nativeId) === true;
   const usage = adapter.getUsage?.(nativeId);
-  const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : grokContextWindowSafe();
+  const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : 0;
   const lines = [
     '⚙ Grok 会话状态',
     `· 模型: ${model}${thinking && thinking !== 'off' ? ` (effort: ${thinking})` : ''}`,
     `· 权限: ${permission}${plan ? ' · Plan 模式: 开启' : ''}`,
   ];
   if (usage) {
-    const pct = limit > 0 ? ((usage.context_tokens / limit) * 100).toFixed(1) : '0.0';
-    lines.push(`· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`);
+    lines.push(limit > 0
+      ? `· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${((usage.context_tokens / limit) * 100).toFixed(1)}%)`
+      : `· 上下文: ${usage.context_tokens.toLocaleString()} tokens（上限未知）`);
     lines.push(`· 累计用量: input ${usage.input_tokens.toLocaleString()} · output ${usage.output_tokens.toLocaleString()}`);
   }
   return lines.join('\n');
@@ -5986,7 +6025,7 @@ function renderDshStatus(adapter: ProviderAdapter, nativeId: string): string {
   const permission = adapter.getPermission?.(nativeId) ?? 'default';
   const plan = adapter.getPlanMode?.(nativeId) === true;
   const usage = adapter.getUsage?.(nativeId);
-  const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : dshStatusContextFallback();
+  const limit = usage?.context_limit && usage.context_limit > 0 ? usage.context_limit : 0;
   const profileInfo = readDshAcpProfile();
   const lines = [
     '⚙ DSH 会话状态',
@@ -5996,8 +6035,9 @@ function renderDshStatus(adapter: ProviderAdapter, nativeId: string): string {
     '· 能力限制: 当前 DSH ACP 实现未暴露原生命令通道与模式切换（modes），/plan、/goal、/compact、/undo、/fork 等不可用',
   ];
   if (usage) {
-    const pct = limit > 0 ? ((usage.context_tokens / limit) * 100).toFixed(1) : '0.0';
-    lines.push(`· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`);
+    lines.push(limit > 0
+      ? `· 上下文: ${usage.context_tokens.toLocaleString()} / ${limit.toLocaleString()} tokens (${((usage.context_tokens / limit) * 100).toFixed(1)}%)`
+      : `· 上下文: ${usage.context_tokens.toLocaleString()} tokens（上限未知）`);
     lines.push(`· 累计用量: input ${usage.input_tokens.toLocaleString()} · output ${usage.output_tokens.toLocaleString()}`);
   }
   const allDeclared = [
@@ -6355,11 +6395,9 @@ function emitV262Usage(
 ): void {
   const usage = adapter.getUsage?.(nativeId);
   if (!usage) return;
-  let contextLimit = usage.context_limit ?? 0;
+  let contextLimit = knownContextLimit(usage.context_limit);
   const model = adapter.getModel?.(nativeId) ?? '';
   if (contextLimit <= 0 && provider === 'claude' && model) contextLimit = claudeContextWindow(model);
-  if (contextLimit <= 0 && provider === 'grok') contextLimit = grokStatusContextFallback();
-  if (contextLimit <= 0 && provider === 'dsh') contextLimit = dshStatusContextFallback();
   hub.broadcastV262(sid, {
     type: 'usage',
     session_id: sid,
@@ -6763,9 +6801,7 @@ function consumeEvent(
   } else if (ev.kind === 'usage') {
     const u = ev.payload as Partial<SessionUsage> | undefined;
     if (u) {
-      let limit = u.context_limit ?? 0;
-      if (limit <= 0 && provider === 'grok') limit = grokStatusContextFallback();
-      if (limit <= 0 && provider === 'dsh') limit = dshStatusContextFallback();
+      const limit = knownContextLimit(u.context_limit);
       hub.broadcastV262(sid, {
         type: 'usage',
         session_id: sid,
@@ -6829,7 +6865,9 @@ async function abortTurn(
       try { resolver(null); } catch { /* ignore */ }
     }
   }
-  await adapter.interrupt(nativeId, active.turnId || undefined);
+  await adapter.interrupt(nativeId, active.turnId || undefined).catch((err: unknown) => {
+    console.warn(`[gateway] interrupt(${sid}) failed, settling turn as aborted:`, err instanceof Error ? err.message : err);
+  });
   hub.busy.delete(sid);
   closeV262Thinking(hub, sid, active);
   closeV262Assistant(hub, sid, active);
@@ -7850,6 +7888,10 @@ function wireModelDto(m: NativeModel): Record<string, unknown> {
   if (filteredEfforts !== undefined) {
     if (filteredEfforts.length > 0) out.support_efforts = filteredEfforts;
     else delete out.support_efforts;
+  }
+  // 上下文长度未知(CLI 没报、目录没填)就不发,不用 0/NaN/猜测值冒充。
+  if (!(typeof m.max_context_size === 'number' && Number.isFinite(m.max_context_size) && m.max_context_size > 0)) {
+    delete out.max_context_size;
   }
   return out;
 }

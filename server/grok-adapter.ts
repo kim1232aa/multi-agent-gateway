@@ -1,8 +1,8 @@
 /**
  * GrokAdapter — wraps the Grok CLI (verified against 1.0.77) as a ProviderAdapter.
  *
- * Main path: ACP (`grok agent stdio`, see grok-acp.ts). One long-lived JSON-RPC
- * process, multiple sessions. Headless `-p` is the fallback when ACP spawn or
+ * Main path: ACP (see grok-acp.ts). Each bounded pool entry serves multiple
+ * sessions for one provider and approval mode. Headless `-p` is the fallback when ACP spawn or
  * initialize fails.
  *
  * Headless turn:
@@ -37,10 +37,10 @@ import {
   GrokAcpClient,
   pickPermissionOption,
   type GrokAcpEvent,
-  type GrokAcpModelInfo,
   type GrokAcpModelState,
 } from './grok-acp.js';
 import { SettingsStore } from './settings-store.js';
+import { encodeModelRef, parseModelRef, type CliProviders } from './provider-store.js';
 import { boundedEntries, containedRegularPath, grokDiskSubagents, subagentStatus } from './subagents.js';
 import type { SubagentInfo, SubagentStatus } from './types.js';
 import {
@@ -99,6 +99,17 @@ export function resolveGrokBin(explicit?: string): string {
     if (isExecutableFile(candidate)) return candidate;
   }
   return DEFAULT_GROK_BIN;
+}
+
+function redactGrokSecrets(text: string, env: NodeJS.ProcessEnv): string {
+  for (const [name, value] of Object.entries(env)) {
+    if (/key|token|secret|auth/i.test(name) && value) {
+      text = text.split(value).join('[redacted]');
+      const escaped = JSON.stringify(value).slice(1, -1);
+      if (escaped !== value) text = text.split(escaped).join('[redacted]');
+    }
+  }
+  return text;
 }
 
 /** Child env: inherit the user's env (incl. proxy), drop gateway secrets, keep loopback out of the proxy. */
@@ -274,8 +285,7 @@ export interface GrokAdapterOptions {
   grokBin?: string;
   env?: Record<string, string>;
   sessionsDir?: string;
-  /** Gateway-managed provider env (GROK_MODELS_BASE_URL/XAI_API_KEY/GROK_CONFIG), read at every spawn. */
-  injection?: () => { args: string[]; env: Record<string, string> };
+  providers?: CliProviders;
 }
 
 export interface GrokProviderAdapterOptions extends GrokAdapterOptions {
@@ -299,12 +309,12 @@ export class GrokAdapter {
   private modelsCache: { ts: number; value: { defaultModel?: string; models: string[] } } | null = null;
   private modelsInflight: Promise<{ defaultModel?: string; models: string[] }> | null = null;
 
-  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private readonly providers?: CliProviders;
 
   constructor(options: GrokAdapterOptions = {}) {
     this.grokBin = resolveGrokBin(options.grokBin);
     this.env = { ...(options.env ?? {}) };
-    this.injection = options.injection;
+    this.providers = options.providers;
     const grokHome = options.env?.GROK_HOME ?? process.env.GROK_HOME ?? path.join(os.homedir(), '.grok');
     this.sessionsDir = options.sessionsDir ?? path.join(grokHome, 'sessions');
   }
@@ -453,7 +463,7 @@ export class GrokAdapter {
     }
     if (this.modelsInflight) return this.modelsInflight;
     const pending = this.spawnText(['models']).then((stdout) => {
-      const parsed = parseGrokModels(stdout);
+      const parsed = parseGrokModels(redactGrokSecrets(stdout, this.childEnv()));
       if (parsed.models.length === 0) {
         throw new Error('grok-adapter: `grok models` returned no models');
       }
@@ -484,6 +494,7 @@ export class GrokAdapter {
     const cwd = opts.cwd ?? this.sessionCwd.get(sessionId) ?? os.homedir();
     this.sessionCwd.set(sessionId, cwd);
 
+    const selected = this.resolveModel(opts.model);
     // Large prompts/images must not land in argv: Linux rejects them with E2BIG.
     const promptFile = materializePromptFile(prompt, opts.contentBlocks);
     const args: string[] = [];
@@ -500,13 +511,15 @@ export class GrokAdapter {
     } else {
       args.push('--resume', sessionId);
     }
-    if (opts.model) args.push('--model', opts.model);
+    if (selected.model) args.push('--model', selected.model);
     if (opts.effort) args.push('--effort', opts.effort);
     if (opts.permissionMode) args.push('--permission-mode', opts.permissionMode);
 
+    const env = this.childEnv(selected.key);
+    const redact = (text: string): string => redactGrokSecrets(text, env);
     const child = spawn(this.grokBin, args, {
       cwd,
-      env: this.childEnv(),
+      env,
       // Grok does not read the prompt from stdin; leave it unused.
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: true,
@@ -516,7 +529,7 @@ export class GrokAdapter {
 
     let stderrTail = '';
     child.stderr?.on('data', (chunk: Buffer) => {
-      stderrTail = (stderrTail + chunk.toString('utf8')).slice(-4000);
+      stderrTail = redact(stderrTail + chunk.toString('utf8')).slice(-4000);
     });
 
     const done = new Promise<void>((resolve, reject) => {
@@ -526,7 +539,7 @@ export class GrokAdapter {
         if (!line.trim()) return;
         let ev: any;
         try {
-          ev = JSON.parse(line);
+          ev = JSON.parse(redact(line));
         } catch {
           return;
         }
@@ -540,8 +553,8 @@ export class GrokAdapter {
         cleanupPromptFile();
         this.running.delete(sessionId);
         this.resolveExitWaiters(sessionId);
-        onEvent({ type: 'error', message: `spawn failed: ${err.message}` });
-        reject(err);
+        onEvent({ type: 'error', message: `spawn failed: ${redact(err.message)}` });
+        reject(new Error(redact(err.message)));
       });
 
       child.on('close', (code, signal) => {
@@ -659,7 +672,7 @@ export class GrokAdapter {
       timer.unref();
       child.on('close', (code) => {
         if (code !== 0 && !stdout.trim()) {
-          done(() => reject(new Error(`grok ${args.join(' ')} failed (code=${code}): ${stderr.trim()}`)));
+          done(() => reject(new Error(`grok ${args.join(' ')} failed (code=${code}): ${redactGrokSecrets(stderr.trim(), this.childEnv())}`)));
           return;
         }
         done(() => resolve(stdout));
@@ -667,9 +680,17 @@ export class GrokAdapter {
     });
   }
 
-  /** CLI 子进程继承用户环境(含代理),去掉 GATEWAY_* 并补 loopback NO_PROXY。 */
-  private childEnv(): NodeJS.ProcessEnv {
-    return grokChildEnv({ ...this.env, ...(this.injection?.().env ?? {}) });
+  private resolveModel(id?: string): { key?: string; model?: string } {
+    const ref = parseModelRef(id);
+    if (!ref) return { model: id };
+    if (!this.providers?.provider(ref.key)) {
+      throw new ProviderError('invalid_request', 'grok-adapter: selected provider is no longer in the catalog', 400);
+    }
+    return { key: ref.key, model: this.providers.cliModelId(id!) ?? ref.model };
+  }
+
+  private childEnv(key?: string): NodeJS.ProcessEnv {
+    return grokChildEnv({ ...this.env, ...(this.providers?.injection(key).env ?? {}) });
   }
 
   /** Provider config changed: drop the cached `grok models` catalog. */
@@ -965,8 +986,18 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private readonly acpSessionIds = new Map<string, string>();
   /** Reverse map: ACP session id → Gateway session id. */
   private readonly gatewaySessionIds = new Map<string, string>();
-  private readonly acpClients = new Map<boolean, GrokAcpClient>();
-  private readonly acpConnecting = new Map<boolean, Promise<GrokAcpClient | null>>();
+  private readonly acpClients = new Map<string, GrokAcpClient>();
+  private readonly clientFingerprints = new Map<GrokAcpClient, string | undefined>();
+  private readonly clientOperations = new Map<GrokAcpClient, number>();
+  private readonly clientLastUsed = new Map<string, number>();
+  private readonly closingClients = new Set<Promise<void>>();
+  private poolClock = 0;
+  private providerFingerprint: string | undefined;
+  private recyclePending = false;
+  private poolQueue: Promise<void> = Promise.resolve();
+  private readonly activeSessions = new Set<string>();
+  private static readonly MAX_ACP_CLIENTS = 4;
+  private readonly acpConnecting = new Map<string, Promise<GrokAcpClient | null>>();
   private readonly sessionClient = new Map<string, GrokAcpClient>();
   private readonly sessionGoals = new Map<string, Record<string, unknown>>();
   private readonly skillCache = new Map<string, { ts: number; skills: SkillCommandInput[] }>();
@@ -978,7 +1009,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
   private static readonly MAX_TOOL_SNAPSHOTS = 128;
   private static readonly MAX_TOOL_SNAPSHOT_BYTES = 256 * 1024;
   private readonly recycleGraceMs: number;
-  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private readonly providers?: CliProviders;
   private recycleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly commandsCache = new Map<string, { ts: number; commands: GrokNativeCommandInput[] }>();
   private readonly toolOutputSnapshots = new Map<string, string>();
@@ -1007,17 +1038,18 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.settings = new SettingsStore(settingsPath);
     this.grokBin = this.inner.binPath;
     this.grokEnv = innerOptions.env ?? {};
-    this.injection = innerOptions.injection;
+    this.providers = innerOptions.providers;
+    this.providerFingerprint = this.providers?.fingerprint();
     this.recycleGraceMs = typeof recycleGraceMs === 'number' && recycleGraceMs > 0 ? recycleGraceMs : 0;
     this.restoreAcpSessionIds();
   }
 
   get client(): GrokAcpClient | null {
-    return this.acpClients.get(false) ?? null;
+    return this.acpClients.get(this.poolKey(false)) ?? null;
   }
 
   get alwaysApproveClient(): GrokAcpClient | null {
-    return this.acpClients.get(true) ?? null;
+    return this.acpClients.get(this.poolKey(true)) ?? null;
   }
 
   clearCommandsCache(): void {
@@ -1072,50 +1104,59 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.recycleTimer.unref?.();
   }
 
-  private isAcpBusy(): boolean {
-    if (this.acpTurns.size > 0 || this.acpConnecting.size > 0) return true;
+  private clientBusy(client: GrokAcpClient): boolean {
+    for (const sid of new Set([...this.activeSessions, ...this.acpTurns.keys()])) {
+      if (this.sessionClient.get(sid) === client) return true;
+    }
     const now = Date.now();
     for (const children of this.subagentLive.values()) {
       for (const live of children.values()) {
-        // running 只是"没见过结束事件";超过 TTL 后不再阻止空闲回收,
-        // 否则一条丢失的 subagent_finished 会让 ACP 进程永远不被回收。
-        if (live.info.status !== 'running') continue;
+        if (live.owner !== client || live.info.status !== 'running') continue;
         if (now - live.updatedAt <= GrokProviderAdapter.SUBAGENT_RUNNING_TTL_MS) return true;
         live.info = { ...live.info, status: 'unknown' };
         live.updatedAt = now;
       }
     }
-    for (const client of this.acpClients.values()) {
-      if (!client.ready) continue;
-      const c = client as unknown as {
-        pending?: Map<unknown, unknown>;
-        permissions?: Map<unknown, unknown>;
-        questions?: Map<unknown, unknown>;
-      };
-      if ((c.pending?.size ?? 0) > 0) return true;
-      if ((c.permissions?.size ?? 0) > 0) return true;
-      if ((c.questions?.size ?? 0) > 0) return true;
-    }
-    return false;
+    return (this.clientOperations.get(client) ?? 0) > 0 || client.busy;
   }
 
-  /** Gateway provider changed: forget model catalogs and respawn idle ACP processes. */
-  providerChanged(): void {
+  private checkProviders(): void {
+    const fingerprint = this.providers?.fingerprint();
+    if (fingerprint === this.providerFingerprint) return;
+    this.providerFingerprint = fingerprint;
+    this.recyclePending = true;
     this.inner.invalidateModels();
     this.lastCliModels = undefined;
     this.defaultModel = undefined;
+  }
+
+  providerChanged(): void {
+    this.checkProviders();
+    this.recyclePending = true;
     void this.recycleIfIdle();
   }
 
   async recycleIfIdle(): Promise<void> {
     if (this.disposed) return;
-    if (this.isAcpBusy()) {
-      if (this.recycleGraceMs > 0) {
-        this.scheduleRecycleWhenIdle();
-      }
-      return;
+    this.checkProviders();
+    for (const [key, client] of [...this.acpClients]) {
+      if (this.acpClients.get(key) === client && (!this.recyclePending || this.clientFingerprints.get(client) !== this.providerFingerprint)
+        && !this.clientBusy(client) && !this.acpConnecting.has(key)) await this.dropClient(key, client);
     }
-    await this.recycleAcpClients();
+    if (this.acpConnecting.size === 0 && [...this.acpClients.values()].every((client) => this.clientFingerprints.get(client) === this.providerFingerprint)) this.recyclePending = false;
+    else if (this.recycleGraceMs > 0) this.scheduleRecycleWhenIdle();
+  }
+
+  private async dropClient(key: string, client: GrokAcpClient): Promise<void> {
+    if (this.acpClients.get(key) === client) this.acpClients.delete(key);
+    this.clientLastUsed.delete(key);
+    this.clientFingerprints.delete(client);
+    for (const [sid, bound] of this.sessionClient) {
+      if (bound === client) this.sessionClient.delete(sid);
+    }
+    const closing = client.close().catch(() => undefined);
+    this.closingClients.add(closing);
+    try { await closing; } finally { this.closingClients.delete(closing); }
   }
 
   private async recycleAcpClients(): Promise<void> {
@@ -1123,12 +1164,13 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.acpConnecting.clear();
     const clients = [...this.acpClients.values()];
     this.acpClients.clear();
+    this.clientLastUsed.clear();
+    this.clientFingerprints.clear();
+    this.clientOperations.clear();
     this.sessionClient.clear();
     const resolvedConnecting = await Promise.allSettled(connecting);
     for (const r of resolvedConnecting) {
-      if (r.status === 'fulfilled' && r.value && !clients.includes(r.value)) {
-        clients.push(r.value);
-      }
+      if (r.status === 'fulfilled' && r.value && !clients.includes(r.value)) clients.push(r.value);
     }
     await Promise.allSettled(clients.map((c) => c.close().catch(() => undefined)));
   }
@@ -1175,7 +1217,8 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return this.inner.isBusy(sessionId)
       || this.inner.isBusy(storageId)
       || this.acpTurns.has(sessionId)
-      || this.acpTurns.has(storageId);
+      || this.acpTurns.has(storageId)
+      || this.activeSessions.has(sessionId);
   }
 
   async list(query: ListSessionsQuery = {}): Promise<SessionPage> {
@@ -1284,6 +1327,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   async startTurn(input: StartTurnInput): Promise<TurnHandle> {
     const sessionId = input.sessionId;
+    if (this.isBusy(sessionId)) throw new ProviderError('busy', 'grok-adapter: a turn is already running', 409);
     let prompt = textOfInput(input.input);
     const skills = await this.discoverSkills(this.getCwd(sessionId));
     const expandable = skills.filter((skill): skill is SkillCommandInput & { path: string } => typeof skill.path === 'string');
@@ -1306,9 +1350,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
     if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
     const storageId = this.storageSessionId(sessionId);
-    const isNew = !this.inner.hasSessionFile(storageId);
+    const isNew = !this.inner.hasSessionFile(storageId) && !this.acpSessionIds.has(sessionId);
     const cwd = this.getCwd(sessionId);
-    const model = this.settings.getString('model', sessionId);
+    const model = this.getModel(sessionId);
+    this.resolveModel(model);
     const thinking = this.getThinking(sessionId);
     const effort = grokEffort(thinking);
     const perm = this.getPermission(sessionId);
@@ -1465,24 +1510,17 @@ export class GrokProviderAdapter implements ProviderAdapter {
     stream: EventStream<GatewayEvent>;
     turnId: string;
   }): Promise<void> {
-    const acp = await this.ensureAcp(opts.yolo);
-    if (acp) {
-      try {
-        await this.runAcpTurn(acp, opts);
-        return;
-      } catch (err) {
-        this.acpTurns.delete(opts.sessionId);
-        if (!opts.stream) return;
-        opts.emit({
-          type: 'error',
-          message: err instanceof Error ? err.message : String(err),
-        });
+    this.activeSessions.add(opts.sessionId);
+    try {
+      const selected = this.resolveModel(opts.model);
+      const acp = await this.ensureAcp(opts.yolo, selected.key, opts.sessionId);
+      if (acp) {
+        await this.runAcpTurn(acp, { ...opts, model: selected.model });
         return;
       }
-    }
-    void this.inner
-      .startTurn({
-        sessionId: opts.sessionId,
+      let terminal: GrokAdapterEvent | undefined;
+      await this.inner.startTurn({
+        sessionId: this.acpId(opts.sessionId),
         prompt: opts.prompt,
         cwd: opts.cwd,
         isNew: opts.isNew,
@@ -1490,78 +1528,130 @@ export class GrokProviderAdapter implements ProviderAdapter {
         effort: opts.effort,
         permissionMode: opts.permissionMode,
         contentBlocks: opts.contentBlocks,
-        onEvent: opts.emit,
-      })
-      .catch((err: unknown) => {
-        opts.stream.push({
-          kind: 'turn',
-          status: 'failed',
-          sessionId: opts.sessionId,
-          turnId: opts.turnId,
-          timestamp: Date.now(),
-          payload: { reason: 'failed', error: err instanceof Error ? err.message : String(err) },
-        });
-        opts.stream.end();
+        onEvent: (event) => {
+          if (event.type === 'done' || event.type === 'error' || event.type === 'interrupted') terminal = event;
+          else opts.emit(event);
+        },
       });
+      this.activeSessions.delete(opts.sessionId);
+      if (terminal) opts.emit(terminal);
+    } catch (err) {
+      opts.emit({ type: 'error', message: this.safeError(err) });
+    } finally {
+      this.activeSessions.delete(opts.sessionId);
+      if (this.recyclePending) await this.recycleIfIdle();
+      else this.scheduleRecycleWhenIdle();
+    }
   }
 
-  private async ensureAcp(alwaysApprove: boolean): Promise<GrokAcpClient | null> {
+  private poolKey(alwaysApprove: boolean, key?: string): string {
+    return JSON.stringify([key ?? null, alwaysApprove]);
+  }
+
+  private resolveModel(id?: string): { key?: string; model?: string } {
+    const ref = parseModelRef(id);
+    if (!ref) return { model: id };
+    if (!this.providers?.provider(ref.key)) {
+      throw new ProviderError('invalid_request', 'grok-adapter: selected provider is no longer in the catalog', 400);
+    }
+    return { key: ref.key, model: this.providers.cliModelId(id!) ?? ref.model };
+  }
+
+  private safeError(err: unknown): string {
+    let text = err instanceof Error ? err.message : String(err);
+    for (const provider of this.providers?.catalog() ?? []) {
+      for (const [name, value] of Object.entries(this.providers!.injection(provider.key).env)) {
+        if (/key|token|secret|auth/i.test(name) && value) text = text.split(value).join('[redacted]');
+      }
+    }
+    return text;
+  }
+
+  private async ensureAcp(alwaysApprove: boolean, key?: string, sessionId?: string): Promise<GrokAcpClient | null> {
+    this.checkProviders();
+    if (this.recyclePending) await this.recycleIfIdle();
     if (this.disposed) return null;
     if (this.recycleTimer) {
       clearTimeout(this.recycleTimer);
       this.recycleTimer = null;
     }
-    const existing = this.acpClients.get(alwaysApprove);
-    if (existing?.ready) return existing;
-    const inflight = this.acpConnecting.get(alwaysApprove);
-    if (inflight) return inflight;
-
-    const pending = (async (): Promise<GrokAcpClient | null> => {
+    const pool = this.poolKey(alwaysApprove, key);
+    const inflight = this.acpConnecting.get(pool);
+    if (inflight) {
+      const client = await inflight;
+      if (client && sessionId) this.sessionClient.set(sessionId, client);
+      return client;
+    }
+    const existing = this.acpClients.get(pool);
+    if (existing?.ready && this.recyclePending && this.clientFingerprints.get(existing) !== this.providerFingerprint) {
+      throw new ProviderError('busy', 'grok-adapter: provider changed; wait for the active process to become idle', 409);
+    }
+    if (existing?.ready) {
+      this.clientLastUsed.set(pool, ++this.poolClock);
+      if (sessionId) this.sessionClient.set(sessionId, existing);
+      return existing;
+    }
+    const pending = this.poolQueue.then(async (): Promise<GrokAcpClient | null> => {
       if (this.disposed) return null;
-      if (existing) {
-        this.acpClients.delete(alwaysApprove);
-        await existing.close().catch(() => undefined);
+      if (existing) await this.dropClient(pool, existing);
+      while (this.closingClients.size > 0) await Promise.allSettled(this.closingClients);
+      if (this.disposed) return null;
+      if (this.acpClients.size >= GrokProviderAdapter.MAX_ACP_CLIENTS) {
+        const idle = [...this.acpClients].filter(([, client]) => !this.clientBusy(client));
+        idle.sort(([a], [b]) => (this.clientLastUsed.get(a) ?? 0) - (this.clientLastUsed.get(b) ?? 0));
+        const oldest = idle[0];
+        if (!oldest) throw new ProviderError('busy', 'grok-adapter: ACP pool capacity reached; all processes are busy', 409);
+        await this.dropClient(...oldest);
       }
+      if (key && !this.providers?.provider(key)) {
+        throw new ProviderError('invalid_request', 'grok-adapter: selected provider was removed before process startup', 400);
+      }
+      const fingerprint = this.providers?.fingerprint();
       const client = new GrokAcpClient({
         grokBin: this.grokBin,
-        env: { ...this.grokEnv, ...(this.injection?.().env ?? {}) },
+        env: { ...this.grokEnv, ...(this.providers?.injection(key).env ?? {}) },
         alwaysApprove,
         requestTimeoutMs: 20_000,
-        // Turns can legitimately run for minutes; the old 20s cap killed live turns.
         promptTimeoutMs: 0,
       });
       try {
         await client.connect();
-        if (this.disposed) {
-          await client.close().catch(() => undefined);
-          return null;
+        if (this.disposed) { await client.close(); return null; }
+        if (fingerprint !== this.providers?.fingerprint()) {
+          throw new ProviderError('busy', 'grok-adapter: provider changed during process startup; retry the turn', 409);
         }
-        this.acpClients.set(alwaysApprove, client);
-        client.onEvent((ev) => this.onAcpProcessEvent(client, alwaysApprove, ev));
-        if (this.recycleGraceMs > 0) {
-          this.scheduleRecycleWhenIdle();
-        }
+        this.acpClients.set(pool, client);
+        this.clientFingerprints.set(client, fingerprint);
+        this.clientLastUsed.set(pool, ++this.poolClock);
+        if (sessionId) this.sessionClient.set(sessionId, client);
+        client.onEvent((ev) => this.onAcpProcessEvent(client, pool, ev));
+        this.scheduleRecycleWhenIdle();
         return client;
-      } catch {
+      } catch (err) {
         await client.close().catch(() => undefined);
+        if (err instanceof ProviderError) throw err;
         return null;
       }
-    })().finally(() => {
-      if (this.acpConnecting.get(alwaysApprove) === pending) {
-        this.acpConnecting.delete(alwaysApprove);
-      }
+    }).finally(() => {
+      if (this.acpConnecting.get(pool) === pending) this.acpConnecting.delete(pool);
     });
-    this.acpConnecting.set(alwaysApprove, pending);
+    this.acpConnecting.set(pool, pending);
+    this.poolQueue = pending.then(() => undefined, () => undefined);
     return pending;
   }
 
   private clientForSession(sessionId: string): GrokAcpClient | null {
     const bound = this.sessionClient.get(sessionId);
-    if (bound?.ready) return bound;
-    for (const client of this.acpClients.values()) {
-      if (client.ready) return client;
+    if (bound?.ready) {
+      if (this.isBusy(sessionId)) return bound;
+      const key = parseModelRef(this.getModel(sessionId))?.key;
+      if (this.acpClients.get(this.poolKey(this.isAlwaysApprove(sessionId), key)) === bound) return bound;
     }
     return null;
+  }
+
+  private isAlwaysApprove(sessionId: string): boolean {
+    return this.settings.getBoolean('plan', sessionId) !== true && grokPermissionMode(this.getPermission(sessionId)) === 'bypassPermissions';
   }
 
   private matchesSessionId(evSessionId: string | undefined, gatewaySessionId: string): boolean {
@@ -1617,7 +1707,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
     this.acpTurns.set(opts.sessionId, opts.stream);
     this.sessionClient.set(opts.sessionId, acp);
-    const unsub = acp.onEvent((ev) => this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev));
+    let replaying = !opts.isNew;
+    const unsub = acp.onEvent((ev) => {
+      if (!replaying) this.mapAcpEvent(opts.sessionId, opts.turnId, opts.stream, ev);
+    });
     let acpSessionId = this.acpId(opts.sessionId);
     try {
       if (opts.isNew) {
@@ -1633,27 +1726,9 @@ export class GrokProviderAdapter implements ProviderAdapter {
         acpSessionId = created.sessionId || opts.sessionId;
         this.rememberAcpSession(opts.sessionId, acpSessionId, cwd);
       } else {
-        try {
-          await acp.sessionLoad({
-            sessionId: acpSessionId,
-            cwd,
-            autoMode: opts.autoMode,
-            yoloMode: opts.yolo,
-          });
-        } catch {
-          const created = await acp.sessionNew({
-            cwd,
-            sessionId: opts.sessionId,
-            yoloMode: opts.yolo,
-            autoMode: opts.autoMode,
-            planMode: opts.plan,
-            model: opts.model,
-            effort: opts.effort,
-          });
-          acpSessionId = created.sessionId || opts.sessionId;
-          this.rememberAcpSession(opts.sessionId, acpSessionId, cwd);
-        }
+        await acp.sessionLoad({ sessionId: acpSessionId, cwd, autoMode: opts.autoMode, yoloMode: opts.yolo });
       }
+      replaying = false;
       // session/new _meta hints are advisory on 1.0.77; the standard RPCs are authoritative.
       await this.applyLiveConfig(acp, acpSessionId, {
         model: opts.model,
@@ -1874,15 +1949,19 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
   }
 
-  private onAcpProcessEvent(client: GrokAcpClient, alwaysApprove: boolean, ev: GrokAcpEvent): void {
+  private onAcpProcessEvent(client: GrokAcpClient, pool: string, ev: GrokAcpEvent): void {
     if (ev.type === 'subagent') {
       this.rememberLiveSubagent(client, ev);
+      if (this.recyclePending && ev.status !== 'running') void this.recycleIfIdle();
       return;
     }
     if (ev.type === 'disconnected') {
-      if (this.acpClients.get(alwaysApprove) === client) {
-        this.acpClients.delete(alwaysApprove);
+      if (this.acpClients.get(pool) === client) {
+        this.acpClients.delete(pool);
+        this.clientLastUsed.delete(pool);
       }
+      this.clientFingerprints.delete(client);
+      this.clientOperations.delete(client);
       for (const [sid, bound] of this.sessionClient) {
         if (bound === client) this.sessionClient.delete(sid);
       }
@@ -1934,28 +2013,24 @@ export class GrokProviderAdapter implements ProviderAdapter {
 
   async interrupt(sessionId: string): Promise<void> {
     const acpId = this.acpId(sessionId);
-    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
-      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
-    for (const client of candidates) {
-      if (client.ready) {
-        client.cancelSessionPending([sessionId, acpId]);
-      }
-    }
     const client = this.clientForSession(sessionId);
     if (client?.ready) {
+      client.cancelSessionPending([sessionId, acpId]);
       await client.sessionCancel(acpId).catch(() => undefined);
     }
     this.inner.interrupt(sessionId);
+    const storageId = this.storageSessionId(sessionId);
+    if (storageId !== sessionId) this.inner.interrupt(storageId);
   }
 
   async resolveApproval(sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<void> {
     const acpId = this.acpId(sessionId);
-    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
-      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    const bound = this.clientForSession(sessionId);
+    const candidates = bound ? [bound] : [...this.acpClients.values()];
     for (const client of candidates) {
       const pending = client.getPendingPermission(approvalId);
       if (!pending) continue;
-      if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
+      if (pending.sessionId ? (pending.sessionId !== sessionId && pending.sessionId !== acpId) : !bound) continue;
       if (decision === 'reject') {
         const rejectOpt = pickPermissionOption(pending.options, 'reject');
         if (rejectOpt) {
@@ -1985,12 +2060,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
     answer: string | Record<string, string[]>,
   ): Promise<void> {
     const acpId = this.acpId(sessionId);
-    const candidates = [this.clientForSession(sessionId), ...this.acpClients.values()]
-      .filter((c, i, arr): c is GrokAcpClient => Boolean(c) && arr.indexOf(c) === i);
+    const bound = this.clientForSession(sessionId);
+    const candidates = bound ? [bound] : [...this.acpClients.values()];
     for (const client of candidates) {
       const pending = client.getPendingQuestion(questionId);
       if (!pending) continue;
-      if (pending.sessionId && pending.sessionId !== sessionId && pending.sessionId !== acpId) continue;
+      if (pending.sessionId ? (pending.sessionId !== sessionId && pending.sessionId !== acpId) : !bound) continue;
       const dismissed = isRecord(answer) && Object.keys(answer).length === 0;
       const ok = dismissed
         ? client.cancelQuestion(questionId)
@@ -2093,6 +2168,10 @@ export class GrokProviderAdapter implements ProviderAdapter {
     this.sessionClient.clear();
     this.acpSessionIds.clear();
     this.gatewaySessionIds.clear();
+    this.clientLastUsed.clear();
+    this.clientFingerprints.clear();
+    this.clientOperations.clear();
+    this.activeSessions.clear();
     this.settings.close();
     const resolvedConnecting = await Promise.allSettled(connecting);
     for (const r of resolvedConnecting) {
@@ -2109,19 +2188,34 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    this.settings.set('model', sessionId, model);
-    const client = this.clientForSession(sessionId);
+    const selected = this.resolveModel(model);
+    if (sessionId !== '__default__' && this.isBusy(sessionId)) {
+      throw new ProviderError('busy', 'grok-adapter: cannot switch model during a running turn', 409);
+    }
+    const client = this.sessionClient.get(sessionId);
+    const currentKey = client ? [...this.acpClients].find(([, c]) => c === client)?.[0] : undefined;
     const acpId = this.acpSessionIds.get(sessionId);
-    if (client?.ready && acpId) {
-      await client.sessionSetModel(acpId, model).catch(async () => {
-        await client.sessionSetConfigOption(acpId, 'model', model).catch(() => undefined);
-      });
+    if (client?.ready && acpId && currentKey === this.poolKey(client.alwaysApproveEnabled === true, selected.key)) {
+      await this.switchLiveModel(client, acpId, selected.model!);
+    }
+    // Cross-pool selections are applied at the next session/load, without re-homing a live session.
+    this.settings.set('model', sessionId, model);
+    this.commandsCache.delete(this.acpId(sessionId));
+  }
+
+  private async switchLiveModel(client: GrokAcpClient, sessionId: string, model: string): Promise<void> {
+    try {
+      await client.sessionSetModel(sessionId, model);
+    } catch {
+      try { await client.sessionSetConfigOption(sessionId, 'model', model); }
+      catch (err) { throw new ProviderError('upstream_error', `grok-adapter: model switch failed: ${this.safeError(err)}`, 502); }
     }
   }
 
   getModel(sessionId: string): string | undefined {
     return this.settings.getString('model', sessionId)
       ?? this.settings.getString('model', '__default__')
+      ?? this.providers?.defaultModelRef()
       ?? this.defaultModel;
   }
 
@@ -2130,12 +2224,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const targetId = modelId || client.modelState?.currentModelId;
     const info = models.find((m) => m.modelId === targetId);
     if (!info || info.supportsReasoningEffort === false) return undefined;
-    const fromDefault = info.reasoningEffort ?? info.reasoningEfforts?.find((e) => e.default)?.value;
-    if (fromDefault) return fromDefault;
-    if (info.supportsReasoningEffort === true || (info.reasoningEfforts && info.reasoningEfforts.length > 0)) {
-      return isKnownGrokReasoningModel(targetId) ? 'high' : info.reasoningEfforts?.[0]?.value;
-    }
-    return undefined;
+    return info.reasoningEffort ?? info.reasoningEfforts?.find((e) => e.default)?.value;
   }
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
@@ -2149,7 +2238,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
         const hasEffortOpt = client.getConfigOptions(acpId)?.some((o) => o.id === 'reasoning_effort');
         const fallbackEffort =
           grokEffort(this.getThinking('__default__'))
-          ?? this.defaultEffortForModel(client, this.getModel(sessionId));
+          ?? this.defaultEffortForModel(client, this.resolveModel(this.getModel(sessionId)).model);
         if (fallbackEffort && (hasEffortOpt || client.modelState)) {
           await client.sessionSetConfigOption(acpId, 'reasoning_effort', fallbackEffort).catch(() => undefined);
         }
@@ -2218,117 +2307,58 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   async listModels(): Promise<NativeModel[]> {
+    this.checkProviders();
+    if (this.recyclePending) await this.recycleIfIdle();
     let liveState: GrokAcpModelState | undefined;
-    for (const client of this.acpClients.values()) {
-      if (client.ready && client.modelState && client.modelState.availableModels.length > 0) {
+    for (const approval of [false, true]) {
+      const client = this.acpClients.get(this.poolKey(approval));
+      if (client?.ready && client.modelState?.availableModels.length) {
         liveState = client.modelState;
         break;
       }
     }
-    const acpModelMap = new Map<string, GrokAcpModelInfo>();
-    if (liveState) {
-      for (const m of liveState.availableModels) {
-        acpModelMap.set(m.modelId, m);
+    let cli = this.inner.getCachedModels() ?? null;
+    if (!cli) {
+      try { cli = await this.inner.listModels(); }
+      catch (err) {
+        cli = this.lastCliModels ?? null;
+        if (!liveState && !cli && !this.providers?.catalog().length) throw err;
       }
     }
-
-    const toAcpModel = (model: string, acpInfo: GrokAcpModelInfo, isDefault: boolean): NativeModel => {
-      const isGrok = isKnownGrokReasoningModel(model);
-      const supportsEffort = acpInfo.supportsReasoningEffort !== false && (
-        acpInfo.supportsReasoningEffort === true ||
-        Boolean(acpInfo.reasoningEfforts?.length) ||
-        Boolean(acpInfo.reasoningEffort) ||
-        isGrok
-      );
-      const supportEfforts = supportsEffort
-        ? (acpInfo.reasoningEfforts?.length
-            ? acpInfo.reasoningEfforts.map((e) => e.value)
-            : (isGrok ? [...GROK_EFFORTS] : undefined))
-        : undefined;
-      const defaultEffort = supportsEffort
-        ? (acpInfo.reasoningEffort
-            ?? acpInfo.reasoningEfforts?.find((e) => e.default)?.value
-            ?? (isGrok ? 'high' : undefined))
-        : undefined;
-      return {
-        provider: 'grok',
-        model,
-        display_name: acpInfo.name ?? model,
-        ...(acpInfo.description ? { description: acpInfo.description } : {}),
-        max_context_size: acpInfo.totalContextTokens ?? grokContextWindow(model),
-        capabilities: supportsEffort ? ['thinking'] : [],
-        support_efforts: supportEfforts,
-        default_effort: defaultEffort,
-        isDefault,
-        raw: acpInfo,
-      };
-    };
-
-    const toCliModel = (model: string, isDefault: boolean): NativeModel => {
-      const isGrok = isKnownGrokReasoningModel(model);
-      return {
-        provider: 'grok',
-        model,
-        display_name: model,
-        max_context_size: grokContextWindow(model),
-        capabilities: isGrok ? ['thinking'] : [],
-        support_efforts: isGrok ? [...GROK_EFFORTS] : undefined,
-        default_effort: isGrok ? 'high' : undefined,
-        isDefault,
-      };
-    };
-
-    if (liveState && liveState.availableModels.length > 0) {
-      if (liveState.currentModelId) this.defaultModel = liveState.currentModelId;
-      let cli = this.inner.getCachedModels?.() ?? null;
-      if (!cli) {
-        try {
-          cli = await this.inner.listModels();
-        } catch {
-          cli = this.lastCliModels ?? null;
-        }
-      }
-      if (cli) this.lastCliModels = cli;
-      const defaultModel = liveState.currentModelId ?? cli?.defaultModel ?? this.defaultModel;
-      const seen = new Set<string>();
-      const out: NativeModel[] = [];
-      for (const m of liveState.availableModels) {
-        seen.add(m.modelId);
-        out.push(toAcpModel(m.modelId, m, defaultModel === m.modelId));
-      }
-      if (cli?.models) {
-        for (const model of cli.models) {
-          if (!seen.has(model)) {
-            seen.add(model);
-            out.push(toCliModel(model, defaultModel === model));
-          }
-        }
-      }
-      return out;
+    if (cli) this.lastCliModels = cli;
+    this.defaultModel = cli?.defaultModel ?? this.defaultModel ?? liveState?.currentModelId;
+    const selectedDefault = this.getModel('__default__');
+    const out: NativeModel[] = [];
+    const native = new Map((liveState?.availableModels ?? []).map((info) => [info.modelId, info]));
+    for (const model of cli?.models ?? []) if (!native.has(model)) native.set(model, { modelId: model });
+    for (const [model, info] of native) {
+      const efforts = info.supportsReasoningEffort === false ? [] : supportedGrokEfforts(info.reasoningEfforts?.map((e) => e.value));
+      const defaultEffort = info.reasoningEffort ?? info.reasoningEfforts?.find((e) => e.default)?.value;
+      out.push({
+        provider: 'grok', model, display_name: info.name ?? model,
+        ...(info.description ? { description: info.description } : {}),
+        ...(info.totalContextTokens && info.totalContextTokens > 0 ? { max_context_size: info.totalContextTokens } : {}),
+        capabilities: info.supportsReasoningEffort || efforts.length ? ['thinking'] : [],
+        ...(efforts.length ? { support_efforts: efforts } : {}),
+        ...(defaultEffort && efforts.includes(defaultEffort) ? { default_effort: defaultEffort } : {}),
+        isDefault: selectedDefault === model,
+      } as NativeModel);
     }
-
-    try {
-      const cli = await this.inner.listModels();
-      this.lastCliModels = cli;
-      const defaultModel = cli.defaultModel ?? this.defaultModel;
-      if (cli.defaultModel) this.defaultModel = cli.defaultModel;
-
-      return cli.models.map((model) => {
-        const acpInfo = acpModelMap.get(model);
-        if (acpInfo) {
-          return toAcpModel(model, acpInfo, defaultModel === model);
-        }
-        return toCliModel(model, defaultModel === model);
-      });
-    } catch (err) {
-      if (liveState && liveState.availableModels.length > 0) {
-        if (liveState.currentModelId) this.defaultModel = liveState.currentModelId;
-        return liveState.availableModels.map((m) =>
-          toAcpModel(m.modelId, m, liveState!.currentModelId === m.modelId),
-        );
+    for (const provider of this.providers?.catalog() ?? []) {
+      for (const model of provider.models) {
+        const id = encodeModelRef(provider.key, model.model);
+        const efforts = supportedGrokEfforts(model.support_efforts);
+        out.push({
+          provider: provider.label, model: id, display_name: model.display_name ?? model.model,
+          ...(model.max_context_size && model.max_context_size > 0 ? { max_context_size: model.max_context_size } : {}),
+          capabilities: model.capabilities ?? [],
+          ...(efforts.length ? { support_efforts: efforts } : {}),
+          ...(model.default_effort && efforts.includes(model.default_effort) ? { default_effort: model.default_effort } : {}),
+          isDefault: selectedDefault === id,
+        } as NativeModel);
       }
-      throw err;
     }
+    return out;
   }
 
   async listCommands(sessionId?: string, cwdOverride?: string): Promise<NativeCommand[]> {
@@ -2337,15 +2367,9 @@ export class GrokProviderAdapter implements ProviderAdapter {
     const cacheKey = sessionId ? this.acpId(sessionId) : '__default__';
     let native: GrokNativeCommandInput[] = [];
 
-    const liveClient = sessionId ? this.clientForSession(sessionId) : this.clientForSession('');
+    const liveClient = sessionId ? this.clientForSession(sessionId) : this.client ?? this.alwaysApproveClient;
     if (liveClient?.ready) {
       native = liveClient.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined);
-      if (native.length === 0) {
-        for (const client of this.acpClients.values()) {
-          native = client.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined);
-          if (native.length > 0) break;
-        }
-      }
       if (native.length > 0) {
         this.setCommandsCache(cacheKey, native);
         if (!sessionId) {
@@ -2358,15 +2382,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
         native = hit.commands;
       } else {
         if (hit) this.commandsCache.delete(cacheKey);
-        const acp = await this.ensureAcp(false);
+        const key = sessionId ? parseModelRef(this.getModel(sessionId))?.key : undefined;
+        const yolo = sessionId ? this.isAlwaysApprove(sessionId) : false;
+        const acp = await this.ensureAcp(yolo, key).catch(() => null);
         if (acp?.ready) {
           native = acp.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined);
-          if (native.length === 0) {
-            for (const client of this.acpClients.values()) {
-              native = client.getAvailableCommands(sessionId ? this.acpId(sessionId) : undefined);
-              if (native.length > 0) break;
-            }
-          }
           if (native.length > 0) {
             this.setCommandsCache(cacheKey, native);
             if (!sessionId) {
@@ -2476,6 +2496,14 @@ export class GrokProviderAdapter implements ProviderAdapter {
   getUsage(sessionId: string): SessionUsage | undefined {
     const fromDisk = this.inner.readUsage(this.storageSessionId(sessionId));
     const cached = this.sessionUsage.get(sessionId);
+    const ref = parseModelRef(this.getModel(sessionId));
+    const limit = ref ? this.providers?.provider(ref.key)?.models.find((m) => m.model === ref.model)?.max_context_size : undefined;
+    for (const usage of [fromDisk, cached]) {
+      if (usage && limit && limit > 0) {
+        usage.context_limit = limit;
+        delete usage.context_unavailable;
+      }
+    }
     if (!fromDisk) return cached;
     if (!cached) return fromDisk;
     return {
@@ -2507,7 +2535,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return skills;
   }
 
-  /** Best-effort live sync; a missing RPC must not fail the turn. */
+  /** Model changes are authoritative; optional mode and effort sync remain best-effort. */
   private async applyLiveConfig(
     acp: GrokAcpClient,
     acpSessionId: string,
@@ -2517,9 +2545,7 @@ export class GrokProviderAdapter implements ProviderAdapter {
       await acp.sessionSetMode(acpSessionId, opts.plan ? 'plan' : 'default').catch(() => undefined);
     }
     if (opts.model) {
-      await acp.sessionSetModel(acpSessionId, opts.model).catch(async () => {
-        await acp.sessionSetConfigOption(acpSessionId, 'model', opts.model as string).catch(() => undefined);
-      });
+      await this.switchLiveModel(acp, acpSessionId, opts.model);
     }
     if (opts.effort) {
       await acp.sessionSetConfigOption(acpSessionId, 'reasoning_effort', opts.effort).catch(() => undefined);
@@ -2537,44 +2563,55 @@ export class GrokProviderAdapter implements ProviderAdapter {
    * through the headless fallback. Returns goal snapshots observed on the way.
    */
   private async promptSlashCommand(sessionId: string, command: string): Promise<Record<string, unknown> | null> {
-    const cwd = this.getCwd(sessionId) ?? process.cwd();
-    const acp = await this.ensureAcp(false);
-    const storageId = this.storageSessionId(sessionId);
-    if (!acp) {
-      await this.inner.startTurn({ sessionId: storageId, prompt: command, cwd, isNew: !this.inner.hasSessionFile(storageId), onEvent: () => undefined });
-      return this.inner.readGoal(storageId);
-    }
-    this.sessionClient.set(sessionId, acp);
-    let acpSessionId = this.acpId(sessionId);
-    const perm = this.getPermission(sessionId);
-    const autoMode = perm === 'auto';
-    const yoloMode = perm === 'bypassPermissions' || perm === 'yolo';
-    if (!this.inner.hasSessionFile(storageId) && !this.acpSessionIds.has(sessionId)) {
-      const created = await acp.sessionNew({ cwd, sessionId, autoMode, yoloMode });
-      acpSessionId = created.sessionId || sessionId;
-      this.rememberAcpSession(sessionId, acpSessionId, cwd);
-    } else {
-      await acp.sessionLoad({ sessionId: acpSessionId, cwd, autoMode, yoloMode }).catch(async () => {
+    if (this.isBusy(sessionId)) throw new ProviderError('busy', 'grok-adapter: a turn is already running', 409);
+    this.activeSessions.add(sessionId);
+    let acp: GrokAcpClient | null = null;
+    try {
+      const cwd = this.getCwd(sessionId) ?? process.cwd();
+      const model = this.getModel(sessionId);
+      const selected = this.resolveModel(model);
+      const perm = this.getPermission(sessionId);
+      const autoMode = perm === 'auto';
+      const yoloMode = this.isAlwaysApprove(sessionId);
+      acp = await this.ensureAcp(yoloMode, selected.key, sessionId);
+      const storageId = this.storageSessionId(sessionId);
+      if (!acp) {
+        await this.inner.startTurn({ sessionId: storageId, prompt: command, cwd,
+          isNew: !this.inner.hasSessionFile(storageId) && !this.acpSessionIds.has(sessionId), model, onEvent: () => undefined });
+        return this.inner.readGoal(storageId);
+      }
+      this.clientOperations.set(acp, (this.clientOperations.get(acp) ?? 0) + 1);
+      this.sessionClient.set(sessionId, acp);
+      let acpSessionId = this.acpId(sessionId);
+      if (!this.inner.hasSessionFile(storageId) && !this.acpSessionIds.has(sessionId)) {
         const created = await acp.sessionNew({ cwd, sessionId, autoMode, yoloMode });
         acpSessionId = created.sessionId || sessionId;
         this.rememberAcpSession(sessionId, acpSessionId, cwd);
+      } else {
+        await acp.sessionLoad({ sessionId: acpSessionId, cwd, autoMode, yoloMode });
+      }
+      await this.applyLiveConfig(acp, acpSessionId, { model: selected.model });
+      let observed: Record<string, unknown> | null = null;
+      const unsub = acp.onEvent((ev) => {
+        if (ev.type === 'goal_update' && (!ev.sessionId || this.matchesSessionId(ev.sessionId, sessionId))) {
+          observed = normalizeGoal(ev.goal, sessionId);
+        }
       });
-    }
-    let observed: Record<string, unknown> | null = null;
-    const unsub = acp.onEvent((ev) => {
-      if (ev.type === 'goal_update' && (!ev.sessionId || this.matchesSessionId(ev.sessionId, sessionId))) {
-        observed = normalizeGoal(ev.goal, sessionId);
-      }
-    });
-    try {
-      await acp.sessionPrompt({ sessionId: acpSessionId, prompt: [{ type: 'text', text: command }] });
+      try { await acp.sessionPrompt({ sessionId: acpSessionId, prompt: [{ type: 'text', text: command }] }); }
+      finally { unsub(); }
+      return observed;
+    } catch (err) {
+      throw new ProviderError('upstream_error', `grok-adapter: command failed: ${this.safeError(err)}`, 502);
     } finally {
-      unsub();
-      if (this.recycleGraceMs > 0) {
-        this.scheduleRecycleWhenIdle();
+      if (acp) {
+        const count = (this.clientOperations.get(acp) ?? 1) - 1;
+        if (count > 0) this.clientOperations.set(acp, count);
+        else this.clientOperations.delete(acp);
       }
+      this.activeSessions.delete(sessionId);
+      if (this.recyclePending) await this.recycleIfIdle();
+      else this.scheduleRecycleWhenIdle();
     }
-    return observed;
   }
 
   private async runGoalCommand(sessionId: string, command: string): Promise<Record<string, unknown> | null> {
@@ -2627,25 +2664,20 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 }
 
-/** Official grok-4.6 / grok-4.5 context window is 500,000 tokens. Unknown aliases share the family. */
-export function grokContextWindow(_model?: string): number {
-  return 500_000;
-}
-
 export function grokPermissionMode(mode: string | undefined): string | undefined {
   switch (mode) {
     case 'manual': return 'default';
     case 'auto': return 'auto';
-    case 'yolo': return 'bypassPermissions';
+    case 'yolo':
+    case 'bypassPermissions': return 'bypassPermissions';
     default: return undefined;
   }
 }
 
 export const GROK_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
-export function isKnownGrokReasoningModel(modelId?: string): boolean {
-  if (!modelId) return false;
-  return /^grok(-|$)/i.test(modelId);
+function supportedGrokEfforts(efforts?: string[]): string[] {
+  return [...new Set(efforts ?? [])].filter((effort) => (['none', ...GROK_EFFORTS] as string[]).includes(effort));
 }
 
 /** Map Kimi thinking chips onto grok --effort. UI 'on' is not a CLI value. */
@@ -2699,12 +2731,12 @@ function usageFromAcp(raw: Record<string, unknown>, prev?: SessionUsage): Sessio
     cache_creation_tokens: (prev?.cache_creation_tokens ?? 0) + cacheCreate,
     total_cost_usd: (prev?.total_cost_usd ?? 0) + cost,
     context_tokens: input + output,
-    context_limit: grokContextWindow(),
+    context_unavailable: true,
     turn_count: turnCount > 0 ? turnCount : (prev?.turn_count ?? 0) + 1,
     ...(reasoning > 0 || prev?.reasoning_output_tokens
       ? { reasoning_output_tokens: (prev?.reasoning_output_tokens ?? 0) + reasoning }
       : {}),
-  };
+  } as SessionUsage;
 }
 
 /** usage.json is cumulative, so its numbers replace (not add to) the cache. */
@@ -2721,11 +2753,11 @@ function usageFromFile(raw: Record<string, unknown>): SessionUsage | null {
     cache_creation_tokens: num(session.cacheCreationTokens ?? session.cache_creation_tokens),
     total_cost_usd: num(session.costUsd ?? session.total_cost_usd) || num(session.costUsdTicks) / 1e10,
     context_tokens: input + output,
-    context_limit: grokContextWindow(),
+    context_unavailable: true,
     turn_count: num(session.turnCount ?? session.turn_count),
     ...(reasoning > 0 ? { reasoning_output_tokens: reasoning } : {}),
     authoritative: true,
-  };
+  } as SessionUsage;
 }
 
 /**

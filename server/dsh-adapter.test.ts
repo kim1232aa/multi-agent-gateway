@@ -11,6 +11,7 @@ import * as zlib from 'node:zlib';
 import { DshAdapter, DshProviderAdapter, resolveDshBin, resolveDshSessionsDir } from './dsh-adapter.js';
 import { DshAcpClient } from './dsh-acp.js';
 import { SettingsStore } from './settings-store.js';
+import { ProviderStore } from './provider-store.js';
 
 test('resolveDshBin falls back gracefully', () => {
   const custom = resolveDshBin('/usr/custom/bin/dsh');
@@ -88,7 +89,7 @@ test('DshAdapter: listSessionsFromDisk and getHistoryMessages from zstd files', 
 test('DshProviderAdapter: contract methods', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'dsh-provider-test-'));
   try {
-    const adapter = new DshProviderAdapter({ sessionsDir: tempDir });
+    const adapter = new DshProviderAdapter({ sessionsDir: tempDir, dshBin: join(tempDir, 'missing-dsh'), settingsPath: join(tempDir, 'settings.json') });
     const caps = adapter.capabilities();
     assert.equal(caps.streaming, true);
     assert.equal(caps.approvals, true);
@@ -114,9 +115,9 @@ test('DshProviderAdapter: contract methods', async () => {
     assert.deepEqual(listRes.items, []);
 
     const usage = adapter.getUsage('test-sess-123');
-    assert.equal(usage?.context_limit, 131_072);
+    assert.ok(Number.isNaN(usage?.context_limit));
 
-    await adapter.setThinking('test-sess-123', 'high');
+    await adapter.setThinking('__default__', 'high');
     assert.equal(adapter.getThinking('test-sess-123'), 'high');
 
     await assert.rejects(
@@ -664,7 +665,7 @@ test('review regression: real DSH session disk format parses user content, filte
   }
 });
 
-test('review regression: listModels removes hardcoded fake DeepSeek models and setModel ignores obsolete models safely', { timeout: 2000 }, async () => {
+test('review regression: listModels removes hardcoded fake DeepSeek models and setModel rejects obsolete models', { timeout: 2000 }, async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'dsh-test-fake-models-'));
   try {
     await withMockDsh((message, child) => {
@@ -685,8 +686,8 @@ test('review regression: listModels removes hardcoded fake DeepSeek models and s
         const models = await adapter.listModels();
         assert.ok(!models.some((m) => m.model === 'deepseek-v4-flash'), 'must not return fake deepseek-v4-flash');
 
-        // Setting obsolete model that is not in the allowed options should not throw an unhandled error to the user
-        await adapter.setModel(session.id, 'deepseek-v4-flash');
+        await assert.rejects(adapter.setModel(session.id, 'deepseek-v4-flash'), /unknown model option/);
+        assert.notEqual(adapter.getModel(session.id), 'deepseek-v4-flash');
       } finally {
         await adapter.dispose();
       }
@@ -764,3 +765,199 @@ test('review regression: listSessionsFromDisk caches parsed files by mtime and s
   }
 });
 
+
+async function dshCatalogFixture(base: string) {
+  const store = new ProviderStore(base);
+  for (const id of ['first', 'second']) store.upsert('dsh', {
+    id, type: 'openai', base_url: 'https://example.invalid/v1', api_key: `test-secret-${id}`,
+    models: [{ model: 'shared', display_name: `${id} model`, max_context_size: 98765,
+      capabilities: ['thinking', 'image_in'], support_efforts: ['low', 'max', 'bogus'], default_effort: 'max' }],
+  });
+  store.setActive('dsh', 'second');
+  return store;
+}
+
+const catalogConfig = [
+  { id: 'model', currentValue: '["custom-a","same-model"]', options: [
+    ...reviewConfigOptions[0].options,
+    { group: 'gw_first', name: 'first', options: [{ value: '["gw_first","shared"]', name: 'Wrong runtime metadata' }] },
+    { group: 'gw_second', name: 'second', options: [{ value: '["gw_second","shared"]', name: 'Wrong runtime metadata' }] },
+  ] },
+  { id: 'reasoning_effort', currentValue: '', options: [
+    { value: '', name: 'Provider default' }, { value: 'off', name: 'Off' }, { value: 'high', name: 'High' },
+  ] },
+];
+
+test('DSH catalog metadata, defaults, native values and reasoning-off follow official config options', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-catalog-'));
+  const store = await dshCatalogFixture(base);
+  const requests: MockRpcMessage[] = [];
+  try {
+    await withMockDsh((message, child) => {
+      requests.push(message);
+      if (message.method === 'initialize') child.send({ id: message.id, result: { protocolVersion: 1 } });
+      if (message.method === 'session/new' || message.method === 'session/resume') child.send({ id: message.id, result: { sessionId: 'catalog-session', configOptions: catalogConfig } });
+      if (message.method === 'session/set_config_option') {
+        if (message.params?.value === '["gw_first","reject"]') child.send({ id: message.id, error: { message: 'unknown model option' } });
+        else child.send({ id: message.id, result: { configOptions: catalogConfig } });
+      }
+      if (message.method === 'session/prompt') child.send({ id: message.id, result: { stopReason: 'end_turn' } });
+    }, async () => {
+      const adapter = new DshProviderAdapter({ dshBin: 'mock', sessionsDir: join(base, 'sessions'), settingsPath: join(base, 'settings.json'), providers: store.forCli('dsh'), recycleGraceMs: 0 });
+      try {
+        const before = await adapter.listModels();
+        assert.ok(before.some((m) => m.model === '@first:shared'));
+        const session = await adapter.create({ provider: 'dsh', cwd: base });
+        assert.equal(adapter.getModel(session.id), '@second:shared');
+        assert.ok(requests.some((r) => r.method === 'session/set_config_option' && r.params?.value === '["gw_second","shared"]'));
+        const models = await adapter.listModels();
+        const catalog = models.find((m) => m.model === '@first:shared')!;
+        assert.equal(catalog.provider, 'first');
+        assert.equal(catalog.max_context_size, 98765);
+        assert.equal(catalog.display_name, 'first model');
+        assert.deepEqual(catalog.capabilities, ['thinking', 'image_in']);
+        assert.deepEqual(catalog.support_efforts, ['low', 'max']);
+        assert.equal(catalog.default_effort, 'max');
+        const native = models.find((m) => m.model === '["custom-b","same-model"]')!;
+        assert.equal(JSON.parse(JSON.stringify(native)).max_context_size, null);
+        assert.equal(native.support_efforts, undefined, 'current model reasoning must not be copied to all models');
+        await adapter.setModel(session.id, '@first:shared');
+        assert.equal(adapter.getModel(session.id), '@first:shared');
+        assert.equal(adapter.getUsage(session.id)?.context_limit, 98765);
+        await adapter.setThinking(session.id, 'off');
+        assert.equal(requests.at(-1)?.params?.value, 'off');
+        await assert.rejects(adapter.setModel(session.id, '@first:reject'), /unknown model option/);
+        assert.equal(adapter.getModel(session.id), '@first:shared');
+        for (const sid of [session.id, '__default__']) await assert.rejects(adapter.setModel(sid, '@missing:shared'),
+          (err: any) => err.code === 'invalid_request' && err.httpStatus === 400);
+        const client: DshAcpClient = (adapter as any).adapter.getAcpClient();
+        client.closeProcess();
+        const handle = await adapter.startTurn({ sessionId: session.id, input: 'hi', metadata: { cwd: base } });
+        for await (const _event of handle.events) {}
+        const resumedAt = requests.map((r) => r.method).lastIndexOf('session/resume');
+        assert.ok(requests.slice(resumedAt).some((r) => r.method === 'session/set_config_option' && r.params?.value === '["gw_first","shared"]'));
+      } finally { await adapter.dispose(); }
+    });
+  } finally { await rm(base, { recursive: true, force: true }); }
+});
+
+test('DSH off rejects provider-default-only config without persisting', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-off-'));
+  try {
+    await withMockDsh((message, child) => {
+      if (message.method === 'initialize') child.send({ id: message.id, result: { protocolVersion: 1 } });
+      if (message.method === 'session/new') child.send({ id: message.id, result: { sessionId: 'off-session', configOptions: reviewConfigOptions } });
+      if (message.method === 'session/resume') child.send({ id: message.id, error: { message: `session is already active: ${message.params?.sessionId}` } });
+      if (message.method === 'session/set_config_option') child.send({ id: message.id, result: { configOptions: reviewConfigOptions } });
+      if (message.method === 'session/prompt') child.send({ id: message.id, result: { stopReason: 'end_turn' } });
+    }, async () => {
+      const settingsPath = join(base, 'settings.json');
+      const seed = new SettingsStore(settingsPath);
+      seed.set('thinking', '__default__', 'off');
+      seed.flushNow();
+      seed.close();
+      const applied: unknown[] = [];
+      const adapter = new DshProviderAdapter({ dshBin: 'mock', sessionsDir: base, settingsPath });
+      try {
+        const session = await adapter.create({ provider: 'dsh', cwd: base });
+        assert.equal(adapter.getCwd(session.id), base, 'a fresh session must stay addressable before its first turn');
+        await assert.rejects(adapter.setThinking(session.id, 'off'), (err: any) => err.code === 'invalid_request');
+        const handle = await adapter.startTurn({ sessionId: session.id, input: 'hi', metadata: { cwd: base } });
+        for await (const _event of handle.events) { /* drain */ }
+        assert.deepEqual(applied, [], 'a stored provider-default thinking level must not block a turn');
+        const store = new SettingsStore(settingsPath);
+        try { assert.equal(store.getString('thinking', '__default__'), 'off'); } finally { store.close(); }
+      } finally { await adapter.dispose(); }
+    });
+  } finally { await rm(base, { recursive: true, force: true }); }
+});
+
+test('DSH fingerprint rotation waits for pending prompt even with idle recycling disabled', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-rotation-'));
+  const store = await dshCatalogFixture(base);
+  let prompt: MockRpcMessage | undefined;
+  let promptReceived!: () => void;
+  const received = new Promise<void>((resolve) => { promptReceived = resolve; });
+  try {
+    await withMockDsh((message, child) => {
+      if (message.method === 'initialize') child.send({ id: message.id, result: { protocolVersion: 1 } });
+      if (message.method === 'session/new') child.send({ id: message.id, result: { sessionId: 'one', configOptions: catalogConfig } });
+      if (message.method === 'session/prompt') { prompt = message; promptReceived(); }
+    }, async (children) => {
+      const client = new DshAcpClient({ dshBin: 'mock', providers: store.forCli('dsh'), recycleGraceMs: 0 });
+      try {
+        await client.newSession(base);
+        const running = client.prompt('one', 'wait');
+        await received;
+        store.upsert('dsh', { api_key: 'rotated-secret' }, 'first');
+        await client.ensureReady();
+        assert.equal(children[0].killed, false);
+        children[0].send({ id: prompt!.id, result: { stopReason: 'end_turn' } });
+        await running;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(children[0].killed, true);
+        await client.ensureReady();
+        assert.equal(children.length, 2);
+      } finally { client.close(); }
+    });
+  } finally { await rm(base, { recursive: true, force: true }); }
+});
+
+test('DSH ACP redacts injected credentials in errors and stderr', async () => {
+  const lines: string[] = [];
+  await withMockDsh((message, child) => {
+    if (message.method === 'initialize') child.send({ id: message.id, result: { protocolVersion: 1 } });
+    if (message.method === 'session/new') {
+      child.stderr.write('sensitive-credential\n');
+      child.send({ id: message.id, error: { message: 'upstream sensitive-credential' } });
+    }
+  }, async () => {
+    const client = new DshAcpClient({ dshBin: 'mock', env: { MAG_DSH_KEY_TEST: 'sensitive-credential' }, onStderr: (line) => lines.push(line) });
+    try {
+      await assert.rejects(client.newSession('/tmp'), (err: Error) => !err.message.includes('sensitive-credential'));
+      assert.ok(lines.every((line) => !line.includes('sensitive-credential')));
+    } finally { client.close(); }
+  });
+});
+
+test('DSH provider patch keeps the user llm-pi-ai routes and fields; user routes win on a clash', async () => {
+  const { mergePiAiConfig } = await import('./dsh-patch.js');
+  const user = {
+    providers: { ccwu: { apiKeyEnv: 'CCWU_API_KEY', baseURL: 'https://relay.example' }, shared: { displayName: 'mine' } },
+    retry: { __jsExpr: "ctx.get('x')" },
+  };
+  const merged = mergePiAiConfig(user, { gw_relay: { apiKeyEnv: 'MAG_DSH_KEY_RELAY' }, shared: { displayName: 'gateway' } });
+  assert.deepEqual(Object.keys(merged.providers as object).sort(), ['ccwu', 'gw_relay', 'shared']);
+  assert.deepEqual((merged.providers as any).shared, { displayName: 'mine' });
+  assert.deepEqual(merged.retry, { __jsExpr: "ctx.get('x')" });
+  assert.deepEqual(mergePiAiConfig(undefined, { gw_a: {} }), { providers: { gw_a: {} } });
+  assert.throws(() => mergePiAiConfig({ providers: { __jsExpr: 'x' } }, { gw_a: {} }), /not a plain mapping/);
+});
+
+test('DSH cancelled empty turn does not write an empty assistant message into gateway_history', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-cancel-hist-'));
+  try {
+    await withMockDsh((message, child) => {
+      if (message.method === 'initialize') child.send({ id: message.id, result: { protocolVersion: 1 } });
+      if (message.method === 'session/new') child.send({ id: message.id, result: { sessionId: 'cancel-s1', configOptions: reviewConfigOptions } });
+      if (message.method === 'session/resume') child.send({ id: message.id, result: { configOptions: reviewConfigOptions } });
+      if (message.method === 'session/set_config_option') child.send({ id: message.id, result: { configOptions: reviewConfigOptions } });
+      if (message.method === 'session/prompt') child.send({ id: message.id, result: { stopReason: 'cancelled' } });
+    }, async () => {
+      const adapter = new DshProviderAdapter({ dshBin: 'mock', sessionsDir: join(base, 'sessions'), settingsPath: join(base, 'settings.json'), recycleGraceMs: 0 });
+      try {
+        const session = await adapter.create({ provider: 'dsh', cwd: base });
+        const handle = await adapter.startTurn({ sessionId: session.id, input: '继续', metadata: { cwd: base } });
+        const events = [];
+        for await (const ev of handle.events) events.push(ev);
+        assert.equal(events.at(-1)?.status, 'cancelled');
+        const history = await adapter.getHistory(session.id);
+        assert.deepEqual(history, []);
+      } finally {
+        await adapter.dispose();
+      }
+    });
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});

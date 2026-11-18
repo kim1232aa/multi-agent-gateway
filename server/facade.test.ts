@@ -13,6 +13,60 @@ import {
   workspaceIdFromCwd,
 } from './facade.js';
 import { fsRepoDiff } from './fs-local.js';
+import { ProviderStore } from './provider-store.js';
+
+test('catalog refs preserve metadata, provider defaults and Claude qwen models', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'facade-providers-'));
+  const store = new ProviderStore(dir);
+  try {
+    for (const cli of ['codex', 'claude'] as const) {
+      store.upsert(cli, { id: 'relay', type: cli === 'codex' ? 'openai_responses' : 'anthropic',
+        base_url: 'https://example.invalid/v1', api_key: 'never-in-dto', models: [
+          { model: 'qwen-model', display_name: 'Relay model', max_context_size: 345678,
+            capabilities: ['thinking', 'image_in'], support_efforts: ['low', 'ultra', 'ultracode'], default_effort: 'low' },
+          { model: 'unknown-context' },
+        ] });
+      store.setActive(cli, 'relay');
+    }
+    const codex = new CodexProviderAdapter({ providers: store.forCli('codex') } as any);
+    const claude = new ClaudeProviderAdapter({ providers: store.forCli('claude') } as any);
+    (codex as any).inner.listModels = async () => [];
+  (codex as any).inner.modelContextWindows = async () => new Map();
+    (claude as any).inner.listBuiltinModels = async () => [];
+    for (const adapter of [codex, claude]) {
+      assert.equal(adapter.getModel('new-session'), '@relay:qwen-model');
+      const models = await adapter.listModels();
+      assert.equal(models[0]?.provider, 'relay');
+      assert.equal(models[0]?.model, '@relay:qwen-model');
+      assert.equal(models[0]?.max_context_size, 345678);
+      assert.deepEqual(models[0]?.capabilities, ['thinking', 'image_in']);
+      assert.deepEqual(models[0]?.support_efforts, adapter === claude ? ['low'] : ['low', 'ultra', 'ultracode']);
+      assert.equal(models[1]?.max_context_size, undefined);
+      assert.ok(!JSON.stringify(models).includes('never-in-dto'));
+      await adapter.setModel('__default__', '@relay:qwen-model');
+      assert.equal(adapter.getModel('new-session'), '@relay:qwen-model');
+      await assert.rejects(adapter.setModel('__default__', '@missing:m'), (err: any) => err.code === 'invalid_request' && err.httpStatus === 400);
+      assert.equal(adapter.getModel('new-session'), '@relay:qwen-model');
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Codex fork does not inherit its parent native thread alias', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).settings.set('nativeThreadId', 'parent', 'actual-parent');
+  (adapter as any).inner.forkThread = async () => ({ id: 'forked', cwd: '/tmp' });
+  await adapter.fork('parent');
+  assert.equal((adapter as any).settings.getString('nativeThreadId', 'forked'), undefined);
+});
+
+test('Codex persists model selection only after the CLI accepts it', async () => {
+  const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.setModel = async () => { throw new Error('switch rejected'); };
+  await assert.rejects(adapter.setModel('existing', 'other'), /switch rejected/);
+  assert.equal(adapter.getModel('existing'), undefined);
+});
 import { discoverClaudeDiskCommands, expandCodexSkill, listClaudeCommands } from './native-commands.js';
 
 test('passes Codex source kinds to thread/list', async () => {
@@ -854,6 +908,7 @@ test('ClaudeProviderAdapter.fork copies session settings onto the new id', async
 
 test('CodexProviderAdapter.fork copies session settings onto the new id', async () => {
   const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.setModel = async () => {};
   await adapter.setModel('old-id', 'gpt-5.6-sol');
   await adapter.setThinking('old-id', 'high');
   (adapter as any).inner.forkThread = async (sessionId: string) => {
@@ -945,8 +1000,8 @@ test('ClaudeProviderAdapter maps approval events and resolveApproval writes allo
 
 test('Claude yolo auto-allows residual can_use_tool requests but still prompts for user-interaction tools and in plan mode', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mag-claude-yolo-'));
+  const adapter = new ClaudeProviderAdapter({ settingsPath: join(dir, 's.json') } as any);
   try {
-    const adapter = new ClaudeProviderAdapter({ settingsPath: join(dir, 's.json') } as any);
     const resolved: Array<[string, string, string]> = [];
     const modeCalls: Array<[string, string]> = [];
     (adapter as any).inner.resolveApproval = async (sessionId: string, approvalId: string, decision: string) => {
@@ -985,6 +1040,8 @@ test('Claude yolo auto-allows residual can_use_tool requests but still prompts f
     assert.deepEqual(await kinds(), ['rm-1', 'mcp-1']);
     assert.deepEqual(resolved, []);
   } finally {
+    // Close first: the settings store flushes lazily and would recreate the directory.
+    await adapter.dispose?.();
     await rm(dir, { recursive: true, force: true });
   }
 });
@@ -1113,6 +1170,7 @@ test('CodexProviderAdapter handles 0.169 items, reverse requests, plans/diffs, u
   assert.equal(skillCalls.length, 3);
 
   // listModels preserves rich metadata
+  (adapter as any).inner.modelContextWindows = async () => new Map();
   (adapter as any).inner.listModels = async () => [{
     model: 'gpt-6.1-sol',
     displayName: 'GPT-6.1 Sol',
@@ -1759,6 +1817,7 @@ test('Codex planMode re-syncs on resume/startTurn and passes model and effective
     events: (async function* () {})(),
   });
 
+  (adapter as any).inner.setModel = async () => {};
   await adapter.setModel('session-plan-1', 'o3-high');
   await adapter.setThinking('session-plan-1', 'high');
   await adapter.setPlanMode('session-plan-1', true);
@@ -1794,6 +1853,7 @@ test('Codex planMode re-syncs on resume/startTurn and passes model and effective
 
 test('Codex effort normalization resolves on to default_effort and normalizes auto/off cleanly', async () => {
   const adapter = new CodexProviderAdapter();
+  (adapter as any).inner.modelContextWindows = async () => new Map();
   (adapter as any).inner.listModels = async () => [
     {
       model: 'gpt-5-pro',
@@ -1814,6 +1874,7 @@ test('Codex effort normalization resolves on to default_effort and normalizes au
   };
 
   // 1. 'on' with model having defaultReasoningEffort -> resolves to 'high'
+  (adapter as any).inner.setModel = async () => {};
   await adapter.setModel('s-effort', 'gpt-5-pro');
   await adapter.setThinking('s-effort', 'on');
   await adapter.startTurn({ sessionId: 's-effort', input: 'test on' });

@@ -19,6 +19,7 @@ import { DshAcpClient, type DshAcpEvent } from './dsh-acp.js';
 import { workspaceIdFromCwd } from './facade.js';
 import { listDshCommands } from './native-commands.js';
 import { SettingsStore } from './settings-store.js';
+import { encodeModelRef, parseModelRef, type CliProviders } from './provider-store.js';
 import {
   ProviderError,
   type ApprovalDecision,
@@ -49,69 +50,75 @@ export function validateSessionId(sessionId: string): string {
   return rawId;
 }
 
-function parseConfigModels(configOptions: unknown): NativeModel[] | null {
+const DSH_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function modelRoute(value: string): { route: string; model: string } | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (Array.isArray(parsed) && parsed.length === 2 && parsed.every((part) => typeof part === 'string')) {
+      return { route: parsed[0], model: parsed[1] };
+    }
+  } catch { /* opaque native value */ }
+  return undefined;
+}
+
+function catalogModels(providers?: CliProviders): NativeModel[] {
+  return (providers?.catalog() ?? []).flatMap((provider) => provider.models.map((model) => {
+    const levels = (model.support_efforts ?? []).filter((level) => DSH_THINKING_LEVELS.has(level));
+    return {
+      provider: provider.label,
+      model: encodeModelRef(provider.key, model.model),
+      display_name: model.display_name ?? model.model,
+      max_context_size: model.max_context_size && model.max_context_size > 0 ? model.max_context_size : Number.NaN,
+      ...(model.max_output_size ? { max_output_tokens: model.max_output_size } : {}),
+      capabilities: [...(model.capabilities ?? [])],
+      support_efforts: levels,
+      ...(model.default_effort && levels.includes(model.default_effort) ? { default_effort: model.default_effort } : {}),
+      ...(levels.includes('off') ? { supportsThinkingOff: true } : {}),
+      ...(providers?.defaultModelRef() === encodeModelRef(provider.key, model.model) ? { isDefault: true } : {}),
+    };
+  }));
+}
+
+function parseConfigModels(configOptions: unknown, providers?: CliProviders): NativeModel[] | null {
   if (!Array.isArray(configOptions)) return null;
-  const modelOpt = configOptions.find((opt: any) => opt && typeof opt === 'object' && opt.id === 'model') as any;
-  if (!modelOpt || !Array.isArray(modelOpt.options) || modelOpt.options.length === 0) return null;
-
-  const reasoningOpt = configOptions.find((opt: any) => opt && typeof opt === 'object' && opt.id === 'reasoning_effort') as any;
-  let supportEfforts: string[] | undefined;
-  let defaultEffort: string | undefined;
-  let supportsThinkingOff: boolean | undefined;
-  if (reasoningOpt && Array.isArray(reasoningOpt.options)) {
-    supportEfforts = [];
-    for (const item of reasoningOpt.options) {
-      if (!item || typeof item !== 'object') continue;
-      if (typeof item.value === 'string') {
-        if (item.value) {
-          supportEfforts.push(item.value);
-        } else {
-          supportsThinkingOff = true;
-        }
-      }
-    }
-    if (typeof reasoningOpt.currentValue === 'string') {
-      defaultEffort = reasoningOpt.currentValue;
-    }
-  }
-
+  const modelOpt = configOptions.find((opt: any) => opt?.id === 'model');
+  if (!Array.isArray(modelOpt?.options)) return null;
+  const reasoningOpt = configOptions.find((opt: any) => opt?.id === 'reasoning_effort');
+  const levels: string[] = Array.isArray(reasoningOpt?.options)
+    ? reasoningOpt.options.map((opt: any) => opt?.value).filter((value: unknown): value is string => typeof value === 'string' && DSH_THINKING_LEVELS.has(value)) : [];
+  const catalog = catalogModels(providers);
   const models: NativeModel[] = [];
-  const currentModelVal = typeof modelOpt.currentValue === 'string' ? modelOpt.currentValue : undefined;
-
-  for (const item of modelOpt.options) {
-    if (!item || typeof item !== 'object') continue;
-    if (Array.isArray(item.options)) {
-      const groupProvider = typeof item.group === 'string' && item.group ? item.group : 'dsh';
-      for (const opt of item.options) {
-        if (!opt || typeof opt.value !== 'string') continue;
-        models.push({
-          provider: groupProvider,
-          model: opt.value,
-          display_name: opt.name || opt.value,
-          ...(opt.description ? { description: opt.description } : {}),
-          max_context_size: 131_072,
-          isDefault: currentModelVal !== undefined ? opt.value === currentModelVal : models.length === 0,
-          ...(supportEfforts && supportEfforts.length > 0 ? { support_efforts: supportEfforts } : {}),
-          ...(defaultEffort !== undefined ? { default_effort: defaultEffort } : {}),
-          ...(supportsThinkingOff ? { supportsThinkingOff: true } : {}),
-        });
+  for (const group of modelOpt.options) {
+    const options = Array.isArray(group?.options) ? group.options : [group];
+    for (const option of options) {
+      if (typeof option?.value !== 'string') continue;
+      const route = modelRoute(option.value);
+      const key = providers?.keyForCliProvider(route?.route ?? group.group);
+      const ref = key && route ? encodeModelRef(key, route.model) : undefined;
+      const entry = ref ? catalog.find((model) => model.model === ref) : undefined;
+      if (key && !entry) continue;
+      if (entry) {
+        models.push({ ...entry });
+        continue;
       }
-    } else if (typeof item.value === 'string') {
+      const current = option.value === modelOpt.currentValue;
       models.push({
-        provider: 'dsh',
-        model: item.value,
-        display_name: item.name || item.value,
-        ...(item.description ? { description: item.description } : {}),
-        max_context_size: 131_072,
-        isDefault: currentModelVal !== undefined ? item.value === currentModelVal : models.length === 0,
-        ...(supportEfforts && supportEfforts.length > 0 ? { support_efforts: supportEfforts } : {}),
-        ...(defaultEffort !== undefined ? { default_effort: defaultEffort } : {}),
-        ...(supportsThinkingOff ? { supportsThinkingOff: true } : {}),
+        provider: group.name || group.group || route?.route || 'dsh',
+        model: option.value,
+        display_name: option.name || route?.model || option.value,
+        ...(option.description ? { description: option.description } : {}),
+        max_context_size: Number.NaN,
+        ...(current ? {
+          isDefault: true,
+          ...(levels.length ? { support_efforts: levels, capabilities: ['thinking'], supportsThinkingOff: levels.includes('off') } : {}),
+          ...(levels.includes(reasoningOpt?.currentValue) ? { default_effort: reasoningOpt.currentValue } : {}),
+        } : {}),
       });
     }
   }
-
-  return models.length > 0 ? models : null;
+  for (const entry of catalog) if (!models.some((model) => model.model === entry.model)) models.push(entry);
+  return models.length ? models : null;
 }
 
 export function parseCordisPatchModels(content: string): NativeModel[] {
@@ -158,7 +165,7 @@ export function parseCordisPatchModels(content: string): NativeModel[] {
           provider: currentProvider,
           model: optValue,
           display_name: displayName,
-          max_context_size: 131_072,
+          max_context_size: Number.NaN,
           isDefault,
         });
       }
@@ -362,7 +369,7 @@ export class DshAdapter {
   private readonly historyCacheDir: string;
   private readonly recycleGraceMs: number;
   private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
-  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private readonly providers?: CliProviders;
   private acpClient: DshAcpClient | null = null;
   private activeTurns = new Set<string>();
   private readonly sessionFileCache = new Map<string, CachedSessionFile>();
@@ -374,9 +381,9 @@ export class DshAdapter {
     historyCacheDir?: string;
     recycleGraceMs?: number;
     permissionModeForSession?: (sessionId: string) => string | undefined;
-    injection?: () => { args: string[]; env: Record<string, string> };
+    providers?: CliProviders;
   } = {}) {
-    this.injection = options.injection;
+    this.providers = options.providers;
     this.dshBin = resolveDshBin(options.dshBin);
     this.sessionsDir = options.sessionsDir ?? resolveDshSessionsDir();
     const dshHome = path.dirname(this.sessionsDir);
@@ -406,11 +413,7 @@ export class DshAdapter {
         alwaysApprove,
         recycleGraceMs: this.recycleGraceMs,
         permissionModeForSession: this.permissionModeForSession,
-        ...(this.injection ? { injection: this.injection } : {}),
-        env: {
-          // dsh profile patches route llm through the ccwu relay; it needs this key.
-          ...(process.env.CCWU_API_KEY ? { CCWU_API_KEY: process.env.CCWU_API_KEY } : {}),
-        },
+        providers: this.providers,
       });
     }
     return this.acpClient;
@@ -768,9 +771,6 @@ export class DshAdapter {
     this.acpClient?.recycleSoon();
   }
 
-  injectedArgs(): string[] {
-    return this.injection?.().args ?? [];
-  }
 }
 
 export class DshProviderAdapter implements ProviderAdapter {
@@ -780,6 +780,9 @@ export class DshProviderAdapter implements ProviderAdapter {
   /** Gateway native id → cwd (recorded at create/resume time for later turns). */
   private readonly sessionCwds = new Map<string, string>();
   private cachedModels: NativeModel[] | null = null;
+  private readonly providers?: CliProviders;
+  private providerFingerprint?: string;
+  private readonly sessionConfigOptions = new Map<string, any[]>();
 
   constructor(options: {
     dshBin?: string;
@@ -787,8 +790,10 @@ export class DshProviderAdapter implements ProviderAdapter {
     settingsPath?: string;
     settingsStore?: SettingsStore;
     recycleGraceMs?: number;
-    injection?: () => { args: string[]; env: Record<string, string> };
+    providers?: CliProviders;
   } = {}) {
+    this.providers = options.providers;
+    this.providerFingerprint = this.providers?.fingerprint();
     this.settingsStore = options.settingsStore ?? new SettingsStore(options.settingsPath);
     this.adapter = new DshAdapter({
       ...options,
@@ -798,12 +803,17 @@ export class DshProviderAdapter implements ProviderAdapter {
 
   /** Gateway provider changed: forget the cached catalog and respawn the idle ACP process. */
   providerChanged(): void {
+    this.providerFingerprint = this.providers?.fingerprint();
     this.cachedModels = null;
     this.adapter.recycleSoon();
   }
 
-  private updateCachedConfigOptions(configOptions: unknown): void {
-    const models = parseConfigModels(configOptions);
+  private updateCachedConfigOptions(configOptions: unknown, sessionId?: string): void {
+    if (sessionId) {
+      if (Array.isArray(configOptions)) this.sessionConfigOptions.set(sessionId, configOptions);
+      else this.sessionConfigOptions.delete(sessionId);
+    }
+    const models = parseConfigModels(configOptions, this.providers);
     if (models && models.length > 0) {
       this.cachedModels = models;
     }
@@ -900,9 +910,10 @@ export class DshProviderAdapter implements ProviderAdapter {
     const client = this.adapter.getAcpClient();
     const res = await client.newSession(cwd);
     if (res?.configOptions) {
-      this.updateCachedConfigOptions(res.configOptions);
+      this.updateCachedConfigOptions(res.configOptions, res.sessionId);
     }
     this.sessionCwds.set(res.sessionId, cwd);
+    await this.applyPreferences(res.sessionId, true);
     const now = new Date().toISOString();
     return {
       id: res.sessionId,
@@ -929,6 +940,7 @@ export class DshProviderAdapter implements ProviderAdapter {
     const rawId = validateSessionId(id);
     this.settingsStore.set('deleted', rawId, true);
     this.sessionCwds.delete(rawId);
+    this.sessionConfigOptions.delete(rawId);
     try {
       const cacheFile = path.join(this.adapter.historyDir, `${rawId}.json`);
       if (fs.existsSync(cacheFile)) fs.unlinkSync(cacheFile);
@@ -940,58 +952,99 @@ export class DshProviderAdapter implements ProviderAdapter {
     this.settingsStore.set('title', rawId, title);
   }
 
+  private cliModelId(model: string): string {
+    if (!parseModelRef(model)) return model;
+    const value = this.providers?.cliModelId(model);
+    if (!value) throw new ProviderError('invalid_request', 'DSH model provider is not in the catalog', 400);
+    return value;
+  }
+
+  private async ensureSession(sessionId: string): Promise<void> {
+    const cwd = this.sessionCwds.get(sessionId)
+      ?? this.adapter.listSessionsFromDisk().find((record) => record.id === sessionId)?.cwd ?? process.cwd();
+    const result = await this.adapter.getAcpClient().resumeSession(sessionId, cwd);
+    this.updateCachedConfigOptions(result.configOptions, sessionId);
+  }
+
   async setModel(sessionId: string, model: string): Promise<void> {
     const rawId = validateSessionId(sessionId);
+    const value = this.cliModelId(model);
     if (rawId === '__default__') {
-      this.settingsStore.set('model', '__default__', model);
-      return;
-    }
-    if (this.cachedModels && this.cachedModels.length > 0) {
-      const exists = this.cachedModels.some((m) => m.model === model);
-      if (!exists) {
-        // Obsolete or invalid model (e.g. legacy deepseek-v4-flash) — ignore silently
-        return;
+      if (!(await this.listModels()).some((entry) => entry.model === model || this.cliModelId(entry.model) === value)) {
+        throw new ProviderError('invalid_request', 'DSH model is not listed in the catalog', 400);
       }
+    } else {
+      await this.ensureSession(rawId);
+      const res = await this.adapter.getAcpClient().setConfigOption(rawId, 'model', value);
+      if (res?.configOptions) this.updateCachedConfigOptions(res.configOptions, rawId);
     }
-    const client = this.adapter.getAcpClient();
-    if (client.isConnected()) {
-      try {
-        const res = await client.setConfigOption(rawId, 'model', model);
-        if (res?.configOptions) {
-          this.updateCachedConfigOptions(res.configOptions);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/unknown model option/i.test(msg)) {
-          // Do not surface obsolete/unknown model errors to the user
-          return;
-        }
-        throw err;
-      }
-    }
-    this.settingsStore.set('model', rawId, model);
+    const route = modelRoute(value);
+    const key = route && this.providers?.keyForCliProvider(route.route);
+    this.settingsStore.set('model', rawId, key && route ? encodeModelRef(key, route.model) : model);
+  }
+
+  /**
+   * cwd of a session created in this process. The disk scan skips placeholder sessions (no turn
+   * yet), so without this a fresh session 404s between creation and its first prompt.
+   */
+  getCwd(sessionId: string): string | undefined {
+    const rawId = validateSessionId(sessionId);
+    if (this.settingsStore.getBoolean('deleted', rawId) === true) return undefined;
+    return this.sessionCwds.get(rawId);
   }
 
   getModel(sessionId: string): string | undefined {
     const rawId = validateSessionId(sessionId);
-    return this.settingsStore.getString('model', rawId) ?? this.settingsStore.getString('model', '__default__');
+    return this.settingsStore.getString('model', rawId) ?? this.settingsStore.getString('model', '__default__')
+      ?? this.providers?.defaultModelRef();
+  }
+
+  private thinkingValue(sessionId: string, thinking: string): string {
+    const config = this.sessionConfigOptions.get(sessionId)?.find((opt) => opt?.id === 'reasoning_effort');
+    if (!Array.isArray(config?.options) || !config.options.some((opt: any) => opt?.value === thinking)) {
+      throw new ProviderError('invalid_request', 'DSH reasoning effort is not offered by the selected model', 400);
+    }
+    return thinking;
   }
 
   async setThinking(sessionId: string, thinking: string): Promise<void> {
     const rawId = validateSessionId(sessionId);
-    if (rawId === '__default__') {
-      this.settingsStore.set('thinking', '__default__', thinking);
-      return;
-    }
-    const client = this.adapter.getAcpClient();
-    if (client.isConnected()) {
-      const effort = thinking === 'off' ? '' : thinking;
-      const res = await client.setConfigOption(rawId, 'reasoning_effort', effort);
-      if (res?.configOptions) {
-        this.updateCachedConfigOptions(res.configOptions);
-      }
+    if (rawId !== '__default__') {
+      await this.ensureSession(rawId);
+      const value = this.thinkingValue(rawId, thinking);
+      const res = await this.adapter.getAcpClient().setConfigOption(rawId, 'reasoning_effort', value);
+      if (res?.configOptions) this.updateCachedConfigOptions(res.configOptions, rawId);
+    } else if (thinking !== '' && !DSH_THINKING_LEVELS.has(thinking)) {
+      throw new ProviderError('invalid_request', 'Unsupported DSH reasoning effort', 400);
     }
     this.settingsStore.set('thinking', rawId, thinking);
+  }
+
+  private async applyPreferences(sessionId: string, isNew = false): Promise<void> {
+    const options = this.sessionConfigOptions.get(sessionId);
+    const desired = this.settingsStore.getString('model', sessionId)
+      ?? this.settingsStore.getString('model', '__default__')
+      ?? (isNew ? this.providers?.defaultModelRef() : undefined);
+    if (desired) {
+      const value = this.cliModelId(desired);
+      const current = options?.find((opt) => opt?.id === 'model')?.currentValue;
+      if (value !== current) {
+        const res = await this.adapter.getAcpClient().setConfigOption(sessionId, 'model', value);
+        if (res?.configOptions) this.updateCachedConfigOptions(res.configOptions, sessionId);
+      }
+      if (isNew) this.settingsStore.set('model', sessionId, desired);
+    }
+    const thinking = this.getThinking(sessionId);
+    const offersThinking = this.sessionConfigOptions.get(sessionId)?.find((opt) => opt?.id === 'reasoning_effort')?.options
+      ?.some((opt: any) => opt?.value === thinking);
+    if (thinking !== undefined && offersThinking) {
+      const value = this.thinkingValue(sessionId, thinking);
+      const current = this.sessionConfigOptions.get(sessionId)?.find((opt) => opt?.id === 'reasoning_effort')?.currentValue;
+      if (value !== current) {
+        const res = await this.adapter.getAcpClient().setConfigOption(sessionId, 'reasoning_effort', value);
+        if (res?.configOptions) this.updateCachedConfigOptions(res.configOptions, sessionId);
+      }
+    }
   }
 
   getThinking(sessionId: string): string | undefined {
@@ -1022,6 +1075,8 @@ export class DshProviderAdapter implements ProviderAdapter {
 
   getUsage(sessionId: string): SessionUsage | undefined {
     const rawId = validateSessionId(sessionId);
+    const model = this.getModel(rawId);
+    const contextLimit = [...catalogModels(this.providers), ...(this.cachedModels ?? [])].find((entry) => entry.model === model)?.max_context_size ?? Number.NaN;
     const proj = this.adapter.readProjcache(rawId);
     const totals = proj?.tokenUsage?.val?.totals;
     if (!totals) {
@@ -1032,7 +1087,7 @@ export class DshProviderAdapter implements ProviderAdapter {
         cache_creation_tokens: 0,
         total_cost_usd: 0,
         context_tokens: 0,
-        context_limit: 131_072,
+        context_limit: contextLimit,
         turn_count: 0,
       };
     }
@@ -1048,7 +1103,7 @@ export class DshProviderAdapter implements ProviderAdapter {
       cache_creation_tokens: cacheWrite,
       total_cost_usd: 0,
       context_tokens: input + cacheRead,
-      context_limit: 131_072,
+      context_limit: contextLimit,
       turn_count: turns,
     };
   }
@@ -1059,15 +1114,21 @@ export class DshProviderAdapter implements ProviderAdapter {
   }
 
   async listModels(): Promise<NativeModel[]> {
+    if (this.providerFingerprint !== this.providers?.fingerprint()) this.providerChanged();
     if (this.cachedModels && this.cachedModels.length > 0) {
       return this.cachedModels;
     }
-    const staticModels = discoverStaticModels(this.adapter.sessionsDirectory, this.adapter.binPath, this.adapter.injectedArgs());
+    // 原生目录只读用户自己的 profile;网关供应商由 catalogModels 提供(带 --patch 读会把用户路由盖掉)。
+    const staticModels = discoverStaticModels(this.adapter.sessionsDirectory, this.adapter.binPath);
     if (staticModels && staticModels.length > 0) {
-      this.cachedModels = staticModels;
-      return staticModels;
+      const catalog = catalogModels(this.providers);
+      this.cachedModels = [...staticModels.filter((model) => {
+        const route = modelRoute(model.model);
+        return !route || !this.providers?.keyForCliProvider(route.route);
+      }), ...catalog];
+      return this.cachedModels;
     }
-    return [];
+    return catalogModels(this.providers);
   }
 
   async listCommands(_sessionId?: string, _cwd?: string): Promise<NativeCommand[]> {
@@ -1091,9 +1152,9 @@ export class DshProviderAdapter implements ProviderAdapter {
       cwd = typeof cwdMeta === 'string' && cwdMeta ? cwdMeta : process.cwd();
     }
     const resumeRes = await client.resumeSession(rawId, cwd);
-    if (resumeRes?.configOptions) {
-      this.updateCachedConfigOptions(resumeRes.configOptions);
-    }
+    this.updateCachedConfigOptions(resumeRes.configOptions, rawId);
+
+    await this.applyPreferences(rawId);
 
     const promptText = typeof input.input === 'string'
       ? input.input
@@ -1197,8 +1258,10 @@ export class DshProviderAdapter implements ProviderAdapter {
     client
       .prompt(rawId, promptText)
       .then((res) => {
-        this.adapter.appendHistoryCache(rawId, promptText, accumulatedAssistantText, accumulatedReasoningText);
         const isCancelled = res?.stopReason === 'cancelled';
+        if (!isCancelled || accumulatedAssistantText.length > 0 || accumulatedReasoningText.length > 0) {
+          this.adapter.appendHistoryCache(rawId, promptText, accumulatedAssistantText, accumulatedReasoningText);
+        }
         events.push({
           kind: 'turn',
           status: isCancelled ? 'cancelled' : 'completed',
@@ -1253,10 +1316,12 @@ export class DshProviderAdapter implements ProviderAdapter {
   async close(sessionId: string): Promise<void> {
     const rawId = validateSessionId(sessionId);
     this.sessionCwds.delete(rawId);
+    this.sessionConfigOptions.delete(rawId);
     this.sessionCwds.delete(sessionId);
   }
 
   async dispose(): Promise<void> {
+    this.sessionConfigOptions.clear();
     this.adapter.dispose();
   }
 }

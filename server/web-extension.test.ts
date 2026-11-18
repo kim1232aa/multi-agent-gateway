@@ -2904,3 +2904,117 @@ test('review regression: Request init abort signal overrides original while sani
   override.abort();
   assert.equal(forwarded.signal.aborted, true);
 });
+
+test('gates message undo/fork buttons, session menu fork items, and right-panel side chat by provider capabilities', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+
+  const makeEl = (opts: { text?: string; ariaLabel?: string } = {}) => {
+    const attrs = new Map<string, string>();
+    if (opts.ariaLabel !== undefined) attrs.set('aria-label', opts.ariaLabel);
+    return {
+      hidden: false,
+      style: { display: '' },
+      textContent: opts.text ?? '',
+      getAttribute: (k: string) => attrs.get(k) ?? null,
+      setAttribute: (k: string, v: string) => attrs.set(k, v),
+      hasAttribute: (k: string) => attrs.has(k),
+      removeAttribute: (k: string) => attrs.delete(k),
+    };
+  };
+
+  const undoWrap = makeEl();
+  const copyBtn = makeEl({ ariaLabel: '复制' });
+  const forkMsgBtnZh = makeEl({ ariaLabel: '从此处分叉' });
+  const forkMsgBtnEn = makeEl({ ariaLabel: 'Fork from here' });
+  const headerFork = makeEl({ text: ' 分叉会话' });
+  const headerRename = makeEl({ text: ' 重命名' });
+  const sidebarFork = makeEl({ text: ' Fork session' });
+  const adminFork = makeEl({ text: ' Fork' });
+  const browserTabFork = makeEl({ text: ' 分叉会话' });
+  const sideChatBtn = makeEl({ text: '侧边聊天' });
+  const filesBtn = makeEl({ text: '文件' });
+
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    querySelector: () => null,
+    querySelectorAll: (selector: string) => {
+      if (selector === '.u-edit-wrap') return [undoWrap];
+      if (selector === 'button.a-cpbtn') return [copyBtn, forkMsgBtnZh, forkMsgBtnEn];
+      if (selector === '.ch-menu .ui-menu-item, .menu .ui-menu-item, .sa-menu .ui-menu-item') {
+        return [headerFork, headerRename, sidebarFork, adminFork];
+      }
+      if (selector === '.sit-link.sit-available') return [sideChatBtn, filesBtn];
+      return [];
+    },
+    addEventListener: () => {},
+    createElement: () => ({}),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    sessionStorage: { getItem: () => null, setItem: () => {} },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response(JSON.stringify({ code: 0, data: { providers: ['kimi', 'claude', 'codex', 'grok', 'pi', 'dsh'] } })),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const api = windowObject.__multiAgent;
+  await new Promise((r) => setTimeout(r, 20));
+
+  // DSH: rollback=false, fork=false, btw=false
+  api.setProvider('dsh');
+  assert.equal(undoWrap.style.display, 'none');
+  assert.equal(forkMsgBtnZh.style.display, 'none');
+  assert.equal(forkMsgBtnEn.style.display, 'none');
+  assert.equal(headerFork.style.display, 'none');
+  assert.equal(sidebarFork.style.display, 'none');
+  assert.equal(adminFork.style.display, 'none');
+  assert.equal(sideChatBtn.style.display, 'none');
+  // Unrelated buttons and browser-tab fork remain untouched
+  assert.equal(copyBtn.style.display, '');
+  assert.equal(headerRename.style.display, '');
+  assert.equal(filesBtn.style.display, '');
+  assert.equal(browserTabFork.style.display, '');
+
+  // Claude: rollback=false, fork=true, btw=false -> fork restores, undo & sideChat stay hidden
+  api.setProvider('claude');
+  assert.equal(undoWrap.style.display, 'none');
+  assert.equal(forkMsgBtnZh.style.display, '');
+  assert.equal(forkMsgBtnEn.style.display, '');
+  assert.equal(headerFork.style.display, '');
+  assert.equal(sidebarFork.style.display, '');
+  assert.equal(adminFork.style.display, '');
+  assert.equal(sideChatBtn.style.display, 'none');
+
+  // Codex: rollback=true, fork=true, btw=false -> undo & fork visible, sideChat hidden
+  api.setProvider('codex');
+  assert.equal(undoWrap.style.display, '');
+  assert.equal(forkMsgBtnZh.style.display, '');
+  assert.equal(sideChatBtn.style.display, 'none');
+
+  // Kimi: all restored
+  api.setProvider('kimi');
+  assert.equal(undoWrap.style.display, '');
+  assert.equal(forkMsgBtnZh.style.display, '');
+  assert.equal(sideChatBtn.style.display, '');
+});

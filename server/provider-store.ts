@@ -1,29 +1,42 @@
 /**
- * provider-store: gateway-owned third-party providers injected into each CLI at spawn time.
+ * provider-store: third-party providers the gateway hands to each CLI at launch.
  *
- * Zero-intrusion: nothing here writes a CLI's own config or credentials. A provider and its
- * key live under the gateway settings dir (0600); each CLI receives it through its documented
- * launch surface when the gateway starts that CLI's process:
- *   codex  `codex app-server -c model_providers.<id>.* -c model_provider=<id>` + env_key
- *   claude `--settings <gateway file>` with `env.ANTHROPIC_BASE_URL/AUTH_TOKEN` (flag layer
- *          outranks ~/.claude/settings.json; a process env var does not)
- *   grok   `GROK_MODELS_BASE_URL` + `XAI_API_KEY` + `GROK_CONFIG` models.default
- *   pi     `--extension <gateway file>` calling `pi.registerProvider()` with `apiKey: "$ENV"`
- *   dsh    `--patch <gateway file>` (YAML ⊇ JSON) adding an llm-pi-ai provider + acp default
- * Only processes started after a change pick it up; running sessions keep their provider.
+ * Two sources feed one catalog per CLI:
+ *   gateway  providers added in the Web UI, stored under the gateway settings dir (0600);
+ *   kimi     providers Kimi Code already has, read through `kimi provider list --json`
+ *            (read-only; keys stay in memory and reach a CLI only through its launch surface).
+ * A provider joins a CLI's catalog only when that CLI can speak its protocol.
+ *
+ * Zero-intrusion: nothing here writes a CLI's own config or credentials. Each CLI gets the
+ * catalog through its documented launch surface when the gateway starts its process:
+ *   codex  `-c model_providers.<id>.*` + env_key for every provider; the CLI default (its own
+ *          login) stays the default and a thread picks a provider via `modelProvider`
+ *   claude one provider per process: `--settings <gateway file>` with env.ANTHROPIC_* (the
+ *          flag layer outranks ~/.claude/settings.json; a process env var does not); every
+ *          model alias and the subagent model are pinned too (see claudeModelPins)
+ *   grok   one provider per process: `GROK_MODELS_BASE_URL` + `XAI_API_KEY`, and a `GROK_CONFIG`
+ *          overlay pinning Grok's side-request models to one the relay serves
+ *   pi     `--extension <gateway file>` calling `pi.registerProvider()` per provider, `$ENV` keys
+ *   dsh    `--patch <gateway file>` declaring every provider under llm-pi-ai, `apiKeyEnv` keys;
+ *          dsh-acp merges it into the user's own llm-pi-ai config first (see dsh-patch.ts)
+ * A model outside the CLI's own catalog is addressed as `@<provider key>:<model>`.
  */
 
-import { randomBytes } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 
 export type InjectableCli = 'codex' | 'claude' | 'grok' | 'pi' | 'dsh';
 
+const CLIS: readonly InjectableCli[] = ['codex', 'claude', 'grok', 'pi', 'dsh'];
+
 /** Wire protocol names the Kimi Web provider form offers (Z4e in the bundle). */
 export type WireProviderType = 'kimi' | 'openai' | 'openai_responses' | 'anthropic' | 'google-genai' | 'vertexai';
 
-/** Which form protocols each CLI can actually speak through its injection surface (verified per CLI). */
+/** Which protocols each CLI can actually speak through its injection surface (verified per CLI). */
 export const SUPPORTED_TYPES: Record<InjectableCli, readonly WireProviderType[]> = {
   codex: ['openai_responses'],
   claude: ['anthropic'],
@@ -31,6 +44,9 @@ export const SUPPORTED_TYPES: Record<InjectableCli, readonly WireProviderType[]>
   pi: ['openai', 'openai_responses', 'anthropic', 'google-genai'],
   dsh: ['openai', 'openai_responses', 'anthropic'],
 };
+
+/** CLIs whose provider is fixed per process: a model from another provider needs another process. */
+export const PROCESS_SCOPED: ReadonlySet<InjectableCli> = new Set(['claude', 'grok']);
 
 const PI_API: Partial<Record<WireProviderType, string>> = {
   openai: 'openai-completions',
@@ -45,6 +61,12 @@ const DSH_API: Partial<Record<WireProviderType, string>> = {
   anthropic: 'anthropic-messages',
 };
 
+/** Pi and DSH share these thinking level names (pi docs/rpc-commands.md, dsh-llm-pi-ai THINKING_LEVELS). */
+const THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** Codex ships these provider ids; a gateway provider must not silently replace one. */
+const CODEX_RESERVED = new Set(['openai', 'oss', 'ollama', 'lmstudio', 'amazon-bedrock']);
+
 /** Same id rule as the Kimi Web form (kR), so an id the form accepts is accepted here. */
 const ID_RE = /^[\p{L}\p{N}][\p{L}\p{N}\-_ ]*$/u;
 
@@ -54,6 +76,8 @@ const ModelSchema = z.object({
   max_context_size: z.number().int().nonnegative().optional(),
   max_output_size: z.number().int().nonnegative().optional(),
   capabilities: z.array(z.string().max(64)).max(32).optional(),
+  support_efforts: z.array(z.string().max(32)).max(16).optional(),
+  default_effort: z.string().max(32).optional(),
 });
 
 const ProviderSchema = z.object({
@@ -72,6 +96,26 @@ const FileSchema = z.object({
 
 export type InjectedModel = z.infer<typeof ModelSchema>;
 export type InjectedProvider = z.infer<typeof ProviderSchema>;
+export type ProviderSource = 'gateway' | 'kimi';
+
+/** One provider in a CLI's catalog. Never carries the key: safe to hand to adapters and DTOs. */
+export interface CatalogProvider {
+  /** Catalog key, unique per CLI: the gateway id, or `kimi.<id>` for a Kimi provider. */
+  key: string;
+  source: ProviderSource;
+  /** The id in its own source. */
+  id: string;
+  /** Grouping label for the model picker. */
+  label: string;
+  type: WireProviderType;
+  base_url: string;
+  models: InjectedModel[];
+  default_model?: string;
+}
+
+interface ResolvedProvider extends CatalogProvider {
+  apiKey: string;
+}
 
 export interface ProviderInput {
   id?: unknown;
@@ -96,6 +140,17 @@ export interface Injection {
 
 const EMPTY: Injection = { args: [], env: {} };
 
+/** `@<provider key>:<model>` — how a catalog model is addressed in the gateway. */
+export function encodeModelRef(key: string, model: string): string {
+  return `@${key}:${model}`;
+}
+
+export function parseModelRef(id: string | undefined | null): { key: string; model: string } | null {
+  if (typeof id !== 'string') return null;
+  const m = /^@([^:]+):(.+)$/s.exec(id.trim());
+  return m ? { key: m[1]!, model: m[2]! } : null;
+}
+
 function atomicWrite(path: string, text: string): void {
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
@@ -108,31 +163,217 @@ function atomicWrite(path: string, text: string): void {
   }
 }
 
-function envKeyName(cli: InjectableCli, id: string): string {
-  return `MAG_${cli.toUpperCase()}_KEY_${id.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`;
+function slug(value: string, allowed: RegExp): string {
+  return value.replace(allowed, '_');
 }
 
-/** Codex `-c` keys and model_provider ids must be bare TOML keys. */
-function codexProviderKey(id: string): string {
-  return `mag_${id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+function stripV1(url: string): string {
+  return url.replace(/\/v1\/?$/, '');
 }
 
-/** TOML literal for a `-c key=value` override (codex parses the value as TOML). */
-function tomlString(value: string): string {
-  return JSON.stringify(value);
+/**
+ * Claude Code resolves its aliases (opus/sonnet/haiku/fable), background work and subagents
+ * through these variables (code.claude.com/docs/en/model-config). Pinning all of them keeps every
+ * request on a model the relay serves, even when ~/.claude/settings.json sets them for another
+ * endpoint (the `--settings` layer wins over the user file).
+ */
+export function claudeModelPins(model: string): Record<string, string> {
+  return {
+    ANTHROPIC_MODEL: model,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: model,
+    CLAUDE_CODE_SUBAGENT_MODEL: model,
+  };
+}
+
+/**
+ * Grok's side requests (session titles/summaries, image description, prompt suggestions,
+ * web_search) default to xAI model ids, which a relay does not serve. `GROK_CONFIG` is Grok's
+ * documented overlay for ACP launchers (user-guide/05-configuration.md, `models` is allowlisted).
+ */
+function grokModelPins(model: string): string {
+  return JSON.stringify({
+    models: { session_summary: model, image_description: model, prompt_suggestion: model, web_search: model },
+  });
+}
+
+function thinkingLevels(m: InjectedModel): string[] {
+  const offered = new Set(m.support_efforts ?? []);
+  return THINKING_LEVELS.filter((level) => offered.has(level));
+}
+
+function hasThinking(m: InjectedModel): boolean {
+  return (m.capabilities ?? []).includes('thinking') || (m.support_efforts?.length ?? 0) > 0;
+}
+
+function inputModes(m: InjectedModel): string[] {
+  return (m.capabilities ?? []).includes('image_in') ? ['text', 'image'] : ['text'];
+}
+
+// ---------------------------------------------------------------------------
+// Kimi source: `kimi provider list --json`, read-only, refreshed when config.toml changes.
+// ---------------------------------------------------------------------------
+
+export interface KimiProviderSourceOptions {
+  bin?: string;
+  home?: string;
+  /** Replace the CLI call (tests). Must resolve to the command's stdout. */
+  run?: () => Promise<string>;
+  timeoutMs?: number;
+}
+
+/** Turn the `kimi provider list --json` payload into providers; drops ones without a usable key. */
+export function parseKimiProviderList(raw: unknown): Array<Omit<ResolvedProvider, 'key' | 'label' | 'source'> & { id: string }> {
+  if (!raw || typeof raw !== 'object') return [];
+  const root = raw as { providers?: unknown; models?: unknown };
+  const providers = root.providers && typeof root.providers === 'object' ? root.providers as Record<string, unknown> : {};
+  const models = root.models && typeof root.models === 'object' ? root.models as Record<string, unknown> : {};
+  const byProvider = new Map<string, InjectedModel[]>();
+  for (const value of Object.values(models)) {
+    if (!value || typeof value !== 'object') continue;
+    const m = value as Record<string, unknown>;
+    const provider = typeof m.provider === 'string' ? m.provider : '';
+    const model = typeof m.model === 'string' ? m.model.trim() : '';
+    if (!provider || !model) continue;
+    const overrides = m.overrides && typeof m.overrides === 'object' ? m.overrides as Record<string, unknown> : {};
+    const defaultEffort = typeof overrides.defaultEffort === 'string'
+      ? overrides.defaultEffort
+      : typeof m.defaultEffort === 'string' ? m.defaultEffort : undefined;
+    const parsed = ModelSchema.safeParse({
+      model,
+      ...(typeof m.displayName === 'string' && m.displayName ? { display_name: m.displayName } : {}),
+      ...(typeof m.maxContextSize === 'number' && m.maxContextSize > 0 ? { max_context_size: Math.floor(m.maxContextSize) } : {}),
+      ...(typeof m.maxOutputSize === 'number' && m.maxOutputSize > 0 ? { max_output_size: Math.floor(m.maxOutputSize) } : {}),
+      ...(Array.isArray(m.capabilities) ? { capabilities: m.capabilities.filter((c): c is string => typeof c === 'string') } : {}),
+      ...(Array.isArray(m.supportEfforts) ? { support_efforts: m.supportEfforts.filter((c): c is string => typeof c === 'string') } : {}),
+      ...(defaultEffort ? { default_effort: defaultEffort } : {}),
+    });
+    if (!parsed.success) continue;
+    const list = byProvider.get(provider) ?? [];
+    if (!list.some((x) => x.model === parsed.data.model)) list.push(parsed.data);
+    byProvider.set(provider, list);
+  }
+  const out: Array<Omit<ResolvedProvider, 'key' | 'label' | 'source'> & { id: string }> = [];
+  for (const [id, value] of Object.entries(providers)) {
+    if (!value || typeof value !== 'object') continue;
+    const p = value as Record<string, unknown>;
+    const type = p.type;
+    const baseUrl = typeof p.baseUrl === 'string' ? p.baseUrl.trim() : '';
+    const apiKey = typeof p.apiKey === 'string' ? p.apiKey.trim() : '';
+    const list = byProvider.get(id) ?? [];
+    if (!ID_RE.test(id) || !baseUrl || !apiKey || /[\r\n\0]/.test(apiKey) || list.length === 0) continue;
+    if (typeof type !== 'string' || !(ProviderSchema.shape.type.options as readonly string[]).includes(type)) continue;
+    try { new URL(baseUrl); } catch { continue; }
+    out.push({ id, type: type as WireProviderType, base_url: baseUrl, models: list, apiKey });
+  }
+  return out;
+}
+
+export class KimiProviderSource {
+  private readonly bin: string;
+  private readonly configFile: string;
+  private readonly run: () => Promise<string>;
+  private providers: ResolvedProvider[] = [];
+  private seenMtime: number | null = null;
+  private inflight: Promise<void> | null = null;
+  private listeners = new Set<() => void>();
+  /** Last load failure, shown in diagnostics; the previous snapshot stays in use. */
+  error: string | undefined;
+
+  constructor(options: KimiProviderSourceOptions = {}) {
+    const home = options.home ?? process.env.KIMI_CODE_HOME ?? join(homedir(), '.kimi-code');
+    const defaultBin = join(homedir(), '.kimi-code', 'bin', 'kimi');
+    this.bin = options.bin ?? process.env.KIMI_BIN ?? (existsSync(defaultBin) ? defaultBin : 'kimi');
+    this.configFile = join(home, 'config.toml');
+    const timeout = options.timeoutMs ?? 15_000;
+    this.run = options.run ?? (() => new Promise<string>((resolve, reject) => {
+      execFile(this.bin, ['provider', 'list', '--json'], { timeout, maxBuffer: 16 * 1024 * 1024, killSignal: 'SIGKILL' }, (err, stdout) => {
+        if (err) reject(err);
+        else resolve(stdout);
+      });
+    }));
+  }
+
+  onChange(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  snapshot(): readonly ResolvedProvider[] {
+    this.refreshIfStale();
+    return this.providers;
+  }
+
+  /** Reload when Kimi's config.toml changed since the last load (cheap stat, async reload). */
+  refreshIfStale(): void {
+    let mtime: number;
+    try { mtime = statSync(this.configFile).mtimeMs; } catch { mtime = 0; }
+    if (mtime === this.seenMtime || this.inflight) return;
+    void this.refresh().catch(() => undefined);
+  }
+
+  refresh(): Promise<void> {
+    if (this.inflight) return this.inflight;
+    let mtime: number;
+    try { mtime = statSync(this.configFile).mtimeMs; } catch { mtime = 0; }
+    this.inflight = this.run()
+      .then((stdout) => {
+        const before = fingerprint(this.providers);
+        this.providers = parseKimiProviderList(JSON.parse(stdout)).map((p) => ({
+          ...p,
+          key: `kimi.${p.id}`,
+          label: `kimi.${p.id}`,
+          source: 'kimi' as const,
+        }));
+        this.error = undefined;
+        this.seenMtime = mtime;
+        if (fingerprint(this.providers) !== before) for (const fn of this.listeners) fn();
+      })
+      .catch((err: unknown) => {
+        this.error = err instanceof Error ? err.message : String(err);
+        this.seenMtime = mtime;
+        throw err;
+      })
+      .finally(() => { this.inflight = null; });
+    return this.inflight;
+  }
+}
+
+function fingerprint(list: readonly ResolvedProvider[]): string {
+  const h = createHash('sha256');
+  for (const p of list) {
+    h.update(JSON.stringify([p.key, p.type, p.base_url, p.models, p.default_model ?? '']));
+    h.update(createHash('sha256').update(p.apiKey).digest('hex'));
+  }
+  return h.digest('hex');
+}
+
+// ---------------------------------------------------------------------------
+// ProviderStore
+// ---------------------------------------------------------------------------
+
+export interface ProviderStoreOptions {
+  /** Kimi Code providers to reuse; `null` turns the Kimi source off. */
+  kimi?: KimiProviderSource | null;
 }
 
 export class ProviderStore {
   private readonly file: string;
   private readonly keysFile: string;
   private readonly dir: string;
+  private readonly kimi: KimiProviderSource | null;
   private data: z.infer<typeof FileSchema> = { version: 1, providers: {}, active: {} };
   private keys: Record<string, string> = {};
+  private readonly listeners = new Set<(cli: InjectableCli) => void>();
+  private readonly lastPrint = new Map<InjectableCli, string>();
 
-  constructor(dir: string) {
+  constructor(dir: string, options: ProviderStoreOptions = {}) {
     this.dir = join(dir, 'providers');
     this.file = join(this.dir, 'providers.json');
     this.keysFile = join(this.dir, 'provider-keys.json');
+    this.kimi = options.kimi ?? null;
     try {
       const parsed = FileSchema.safeParse(JSON.parse(readFileSync(this.file, 'utf8')));
       if (parsed.success) this.data = parsed.data;
@@ -144,7 +385,39 @@ export class ProviderStore {
         for (const [k, v] of Object.entries(raw)) if (typeof v === 'string') this.keys[k] = v;
       }
     } catch { /* missing: empty */ }
+    for (const cli of CLIS) this.lastPrint.set(cli, fingerprint(this.resolved(cli)));
+    this.kimi?.onChange(() => this.emitChanges());
   }
+
+  /** Wait for the first Kimi load (bounded); the catalog works without it. */
+  async ready(timeoutMs = 20_000): Promise<void> {
+    if (!this.kimi) return;
+    const load = this.kimi.refresh().catch(() => undefined);
+    await Promise.race([load, new Promise<void>((resolve) => setTimeout(resolve, timeoutMs).unref?.())]);
+    for (const cli of CLIS) this.lastPrint.set(cli, fingerprint(this.resolved(cli)));
+  }
+
+  kimiError(): string | undefined {
+    return this.kimi?.error;
+  }
+
+  /** Called with the CLI whose catalog changed (gateway edit or Kimi config change). */
+  onChange(listener: (cli: InjectableCli) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private emitChanges(): void {
+    for (const cli of CLIS) {
+      const print = fingerprint(this.resolved(cli));
+      if (this.lastPrint.get(cli) === print) continue;
+      this.lastPrint.set(cli, print);
+      this.writeLaunchFiles(cli);
+      for (const fn of this.listeners) fn(cli);
+    }
+  }
+
+  // -- gateway-managed providers (Web UI CRUD) --------------------------------
 
   list(cli: InjectableCli): InjectedProvider[] {
     return [...(this.data.providers[cli] ?? [])];
@@ -158,27 +431,30 @@ export class ProviderStore {
     return Boolean(this.keys[`${cli}/${id}`]);
   }
 
+  /** Provider whose default model new sessions use; undefined = the CLI's own default. */
   activeId(cli: InjectableCli): string | undefined {
     const id = this.data.active[cli];
-    return id && this.get(cli, id) ? id : undefined;
+    return id && this.provider(cli, id) ? id : undefined;
   }
 
-  active(cli: InjectableCli): InjectedProvider | undefined {
-    const id = this.activeId(cli);
-    return id ? this.get(cli, id) : undefined;
-  }
-
-  setActive(cli: InjectableCli, id: string | null): void {
-    if (id === null) delete this.data.active[cli];
+  setActive(cli: InjectableCli, key: string | null): void {
+    if (key === null) delete this.data.active[cli];
     else {
-      if (!this.get(cli, id)) throw new ProviderStoreError(404, `provider ${id} not found`);
-      this.data.active[cli] = id;
+      if (!this.provider(cli, key)) throw new ProviderStoreError(404, `provider ${key} not found`);
+      this.data.active[cli] = key;
     }
     this.persist();
-    this.writeLaunchFiles(cli);
   }
 
-  /** Create (no `existingId`) or update a provider; the saved provider becomes the CLI's active one. */
+  /** Default model ref for new sessions, from the active provider; undefined = CLI default. */
+  defaultModelRef(cli: InjectableCli): string | undefined {
+    const key = this.activeId(cli);
+    const p = key ? this.provider(cli, key) : undefined;
+    if (!p) return undefined;
+    return encodeModelRef(p.key, p.default_model ?? p.models[0]!.model);
+  }
+
+  /** Create (no `existingId`) or update a gateway provider. */
   upsert(cli: InjectableCli, input: ProviderInput, existingId?: string): InjectedProvider {
     const current = existingId !== undefined ? this.get(cli, existingId) : undefined;
     if (existingId !== undefined && !current) throw new ProviderStoreError(404, `provider ${existingId} not found`);
@@ -201,6 +477,8 @@ export class ProviderStore {
             ...(row.max_context_size !== undefined ? { max_context_size: Number(row.max_context_size) } : {}),
             ...(row.max_output_size !== undefined ? { max_output_size: Number(row.max_output_size) } : {}),
             ...(Array.isArray(row.capabilities) ? { capabilities: row.capabilities } : {}),
+            ...(Array.isArray(row.support_efforts) ? { support_efforts: row.support_efforts } : {}),
+            ...(typeof row.default_effort === 'string' && row.default_effort ? { default_effort: row.default_effort } : {}),
           };
         })
       : current?.models;
@@ -237,9 +515,9 @@ export class ProviderStore {
     this.data.providers[cli] = nextList;
     if (oldKeyName && oldKeyName !== keyName) delete this.keys[oldKeyName];
     this.keys[keyName] = nextKey;
-    this.data.active[cli] = id;
+    if (existingId !== undefined && this.data.active[cli] === existingId) this.data.active[cli] = id;
     this.persist();
-    this.writeLaunchFiles(cli);
+    this.emitChanges();
     return provider;
   }
 
@@ -250,55 +528,117 @@ export class ProviderStore {
     delete this.keys[`${cli}/${id}`];
     if (this.data.active[cli] === id) delete this.data.active[cli];
     this.persist();
-    this.writeLaunchFiles(cli);
+    this.emitChanges();
   }
 
-  /** What to add to a CLI's spawn: extra argv and env. Empty when no gateway provider is active. */
-  injectionFor(cli: InjectableCli): Injection {
-    const provider = this.active(cli);
-    const key = provider ? this.keys[`${cli}/${provider.id}`] : undefined;
-    if (!provider || !key) return EMPTY;
-    const model = provider.default_model ?? provider.models[0]!.model;
-    const envKey = envKeyName(cli, provider.id);
-    switch (cli) {
-      case 'codex': {
-        const pid = codexProviderKey(provider.id);
-        return {
-          args: [
-            '-c', `model_providers.${pid}.name=${tomlString(provider.id)}`,
-            '-c', `model_providers.${pid}.base_url=${tomlString(provider.base_url)}`,
-            '-c', `model_providers.${pid}.wire_api="responses"`,
-            '-c', `model_providers.${pid}.env_key=${tomlString(envKey)}`,
-            '-c', `model_provider=${tomlString(pid)}`,
-            '-c', `model=${tomlString(model)}`,
-          ],
-          env: { [envKey]: key },
-        };
+  // -- catalog ----------------------------------------------------------------
+
+  private resolved(cli: InjectableCli): ResolvedProvider[] {
+    const supported = SUPPORTED_TYPES[cli] as readonly string[];
+    const out: ResolvedProvider[] = [];
+    for (const p of this.data.providers[cli] ?? []) {
+      const apiKey = this.keys[`${cli}/${p.id}`];
+      if (!apiKey || !supported.includes(p.type)) continue;
+      out.push({ ...p, key: p.id, label: p.id, source: 'gateway', apiKey });
+    }
+    for (const p of this.kimi?.snapshot() ?? []) {
+      if (supported.includes(p.type)) out.push(p);
+    }
+    return out;
+  }
+
+  /** Providers this CLI can use, gateway first. Contains no keys. */
+  catalog(cli: InjectableCli): CatalogProvider[] {
+    return this.resolved(cli).map(({ apiKey: _key, ...rest }) => rest);
+  }
+
+  provider(cli: InjectableCli, key: string): CatalogProvider | undefined {
+    return this.catalog(cli).find((p) => p.key === key);
+  }
+
+  /** Change marker for a CLI's catalog; adapters respawn processes when it moves. */
+  catalogFingerprint(cli: InjectableCli): string {
+    return fingerprint(this.resolved(cli));
+  }
+
+  /** The id this provider has inside the CLI (`modelProvider`, Pi provider, DSH route). */
+  cliProviderId(cli: InjectableCli, key: string): string | undefined {
+    return this.namesFor(cli).get(key)?.cliId;
+  }
+
+  private namesFor(cli: InjectableCli): Map<string, { cliId: string; envKey: string }> {
+    const used = new Set<string>();
+    const usedEnv = new Set<string>();
+    const unique = (base: string, set: Set<string>): string => {
+      let name = base;
+      for (let i = 2; set.has(name); i++) name = `${base}_${i}`;
+      set.add(name);
+      return name;
+    };
+    const names = new Map<string, { cliId: string; envKey: string }>();
+    for (const p of this.resolved(cli)) {
+      const tag = p.source === 'kimi' ? 'KIMI' : 'KEY';
+      const envKey = unique(`MAG_${cli.toUpperCase()}_${tag}_${slug(p.id, /[^A-Za-z0-9]/g).toUpperCase()}`, usedEnv);
+      let cliId: string;
+      if (cli === 'codex') {
+        const base = slug(p.id, /[^A-Za-z0-9_-]/g);
+        cliId = p.source === 'kimi' ? `kimi_${base}` : CODEX_RESERVED.has(base) ? `mag_${base}` : base;
+      } else if (cli === 'pi') {
+        const base = p.id.replace(/[^A-Za-z0-9_-]/g, '-');
+        cliId = p.source === 'kimi' ? `mag-kimi-${base}` : `gw-${base}`;
+      } else if (cli === 'dsh') {
+        const base = slug(p.id, /[^A-Za-z0-9_-]/g);
+        cliId = p.source === 'kimi' ? `mag_kimi_${base}` : `gw_${base}`;
+      } else {
+        cliId = p.key;
       }
-      case 'claude':
-        return { args: ['--settings', this.launchFile('claude', 'json')], env: {} };
-      case 'grok':
+      names.set(p.key, { cliId: unique(cliId, used), envKey });
+    }
+    return names;
+  }
+
+  /**
+   * What to add to a CLI spawn. Codex, Pi and DSH get every provider at once (a session
+   * picks one by id). Claude and Grok get exactly the provider `key` names, or nothing —
+   * which leaves the CLI on its own login and config.
+   */
+  injectionFor(cli: InjectableCli, key?: string): Injection {
+    const list = this.resolved(cli);
+    const names = this.namesFor(cli);
+    if (cli === 'claude' || cli === 'grok') {
+      const p = key ? list.find((x) => x.key === key) : undefined;
+      if (!p) return EMPTY;
+      if (cli === 'grok') {
         return {
           args: [],
           env: {
-            GROK_MODELS_BASE_URL: provider.base_url,
-            XAI_API_KEY: key,
-            GROK_CONFIG: JSON.stringify({ models: { default: model } }),
+            GROK_MODELS_BASE_URL: p.base_url,
+            XAI_API_KEY: p.apiKey,
+            GROK_CONFIG: grokModelPins(p.default_model ?? p.models[0]!.model),
           },
         };
-      case 'pi':
-        return { args: ['--extension', this.launchFile('pi', 'ts')], env: { [envKey]: key } };
-      case 'dsh':
-        return { args: ['--patch', this.launchFile('dsh', 'yml')], env: { [envKey]: key } };
+      }
+      return { args: ['--settings', this.writeClaudeSettings(p)], env: {} };
     }
-  }
-
-  /** Model id the CLI will see for the active provider (Pi prefixes the provider). */
-  activeModelId(cli: InjectableCli): string | undefined {
-    const provider = this.active(cli);
-    if (!provider) return undefined;
-    const model = provider.default_model ?? provider.models[0]!.model;
-    return cli === 'pi' ? `${piProviderName(provider.id)}/${model}` : model;
+    if (list.length === 0) return EMPTY;
+    const env: Record<string, string> = {};
+    for (const p of list) env[names.get(p.key)!.envKey] = p.apiKey;
+    if (cli === 'codex') {
+      const args: string[] = [];
+      for (const p of list) {
+        const { cliId, envKey } = names.get(p.key)!;
+        args.push(
+          '-c', `model_providers.${cliId}.name=${JSON.stringify(p.label)}`,
+          '-c', `model_providers.${cliId}.base_url=${JSON.stringify(p.base_url)}`,
+          '-c', `model_providers.${cliId}.wire_api="responses"`,
+          '-c', `model_providers.${cliId}.env_key=${JSON.stringify(envKey)}`,
+        );
+      }
+      return { args, env };
+    }
+    const file = this.writeLaunchFiles(cli);
+    if (!file) return EMPTY;
+    return { args: [cli === 'pi' ? '--extension' : '--patch', file], env };
   }
 
   private launchFile(cli: InjectableCli, ext: string): string {
@@ -311,88 +651,183 @@ export class ProviderStore {
     atomicWrite(this.keysFile, JSON.stringify(this.keys));
   }
 
-  /** Rewrite (or delete) the per-CLI file a launch flag points at. */
-  writeLaunchFiles(cli: InjectableCli): void {
-    const provider = this.active(cli);
-    const key = provider ? this.keys[`${cli}/${provider.id}`] : undefined;
-    const ext = cli === 'claude' ? 'json' : cli === 'pi' ? 'ts' : cli === 'dsh' ? 'yml' : null;
-    if (!ext) return;
-    const file = this.launchFile(cli, ext);
-    if (!provider || !key) {
-      try { unlinkSync(file); } catch { /* ignore */ }
-      return;
-    }
+  /** Claude's `--settings` file for one provider (the only launch surface that outranks ~/.claude). */
+  private writeClaudeSettings(p: ResolvedProvider): string {
     mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    const model = provider.default_model ?? provider.models[0]!.model;
-    const envKey = envKeyName(cli, provider.id);
+    const tag = createHash('sha256').update(p.key).digest('hex').slice(0, 12);
+    const file = join(this.dir, `inject.claude.${tag}.json`);
+    const model = p.default_model ?? p.models[0]!.model;
+    atomicWrite(file, JSON.stringify({
+      env: {
+        ANTHROPIC_BASE_URL: stripV1(p.base_url),
+        ANTHROPIC_AUTH_TOKEN: p.apiKey,
+        ANTHROPIC_API_KEY: '',
+        ...claudeModelPins(model),
+      },
+      model,
+    }));
+    return file;
+  }
+
+  /** Rewrite (or delete) the Pi extension / DSH patch for a CLI. Returns the file, if any. */
+  writeLaunchFiles(cli: InjectableCli): string | undefined {
     if (cli === 'claude') {
-      atomicWrite(file, JSON.stringify({
-        env: {
-          ANTHROPIC_BASE_URL: provider.base_url.replace(/\/v1\/?$/, ''),
-          ANTHROPIC_AUTH_TOKEN: key,
-          ANTHROPIC_API_KEY: '',
-          ANTHROPIC_MODEL: model,
-        },
-        model,
-      }));
-    } else if (cli === 'pi') {
-      const api = PI_API[provider.type];
-      const spec = {
-        name: provider.id,
-        baseUrl: provider.base_url,
-        apiKey: `$${envKey}`,
-        api,
-        models: provider.models.map((m) => ({
-          id: m.model,
-          name: m.display_name ?? m.model,
-          reasoning: (m.capabilities ?? []).includes('thinking'),
-          input: (m.capabilities ?? []).includes('image_in') ? ['text', 'image'] : ['text'],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: m.max_context_size || 128000,
-          maxTokens: m.max_output_size || 16384,
-        })),
-      };
+      this.pruneClaudeFiles();
+      return undefined;
+    }
+    if (cli !== 'pi' && cli !== 'dsh') return undefined;
+    const file = this.launchFile(cli, cli === 'pi' ? 'ts' : 'yml');
+    const list = this.resolved(cli);
+    if (list.length === 0) {
+      try { unlinkSync(file); } catch { /* ignore */ }
+      return undefined;
+    }
+    const names = this.namesFor(cli);
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    if (cli === 'pi') {
+      const calls = list.map((p) => {
+        const { cliId, envKey } = names.get(p.key)!;
+        const anthropic = p.type === 'anthropic';
+        const spec = {
+          name: p.label,
+          baseUrl: anthropic ? stripV1(p.base_url) : p.base_url,
+          apiKey: `$${envKey}`,
+          api: PI_API[p.type],
+          models: p.models.map((m) => {
+            const reasoning = hasThinking(m);
+            const levels = thinkingLevels(m);
+            return {
+              id: m.model,
+              name: m.display_name ?? m.model,
+              reasoning,
+              input: inputModes(m),
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: m.max_context_size || 128000,
+              maxTokens: m.max_output_size || 16384,
+              ...(reasoning && levels.length > 0
+                ? { thinkingLevelMap: Object.fromEntries(THINKING_LEVELS.map((l) => [l, levels.includes(l) ? l : null])) }
+                : {}),
+            };
+          }),
+        };
+        return `  pi.registerProvider(${JSON.stringify(cliId)}, ${JSON.stringify(spec)});`;
+      });
       atomicWrite(file, [
-        '// Generated by multi-agent-gateway: registers the gateway-managed provider for this Pi process only.',
-        `export default function (pi: any) { pi.registerProvider(${JSON.stringify(piProviderName(provider.id))}, ${JSON.stringify(spec)}); }`,
+        '// Generated by multi-agent-gateway: registers gateway and Kimi providers for this Pi process only.',
+        'export default function (pi: any) {',
+        ...calls,
+        '}',
         '',
       ].join('\n'));
-    } else {
-      const name = `gw_${provider.id.replace(/[^A-Za-z0-9_-]/g, '_')}`;
-      atomicWrite(file, JSON.stringify([
-        {
-          id: 'llm-pi-ai',
-          config: {
-            providers: {
-              [name]: {
-                apiKeyEnv: envKey,
-                displayName: provider.id,
-                api: DSH_API[provider.type],
-                baseURL: provider.type === 'anthropic' ? provider.base_url.replace(/\/v1\/?$/, '') : provider.base_url,
-                models: provider.models.map((m) => ({
-                  id: m.model,
-                  displayName: m.display_name ?? m.model,
-                  input: (m.capabilities ?? []).includes('image_in') ? ['text', 'image'] : ['text'],
-                })),
-              },
-            },
-          },
-        },
-        { id: 'acp', config: { provider: name, model } },
-      ], null, 2));
+      return file;
+    }
+    const providers: Record<string, unknown> = {};
+    for (const p of list) {
+      const { cliId, envKey } = names.get(p.key)!;
+      providers[cliId] = {
+        apiKeyEnv: envKey,
+        displayName: p.label,
+        api: DSH_API[p.type],
+        baseURL: p.type === 'anthropic' ? stripV1(p.base_url) : p.base_url,
+        models: p.models.map((m) => {
+          const levels = thinkingLevels(m);
+          return {
+            id: m.model,
+            name: m.display_name ?? m.model,
+            input: inputModes(m),
+            ...(m.max_context_size ? { contextWindow: m.max_context_size } : {}),
+            ...(m.max_output_size ? { maxTokens: m.max_output_size } : {}),
+            ...(!hasThinking(m)
+              ? { reasoningEfforts: false }
+              : levels.length > 0 ? { reasoningEfforts: Object.fromEntries(levels.map((l) => [l, l])) } : {}),
+          };
+        }),
+      };
+    }
+    atomicWrite(file, JSON.stringify([{ id: 'llm-pi-ai', config: { providers } }], null, 2));
+    return file;
+  }
+
+  /** Drop Claude settings files of providers that left the catalog (they hold keys). */
+  private pruneClaudeFiles(): void {
+    const keep = new Set(this.resolved('claude').map((p) => `inject.claude.${createHash('sha256').update(p.key).digest('hex').slice(0, 12)}.json`));
+    let entries: string[] = [];
+    try { entries = readdirSync(this.dir); } catch { return; }
+    for (const name of entries) {
+      if (/^inject\.claude\.(?:[0-9a-f]{12}\.)?json$/.test(name) && !keep.has(name)) {
+        try { unlinkSync(join(this.dir, name)); } catch { /* ignore */ }
+      }
     }
   }
 
-  /** Regenerate every launch file (startup: keeps them in sync with providers.json). */
+  /** Regenerate every launch file (startup: keeps them in sync with the catalog). */
   syncLaunchFiles(): void {
-    for (const cli of Object.keys(SUPPORTED_TYPES) as InjectableCli[]) {
+    for (const cli of CLIS) {
       try { this.writeLaunchFiles(cli); } catch (err) {
         console.warn(`[providers] could not write ${cli} launch file: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   }
+
+  /**
+   * The model id a CLI itself uses for a catalog ref: Pi `<provider>/<model>`, DSH's ACP option
+   * value `["<route>","<model>"]`, otherwise the bare model (Codex/Claude/Grok pick the provider
+   * per thread or per process). Undefined when the ref is not in this CLI's catalog.
+   */
+  cliModelId(cli: InjectableCli, ref: string): string | undefined {
+    const parsed = parseModelRef(ref);
+    if (!parsed) return undefined;
+    const p = this.provider(cli, parsed.key);
+    if (!p) return undefined;
+    const cliId = this.cliProviderId(cli, p.key)!;
+    if (cli === 'pi') return `${cliId}/${parsed.model}`;
+    if (cli === 'dsh') return JSON.stringify([cliId, parsed.model]);
+    return parsed.model;
+  }
+
+  /** Reverse of {@link cliProviderId}: which catalog provider a CLI-side provider id belongs to. */
+  keyForCliProvider(cli: InjectableCli, cliId: string): string | undefined {
+    for (const [key, names] of this.namesFor(cli)) if (names.cliId === cliId) return key;
+    return undefined;
+  }
+
+  /** A CLI-bound view handed to one adapter. */
+  forCli(cli: InjectableCli): CliProviders {
+    return {
+      cli,
+      catalog: () => this.catalog(cli),
+      provider: (key) => this.provider(cli, key),
+      injection: (key) => this.injectionFor(cli, key),
+      cliProviderId: (key) => this.cliProviderId(cli, key),
+      keyForCliProvider: (cliId) => this.keyForCliProvider(cli, cliId),
+      cliModelId: (ref) => this.cliModelId(cli, ref),
+      fingerprint: () => this.catalogFingerprint(cli),
+      defaultModelRef: () => this.defaultModelRef(cli),
+    };
+  }
 }
 
-export function piProviderName(id: string): string {
-  return `gw-${id.replace(/[^A-Za-z0-9_-]/g, '-')}`;
+/**
+ * What an adapter sees of the provider catalog. Model refs look like `@<key>:<model>`
+ * (see {@link encodeModelRef}); a model id without that shape belongs to the CLI itself.
+ */
+export interface CliProviders {
+  readonly cli: InjectableCli;
+  /** Providers this CLI can use (gateway first, then Kimi). No keys. */
+  catalog(): CatalogProvider[];
+  provider(key: string): CatalogProvider | undefined;
+  /**
+   * Spawn additions. Codex/Pi/DSH: all providers, ignore `key`. Claude/Grok: only `key`'s
+   * provider; no key (or unknown key) = empty = the CLI's own login and config.
+   */
+  injection(key?: string): Injection;
+  /** Provider id inside the CLI: Codex `modelProvider`, Pi provider name, DSH route. */
+  cliProviderId(key: string): string | undefined;
+  keyForCliProvider(cliId: string): string | undefined;
+  /** The CLI's own model id for a ref (Pi `p/m`, DSH option value, else bare model). */
+  cliModelId(ref: string): string | undefined;
+  /** Changes whenever the catalog or a key changes; respawn long-lived processes on change. */
+  fingerprint(): string;
+  /** Default model ref for new sessions (from the active provider); undefined = CLI default. */
+  defaultModelRef(): string | undefined;
 }

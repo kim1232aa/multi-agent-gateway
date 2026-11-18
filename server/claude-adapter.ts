@@ -15,6 +15,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { claudeModelPins, parseModelRef, type CliProviders } from "./provider-store.js";
 import * as fs from "node:fs";
 import { constants as fsConstants, promises as fsp } from "node:fs";
 import * as os from "node:os";
@@ -507,8 +508,7 @@ export interface ClaudeAdapterOptions {
   projectsDir?: string;
   /** Root Claude config dir. Default `CLAUDE_CONFIG_DIR || ~/.claude`. */
   configDir?: string;
-  /** Gateway-managed provider (`--settings <gateway file>`), read at every spawn. */
-  injection?: () => { args: string[]; env: Record<string, string> };
+  providers?: CliProviders;
 }
 
 // ---------------------------------------------------------------------------
@@ -672,11 +672,16 @@ export class ClaudeAdapter {
     this.configDir = this.explicitConfigDir ?? path.join(this.homeDir, ".claude");
     this.env = { ...DEFAULT_ENV, ...(options.env ?? {}) };
     this.projectsDir = options.projectsDir ?? path.join(this.configDir, "projects");
-    this.injection = options.injection;
+    this.providers = options.providers;
   }
 
-  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private readonly providers?: CliProviders;
   private versionCache: string | undefined;
+
+  isRunning(sessionId: string): boolean {
+    return this.running.has(sessionId);
+  }
+
 
   /**
    * Claude CLI 版本,来自 initialize 握手回包的 `claude_code_version`(不额外起进程),
@@ -695,24 +700,50 @@ export class ClaudeAdapter {
     return this.versionCache;
   }
 
-  private childEnv(): NodeJS.ProcessEnv {
-    return buildClaudeChildEnv({ ...this.env, ...(this.injection?.().env ?? {}) }, this.explicitConfigDir);
+  private childEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
+    return buildClaudeChildEnv({ ...this.env, ...overrides }, this.explicitConfigDir);
   }
 
   /**
-   * `--settings` for a spawn. Claude takes one `--settings`; a turn's own inline settings are
-   * merged over the gateway provider file so neither is dropped.
+   * `--settings` for one turn. With a catalog provider (`key`), the provider's launch file is
+   * merged with `inline`, and every model alias plus the subagent model is pinned to this turn's
+   * `model`, so background work and subagents stay on a model the relay serves.
    */
-  private settingsArgs(inline?: Record<string, unknown>): string[] {
-    const injected = this.injection?.().args ?? [];
-    const at = injected.indexOf("--settings");
-    const file = at >= 0 ? injected[at + 1] : undefined;
-    if (!inline) return file ? ["--settings", file] : [];
-    if (!file) return ["--settings", JSON.stringify(inline)];
-    let base: Record<string, unknown> = {};
-    try { base = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>; } catch { /* missing: inline only */ }
-    const env = { ...((base.env as Record<string, unknown>) ?? {}), ...((inline.env as Record<string, unknown>) ?? {}) };
-    return ["--settings", JSON.stringify({ ...base, ...inline, ...(Object.keys(env).length ? { env } : {}) })];
+  private settingsArgs(inline?: Record<string, unknown>, key?: string, model?: string): {
+    args: string[]; env?: Record<string, string>; secrets: string[]; cleanup?: () => void;
+  } {
+    if (!key) return { args: inline ? ["--settings", JSON.stringify(inline)] : [], secrets: [] };
+    let tempDir: string | undefined;
+    const cleanup = (): void => {
+      if (tempDir) {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    };
+    try {
+      const injected = this.providers?.injection(key);
+      const at = injected?.args.indexOf("--settings") ?? -1;
+      const file = at < 0 ? undefined : injected?.args[at + 1];
+      if (!file) throw new Error("Missing launch settings");
+      const base = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+      const pins = model && model !== base.model ? claudeModelPins(model) : {};
+      const env = {
+        ...(inline?.env as Record<string, unknown> | undefined),
+        ...(base.env as Record<string, unknown> | undefined),
+        ...pins,
+      };
+      const secrets = [
+        ...Object.values(injected?.env ?? {}),
+        ...Object.entries(env).filter(([name]) => /(?:KEY|TOKEN|SECRET)/i.test(name)).map(([, value]) => value),
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+      if (!inline && Object.keys(pins).length === 0) return { args: ["--settings", file], env: injected?.env, secrets };
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mag-claude-settings-"));
+      const merged = path.join(tempDir, "settings.json");
+      fs.writeFileSync(merged, JSON.stringify({ ...base, ...inline, ...(model ? { model } : {}), env }), { mode: 0o600, flag: "wx" });
+      return { args: ["--settings", merged], env: injected?.env, secrets, cleanup };
+    } catch {
+      cleanup();
+      throw new ProviderError("invalid_request", "无法读取或合并所选供应商的启动设置，未启动 Claude。", 400);
+    }
   }
 
   /** 等某会话的 running 进程退出;超时返回(不抛错,调用方自行判活)。 */
@@ -1537,7 +1568,12 @@ export class ClaudeAdapter {
       args.push("--resume", sessionId);
       if (opts.fork) args.push("--fork-session");
     }
-    const model = opts.model;
+    const id = opts.model;
+    const ref = parseModelRef(id);
+    if (ref && !this.providers?.provider(ref.key)) {
+      throw new ProviderError("invalid_request", "所选模型的供应商不在当前目录中，请刷新模型目录后重试。", 400);
+    }
+    const model = ref ? ref.model : id;
     const effort = opts.effort;
     const permissionMode = opts.permissionMode ?? opts.permission_mode;
 
@@ -1559,14 +1595,32 @@ export class ClaudeAdapter {
     const merged = ultracode
       ? { ...(opts.settings ?? {}), ...ultracode }
       : opts.settings;
-    args.push(...this.settingsArgs(merged));
+    const launch = this.settingsArgs(merged, ref?.key, ref ? model : undefined);
+    args.push(...launch.args);
+    const redact = (text: string): string => {
+      for (const secret of launch.secrets) text = text.split(secret).join('[REDACTED]');
+      return text;
+    };
+    const redactValue = (value: unknown): unknown => {
+      if (typeof value === 'string') return redact(value);
+      if (Array.isArray(value)) return value.map(redactValue);
+      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [redact(k), redactValue(v)]));
+      return value;
+    };
 
-    const child = spawn(this.claudeBin, args, {
-      cwd,
-      env: this.childEnv(),
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
+    let child: ChildProcess;
+    try {
+      child = spawn(this.claudeBin, args, {
+        cwd,
+        env: this.childEnv(launch.env),
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+      });
+    } catch (err) {
+      launch.cleanup?.();
+      if (launch.secrets.length) throw new Error('Claude 进程启动失败');
+      throw err;
+    }
     this.running.set(sessionId, child);
     const controlState: SessionControlState = {
       pendingOutbound: new Map(),
@@ -1577,7 +1631,7 @@ export class ClaudeAdapter {
 
     let stderrTail = "";
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderrTail = (stderrTail + chunk.toString("utf8")).slice(-4000);
+      stderrTail = redact(stderrTail + chunk.toString("utf8")).slice(-4000);
     });
 
     const cleanupTurnState = (err?: Error): void => {
@@ -1598,6 +1652,7 @@ export class ClaudeAdapter {
         let ev: any;
         try {
           ev = JSON.parse(line);
+          if (launch.secrets.length) ev = redactValue(ev);
         } catch {
           return; // non-JSON noise
         }
@@ -1654,13 +1709,16 @@ export class ClaudeAdapter {
       });
 
       child.on("error", (err) => {
+        launch.cleanup?.();
         endStdin(child);
-        cleanupTurnState(err);
-        onEvent({ type: "error", message: `spawn failed: ${err.message}` });
-        reject(err);
+        const safeErr = launch.secrets.length ? new Error(redact(err.message)) : err;
+        cleanupTurnState(safeErr);
+        onEvent({ type: "error", message: `spawn failed: ${safeErr.message}` });
+        reject(safeErr);
       });
 
       child.on("close", (code, signal) => {
+        launch.cleanup?.();
         endStdin(child);
         cleanupTurnState();
         const wasInterrupted =
@@ -1710,7 +1768,6 @@ export class ClaudeAdapter {
       "--verbose",
       "--resume", sessionId,
       "--fork-session",
-      ...this.settingsArgs(),
     ];
     if (this.closed) {
       throw new ProviderError("not_found", "claude adapter closed", 404);
@@ -2392,7 +2449,7 @@ export class ClaudeAdapter {
       const requestId = request.subtype === "initialize" ? "gw_init" : `probe_${randomUUID()}`;
       const child = spawn(
         this.claudeBin,
-        ["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", ...this.settingsArgs()],
+        ["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
         { cwd: cwd ?? os.homedir(), env: this.childEnv(), stdio: ["pipe", "pipe", "pipe"], detached: true },
       );
       this.activeProbes.add(child);

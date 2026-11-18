@@ -1380,6 +1380,54 @@
     });
   }
 
+  function setActionHidden(el, hide) {
+    if (!el || !el.style) return;
+    if (hide) {
+      el.hidden = true;
+      el.style.display = 'none';
+      if (el.setAttribute) el.setAttribute('data-multi-agent-action-hidden', '');
+    } else if (el.hasAttribute && el.hasAttribute('data-multi-agent-action-hidden')) {
+      el.hidden = false;
+      el.style.display = '';
+      if (el.removeAttribute) el.removeAttribute('data-multi-agent-action-hidden');
+    }
+  }
+
+  function gateConversationActions() {
+    if (!document.querySelectorAll) return;
+    var provider = selectedProvider();
+    var caps = getCapabilities(provider);
+
+    // 消息撤回图标（.u-edit-wrap）：Claude / Pi / DSH 不支持 rollback，隐藏以避免点击触发 400。
+    document.querySelectorAll('.u-edit-wrap').forEach(function (el) {
+      setActionHidden(el, !caps.rollback);
+    });
+
+    // 消息级「从此处分叉」按钮：共享 .a-cpbtn 类，必须严格按 aria-label 匹配，不能误伤复制按钮。
+    document.querySelectorAll('button.a-cpbtn').forEach(function (btn) {
+      var aria = btn.getAttribute ? String(btn.getAttribute('aria-label') || '').trim().toLowerCase() : '';
+      if (aria === '从此处分叉' || aria === 'fork from here') {
+        setActionHidden(btn, !caps.fork);
+      }
+    });
+
+    // 头部 .ch-menu、侧栏 .menu、会话管理 .sa-menu 中的分叉菜单项（不触碰浏览器标签页菜单）。
+    document.querySelectorAll('.ch-menu .ui-menu-item, .menu .ui-menu-item, .sa-menu .ui-menu-item').forEach(function (item) {
+      var text = String(item.textContent || '').trim().toLowerCase();
+      if (text === '分叉会话' || text === 'fork session' || text === 'fork') {
+        setActionHidden(item, !caps.fork);
+      }
+    });
+
+    // 右侧「可打开」面板中的「侧边聊天」入口对应 :btw，目前仅 Kimi 原生支持。
+    document.querySelectorAll('.sit-link.sit-available').forEach(function (btn) {
+      var text = String(btn.textContent || '').trim().toLowerCase();
+      if (text === '侧边聊天' || text === 'side chat') {
+        setActionHidden(btn, !caps.btw);
+      }
+    });
+  }
+
   // 官方 2.6.2 SlashMenu 内置 /swarm /tower /goal /btw /compact /undo /fork 等。移动端走 .slash-menu.is-sheet。
   // 基于 providerCapabilities 动态门控 Tier-1 命令，未就绪时回退安全默认值。
   function blockedSlashNames(provider) {
@@ -1756,10 +1804,26 @@
       updateSegIndicator(seg);
     }
     gateModes();
+    gateConversationActions();
     gateSlashMenu();
     enhanceQuestionCards();
     syncExtBar();
+    cleanModelMeta();
     if (pendingProviderRefresh) refreshProviderData();
+  }
+
+  // 模型选择器每行都会拼「{size} ctx」；CLI 没报上下文长度时原版会显示 "undefined ctx" / "0 ctx"。
+  // 只改 Vue 持有的那个文本节点的 nodeValue（不换节点），Vue 下次 patch 仍能正常更新它。
+  var UNKNOWN_CTX_RE = /^(?:0|undefined|NaN)\s*ctx$/;
+  function cleanModelMeta() {
+    if (selectedProvider() === 'kimi' || !document.querySelectorAll) return;
+    document.querySelectorAll('.model-meta').forEach(function (el) {
+      var node = el.firstChild;
+      if (!node || node.nodeType !== 3 || typeof node.nodeValue !== 'string') return;
+      var parts = node.nodeValue.split(' · ');
+      var kept = parts.filter(function (part) { return !UNKNOWN_CTX_RE.test(part.trim()); });
+      if (kept.length !== parts.length) node.nodeValue = kept.join(' · ');
+    });
   }
 
   var lastRouteProvider = selectedProvider();
@@ -1787,7 +1851,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', syncUi, { once: true });
   }
   var syncTimer = null;
-  var uiMutationSelector = '.side-footer, .user-menu-trigger, .view-tabs, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard, .qcard, .qpane, .qopts, .composer, .empty-composer';
+  var uiMutationSelector = '.side-footer, .user-menu-trigger, .view-tabs, .multi-agent-provider-wrap, .multi-agent-provider-seg, .am-row, .slash-menu, .slash-name, .wizard, .qcard, .qpane, .qopts, .composer, .empty-composer, .model-meta, .u-edit-wrap, .u-edit, .a-cpbtn, .ch-menu, .menu, .sa-menu, .ui-menu, .sit-link, .m-user, .m-assistant';
   function scheduleSyncUi() {
     if (syncTimer !== null) return;
     syncTimer = setTimeout(function () {

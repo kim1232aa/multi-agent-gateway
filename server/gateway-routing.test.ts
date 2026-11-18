@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import type { ProviderAdapter, ProviderCapabilities, NativeModel, NativeCommand, Session, SessionPage, Message, StartTurnInput, TurnHandle, ApprovalDecision, HistoryQuery, ListSessionsQuery, CreateSessionInput, SubagentInfo } from './types.js';
 import type { TranscriptTask } from './local-transcript.js';
 import { activeKimiTier1Names, collectSessionWireTasks, detectAvailableProviders, executeCodexCommand, formatCodexAccountUsage, parseWireThinkingPatch, renderCodexUsage, SessionHub, skillDto, startGateway } from './gateway.js';
+import { KimiProviderSource } from './provider-store.js';
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
 
@@ -2739,14 +2740,15 @@ test('gateway-injected providers: CRUD, native row read-only, protocol check, ad
     });
     assert.equal(created.status, 200);
     assert.equal(created.body.data.has_api_key, true);
-    assert.equal(created.body.data.status, 'connected');
+    // 添加只进目录,不抢默认:新会话仍用 CLI 自己的默认,直到用户选它。
+    assert.equal(created.body.data.status, 'inactive');
     assert.equal(created.body.data.api_key, undefined);
     assert.equal(changed, 1);
 
     const list = await call('GET', '/providers?provider=grok');
     assert.deepEqual(list.body.data.items.map((p: any) => [p.id, p.status, p.read_only]), [
-      ['grok', 'inactive', true],
-      ['relay', 'connected', false],
+      ['grok', 'connected', true],
+      ['relay', 'inactive', false],
     ]);
     assert.ok(!JSON.stringify(list.body).includes('sk-x'));
 
@@ -2757,9 +2759,12 @@ test('gateway-injected providers: CRUD, native row read-only, protocol check, ad
     assert.equal(updated.body.data.provider.base_url, 'https://relay2.example/v1');
     assert.equal(updated.body.data.provider.has_api_key, true);
 
-    const config = await call('GET', '/config?provider=grok');
+    const config = await call('POST', '/config?provider=grok', { default_provider: 'relay' });
     assert.equal(config.body.data.default_provider, 'relay');
-    assert.equal(config.body.data.models['relay/m2'].provider, 'relay');
+    assert.equal(config.body.data.providers.relay.default_model, '@relay:m2');
+    assert.ok(!JSON.stringify(config.body).includes('sk-x'));
+    const missing = await call('POST', '/config?provider=grok', { default_provider: 'nope' });
+    assert.equal(missing.status, 404);
 
     const back = await call('POST', '/config?provider=grok', { default_provider: 'grok' });
     assert.equal(back.body.data.default_provider, 'grok');
@@ -2769,7 +2774,72 @@ test('gateway-injected providers: CRUD, native row read-only, protocol check, ad
     const after = await call('GET', '/providers?provider=grok');
     assert.deepEqual(after.body.data.items.map((p: any) => p.id), ['grok']);
     assert.equal(after.body.data.items[0].status, 'connected');
-    assert.equal(changed, 4);
+    assert.equal(changed, 5);
+  } finally {
+    await gateway.close();
+    await rm(settingsDir, { recursive: true, force: true });
+  }
+});
+
+test('kimi providers are listed read-only, selectable as default, and never leak keys', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-kimi-providers-'));
+  const claude = fakeAdapter('claude') as any;
+  let changed = 0;
+  claude.providerChanged = () => { changed += 1; };
+  const kimiProviders = new KimiProviderSource({
+    home: settingsDir,
+    run: async () => JSON.stringify({
+      providers: { a9: { type: 'anthropic', baseUrl: 'https://a9.example', apiKey: 'sk-kimi-secret' } },
+      models: { 'a9/m-one': { provider: 'a9', model: 'm-one', maxContextSize: 200000, displayName: 'M One' } },
+    }),
+  });
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir,
+    kimiProviders,
+    codex: fakeAdapter('codex') as any,
+    claude,
+    grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const call = async (method: string, path: string, body?: unknown) => {
+    const response = await fetch(`${gateway.url}/api/v1${path}`, {
+      method,
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: response.status, body: (await response.json()) as any };
+  };
+  try {
+    const list = await call('GET', '/providers?provider=claude');
+    assert.deepEqual(list.body.data.items.map((p: any) => [p.id, p.read_only, p.source ?? null]), [
+      ['claude', true, null],
+      ['kimi.a9', true, 'kimi'],
+    ]);
+    assert.deepEqual(list.body.data.items[1].models, ['m-one']);
+    assert.ok(!JSON.stringify(list.body).includes('sk-kimi-secret'));
+
+    const edit = await call('PUT', '/providers/kimi.a9?provider=claude', { type: 'anthropic', models: [] });
+    assert.equal(edit.status, 403);
+    const del = await call('DELETE', '/providers/kimi.a9?provider=claude');
+    assert.equal(del.status, 403);
+    const one = await call('GET', '/providers/kimi.a9?provider=claude');
+    assert.equal(one.body.data.read_only, true);
+
+    const picked = await call('POST', '/config?provider=claude', { default_provider: 'kimi.a9' });
+    assert.equal(picked.status, 200);
+    assert.equal(picked.body.data.default_provider, 'kimi.a9');
+    assert.equal(picked.body.data.providers['kimi.a9'].default_model, '@kimi.a9:m-one');
+    assert.equal(picked.body.data.providers['kimi.a9'].read_only, true);
+    assert.ok(!JSON.stringify(picked.body).includes('sk-kimi-secret'));
+    assert.equal(changed, 1);
+
+    // grok 只能用 openai 协议,anthropic 的 Kimi 供应商不出现。
+    const grokList = await call('GET', '/providers?provider=grok');
+    assert.deepEqual(grokList.body.data.items.map((p: any) => p.id), ['grok']);
   } finally {
     await gateway.close();
     await rm(settingsDir, { recursive: true, force: true });
@@ -3265,7 +3335,7 @@ test('PATCH and DELETE local workspaces without wd_codex_/wd_claude_ prefixes st
   }
 });
 
-test('GET grok session status fills max_context_tokens from grok window when usage is 0', async () => {
+test('GET grok session status reports an unknown context window as 0 instead of guessing', async () => {
   const gateway = await startGateway({
     port: 0,
     token: 'gateway-token',
@@ -3281,7 +3351,9 @@ test('GET grok session status fills max_context_tokens from grok window when usa
       headers: { authorization: 'Bearer gateway-token' },
     });
     assert.equal(response.status, 200);
-    assert.equal((await response.json() as any).data.max_context_tokens, 500000);
+    const data = (await response.json() as any).data;
+    assert.equal(data.max_context_tokens, 0);
+    assert.equal(data.context_usage, 0);
   } finally {
     await gateway.close();
   }
@@ -6563,5 +6635,138 @@ test('WS subscribe delivers turns and agent status for requested child agent_ids
     ws?.close();
     await gateway.close();
     await rm(settingsDir, { recursive: true, force: true });
+  }
+});
+
+test('aborted empty turn does not emit fallback completed text after abortTurn settles', async () => {
+  const dsh = fakeAdapter('dsh');
+  let resolveInterrupt!: () => void;
+  const interruptedGate = new Promise<void>((resolve) => { resolveInterrupt = resolve; });
+  dsh.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'dsh-abort-turn',
+    events: (async function* () {
+      await interruptedGate;
+      yield {
+        sessionId: 'dsh-native', turnId: 'dsh-abort-turn', kind: 'turn',
+        status: 'cancelled', timestamp: Date.now(), payload: { reason: 'cancelled' },
+      } as any;
+    })(),
+  });
+  dsh.interrupt = async () => { resolveInterrupt(); };
+  const gateway = await startGateway({
+    host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
+    codex: fakeAdapter('codex') as any, claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any, pi: fakeAdapter('pi') as any, dsh: dsh as any,
+    availableProviders: ['kimi', 'dsh'],
+  });
+  const v262Frames: Array<Record<string, any>> = [];
+  let ws: WebSocket | undefined;
+  let resolveAborted!: () => void;
+  const abortedSeen = new Promise<void>((resolve) => { resolveAborted = resolve; });
+  try {
+    ws = new WebSocket(
+      `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=dsh`,
+      ['kimi-code.bearer.test-token'],
+    );
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('ws open/subscribe timeout')), 1500);
+      ws!.onopen = () => ws?.send(JSON.stringify({
+        type: 'subscribe', request_id: 'sub-abort-1', session_id: 'dsh_dsh-native', agent_ids: ['main'],
+      }));
+      ws!.onmessage = (ev) => {
+        const frame = JSON.parse(String(ev.data)) as Record<string, any>;
+        v262Frames.push(frame);
+        if (frame.type === 'turns') { clearTimeout(t); resolve(); }
+        if (frame.type === 'turn.ended' && frame.turn?.outcome === 'interrupted') resolveAborted();
+      };
+    });
+
+    const res = await fetch(`${gateway.url}/api/v1/sessions/dsh_dsh-native/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: '继续' }] }),
+    });
+    assert.equal(res.status, 200);
+
+    const abortRes = await fetch(`${gateway.url}/api/v1/sessions/dsh_dsh-native:abort`, {
+      method: 'POST', headers: { authorization: 'Bearer test-token' },
+    });
+    assert.equal((await abortRes.json() as any).data.aborted, true);
+    await Promise.race([
+      abortedSeen,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('interrupted turn.ended timeout')), 1500)),
+    ]);
+    await new Promise((r) => setTimeout(r, 40));
+
+    const deltas = v262Frames.filter((f) => f.type === 'item.delta').map((f) => String(f.delta ?? ''));
+    assert.equal(deltas.some((d) => d.includes('已完成（无额外文本输出）')), false);
+    const turnEnds = v262Frames.filter((f) => f.type === 'turn.ended');
+    assert.equal(turnEnds.length, 1);
+    assert.equal(turnEnds[0]?.turn?.outcome, 'interrupted');
+  } finally {
+    resolveInterrupt();
+    ws?.close();
+    await gateway.close();
+  }
+});
+
+test('adapter-emitted cancelled turn settles as interrupted without fallback completed text', async () => {
+  const dsh = fakeAdapter('dsh');
+  dsh.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'dsh-self-cancel',
+    events: (async function* () {
+      yield {
+        sessionId: 'dsh-native', turnId: 'dsh-self-cancel', kind: 'turn',
+        status: 'cancelled', timestamp: Date.now(), payload: { reason: 'cancelled' },
+      } as any;
+    })(),
+  });
+  const gateway = await startGateway({
+    host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
+    codex: fakeAdapter('codex') as any, claude: fakeAdapter('claude') as any,
+    grok: fakeAdapter('grok') as any, pi: fakeAdapter('pi') as any, dsh: dsh as any,
+    availableProviders: ['kimi', 'dsh'],
+  });
+  const v262Frames: Array<Record<string, any>> = [];
+  let ws: WebSocket | undefined;
+  let resolveEnded!: () => void;
+  const endedSeen = new Promise<void>((resolve) => { resolveEnded = resolve; });
+  try {
+    ws = new WebSocket(
+      `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=dsh`,
+      ['kimi-code.bearer.test-token'],
+    );
+    await new Promise<void>((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('ws open/subscribe timeout')), 1500);
+      ws!.onopen = () => ws?.send(JSON.stringify({
+        type: 'subscribe', request_id: 'sub-cancel-2', session_id: 'dsh_dsh-native', agent_ids: ['main'],
+      }));
+      ws!.onmessage = (ev) => {
+        const frame = JSON.parse(String(ev.data)) as Record<string, any>;
+        v262Frames.push(frame);
+        if (frame.type === 'turns') { clearTimeout(t); resolve(); }
+        if (frame.type === 'turn.ended') resolveEnded();
+      };
+    });
+
+    const res = await fetch(`${gateway.url}/api/v1/sessions/dsh_dsh-native/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ content: [{ type: 'text', text: '继续' }] }),
+    });
+    assert.equal(res.status, 200);
+    await Promise.race([
+      endedSeen,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('turn.ended timeout')), 1500)),
+    ]);
+
+    const deltas = v262Frames.filter((f) => f.type === 'item.delta').map((f) => String(f.delta ?? ''));
+    assert.equal(deltas.some((d) => d.includes('已完成（无额外文本输出）')), false);
+    const turnEnds = v262Frames.filter((f) => f.type === 'turn.ended');
+    assert.equal(turnEnds.length, 1);
+    assert.equal(turnEnds[0]?.turn?.outcome, 'interrupted');
+  } finally {
+    ws?.close();
+    await gateway.close();
   }
 });

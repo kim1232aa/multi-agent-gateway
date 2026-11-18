@@ -17,6 +17,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startGateway } from './gateway.js';
+import { KimiProviderSource } from './provider-store.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.basename(here) === 'dist' ? path.dirname(here) : here;
@@ -41,6 +42,8 @@ const token = envToken ?? ephemeralToken!;
 const staticDir = process.env.STATIC_DIR ?? defaultStaticDir;
 const kimi = process.env.GATEWAY_KIMI === 'off' ? 'off' as const : undefined;
 const settingsDir = process.env.GATEWAY_SETTINGS_DIR ?? path.join(os.homedir(), '.config', 'multi-agent-gateway');
+// 复用 Kimi Code 已配置的供应商(只读);GATEWAY_KIMI_PROVIDERS=off 关闭。
+const kimiProviders = (process.env.GATEWAY_KIMI_PROVIDERS ?? 'on').toLowerCase() === 'off' ? null : new KimiProviderSource();
 
 const { url, close, web } = await startGateway({
   port,
@@ -48,6 +51,7 @@ const { url, close, web } = await startGateway({
   token,
   staticDir,
   settingsDir,
+  kimiProviders,
   ...(kimi ? { kimi } : {}),
 });
 

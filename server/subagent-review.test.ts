@@ -34,10 +34,10 @@ test('grok review: a lost subagent_finished no longer pins the ACP process after
     (adapter as any).onAcpProcessEvent(client, false, { type: 'subagent', sessionId: parent, agentId: child, status, raw: {} });
   (adapter as any).rememberAcpSession(gateway, parent, '/work');
   emit('running');
-  assert.equal((adapter as any).isAcpBusy(), true);
+  assert.equal((adapter as any).clientBusy(client), true);
   const TTL = (GrokProviderAdapter as any).SUBAGENT_RUNNING_TTL_MS as number;
   (adapter as any).subagentLive.get(gateway).get(child).updatedAt = Date.now() - TTL - 1000;
-  assert.equal((adapter as any).isAcpBusy(), false);
+  assert.equal((adapter as any).clientBusy(client), false);
   assert.equal((await adapter.listSubagents(gateway)).find((c) => c.agentId === child)?.status, 'unknown');
 });
 

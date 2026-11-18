@@ -31,6 +31,7 @@ import {
   resolvePiBin,
 } from './pi-adapter.js';
 import { ProviderError, type GatewayEvent } from './types.js';
+import { ProviderStore } from './provider-store.js';
 
 /** Real-CLI tests run only when PI_REAL_BIN names a binary; never assume the author's home. */
 const REAL_PI_BIN = process.env.PI_REAL_BIN ?? '';
@@ -3277,4 +3278,125 @@ test('review regression: an unconfirmed recent prompt falls back to the first pr
     await adapter.dispose();
     await rm(base, { recursive: true, force: true });
   }
+});
+
+async function piCatalogFixture(base: string) {
+  const store = new ProviderStore(base);
+  for (const id of ['first', 'second']) store.upsert('pi', {
+    id, type: 'openai', base_url: 'https://example.invalid/v1', api_key: `test-secret-${id}`,
+    models: [{ model: 'shared', display_name: `${id} model`, max_context_size: 98765,
+      capabilities: ['thinking', 'image_in'], support_efforts: ['low', 'max', 'bogus'], default_effort: 'max' }],
+  });
+  store.setActive('pi', 'second');
+  return store;
+}
+
+test('Pi catalog refs preserve metadata, provider groups and redact raw models', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-catalog-'));
+  const store = await piCatalogFixture(base);
+  const adapter = new PiProviderAdapter({ providers: store.forCli('pi'), settingsPath: join(base, 'settings.json') });
+  const inner = (adapter as any).inner;
+  inner.getAvailableModels = async () => [
+    { provider: 'anthropic', id: 'own', contextWindow: 200000, apiKey: 'never-expose' },
+    { provider: 'gw-first', id: 'shared', contextWindow: 128000, reasoning: true },
+    { provider: 'gw-second', id: 'shared', contextWindow: 128000, reasoning: true },
+    { provider: 'local', id: 'unknown' },
+  ];
+  try {
+    const models = await adapter.listModels();
+    const model = models.find((m) => m.model === '@second:shared')!;
+    assert.ok(model);
+    assert.equal(model.provider, 'second');
+    assert.equal(model.max_context_size, 98765);
+    assert.equal(model.display_name, 'second model');
+    assert.deepEqual(model.capabilities, ['thinking', 'image_in']);
+    assert.deepEqual(model.support_efforts, ['low', 'max']);
+    assert.equal(model.default_effort, 'max');
+    assert.equal(model.isDefault, true);
+    assert.equal(models.find((m) => m.model === 'anthropic/own')?.provider, 'anthropic');
+    assert.equal(JSON.parse(JSON.stringify(models)).find((m: any) => m.model === 'local/unknown').max_context_size, null);
+    assert.ok(!JSON.stringify(models).includes('never-expose'));
+    assert.ok(models.every((m) => m.raw === undefined));
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('Pi catalog setModel translates refs and rejects unknown providers before persistence', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-ref-selection-'));
+  const store = await piCatalogFixture(base);
+  const adapter = new PiProviderAdapter({ providers: store.forCli('pi'), settingsPath: join(base, 'settings.json') });
+  const calls: string[] = [];
+  (adapter as any).inner.setModel = async (_sid: string, id: string) => {
+    calls.push(id);
+    if (id.endsWith('/reject')) throw new Error('switch rejected');
+    return { provider: id.split('/')[0], id: id.split('/').slice(1).join('/') };
+  };
+  try {
+    assert.equal(adapter.getModel('__default__'), '@second:shared');
+    await adapter.setModel('session-1', '@first:shared');
+    assert.deepEqual(calls, ['gw-first/shared']);
+    assert.equal(adapter.getModel('session-1'), '@first:shared');
+    for (const sid of ['session-1', '__default__']) await assert.rejects(adapter.setModel(sid, '@missing:shared'),
+      (err: any) => err.code === 'invalid_request' && err.httpStatus === 400);
+    await assert.rejects(adapter.setModel('session-1', '@second:reject'), /switch rejected/);
+    assert.equal(adapter.getModel('session-1'), '@first:shared');
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('Pi idle selection validates through RPC and provider fingerprint recycles only after turn settles', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-ref-rpc-'));
+  const store = await piCatalogFixture(base);
+  const { bin, stdinLog } = await writeContractFakePi(base);
+  const adapter = new PiProviderAdapter({ piBin: bin, sessionsDir: join(base, 'sessions'), settingsPath: join(base, 'settings.json'),
+    providers: store.forCli('pi'), recycleGraceMs: 0, env: { FAKE_STDIN_LOG: stdinLog, FAKE_PI_MODE: 'wait_for_abort' } });
+  try {
+    const session = await adapter.create({ provider: 'pi', cwd: base });
+    await adapter.setModel(session.id, '@first:shared');
+    assert.ok((await readFile(stdinLog, 'utf8')).trim().split('\n').map((row) => JSON.parse(row)).some((row) => row.cmd.type === 'set_model' && row.cmd.provider === 'gw-first'));
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'wait' });
+    const inner = (adapter as any).inner;
+    const old = inner.processes.get(session.id);
+    store.upsert('pi', { api_key: 'rotated-secret' }, 'first');
+    await adapter.providerChanged();
+    assert.equal(inner.processes.get(session.id), old);
+    await adapter.interrupt(session.id);
+    await drainEvents(handle);
+    for (let i = 0; i < 100 && inner.processes.has(session.id); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(inner.processes.has(session.id), false);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('Pi RPC redacts injected credentials in stderr and upstream errors', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-secret-'));
+  const lines: string[] = [];
+  const bin = await writeFakePiScript(base, `#!/usr/bin/env python3
+import json, os, sys
+for line in sys.stdin:
+    req = json.loads(line)
+    secret = os.environ['MAG_PI_KEY_TEST']
+    sys.stderr.write(secret + '\\n')
+    sys.stderr.flush()
+    print(json.dumps({'id':req['id'], 'type':'response', 'success':False, 'error':secret}), flush=True)
+`);
+  const client = new PiRpcClient({ piBin: bin, args: ['--no-session'], env: { MAG_PI_KEY_TEST: 'sensitive-credential' }, onStderr: (line) => lines.push(line) });
+  try {
+    await assert.rejects(client.request({ type: 'get_state' }), (err: Error) => !err.message.includes('sensitive-credential'));
+    assert.ok(lines.every((line) => !line.includes('sensitive-credential')));
+    assert.ok(!client.getStderrTail().includes('sensitive-credential'));
+  } finally { await client.close(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('Pi usage uses catalog context instead of extension fallback context', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-catalog-usage-'));
+  const store = await piCatalogFixture(base);
+  const adapter = new PiProviderAdapter({ providers: store.forCli('pi'), settingsPath: join(base, 'settings.json') });
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0, total_cost_usd: 0,
+    context_tokens: 2, context_limit: 128000, turn_count: 1 };
+  const inner = (adapter as any).inner;
+  inner.getCachedModel = () => 'gw-first/shared';
+  inner.getCachedUsage = () => usage;
+  inner.refreshUsage = async () => usage;
+  try {
+    assert.equal(adapter.getUsage('session')?.context_limit, 98765);
+    assert.equal((await adapter.refreshUsage('session')).context_limit, 98765);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
 });

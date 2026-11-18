@@ -15,6 +15,70 @@ import {
   type ClaudeAdapterEvent,
 } from './claude-adapter.js';
 import { ClaudeProviderAdapter } from './facade.js';
+import { ProviderStore } from './provider-store.js';
+
+test('Claude launch settings select only the current ref provider and probes stay native', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-provider-settings-'));
+  const store = new ProviderStore(dir);
+  store.upsert('claude', { id: 'relay', type: 'anthropic', base_url: 'https://example.invalid/v1', api_key: 'private-token', models: [{ model: 'qwen' }] });
+  const adapter = new ClaudeAdapter({ providers: store.forCli('claude') } as any);
+  try {
+    assert.deepEqual((adapter as any).settingsArgs().args, []);
+    const launch = (adapter as any).settingsArgs({ fastMode: true, env: { EXTRA: 'yes', ANTHROPIC_AUTH_TOKEN: 'not-the-provider-token' } }, 'relay');
+    try {
+      assert.ok(!JSON.stringify(launch.args).includes('private-token'));
+      const settings = JSON.parse(await readFile(launch.args[1], 'utf8'));
+      assert.equal(settings.env.ANTHROPIC_AUTH_TOKEN, 'private-token');
+      assert.equal(settings.env.EXTRA, 'yes');
+      assert.equal(settings.fastMode, true);
+    } finally { launch.cleanup(); }
+    await assert.rejects(adapter.startTurn({ sessionId: 'test', prompt: 'not sent', model: '@missing:m', onEvent() {} }), (err: any) => err.code === 'invalid_request' && err.httpStatus === 400);
+  } finally {
+    await adapter.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('Claude per-turn spawns route refs and redact provider credentials without touching native probes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-route-spawn-'));
+  const bin = join(dir, 'fake-claude');
+  const record = join(dir, 'record.jsonl');
+  const store = new ProviderStore(dir);
+  for (const id of ['one', 'two']) store.upsert('claude', { id, type: 'anthropic', base_url: `https://${id}.invalid/v1`, api_key: `secret-${id}`, models: [{ model: 'qwen' }, { model: 'qwen-max' }] });
+  await writeFile(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const i = args.indexOf('--settings');
+const settings = i < 0 ? undefined : JSON.parse(args[i+1].startsWith('{') ? args[i+1] : fs.readFileSync(args[i+1], 'utf8'));
+fs.appendFileSync(process.env.RECORD, JSON.stringify({args: args.filter((_, j) => j !== i+1), settings})+'\\n');
+const readline = require('node:readline').createInterface({input:process.stdin});
+readline.on('line', line => {
+const row=JSON.parse(line);
+if(row.type==='control_request') console.log(JSON.stringify({type:'control_response',response:{subtype:'success',request_id:row.request_id,response:{models:[{value:'sonnet'}]}}}));
+else console.log(JSON.stringify({type:'result',subtype:'success',session_id:'test',result:settings?.env?.ANTHROPIC_AUTH_TOKEN ?? 'native'}));
+process.exit(0);
+});
+`);
+  await chmod(bin, 0o755);
+  const adapter = new ClaudeAdapter({ claudeBin: bin, providers: store.forCli('claude'), env: { RECORD: record } });
+  try {
+    const events: ClaudeAdapterEvent[] = [];
+    for (const model of ['@one:qwen', '@two:qwen-max', 'sonnet']) await adapter.startTurn({ sessionId: 'test', prompt: 'test', model, settings: { fastMode: true }, onEvent: (e) => events.push(e) });
+    await adapter.listBuiltinModels();
+    const launches = (await readFile(record, 'utf8')).trim().split('\n').map((s) => JSON.parse(s));
+    assert.deepEqual(launches.slice(0, 3).map((l) => l.args[l.args.indexOf('--model') + 1]), ['qwen', 'qwen-max', 'sonnet']);
+    assert.deepEqual(launches.slice(0, 2).map((l) => l.settings.env.ANTHROPIC_BASE_URL), ['https://one.invalid', 'https://two.invalid']);
+    // Aliases, background work and subagents follow this turn's model, not the provider default
+    // or whatever ~/.claude/settings.json pins.
+    assert.deepEqual(
+      launches.slice(0, 2).map((l) => [l.settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, l.settings.env.ANTHROPIC_DEFAULT_SONNET_MODEL, l.settings.env.CLAUDE_CODE_SUBAGENT_MODEL]),
+      [['qwen', 'qwen', 'qwen'], ['qwen-max', 'qwen-max', 'qwen-max']],
+    );
+    assert.equal(launches[2].settings.env, undefined);
+    assert.equal(launches[3].settings, undefined);
+    assert.ok(!JSON.stringify(events).includes('secret-'));
+  } finally { await adapter.close(); await rm(dir, { recursive: true, force: true }); }
+});
 
 test('review regression: array history sanitizes tags and parses local commands', async () => {
   const base = await mkdtemp(join(tmpdir(), 'claude-review-regression-'));

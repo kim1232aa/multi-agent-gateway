@@ -13,6 +13,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
+import { composeDshProviderPatch } from './dsh-patch.js';
+import type { CliProviders } from './provider-store.js';
 
 function buildChildEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
@@ -86,8 +88,7 @@ export interface DshAcpOptions {
   recycleGraceMs?: number;
   permissionModeForSession?: (sessionId: string) => string | undefined;
   onStderr?: (line: string) => void;
-  /** Gateway-managed provider overrides (`--patch <file>` + key env), read at every spawn. */
-  injection?: () => { args: string[]; env: Record<string, string> };
+  providers?: CliProviders;
 }
 
 interface PendingRequest {
@@ -113,7 +114,11 @@ export class DshAcpClient {
   private readonly recycleGraceMs: number;
   private readonly permissionModeForSession?: (sessionId: string) => string | undefined;
   private readonly onStderr?: (line: string) => void;
-  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private readonly providers?: CliProviders;
+  private providerFingerprint?: string;
+  private recycleRequested = false;
+  private secrets: string[] = [];
+  private readonly sessionConfigs = new Map<string, unknown>();
 
   private child: ChildProcess | null = null;
   private rl: readline.Interface | null = null;
@@ -137,7 +142,7 @@ export class DshAcpClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 25_000;
     this.promptTimeoutMs = options.promptTimeoutMs ?? 0;
     this.recycleGraceMs = options.recycleGraceMs ?? 60_000;
-    this.injection = options.injection;
+    this.providers = options.providers;
     this.permissionModeForSession = options.permissionModeForSession;
     this.onStderr = options.onStderr;
   }
@@ -171,6 +176,7 @@ export class DshAcpClient {
 
   async ensureReady(): Promise<void> {
     if (this.closed) throw new Error('DshAcpClient is closed');
+    if (this.child && this.providerFingerprint !== this.providers?.fingerprint()) this.recycleSoon();
     if (this.isConnected()) {
       this.cancelRecycleTimer();
       return;
@@ -186,10 +192,16 @@ export class DshAcpClient {
   private async spawnAndHandshake(): Promise<void> {
     this.cancelRecycleTimer();
     const generation = ++this.childGeneration;
-    const injected = this.injection?.() ?? { args: [], env: {} };
-    const child = spawn(this.dshBin, ['--profile', 'acp', ...injected.args], {
+    this.providerFingerprint = this.providers?.fingerprint();
+    this.recycleRequested = false;
+    const injected = this.providers?.injection() ?? { args: [], env: {} };
+    const env = buildChildEnv({ ...this.env, ...injected.env });
+    this.secrets = Object.entries(env).filter(([key, value]) => /^MAG_DSH_|KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(key) && value).map(([, value]) => value as string);
+    const args = await this.providerPatchArgs(injected.args, env);
+    if (generation !== this.childGeneration || this.closed) throw new Error('dsh client closed while preparing the provider patch');
+    const child = spawn(this.dshBin, ['--profile', 'acp', ...args], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildChildEnv({ ...this.env, ...injected.env }),
+      env,
     });
     this.child = child;
     this.connected = false;
@@ -198,15 +210,18 @@ export class DshAcpClient {
     const rl = readline.createInterface({ input: child.stdout!, crlfDelay: Infinity });
     this.rl = rl;
     rl.on('line', (line) => this.handleStdoutLine(line, child, generation));
+    let stderrLine = '';
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      for (const line of text.split(/\r?\n/)) {
-        if (line.trim()) this.onStderr?.(line);
-      }
+      if (generation !== this.childGeneration || child !== this.child) return;
+      stderrLine += chunk.toString();
+      const lines = stderrLine.split(/\r?\n/);
+      stderrLine = lines.pop() ?? '';
+      for (const line of lines) if (line.trim()) this.onStderr?.(this.redact(line));
+      if (stderrLine.length > 65536) stderrLine = '';
     });
     child.on('error', (err) => {
       if (generation !== this.childGeneration) return;
-      this.emit({ type: 'error', message: `dsh process error: ${err.message}` });
+      this.emit({ type: 'error', message: `dsh process error: ${this.redact(err.message)}` });
       this.cleanupProcess(child, generation, null, null);
     });
     child.on('close', (code, signal) => this.cleanupProcess(child, generation, code, signal));
@@ -226,6 +241,26 @@ export class DshAcpClient {
       await this.terminateChild(child);
       this.cleanupProcess(child, generation, null, null);
       throw err;
+    }
+  }
+
+  /**
+   * A `--patch` replaces `llm-pi-ai`'s whole config, so the gateway providers are merged into the
+   * user's own routes first (see dsh-patch.ts). If the user's config cannot be read, start DSH
+   * without the gateway providers instead of replacing the user's.
+   */
+  private async providerPatchArgs(args: string[], env: NodeJS.ProcessEnv): Promise<string[]> {
+    const at = args.indexOf('--patch');
+    const file = at >= 0 ? args[at + 1] : undefined;
+    if (!file) return args;
+    try {
+      const merged = await composeDshProviderPatch(this.dshBin, file, env);
+      return [...args.slice(0, at), '--patch', merged, ...args.slice(at + 2)];
+    } catch (err) {
+      const reason = this.redact(err instanceof Error ? err.message : String(err));
+      this.onStderr?.(`gateway providers skipped: cannot read the acp profile's llm-pi-ai config (${reason})`);
+      console.warn(`[dsh-acp] gateway providers skipped: ${reason}`);
+      return [...args.slice(0, at), ...args.slice(at + 2)];
     }
   }
 
@@ -266,7 +301,13 @@ export class DshAcpClient {
     this.pending.clear();
     this.permissions.clear();
     this.activeSessions.clear();
+    this.sessionConfigs.clear();
     if (wasConnected) this.emit({ type: 'disconnected', code, signal });
+  }
+
+  private redact(text: string): string {
+    for (const secret of this.secrets) text = text.split(secret).join('[redacted]');
+    return text;
   }
 
   private handleStdoutLine(line: string, child: ChildProcess, generation: number): void {
@@ -275,7 +316,7 @@ export class DshAcpClient {
     if (!trimmed) return;
     let message: any;
     try {
-      message = JSON.parse(trimmed);
+      message = JSON.parse(trimmed, (_key, value) => typeof value === 'string' ? this.redact(value) : value);
     } catch {
       return;
     }
@@ -472,12 +513,14 @@ export class DshAcpClient {
       mcpServers: [],
     });
     this.activeSessions.add(res.sessionId);
+    this.sessionConfigs.set(res.sessionId, res.configOptions);
     return res;
   }
 
   async resumeSession(sessionId: string, cwd: string): Promise<{ configOptions?: unknown }> {
     if (this.activeSessions.has(sessionId)) {
-      return {};
+      await this.ensureReady();
+      if (this.activeSessions.has(sessionId)) return { configOptions: this.sessionConfigs.get(sessionId) };
     }
     try {
       const res = await this.request<{ configOptions?: unknown }>('session/resume', {
@@ -486,6 +529,7 @@ export class DshAcpClient {
         mcpServers: [],
       });
       this.activeSessions.add(sessionId);
+      this.sessionConfigs.set(sessionId, res.configOptions);
       return res;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -498,11 +542,13 @@ export class DshAcpClient {
   }
 
   async setConfigOption(sessionId: string, configId: string, value: string): Promise<{ configOptions?: unknown }> {
-    return this.request<{ configOptions?: unknown }>('session/set_config_option', {
+    const res = await this.request<{ configOptions?: unknown }>('session/set_config_option', {
       sessionId,
       configId,
       value,
     });
+    if (res.configOptions) this.sessionConfigs.set(sessionId, res.configOptions);
+    return res;
   }
 
   async prompt(sessionId: string, promptText: string): Promise<{ stopReason?: string }> {
@@ -577,12 +623,17 @@ export class DshAcpClient {
 
   /** Provider config changed: drop the process now if idle; the next request respawns with it. */
   recycleSoon(): void {
-    if (!this.isBusy() && this.isConnected()) this.closeProcess();
+    this.recycleRequested = true;
+    this.scheduleRecycleIfIdle();
   }
 
   private scheduleRecycleIfIdle(): void {
-    if (this.closed || this.recycleGraceMs <= 0) return;
-    if (this.isBusy()) return;
+    if (this.closed || this.isBusy()) return;
+    if (this.recycleRequested || (this.child && this.providerFingerprint !== this.providers?.fingerprint())) {
+      this.closeProcess();
+      return;
+    }
+    if (this.recycleGraceMs <= 0) return;
 
     this.cancelRecycleTimer();
     this.recycleTimer = setTimeout(() => {
@@ -616,6 +667,7 @@ export class DshAcpClient {
     }
     this.connected = false;
     this.activeSessions.clear();
+    this.sessionConfigs.clear();
   }
 
   close(): void {

@@ -12,6 +12,92 @@ import {
   type CodexEvent,
 } from './codex-adapter.js';
 import { ProviderError } from './types.js';
+import { ProviderStore } from './provider-store.js';
+
+test('Codex routes refs on thread/start and rejects persisted cross-provider switches', async () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), 'codex-providers-'));
+  const store = new ProviderStore(dir);
+  store.upsert('codex', { id: 'relay', type: 'openai_responses', base_url: 'https://example.invalid/v1', api_key: 'secret', models: [{ model: 'remote' }] });
+  const adapter = new CodexAdapter({ providers: store.forCli('codex') } as any);
+  (adapter as any).connect = async () => {};
+  const calls: any[] = [];
+  (adapter as any).request = async (method: string, params: any) => {
+    calls.push({ method, params });
+    if (method === 'thread/start') return { thread: { id: 'new', modelProvider: 'relay' }, model: params.model };
+    if (method === 'thread/read') return { thread: { id: params.threadId, modelProvider: 'openai', turns: [{ id: 't', status: 'completed' }] } };
+    return {};
+  };
+  try {
+    await adapter.create({ model: '@relay:remote' });
+    assert.equal(calls[0].params.modelProvider, 'relay');
+    assert.equal(calls[0].params.model, 'remote');
+    await assert.rejects((adapter as any).setModel('persisted', '@relay:remote'), /新建会话.*\/fork/);
+    await assert.rejects(adapter.create({ model: '@missing:remote' }), (err: any) => err.code === 'invalid_request' && err.httpStatus === 400);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Codex rebuilds only drafts and preserves a logical id across process recycling', async () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), 'codex-draft-providers-'));
+  const store = new ProviderStore(dir);
+  for (const id of ['one', 'two']) store.upsert('codex', { id, type: 'openai_responses', base_url: 'https://example.invalid/v1', api_key: 'secret', models: [{ model: 'remote' }] });
+  const adapter = new CodexAdapter({ providers: store.forCli('codex') });
+  (adapter as any).connect = async () => {};
+  (adapter as any).locateRollout = async () => null;
+  const starts: any[] = [];
+  (adapter as any).request = async (method: string, params: any) => {
+    if (method === 'thread/start') {
+      starts.push(params);
+      return { thread: { id: `draft-${starts.length}`, modelProvider: params.modelProvider }, model: params.model };
+    }
+    if (method === 'turn/start') return { turn: { id: 't', status: 'inProgress' } };
+    if (method === 'thread/resume') return { thread: { id: params.threadId, modelProvider: 'two' } };
+    return {};
+  };
+  try {
+    const draft = await adapter.create({ model: '@one:remote', cwd: '/tmp' });
+    assert.equal(await adapter.setModel(draft.id, '@two:remote'), 'draft-2');
+    assert.equal(adapter.nativeThreadId(draft.id), 'draft-2');
+    (adapter as any).providerRecyclePending = true;
+    (adapter as any).handleProcessExit(null, 0, null);
+    const handle = await adapter.startTurn(draft.id, 'test', { model: '@two:remote' });
+    assert.equal(starts.length, 3);
+    assert.equal(adapter.nativeThreadId(draft.id), 'draft-3');
+    assert.equal(starts[2].modelProvider, 'two');
+    (adapter as any).handleNotification('turn/completed', { threadId: draft.id, turn: { id: handle.turnId, status: 'completed' } });
+    await assert.rejects(adapter.setModel(draft.id, '@one:remote'), /新建会话.*\/fork/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Codex native context discovery is cached and unknown models stay unknown', async () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), 'codex-model-context-'));
+  const bin = join(dir, 'fake-codex');
+  const marker = join(dir, 'calls');
+  fs.writeFileSync(bin, `#!/usr/bin/env node\nrequire('node:fs').appendFileSync(${JSON.stringify(marker)}, '1');\nconsole.log(JSON.stringify({models:[{slug:'known',context_window:987654,max_context_window:2000000}]}));\n`, { mode: 0o755 });
+  const adapter = new CodexAdapter({ codexPath: bin });
+  try {
+    const contexts = await adapter.modelContextWindows();
+    assert.equal(contexts.get('known'), 987654);
+    assert.equal(contexts.get('unknown'), undefined);
+    assert.equal(await adapter.modelContextWindows(), contexts);
+    assert.equal(fs.readFileSync(marker, 'utf8'), '1');
+  } finally { await adapter.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Codex provider changes wait for active turns even when idle recycling is disabled', async () => {
+  const adapter = new CodexAdapter({ recycleGraceMs: 0 });
+  let kills = 0;
+  (adapter as any).child = { exitCode: null, kill() { kills++; }, once() {} };
+  (adapter as any).turnQueues.set('t:r', {});
+  (adapter as any).lastTurnActivityAt = Date.now();
+  adapter.recycleSoon();
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(kills, 0);
+  (adapter as any).turnQueues.clear();
+  await new Promise((r) => setTimeout(r, 260));
+  assert.equal(kills, 1);
+  (adapter as any).child = null;
+  await adapter.close();
+});
 
 function stubTransport(adapter: CodexAdapter): void {
   (adapter as any).connect = async () => undefined;

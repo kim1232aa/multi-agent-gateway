@@ -28,6 +28,7 @@ import {
 import { expandCodexSkill, listClaudeCommands, listCodexCommands } from './native-commands.js';
 import { extractSubagentIdFromOutput, findCodexRollout } from './local-transcript.js';
 import { SettingsStore } from './settings-store.js';
+import { encodeModelRef, parseModelRef, type CliProviders } from './provider-store.js';
 import { readSubagentTail, subagentStatus } from './subagents.js';
 import { supportsUltracode, THINKING_PROFILES } from './thinking-levels.js';
 import {
@@ -370,11 +371,14 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private readonly settings: SettingsStore;
   private readonly syncedPlanThreads = new Set<string>();
   private cachedModels: NativeModel[] | null = null;
+  private readonly providers?: CliProviders;
 
   constructor(options?: ConstructorParameters<typeof CodexAdapter>[0] & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
     this.inner = new CodexAdapter(innerOptions);
+    this.providers = innerOptions.providers;
     this.settings = new SettingsStore(settingsPath);
+    this.inner.restoreThreadAliases(this.settings.listStrings('nativeThreadId'));
     if (typeof (this.inner as any).onEvent === 'function') {
       (this.inner as any).onEvent((ev: any) => {
         if (ev && ev.type === 'disconnected') {
@@ -554,7 +558,9 @@ export class CodexProviderAdapter implements ProviderAdapter {
 
   async create(input: CreateSessionInput): Promise<Session> {
     const cwd = input.cwd ?? (input.metadata?.cwd as string | undefined) ?? process.cwd();
-    const thread = await this.inner.create({ cwd });
+    const model = this.settings.getString('model', '__default__') ?? this.providers?.defaultModelRef();
+    const thread = await this.inner.create({ cwd, ...(model ? { model } : {}) });
+    if (model) this.settings.set('model', thread.id, model);
     // app-server 的 thread/start 不带标题参数;用户指定的标题存 renames,
     // toSession 优先取它(否则 create 响应和列表都退回 preview/截断 id)。
     if (input.title) this.renames.set(thread.id as string, input.title);
@@ -1569,6 +1575,8 @@ export class CodexProviderAdapter implements ProviderAdapter {
       ...(serviceTier !== undefined ? { serviceTier } : {}),
       approvalPolicy: codexApprovalPolicy(this.settings.getString('permission', input.sessionId)),
     });
+    const nativeId = this.inner.nativeThreadId(input.sessionId);
+    if (nativeId) this.settings.set('nativeThreadId', input.sessionId, nativeId);
     this.activeThreadTurns.add(input.sessionId);
     this.invalidateListCache(); // turn 会改动 preview/updatedAt,列表缓存失效
     const events = this.mapCodexEvents(input.sessionId, handle.turnId, handle.events);
@@ -1581,12 +1589,15 @@ export class CodexProviderAdapter implements ProviderAdapter {
   private defaultModel: string | undefined;
 
   async setModel(sessionId: string, model: string): Promise<void> {
+    const nativeId = await this.inner.setModel(sessionId, model);
+    if (nativeId) this.settings.set('nativeThreadId', sessionId, nativeId);
     this.settings.set('model', sessionId, model);
   }
 
   getModel(sessionId: string): string | undefined {
     return this.settings.getString('model', sessionId)
       ?? this.settings.getString('model', '__default__')
+      ?? this.providers?.defaultModelRef()
       ?? this.defaultModel;
   }
 
@@ -1704,6 +1715,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     this.threadCwd.delete(sessionId);
     this.syncedPlanThreads.delete(sessionId);
     this.settings.delete('model', sessionId);
+    this.settings.delete('nativeThreadId', sessionId);
     this.settings.delete('thinking', sessionId);
     this.settings.delete('permission', sessionId);
     this.settings.delete('plan', sessionId);
@@ -1715,6 +1727,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
     const thread = await this.inner.forkThread(sessionId);
     const forkedId = typeof thread.id === 'string' ? thread.id : '';
     this.settings.copySession(sessionId, forkedId);
+    this.settings.delete('nativeThreadId', forkedId);
     this.invalidateListCache();
     return this.toSession(thread);
   }
@@ -1806,6 +1819,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
   /** 原生模型目录:codex app-server 的 model/list(0.147.0–0.169.0)。 */
   async listModels(): Promise<NativeModel[]> {
     const rows = await this.inner.listModels();
+    const contexts = rows.length ? await this.inner.modelContextWindows() : new Map<string, number>();
     const out: NativeModel[] = [];
     for (const r of rows) {
       // hidden=true 的是内部模型(如 codex-auto-review),不进选择器。
@@ -1828,7 +1842,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
         ...(modalities.includes('image') ? ['vision'] : []),
         ...(efforts?.length ? ['thinking'] : []),
       ];
-      const maxContextSize = num(r.maxContextSize ?? r.contextWindow);
+      const maxContextSize = r.maxContextSize ?? r.contextWindow ?? contexts.get(model);
       const maxOutputTokens = typeof r.maxOutputTokens === 'number' && Number.isFinite(r.maxOutputTokens)
         ? r.maxOutputTokens
         : undefined;
@@ -1837,7 +1851,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
         model,
         display_name: typeof r.displayName === 'string' ? r.displayName : model,
         ...(typeof r.description === 'string' && r.description ? { description: r.description } : {}),
-        max_context_size: maxContextSize,
+        ...(typeof maxContextSize === 'number' && maxContextSize > 0 ? { max_context_size: maxContextSize } : {}),
         ...(maxOutputTokens !== undefined ? { max_output_tokens: maxOutputTokens } : {}),
         capabilities: caps.length ? caps : undefined,
         support_efforts: efforts?.length ? efforts : undefined,
@@ -1849,7 +1863,21 @@ export class CodexProviderAdapter implements ProviderAdapter {
           : {}),
         ...(r.isDefault === true ? { isDefault: true } : {}),
         raw: r,
-      });
+      } as NativeModel);
+    }
+    for (const provider of this.providers?.catalog() ?? []) {
+      for (const m of provider.models) {
+        const efforts = m.support_efforts?.filter((v) => v.length > 0);
+        out.push({ provider: provider.label, model: encodeModelRef(provider.key, m.model),
+          display_name: m.display_name ?? m.model,
+          ...(m.max_context_size ? { max_context_size: m.max_context_size } : {}),
+          ...(m.max_output_size ? { max_output_tokens: m.max_output_size } : {}),
+          capabilities: m.capabilities,
+          ...(efforts?.length ? { support_efforts: efforts } : {}),
+          ...(m.default_effort && efforts?.includes(m.default_effort) ? { default_effort: m.default_effort } : {}),
+          ...(this.providers?.defaultModelRef() === encodeModelRef(provider.key, m.model) ? { isDefault: true } : {}),
+        } as NativeModel);
+      }
     }
     this.cachedModels = out;
     return out;
@@ -2587,6 +2615,7 @@ export class CodexProviderAdapter implements ProviderAdapter {
 export class ClaudeProviderAdapter implements ProviderAdapter {
   readonly name = 'claude' as const;
   private readonly inner: ClaudeAdapter;
+  private readonly providers?: CliProviders;
   /** 记录每个会话最近一次 turn 的 cwd,供 resume 时复用。 */
   private readonly sessionCwd = new Map<string, string>();
   /** `/clear` 在 stream-json 下会生成新 CLI sessionId，保存逻辑 id → 实际 CLI id 映射。 */
@@ -2642,6 +2671,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
 
   constructor(options?: ConstructorParameters<typeof ClaudeAdapter>[0] & { settingsPath?: string }) {
     const { settingsPath, ...innerOptions } = options ?? {};
+    this.providers = innerOptions.providers;
     const claudeBin = innerOptions.claudeBin ?? process.env.CLAUDE_BIN;
     this.inner = new ClaudeAdapter({
       ...innerOptions,
@@ -2860,14 +2890,8 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
     if (notes.length > 0) prompt = [...notes, prompt].filter((s) => s.trim()).join('\n');
     const isNew = !this.inner.hasSessionFile(effectiveId);
     const cwd = this.sessionCwd.get(effectiveId) ?? this.sessionCwd.get(sessionId);
-    const storedModel = this.settings.getString('model', sessionId);
-    const alias = storedModel && !/qwen/i.test(storedModel) ? claudeCatalogAlias(storedModel) : undefined;
-    // `'default'` 交给 Claude CLI 自身配置/ANTHROPIC_MODEL 决定;显式传 `--model default`
-    // 在 2.1.325 上会绕过 ANTHROPIC_MODEL 回落到内部默认模型。
-    const model =
-      storedModel && !/qwen/i.test(storedModel)
-        ? (alias === 'default' ? undefined : (alias ?? storedModel))
-        : undefined;
+    const storedModel = this.getModel(sessionId);
+    const model = storedModel === 'default' ? undefined : storedModel;
     // thinking 'off' / 'on' / 'auto' = 不传 --effort(CLI 无 off 档，'on'/'auto' 由 CLI 内部自适应)。
     const thinking = this.getThinking(sessionId);
     const effort = thinking && thinking !== 'off' && thinking !== 'on' && thinking !== 'auto' ? thinking : undefined;
@@ -3462,8 +3486,17 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
 
   async setModel(sessionId: string, model: string): Promise<void> {
-    if (!model.trim() || /qwen/i.test(model)) return;
-    const value = claudeCatalogAlias(model) ?? model.trim();
+    const ref = parseModelRef(model);
+    if (ref && !this.providers?.provider(ref.key)) {
+      throw new ProviderError('invalid_request', '所选模型的供应商不在当前目录中，请刷新模型目录后重试。', 400);
+    }
+    if (!model.trim() || (!ref && /qwen/i.test(model))) {
+      throw new ProviderError('invalid_request', 'Claude 自带模型不接受空值或遗留的 qwen 模型名。', 400);
+    }
+    if (sessionId !== '__default__' && this.inner.isRunning(this.resolveEffectiveSessionId(sessionId))) {
+      throw new ProviderError('busy', 'Claude 当前回合仍在进行，请等待结束后切换模型。', 409);
+    }
+    const value = ref ? encodeModelRef(ref.key, ref.model) : claudeCatalogAlias(model) ?? model.trim();
     this.settings.set('model', sessionId, value);
   }
 
@@ -3557,8 +3590,11 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
   getModel(sessionId: string): string | undefined {
     // 忽略 ANTHROPIC_MODEL 与旧会话里的 qwen 残留值;保留官方别名与合法动态非 qwen 模型 ID。
     const stored = this.settings.getString('model', sessionId)
-      ?? this.settings.getString('model', '__default__');
-    if (!stored || /qwen/i.test(stored)) return undefined;
+      ?? this.settings.getString('model', '__default__')
+      ?? this.providers?.defaultModelRef();
+    if (!stored) return undefined;
+    if (parseModelRef(stored)) return stored;
+    if (/qwen/i.test(stored)) return undefined;
     return claudeCatalogAlias(stored) ?? stored;
   }
 
@@ -3600,6 +3636,7 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
         model.resolvedModel && !/qwen/i.test(model.resolvedModel) ? model.resolvedModel : undefined;
       const safeDescription =
         model.description && !/qwen/i.test(model.description) ? model.description : undefined;
+      const { resolvedModel: _rawResolved, displayName: _rawDisplay, description: _rawDesc, ...restModel } = model;
       const displayName = alias
         ? CLAUDE_CATALOG_DISPLAY_NAME[alias]
         : model.displayName && !/qwen/i.test(model.displayName)
@@ -3615,18 +3652,17 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           : typeof (model as any).default_effort === 'string'
             ? (model as any).default_effort
             : (model.supportsEffort ? 'medium' : undefined);
-      const { resolvedModel: _rawResolved, displayName: _rawDisplay, description: _rawDesc, ...restModel } = model;
       out.push({
         provider: 'claude',
         model: modelId,
         display_name: displayName,
         ...(safeDescription ? { description: safeDescription } : {}),
-        max_context_size: claudeContextWindow(modelId, model.value, safeResolved),
+        ...(alias ? { max_context_size: claudeContextWindow(modelId, model.value, safeResolved) } : {}),
         capabilities: caps,
         ...(model.supportedEffortLevels?.length ? { support_efforts: model.supportedEffortLevels } : {}),
         ...(defaultEffort ? { default_effort: defaultEffort } : {}),
-        // 档位表按 CLI 版本钉住；ultracode 自 2.1.284 起是独立开关，不是档位。
-        ...(effortProfile.efforts.length ? { support_efforts: [...effortProfile.efforts] } : {}),
+        ...(!model.supportedEffortLevels?.length && effortProfile.efforts.length
+          ? { support_efforts: [...effortProfile.efforts] } : {}),
         ...(effortProfile.verified !== undefined ? { efforts_verified: effortProfile.verified } : {}),
         ...(effortProfile.ultracode !== undefined ? { supports_ultracode: effortProfile.ultracode } : {}),
         ...(model.supportsAdaptiveThinking !== undefined
@@ -3644,7 +3680,21 @@ export class ClaudeProviderAdapter implements ProviderAdapter {
           ...(safeDescription ? { description: safeDescription } : {}),
           ...(safeResolved ? { resolvedModel: safeResolved } : {}),
         },
-      });
+      } as NativeModel);
+    }
+    for (const provider of this.providers?.catalog() ?? []) {
+      for (const m of provider.models) {
+        const efforts = m.support_efforts?.filter((v) => THINKING_PROFILES.claude.levels.includes(v));
+        out.push({ provider: provider.label, model: encodeModelRef(provider.key, m.model),
+          display_name: m.display_name ?? m.model,
+          ...(m.max_context_size ? { max_context_size: m.max_context_size } : {}),
+          ...(m.max_output_size ? { max_output_tokens: m.max_output_size } : {}),
+          capabilities: m.capabilities,
+          ...(efforts?.length ? { support_efforts: efforts } : {}),
+          ...(m.default_effort && efforts?.includes(m.default_effort) ? { default_effort: m.default_effort } : {}),
+          ...(this.providers?.defaultModelRef() === encodeModelRef(provider.key, m.model) ? { isDefault: true } : {}),
+        } as NativeModel);
+      }
     }
     return out;
   }

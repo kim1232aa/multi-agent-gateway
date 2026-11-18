@@ -112,13 +112,13 @@ test('Grok live subagent state survives the parent turn and merges with disk by 
       'sub-disk-future': 'completed',
       'sub-live-only': 'running',
     });
-    assert.equal((adapter as any).isAcpBusy(), true);
+    assert.equal((adapter as any).clientBusy(client), true);
 
     emit({ sessionId: parent, agentId: 'sub-disk-old', status: 'completed' });
     emit({ sessionId: parent, agentId: 'sub-live-only', status: 'cancelled' });
     emit({ sessionId: parent, agentId: 'sub-disk-future', status: 'completed' });
     assert.equal((await statuses())['sub-live-only'], 'cancelled');
-    assert.equal((adapter as any).isAcpBusy(), false);
+    assert.equal((adapter as any).clientBusy(client), false);
   } finally {
     await adapter.dispose();
     await rm(root, { recursive: true, force: true });
@@ -133,10 +133,10 @@ test('Grok live subagent state goes unknown on disconnect and is cleared on clos
   (adapter as any).rememberAcpSession(gateway, parent, '/work');
   emit({ sessionId: parent, agentId: 'sub-a', status: 'running' });
   emit({ sessionId: parent, agentId: 'sub-b', status: 'running' });
-  assert.equal((adapter as any).isAcpBusy(), true);
+  assert.equal((adapter as any).clientBusy(client), true);
   (adapter as any).onAcpProcessEvent(client, false, { type: 'disconnected', code: null, signal: null });
   assert.deepEqual(await statuses(), { 'sub-a': 'unknown', 'sub-b': 'unknown' });
-  assert.equal((adapter as any).isAcpBusy(), false);
+  assert.equal((adapter as any).clientBusy(client), false);
 
   emit({ sessionId: parent, agentId: 'sub-c', status: 'running' });
   await adapter.close(gateway);

@@ -2,7 +2,7 @@
  * Grok ACP client — one long-lived `grok agent stdio` JSON-RPC process.
  *
  * Verified against @xai-official/grok@1.0.77 (and 1.0.87 alpha):
- *   grok agent stdio [--always-approve]
+ *   grok agent --no-leader [--always-approve] stdio
  *
  * Handshake: initialize (protocolVersion 1) → initialized notification.
  * Sessions: session/new, session/load, session/resume, session/prompt,
@@ -214,6 +214,10 @@ export class GrokAcpClient {
     return this.alwaysApprove;
   }
 
+  get busy(): boolean {
+    return this.pending.size > 0 || this.permissions.size > 0 || this.questions.size > 0;
+  }
+
   get modelState(): GrokAcpModelState | null {
     return this.currentModelState;
   }
@@ -412,7 +416,10 @@ export class GrokAcpClient {
 
   async sessionSetModel(sessionId: string, modelId: string): Promise<void> {
     await this.connect();
-    await this.request('session/set_model', { sessionId, modelId });
+    const result = await this.request('session/set_model', { sessionId, modelId });
+    const meta = isRecord(result) && isRecord(result._meta) ? result._meta : undefined;
+    const model = meta && isRecord(meta.model) ? meta.model : undefined;
+    if (model && 'Err' in model) throw new Error('ACP session/set_model rejected the model');
   }
 
   async sessionSetConfigOption(
@@ -603,8 +610,9 @@ export class GrokAcpClient {
   }
 
   private async doConnect(): Promise<void> {
-    const args = ['agent', 'stdio'];
+    const args = ['agent', '--no-leader'];
     if (this.alwaysApprove) args.push('--always-approve');
+    args.push('stdio');
     const child = spawn(this.grokBin, args, {
       cwd: os.homedir(),
       env: this.childEnv(),
@@ -618,7 +626,7 @@ export class GrokAcpClient {
     child.on('exit', (code, signal) => this.handleExit(null, code, signal));
     child.stderr?.on('data', (chunk: Buffer) => {
       for (const line of chunk.toString('utf8').split(/\r?\n/)) {
-        if (line.trim()) this.onStderr?.(line);
+        if (line.trim()) this.onStderr?.(this.redact(line));
       }
     });
     this.rl = readline.createInterface({ input: child.stdout! });
@@ -631,10 +639,7 @@ export class GrokAcpClient {
       this.connected = true;
     } catch (err) {
       this.connected = false;
-      this.killGroup(child, 'SIGTERM');
-      this.child = null;
-      this.rl?.close();
-      this.rl = null;
+      await this.close();
       throw err;
     }
   }
@@ -654,8 +659,20 @@ export class GrokAcpClient {
     }
   }
 
+  private redact(text: string): string {
+    for (const [name, value] of Object.entries({ ...process.env, ...this.env })) {
+      if (/key|token|secret|auth/i.test(name) && value) {
+        text = text.split(value).join('[redacted]');
+        const escaped = JSON.stringify(value).slice(1, -1);
+        if (escaped !== value) text = text.split(escaped).join('[redacted]');
+      }
+    }
+    return text;
+  }
+
   private handleLine(line: string): void {
     if (!line.trim()) return;
+    line = this.redact(line);
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(line);
@@ -1056,7 +1073,7 @@ export class GrokAcpClient {
     this.rl?.close();
     this.rl = null;
     const message = err
-      ? `Grok ACP spawn failed: ${err.message}`
+      ? `Grok ACP spawn failed: ${this.redact(err.message)}`
       : `Grok ACP exited (code=${code ?? null}, signal=${signal ?? null})`;
     this.rejectAll(new Error(message));
     this.permissions.clear();

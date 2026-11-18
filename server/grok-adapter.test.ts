@@ -8,17 +8,16 @@ import test from 'node:test';
 import {
   GrokAdapter,
   GrokProviderAdapter,
-  grokContextWindow,
   grokEffort,
   resolveGrokBin,
   GROK_EFFORTS,
   acpPrompt,
   materializePromptFile,
   discoverGrokDiskSkills,
-  isKnownGrokReasoningModel,
 } from './grok-adapter.js';
 import { GrokAcpClient } from './grok-acp.js';
 import { ProviderError } from './types.js';
+import { ProviderStore } from './provider-store.js';
 
 async function writeFakeGrok(dir: string): Promise<{ bin: string; argvLog: string; stdinLog: string }> {
   const bin = join(dir, 'grok');
@@ -45,7 +44,7 @@ if argv_log:
         json.dump(args, f)
 
 stdin = ""
-if args[:2] == ["agent", "stdio"]:
+if args[:1] == ["agent"] and "stdio" in args:
     pass
 elif not sys.stdin.isatty():
     ready, _, _ = select.select([sys.stdin], [], [], 0.15)
@@ -56,7 +55,7 @@ if stdin_log:
         f.write(stdin)
 
 # ACP is opt-in and answered inline so headless -p tests exit immediately.
-if args[:2] == ["agent", "stdio"]:
+if args[:1] == ["agent"] and "stdio" in args:
     if os.environ.get("GROK_FAKE_ACP") != "1":
         sys.exit(1)
     sys.stdout.reconfigure(line_buffering=True)
@@ -145,7 +144,7 @@ async function drain(handle: { events: AsyncIterable<unknown> }): Promise<unknow
   return events;
 }
 
-test('listModels max_context_size is 500000 not 0/200000', async () => {
+test('listModels leaves unknown context and reasoning menu absent', async () => {
   const base = await mkdtemp(join(tmpdir(), 'multi-agent-grok-models-'));
   try {
     const { bin } = await writeFakeGrok(base);
@@ -153,17 +152,10 @@ test('listModels max_context_size is 500000 not 0/200000', async () => {
     const models = await adapter.listModels();
     assert.deepEqual(models.map((m) => m.model), ['grok-4.5', 'grok-4.6', 'grok']);
     assert.equal(models[0]?.provider, 'grok');
-    assert.ok(models.every((m) => m.max_context_size === 500_000));
-    assert.ok(models.every((m) => m.max_context_size !== 0));
-    assert.ok(models.every((m) => m.max_context_size !== 200_000));
-    assert.equal(grokContextWindow('grok-4.6'), 500_000);
-    assert.equal(grokContextWindow('grok-4.5'), 500_000);
-    assert.equal(grokContextWindow('grok'), 500_000);
-    assert.equal(grokContextWindow('unknown-family-model'), 500_000);
-    assert.equal(grokContextWindow(), 500_000);
-    assert.deepEqual(models[0]?.support_efforts, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-    assert.equal(models[0]?.default_effort, 'high');
-    assert.ok(models.every((m) => m.capabilities?.includes('thinking')));
+    assert.ok(models.every((m) => m.max_context_size === undefined));
+    assert.equal(models[0]?.support_efforts, undefined);
+    assert.equal(models[0]?.default_effort, undefined);
+    assert.ok(models.every((m) => m.capabilities?.length === 0));
   } finally {
     await rm(base, { recursive: true, force: true });
   }
@@ -558,7 +550,7 @@ spawn_log = os.environ.get("GROK_SPAWN_LOG")
 if spawn_log:
     with open(spawn_log, "a", encoding="utf-8") as f:
         f.write(json.dumps(args) + "\\n")
-if args[:2] == ["agent", "stdio"]:
+if args[:1] == ["agent"] and "stdio" in args:
     count_path = os.environ.get("GROK_ACP_COUNT")
     n = 1
     if count_path:
@@ -622,10 +614,10 @@ sys.exit(0)
     assert.equal((adapter as any).acpSessionIds.get(session.id), 'acp-assigned');
     const spawns = (await readFile(spawnLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as string[]);
     assert.ok(spawns.length >= 3, JSON.stringify(spawns));
-    assert.deepEqual(spawns[0].slice(0, 2), ['agent', 'stdio']);
+    assert.deepEqual(spawns[0].slice(0, 2), ['agent', '--no-leader']);
     assert.ok(spawns[1].includes('-p') || spawns[1][0] === '-p', JSON.stringify(spawns[1]));
-    assert.deepEqual(spawns[2].slice(0, 2), ['agent', 'stdio']);
-    assert.equal(spawns.filter((args) => args[0] === 'agent' && args[1] === 'stdio').length, 2);
+    assert.deepEqual(spawns[2].slice(0, 2), ['agent', '--no-leader']);
+    assert.equal(spawns.filter((args) => args[0] === 'agent' && args.includes('stdio')).length, 2);
   } finally {
     await adapter?.dispose().catch(() => undefined);
     await rm(base, { recursive: true, force: true });
@@ -1328,8 +1320,8 @@ for raw in sys.stdin:
     const withReason = models.find((m) => m.model === 'grok-with-reason');
     assert.ok(withReason);
     assert.deepEqual(withReason.capabilities, ['thinking']);
-    assert.deepEqual(withReason.support_efforts, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-    assert.equal(withReason.default_effort, 'high');
+    assert.equal(withReason.support_efforts, undefined);
+    assert.equal(withReason.default_effort, undefined);
   } finally {
     await adapter?.dispose().catch(() => undefined);
     await rm(base, { recursive: true, force: true });
@@ -1507,9 +1499,9 @@ test('listModels merges acp modelState when ready and protects non-Grok models o
     const geminiModel = offlineModels.find((m) => m.model === 'gemini-3.8-flash');
 
     assert.ok(grokModel);
-    assert.deepEqual(grokModel.capabilities, ['thinking']);
-    assert.equal(grokModel.default_effort, 'high');
-    assert.deepEqual(grokModel.support_efforts, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    assert.deepEqual(grokModel.capabilities, []);
+    assert.equal(grokModel.default_effort, undefined);
+    assert.equal(grokModel.support_efforts, undefined);
 
     assert.ok(geminiModel);
     assert.deepEqual(geminiModel.capabilities, []);
@@ -1534,7 +1526,7 @@ test('listModels merges acp modelState when ready and protects non-Grok models o
         ],
       },
     };
-    (adapter as any).acpClients.set(false, fakeClient);
+    (adapter as any).acpClients.set(JSON.stringify([null, false]), fakeClient);
 
     const mergedModels = await adapter.listModels();
     const mergedGemini = mergedModels.find((m) => m.model === 'gemini-3.8-flash');
@@ -1729,7 +1721,7 @@ test('non-grok ACP model with empty reasoningEfforts does not inherit GROK_EFFOR
         return [];
       },
     };
-    (adapter as any).acpClients.set(false, fakeClient);
+    (adapter as any).acpClients.set(JSON.stringify([null, false]), fakeClient);
     (adapter as any).sessionClient.set('sess-1', fakeClient);
     (adapter as any).acpSessionIds.set('sess-1', 'acp-1');
     await adapter.setModel('sess-1', 'grok-4.6');
@@ -2009,7 +2001,7 @@ test('review regression: reject selects reject_once ahead of reject_always', asy
       resolvePermission: (_id: number, optionId: string) => { selected = optionId; },
       close: async () => undefined,
     };
-    (adapter as any).acpClients.set(false, client);
+    (adapter as any).acpClients.set(JSON.stringify([null, false]), client);
     await adapter.resolveApproval('session', '42', 'reject');
     assert.equal(selected, 'one-time');
   } finally {
@@ -2027,7 +2019,7 @@ test('review regression: initial catalog includes CLI-only and ACP-only models',
       modelState: { currentModelId: 'acp-model', availableModels: [{ modelId: 'acp-model', supportsReasoningEffort: false }] },
       close: async () => undefined,
     };
-    (adapter as any).acpClients.set(false, client);
+    (adapter as any).acpClients.set(JSON.stringify([null, false]), client);
     (adapter as any).inner.listModels = async () => ({ defaultModel: 'cli-model', models: ['cli-model'] });
     const models = await adapter.listModels();
     assert.ok(models.some((model) => model.model === 'cli-model'));
@@ -2049,7 +2041,7 @@ test('review regression: expired CLI model cache is refreshed alongside live ACP
       modelState: { currentModelId: 'acp-model', availableModels: [{ modelId: 'acp-model' }] },
       close: async () => undefined,
     };
-    (adapter as any).acpClients.set(false, client);
+    (adapter as any).acpClients.set(JSON.stringify([null, false]), client);
     const old = { defaultModel: 'old-model', models: ['old-model'] };
     (adapter as any).lastCliModels = old;
     (adapter as any).inner.modelsCache = { ts: Date.now() - 10 * 60_000, value: old };
@@ -2559,4 +2551,310 @@ test('grok acp: ask_user_question answers are keyed by question text only (Strin
     answers: { 'Colour?': 'Red', 'Extras?': ['Logo', 'Icon'] },
     annotations: {},
   });
+});
+
+function grokProviders(base: string): ProviderStore {
+  const store = new ProviderStore(join(base, 'providers'));
+  for (const id of ['alpha', 'beta', 'gamma', 'delta', 'epsilon']) {
+    store.upsert('grok', {
+      id, type: 'openai', base_url: `https://${id}.example/v1`, api_key: `test-secret-${id}`,
+      models: [{ model: 'shared', display_name: `${id} model`, max_context_size: 123456, capabilities: ['thinking', 'image_in'], support_efforts: ['none', 'low', 'high', 'deep'], default_effort: 'high' }],
+    });
+  }
+  store.setActive('grok', 'alpha');
+  return store;
+}
+
+test('provider catalog supplies model refs and metadata without enumerating injected live models', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-catalog-'));
+  const store = grokProviders(base);
+  const adapter = new GrokProviderAdapter({ grokBin: join(base, 'missing'), providers: store.forCli('grok') });
+  try {
+    (adapter as any).inner.listModels = async () => ({ defaultModel: 'native', models: ['native'] });
+    (adapter as any).acpClients.set(JSON.stringify(['alpha', false]), {
+      ready: true, modelState: { availableModels: [{ modelId: 'undeclared-remote' }] }, close: async () => undefined,
+    });
+    const models = await adapter.listModels();
+    assert.equal(models.some((m) => m.model === 'undeclared-remote'), false);
+    const alpha = models.find((m) => m.model === '@alpha:shared');
+    assert.ok(alpha);
+    assert.equal(alpha.provider, 'alpha');
+    assert.equal(alpha.display_name, 'alpha model');
+    assert.equal(alpha.max_context_size, 123456);
+    assert.deepEqual(alpha.capabilities, ['thinking', 'image_in']);
+    assert.deepEqual(alpha.support_efforts, ['none', 'low', 'high']);
+    assert.equal(alpha.default_effort, 'high');
+    assert.equal(alpha.isDefault, true);
+    assert.equal(models.find((m) => m.model === 'native')?.max_context_size, undefined);
+    assert.equal(JSON.stringify(models).includes('test-secret'), false);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('provider defaults reach fallback CLI as bare model and selected provider env', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-fallback-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin, argvLog } = await writeFakeGrok(base);
+    const envLog = join(base, 'route.log');
+    await writeFile(bin, (await readFile(bin, 'utf8')).replace('args = sys.argv[1:]', `args = sys.argv[1:]\nopen(os.environ["ROUTE_LOG"], "a").write(str(os.environ.get("GROK_MODELS_BASE_URL", "native")) + "\\n")`));
+    const store = grokProviders(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, settingsPath: join(base, 'settings.json'), providers: store.forCli('grok'), env: { ROUTE_LOG: envLog, GROK_ARGV_LOG: argvLog } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    assert.equal(adapter.getModel(session.id), '@alpha:shared');
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'hello' }));
+    const args = JSON.parse(await readFile(argvLog, 'utf8')) as string[];
+    assert.equal(args[args.indexOf('--model') + 1], 'shared');
+    assert.ok((await readFile(envLog, 'utf8')).trim().split('\n').every((line) => line === 'https://alpha.example/v1'));
+    await adapter.setModel('__default__', 'native-choice');
+    assert.equal(adapter.getModel(session.id), 'native-choice');
+  } finally { await adapter?.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('unknown provider and failed live model switches do not persist settings or secrets', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-switch-fail-'));
+  const store = grokProviders(base);
+  const adapter = new GrokProviderAdapter({ providers: store.forCli('grok'), settingsPath: join(base, 'settings.json') });
+  try {
+    await assert.rejects(adapter.setModel('s', '@gone:shared'), (err: unknown) => err instanceof ProviderError && err.code === 'invalid_request' && err.httpStatus === 400);
+    const client = {
+      ready: true, sessionSetModel: async () => { throw new Error('test-secret-alpha rejected'); },
+      sessionSetConfigOption: async () => { throw new Error('test-secret-alpha denied'); }, close: async () => undefined,
+    };
+    (adapter as any).acpClients.set(JSON.stringify(['alpha', false]), client);
+    (adapter as any).sessionClient.set('s', client);
+    (adapter as any).acpSessionIds.set('s', 'acp-s');
+    await assert.rejects(adapter.setModel('s', '@alpha:other'), (err: unknown) => err instanceof Error && err.message.includes('denied') && !err.message.includes('test-secret'));
+    assert.equal(adapter.getModel('s'), '@alpha:shared');
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('supplier and approval pools stay isolated and switching loads existing session in target pool', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-pools-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const rpcLog = join(base, 'rpc.log');
+    await writeFile(bin, (await readFile(bin, 'utf8')).replace('json.dumps({"method": method, "params": params})', 'json.dumps({"method": method, "params": params, "route": os.environ.get("GROK_MODELS_BASE_URL", "native")})'));
+    const store = grokProviders(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, settingsPath: join(base, 'settings.json'), providers: store.forCli('grok'), env: { GROK_FAKE_ACP: '1', GROK_RPC_LOG: rpcLog } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'one' }));
+    const first = (adapter as any).sessionClient.get(session.id);
+    await adapter.setModel(session.id, '@beta:shared');
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'two' }));
+    const second = (adapter as any).sessionClient.get(session.id);
+    assert.notEqual(first, second);
+    const calls = (await readFile(rpcLog, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    const loaded = calls.find((c) => c.method === 'session/load' && c.route === 'https://beta.example/v1');
+    assert.ok(loaded);
+    assert.equal(loaded.params.sessionId, session.id);
+    assert.equal(calls.filter((c) => c.method === 'session/new').length, 1);
+    assert.ok(calls.filter((c) => c.method === 'session/set_model').every((c) => c.params.modelId === 'shared'));
+    await adapter.setPermission(session.id, 'yolo');
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'three' }));
+    assert.notEqual((adapter as any).sessionClient.get(session.id), second);
+  } finally { await adapter?.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('load failures are reported without silently creating a replacement conversation', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-load-fail-'));
+  const adapter = new GrokProviderAdapter({ sessionsDir: base });
+  let created = false;
+  try {
+    const client = {
+      onEvent: () => () => undefined, sessionLoad: async () => { throw new Error('load rejected'); },
+      sessionNew: async () => { created = true; return { sessionId: 'replacement' }; }, cancelSessionPending: () => undefined,
+      sessionSetMode: async () => undefined, getConfigOptions: () => undefined, sessionPrompt: async () => ({}),
+    };
+    await assert.rejects((adapter as any).runAcpTurn(client, {
+      sessionId: 'session', turnId: 'turn', prompt: 'hello', isNew: false, plan: false, yolo: false,
+      stream: { push: () => undefined, end: () => undefined }, emit: () => undefined,
+    }), /load rejected/);
+    assert.equal(created, false);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('fingerprint changes defer recycle until busy turn is done even without idle grace', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-fingerprint-'));
+  const store = grokProviders(base);
+  const adapter = new GrokProviderAdapter({ providers: store.forCli('grok') });
+  let closed = 0;
+  try {
+    const client = { ready: true, close: async () => { closed++; } };
+    (adapter as any).acpClients.set(JSON.stringify(['alpha', false]), client);
+    (adapter as any).sessionClient.set('busy', client);
+    (adapter as any).acpTurns.set('busy', {});
+    store.upsert('grok', { api_key: 'changed-secret' }, 'alpha');
+    adapter.providerChanged();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(closed, 0);
+    (adapter as any).acpTurns.delete('busy');
+    await adapter.recycleIfIdle();
+    assert.equal(closed, 1);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('pool capacity evicts least recently used idle client and refuses when every pool is busy', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-lru-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const store = grokProviders(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, providers: store.forCli('grok'), env: { GROK_FAKE_ACP: '1' } });
+    const a = await (adapter as any).ensureAcp(false, 'alpha');
+    const b = await (adapter as any).ensureAcp(false, 'beta');
+    await (adapter as any).ensureAcp(false, 'gamma');
+    await (adapter as any).ensureAcp(false, 'delta');
+    assert.equal(await (adapter as any).ensureAcp(false, 'alpha'), a);
+    await (adapter as any).ensureAcp(false, 'epsilon');
+    assert.equal(a.ready, true);
+    assert.equal(b.ready, false);
+    assert.equal((adapter as any).acpClients.size, 4);
+    let n = 0;
+    for (const client of (adapter as any).acpClients.values()) {
+      const sid = `busy-${n++}`;
+      (adapter as any).sessionClient.set(sid, client);
+      (adapter as any).acpTurns.set(sid, {});
+    }
+    await assert.rejects((adapter as any).ensureAcp(true, 'beta'), /busy|capacity|limit/i);
+  } finally { await adapter?.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('provider fingerprint is checked without notification and stale busy pools wait for turn completion', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-rotate-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const store = grokProviders(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, providers: store.forCli('grok'), env: { GROK_FAKE_ACP: '1', GROK_FAKE_QUESTION: '1' } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    const handle = await adapter.startTurn({ sessionId: session.id, input: 'wait' });
+    for await (const event of handle.events) { if ((event as any).kind === 'question') break; }
+    const old = (adapter as any).sessionClient.get(session.id);
+    store.upsert('grok', { api_key: 'rotated-secret' }, 'alpha');
+    await assert.rejects((adapter as any).ensureAcp(false, 'alpha'), /provider changed/);
+    assert.equal(old.ready, true);
+    await adapter.resolveQuestion(session.id, 'ask-1', 'Alpha');
+    await drain(handle);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(old.ready, false);
+    const next = await (adapter as any).ensureAcp(false, 'alpha');
+    assert.notEqual(next, old);
+    assert.equal(next.ready, true);
+  } finally { await adapter?.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('ACP scrubs injected credentials from raw notifications', () => {
+  const client = new GrokAcpClient({ grokBin: 'unused', env: { XAI_API_KEY: 'sensitive-test-token' } });
+  const events: unknown[] = [];
+  client.onEvent((event) => events.push(event));
+  (client as any).handleLine(JSON.stringify({ method: 'session/update', params: { sessionId: 's', update: {
+    sessionUpdate: 'subagent_spawned', child_session_id: 'child', description: 'sensitive-test-token', api_key: 'sensitive-test-token',
+  } } }));
+  assert.equal(JSON.stringify(events).includes('sensitive-test-token'), false);
+  assert.ok(JSON.stringify(events).includes('[redacted]'));
+});
+
+test('model RPC rejection before prompt produces a failed turn and never sends the prompt', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-rpc-fail-'));
+  const adapter = new GrokProviderAdapter({ sessionsDir: base });
+  let prompted = false;
+  try {
+    const client = {
+      onEvent: () => () => undefined, sessionNew: async () => ({ sessionId: 's' }), sessionSetMode: async () => undefined,
+      sessionSetModel: async () => { throw new Error('unknown model'); },
+      sessionSetConfigOption: async () => { throw new Error('unknown model'); },
+      sessionPrompt: async () => { prompted = true; return {}; }, cancelSessionPending: () => undefined,
+    };
+    await assert.rejects((adapter as any).runAcpTurn(client, {
+      sessionId: 's', turnId: 't', prompt: 'hello', isNew: true, plan: false, yolo: false, model: 'invalid',
+      stream: { push: () => undefined, end: () => undefined }, emit: () => undefined,
+    }), /model switch failed/);
+    assert.equal(prompted, false);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('session/load replay does not leak old messages or usage into the next turn', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-replay-'));
+  const adapter = new GrokProviderAdapter({ sessionsDir: base });
+  let listener: (event: unknown) => void = () => undefined;
+  const events: any[] = [];
+  try {
+    const client = {
+      onEvent: (handler: (event: unknown) => void) => { listener = handler; return () => undefined; },
+      sessionLoad: async () => {
+        listener({ type: 'message_chunk', sessionId: 's', text: 'old text' });
+        listener({ type: 'usage', sessionId: 's', usage: { input_tokens: 99 } });
+      },
+      sessionSetMode: async () => undefined, getConfigOptions: () => undefined,
+      sessionPrompt: async () => { listener({ type: 'message_chunk', sessionId: 's', text: 'new text' }); return {}; },
+      cancelSessionPending: () => undefined,
+    };
+    await (adapter as any).runAcpTurn(client, {
+      sessionId: 's', turnId: 't', prompt: 'hello', isNew: false, plan: false, yolo: false,
+      stream: { push: (event: unknown) => events.push(event), end: () => undefined }, emit: () => undefined,
+    });
+    assert.deepEqual(events.filter((e) => e.kind === 'message').map((e) => e.payload.delta), ['new text']);
+    assert.equal(adapter.getUsage('s'), undefined);
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('simultaneous pool allocation reserves a starting turn before LRU eviction', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-reserve-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const store = grokProviders(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, providers: store.forCli('grok'), env: { GROK_FAKE_ACP: '1' } });
+    (adapter as any).activeSessions.add('starting');
+    const [first] = await Promise.all([
+      (adapter as any).ensureAcp(false, 'alpha', 'starting'),
+      ...['beta', 'gamma', 'delta', 'epsilon'].map((key) => (adapter as any).ensureAcp(false, key)),
+    ]);
+    assert.equal(first.ready, true);
+    assert.equal((adapter as any).sessionClient.get('starting'), first);
+    assert.equal((adapter as any).acpClients.size, 4);
+  } finally { await adapter?.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('switching to native IDs returns to the un-injected pool and busy model changes are rejected', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-native-'));
+  let adapter: GrokProviderAdapter | undefined;
+  try {
+    const { bin } = await writeFakeGrok(base);
+    const store = grokProviders(base);
+    adapter = new GrokProviderAdapter({ grokBin: bin, providers: store.forCli('grok'), env: { GROK_FAKE_ACP: '1' } });
+    const session = await adapter.create({ provider: 'grok', cwd: base });
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'first' }));
+    const injected = (adapter as any).sessionClient.get(session.id);
+    await adapter.setModel(session.id, 'native-model');
+    await drain(await adapter.startTurn({ sessionId: session.id, input: 'second' }));
+    assert.notEqual((adapter as any).sessionClient.get(session.id), injected);
+    assert.equal((adapter as any).sessionClient.get(session.id), adapter.client);
+    assert.equal((adapter.client as any).env.GROK_MODELS_BASE_URL, undefined);
+    (adapter as any).activeSessions.add(session.id);
+    await assert.rejects(adapter.setModel(session.id, '@beta:shared'), (err: unknown) => err instanceof ProviderError && err.code === 'busy');
+    assert.equal(adapter.getModel(session.id), 'native-model');
+  } finally { await adapter?.dispose(); await rm(base, { recursive: true, force: true }); }
+});
+
+test('model config option fallback is committed only after its successful RPC', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-provider-rpc-fallback-'));
+  const adapter = new GrokProviderAdapter({ settingsPath: join(base, 'settings.json') });
+  try {
+    let called = false;
+    const client = { ready: true, alwaysApproveEnabled: false,
+      sessionSetModel: async () => { throw new Error('unsupported'); },
+      sessionSetConfigOption: async (_sid: string, config: string, value: string) => {
+        assert.equal(adapter.getModel('s'), undefined);
+        assert.equal(config, 'model'); assert.equal(value, 'next'); called = true;
+      }, close: async () => undefined,
+    };
+    (adapter as any).acpClients.set(JSON.stringify([null, false]), client);
+    (adapter as any).sessionClient.set('s', client);
+    (adapter as any).acpSessionIds.set('s', 'acp-s');
+    await adapter.setModel('s', 'next');
+    assert.equal(called, true);
+    assert.equal(adapter.getModel('s'), 'next');
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
 });

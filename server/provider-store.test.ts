@@ -1,36 +1,98 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { ProviderStore, ProviderStoreError, piProviderName } from './provider-store.js';
+import {
+  KimiProviderSource,
+  ProviderStore,
+  ProviderStoreError,
+  encodeModelRef,
+  parseKimiProviderList,
+  parseModelRef,
+} from './provider-store.js';
 
 const models = [{ model: 'gemini-3.8-flash', max_context_size: 1048576 }];
 
-async function withStore(fn: (store: ProviderStore, dir: string) => Promise<void> | void): Promise<void> {
+async function withStore(
+  fn: (store: ProviderStore, dir: string) => Promise<void> | void,
+  kimi?: KimiProviderSource,
+): Promise<void> {
   const dir = await mkdtemp(join(tmpdir(), 'mag-provider-store-'));
   try {
-    await fn(new ProviderStore(dir), dir);
+    const store = new ProviderStore(dir, { kimi: kimi ?? null });
+    await store.ready(2_000);
+    await fn(store, dir);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 }
 
-test('no active provider means no injection', () => withStore((store) => {
+const KIMI_LIST = {
+  providers: {
+    a9: { baseUrl: 'https://a9.example', type: 'anthropic', apiKey: 'sk-kimi-a9' },
+    sx: { baseUrl: 'https://sx.example/v1', type: 'openai', apiKey: 'sk-kimi-sx' },
+    nokey: { baseUrl: 'https://n.example/v1', type: 'openai', apiKey: '' },
+    vx: { baseUrl: 'https://vx.example', type: 'vertexai', apiKey: 'sk-v' },
+  },
+  models: {
+    'a9/claude-opus-5-5': {
+      provider: 'a9', model: 'claude-opus-5-5', maxContextSize: 1000000,
+      capabilities: ['thinking', 'image_in'], supportEfforts: ['low', 'high', 'max'], defaultEffort: 'high',
+      overrides: { defaultEffort: 'max' }, reasoningKey: 'secret-ish',
+    },
+    'sx/gemini-3.8-flash': {
+      provider: 'sx', model: 'gemini-3.8-flash', maxContextSize: 1048576, capabilities: ['tool_use'], displayName: 'Gemini Flash',
+    },
+    'nokey/m': { provider: 'nokey', model: 'm', maxContextSize: 1000, capabilities: [] },
+    'vx/m': { provider: 'vx', model: 'm', maxContextSize: 1000, capabilities: [] },
+  },
+};
+
+function kimiSource(payload: unknown = KIMI_LIST): KimiProviderSource {
+  return new KimiProviderSource({ home: '/nonexistent-kimi-home', run: async () => JSON.stringify(payload) });
+}
+
+test('model refs round-trip and reject bare ids', () => {
+  assert.equal(encodeModelRef('kimi.a9', 'aistudio/gemini'), '@kimi.a9:aistudio/gemini');
+  assert.deepEqual(parseModelRef('@kimi.a9:aistudio/gemini'), { key: 'kimi.a9', model: 'aistudio/gemini' });
+  assert.equal(parseModelRef('gpt-6.2-sol'), null);
+  assert.equal(parseModelRef('ccwu/gemini'), null);
+});
+
+test('parseKimiProviderList keeps keyed, well-formed providers and real metadata', () => {
+  const parsed = parseKimiProviderList(KIMI_LIST);
+  assert.deepEqual(parsed.map((p) => p.id).sort(), ['a9', 'sx', 'vx']);
+  const a9 = parsed.find((p) => p.id === 'a9')!;
+  assert.equal(a9.models[0]!.max_context_size, 1000000);
+  assert.equal(a9.models[0]!.default_effort, 'max');
+  assert.deepEqual(a9.models[0]!.support_efforts, ['low', 'high', 'max']);
+  assert.ok(!JSON.stringify(a9.models).includes('secret-ish'));
+});
+
+test('no providers means no injection', () => withStore((store) => {
   for (const cli of ['codex', 'claude', 'grok', 'pi', 'dsh'] as const) {
     assert.deepEqual(store.injectionFor(cli), { args: [], env: {} });
+    assert.deepEqual(store.catalog(cli), []);
   }
 }));
 
-test('codex injection uses -c overrides and keeps the key in env only', () => withStore((store) => {
+test('codex gets every provider via -c, keeps its own default, key only in env', () => withStore((store) => {
   store.upsert('codex', { id: 'ccwu', type: 'openai_responses', base_url: 'https://relay.example/v1', api_key: 'sk-secret', models });
+  store.upsert('codex', { id: 'openai', type: 'openai_responses', base_url: 'https://o.example/v1', api_key: 'sk-o', models });
   const inj = store.injectionFor('codex');
-  assert.ok(!inj.args.join(' ').includes('sk-secret'));
-  assert.ok(inj.args.includes('model_provider="mag_ccwu"'));
-  assert.ok(inj.args.includes('model_providers.mag_ccwu.base_url="https://relay.example/v1"'));
-  assert.ok(inj.args.includes('model_providers.mag_ccwu.wire_api="responses"'));
+  const joined = inj.args.join(' ');
+  assert.ok(!joined.includes('sk-secret'));
+  assert.ok(!inj.args.some((a) => a.startsWith('model_provider=')), 'must not override the CLI default provider');
+  assert.ok(!inj.args.some((a) => a.startsWith('model=')));
+  assert.ok(inj.args.includes('model_providers.ccwu.base_url="https://relay.example/v1"'), 'gateway id kept so old rollouts resume');
+  assert.ok(inj.args.includes('model_providers.ccwu.wire_api="responses"'));
+  assert.ok(inj.args.includes('model_providers.mag_openai.base_url="https://o.example/v1"'), 'built-in ids are not shadowed');
   assert.equal(inj.env.MAG_CODEX_KEY_CCWU, 'sk-secret');
+  assert.equal(store.cliProviderId('codex', 'ccwu'), 'ccwu');
+  assert.equal(store.cliModelId('codex', '@ccwu:gemini-3.8-flash'), 'gemini-3.8-flash');
+  assert.equal(store.cliModelId('codex', '@nope:x'), undefined);
 }));
 
 test('rejects a protocol the CLI cannot speak', () => withStore((store) => {
@@ -44,9 +106,10 @@ test('rejects a protocol the CLI cannot speak', () => withStore((store) => {
   );
 }));
 
-test('claude injection writes a 0600 --settings file outside ~/.claude', () => withStore(async (store, dir) => {
+test('claude injects only the requested provider via a 0600 --settings file outside ~/.claude', () => withStore(async (store, dir) => {
   store.upsert('claude', { id: 'relay', type: 'anthropic', base_url: 'https://relay.example/v1', api_key: 'sk-a', models });
-  const inj = store.injectionFor('claude');
+  assert.deepEqual(store.injectionFor('claude'), { args: [], env: {} }, 'no key = own login');
+  const inj = store.injectionFor('claude', 'relay');
   assert.equal(inj.args[0], '--settings');
   const file = inj.args[1]!;
   assert.ok(file.startsWith(dir));
@@ -55,56 +118,109 @@ test('claude injection writes a 0600 --settings file outside ~/.claude', () => w
   assert.equal(settings.env.ANTHROPIC_BASE_URL, 'https://relay.example');
   assert.equal(settings.env.ANTHROPIC_AUTH_TOKEN, 'sk-a');
   assert.equal(settings.model, 'gemini-3.8-flash');
+  for (const name of ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']) {
+    assert.equal(settings.env[name], 'gemini-3.8-flash', `${name} must stay on the relay's model`);
+  }
+  store.remove('claude', 'relay');
+  assert.ok(!(await readdir(join(dir, 'providers'))).some((n) => n.startsWith('inject.claude')), 'key file pruned');
 }));
 
-test('grok injection is env-only', () => withStore((store) => {
+test('grok injection is env-only and per provider', () => withStore((store) => {
   store.upsert('grok', { id: 'relay', type: 'openai', base_url: 'https://relay.example/v1', api_key: 'sk-g', models });
-  const inj = store.injectionFor('grok');
+  assert.deepEqual(store.injectionFor('grok'), { args: [], env: {} });
+  const inj = store.injectionFor('grok', 'relay');
   assert.deepEqual(inj.args, []);
   assert.equal(inj.env.GROK_MODELS_BASE_URL, 'https://relay.example/v1');
   assert.equal(inj.env.XAI_API_KEY, 'sk-g');
-  assert.deepEqual(JSON.parse(inj.env.GROK_CONFIG!), { models: { default: 'gemini-3.8-flash' } });
+  assert.deepEqual(JSON.parse(inj.env.GROK_CONFIG!), {
+    models: { session_summary: 'gemini-3.8-flash', image_description: 'gemini-3.8-flash', prompt_suggestion: 'gemini-3.8-flash', web_search: 'gemini-3.8-flash' },
+  });
 }));
 
-test('pi extension references the key by $ENV, never inline', () => withStore(async (store) => {
+test('pi extension registers every provider, keys by $ENV, thinking map from efforts', () => withStore(async (store) => {
   store.upsert('pi', { id: 'relay', type: 'openai', base_url: 'https://relay.example/v1', api_key: 'sk-p', models });
   const inj = store.injectionFor('pi');
   assert.equal(inj.args[0], '--extension');
   const src = await readFile(inj.args[1]!, 'utf8');
-  assert.ok(!src.includes('sk-p'));
+  assert.ok(!src.includes('sk-p') && !src.includes('sk-kimi'));
   assert.ok(src.includes('"$MAG_PI_KEY_RELAY"'));
-  assert.ok(src.includes('"openai-completions"'));
-  assert.ok(src.includes(JSON.stringify(piProviderName('relay'))));
+  assert.ok(src.includes('pi.registerProvider("gw-relay"'));
+  assert.ok(src.includes('pi.registerProvider("mag-kimi-a9"'));
+  assert.ok(src.includes('"baseUrl":"https://a9.example"'));
+  assert.ok(src.includes('"api":"anthropic-messages"'));
+  assert.ok(src.includes('"thinkingLevelMap":{"minimal":null,"low":"low","medium":null,"high":"high","xhigh":null,"max":"max"}'));
   assert.equal(inj.env.MAG_PI_KEY_RELAY, 'sk-p');
-  assert.equal(store.activeModelId('pi'), 'gw-relay/gemini-3.8-flash');
-}));
+  assert.equal(inj.env.MAG_PI_KIMI_A9, 'sk-kimi-a9');
+  assert.equal(store.cliModelId('pi', '@kimi.a9:claude-opus-5-5'), 'mag-kimi-a9/claude-opus-5-5');
+  assert.equal(store.keyForCliProvider('pi', 'gw-relay'), 'relay');
+}, kimiSource()));
 
-test('dsh patch is JSON (valid YAML) naming the key env', () => withStore(async (store) => {
+test('dsh patch declares every provider under llm-pi-ai with model `name`', () => withStore(async (store) => {
   store.upsert('dsh', { id: 'relay', type: 'anthropic', base_url: 'https://relay.example/v1', api_key: 'sk-d', models });
   const inj = store.injectionFor('dsh');
   assert.equal(inj.args[0], '--patch');
   const patch = JSON.parse(await readFile(inj.args[1]!, 'utf8'));
-  assert.equal(patch[0].config.providers.gw_relay.apiKeyEnv, 'MAG_DSH_KEY_RELAY');
-  assert.equal(patch[0].config.providers.gw_relay.baseURL, 'https://relay.example');
-  assert.deepEqual(patch[1], { id: 'acp', config: { provider: 'gw_relay', model: 'gemini-3.8-flash' } });
-  assert.ok(!JSON.stringify(patch).includes('sk-d'));
+  assert.equal(patch.length, 1, 'no acp default: the CLI keeps its own default model');
+  const providers = patch[0].config.providers;
+  assert.equal(providers.gw_relay.apiKeyEnv, 'MAG_DSH_KEY_RELAY');
+  assert.equal(providers.gw_relay.baseURL, 'https://relay.example');
+  assert.equal(providers.gw_relay.models[0].name, 'gemini-3.8-flash');
+  assert.equal(providers.gw_relay.models[0].reasoningEfforts, false);
+  assert.deepEqual(providers.mag_kimi_a9.models[0].reasoningEfforts, { low: 'low', high: 'high', max: 'max' });
+  assert.equal(providers.mag_kimi_sx.api, 'openai-completions');
+  assert.ok(!JSON.stringify(patch).includes('sk-'));
+  assert.equal(store.cliModelId('dsh', '@kimi.sx:gemini-3.8-flash'), '["mag_kimi_sx","gemini-3.8-flash"]');
+}, kimiSource()));
+
+test('kimi providers are filtered by protocol per CLI', () => withStore((store) => {
+  assert.deepEqual(store.catalog('claude').map((p) => p.key), ['kimi.a9']);
+  assert.deepEqual(store.catalog('grok').map((p) => p.key), ['kimi.sx']);
+  assert.deepEqual(store.catalog('codex').map((p) => p.key), []);
+  assert.deepEqual(store.catalog('pi').map((p) => p.key).sort(), ['kimi.a9', 'kimi.sx']);
+  assert.ok(!JSON.stringify(store.catalog('pi')).includes('sk-kimi'));
+  assert.equal(store.injectionFor('claude', 'kimi.a9').args[0], '--settings');
+}, kimiSource()));
+
+test('kimi load failure leaves the gateway catalog usable', async () => {
+  const failing = new KimiProviderSource({ home: '/nonexistent', run: async () => { throw new Error('kimi missing'); } });
+  await withStore((store) => {
+    store.upsert('grok', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', api_key: 'k', models });
+    assert.deepEqual(store.catalog('grok').map((p) => p.key), ['a']);
+    assert.match(store.kimiError() ?? '', /kimi missing/);
+  }, failing);
+});
+
+test('catalog changes notify per CLI and move the fingerprint', () => withStore((store) => {
+  const seen: string[] = [];
+  store.onChange((cli) => seen.push(cli));
+  const before = store.catalogFingerprint('grok');
+  store.upsert('grok', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', api_key: 'k', models });
+  assert.deepEqual(seen, ['grok']);
+  assert.notEqual(store.catalogFingerprint('grok'), before);
+  const mid = store.catalogFingerprint('grok');
+  store.upsert('grok', { api_key: 'k2' }, 'a');
+  assert.notEqual(store.catalogFingerprint('grok'), mid, 'key rotation counts as a change');
 }));
 
-test('update keeps the old key when api_key is omitted, renames move the key', () => withStore((store) => {
+test('update keeps the old key when api_key is omitted, renames move the key and active', () => withStore((store) => {
   store.upsert('grok', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', api_key: 'k1', models });
+  store.setActive('grok', 'a');
   store.upsert('grok', { new_id: 'b', base_url: 'https://b.example/v1' }, 'a');
   assert.equal(store.get('grok', 'a'), undefined);
   assert.equal(store.get('grok', 'b')?.base_url, 'https://b.example/v1');
-  assert.equal(store.injectionFor('grok').env.XAI_API_KEY, 'k1');
+  assert.equal(store.injectionFor('grok', 'b').env.XAI_API_KEY, 'k1');
   assert.equal(store.hasKey('grok', 'a'), false);
+  assert.equal(store.activeId('grok'), 'b');
 }));
 
 test('create requires a key; duplicates conflict; delete clears active and launch file', () => withStore(async (store) => {
   assert.throws(() => store.upsert('pi', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', models }), /api_key is required/);
   store.upsert('pi', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', api_key: 'k', models });
   assert.throws(() => store.upsert('pi', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', api_key: 'k', models }), /already exists/);
+  store.setActive('pi', 'a');
   const file = store.injectionFor('pi').args[1]!;
   store.remove('pi', 'a');
+  assert.equal(store.activeId('pi'), undefined);
   assert.deepEqual(store.injectionFor('pi'), { args: [], env: {} });
   await assert.rejects(stat(file));
 }));
@@ -112,17 +228,28 @@ test('create requires a key; duplicates conflict; delete clears active and launc
 test('persists across instances with 0600 files', () => withStore(async (store, dir) => {
   store.upsert('codex', { id: 'r', type: 'openai_responses', base_url: 'https://r.example/v1', api_key: 'sk-r', models });
   const again = new ProviderStore(dir);
-  assert.equal(again.activeId('codex'), 'r');
   assert.equal(again.injectionFor('codex').env.MAG_CODEX_KEY_R, 'sk-r');
   assert.equal((await stat(join(dir, 'providers', 'provider-keys.json'))).mode & 0o777, 0o600);
   const listed = await readFile(join(dir, 'providers', 'providers.json'), 'utf8');
   assert.ok(!listed.includes('sk-r'));
 }));
 
-test('setActive(null) falls back to the CLI native config', () => withStore((store) => {
+test('active provider sets the default model ref; null falls back to the CLI default', () => withStore((store) => {
   store.upsert('grok', { id: 'a', type: 'openai', base_url: 'https://a.example/v1', api_key: 'k', models });
-  store.setActive('grok', null);
-  assert.deepEqual(store.injectionFor('grok'), { args: [], env: {} });
+  assert.equal(store.defaultModelRef('grok'), undefined, 'adding a provider does not change the default');
   store.setActive('grok', 'a');
-  assert.equal(store.injectionFor('grok').env.XAI_API_KEY, 'k');
+  assert.equal(store.defaultModelRef('grok'), '@a:gemini-3.8-flash');
+  store.setActive('grok', null);
+  assert.equal(store.defaultModelRef('grok'), undefined);
+  assert.throws(() => store.setActive('grok', 'missing'), /not found/);
+}));
+
+test('forCli binds every helper to one CLI', () => withStore((store) => {
+  store.upsert('pi', { id: 'relay', type: 'openai', base_url: 'https://relay.example/v1', api_key: 'sk-p', models });
+  const view = store.forCli('pi');
+  assert.equal(view.cli, 'pi');
+  assert.deepEqual(view.catalog().map((p) => p.key), ['relay']);
+  assert.equal(view.cliModelId('@relay:gemini-3.8-flash'), 'gw-relay/gemini-3.8-flash');
+  assert.equal(view.cliProviderId('relay'), 'gw-relay');
+  assert.equal(view.fingerprint(), store.catalogFingerprint('pi'));
 }));

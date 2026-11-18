@@ -31,6 +31,7 @@ const serverRoot = path.basename(here) === 'dist' ? path.dirname(here) : here;
 const DEFAULT_APPROVAL_EXTENSION_PATH = path.resolve(serverRoot, 'extensions', 'pi-gateway-approval.ts');
 import { listPiCommands, type PiNativeCommandInput } from './native-commands.js';
 import { SettingsStore } from './settings-store.js';
+import { encodeModelRef, parseModelRef, type CliProviders } from './provider-store.js';
 import {
   ProviderError,
   type ApprovalDecision,
@@ -222,14 +223,10 @@ export interface PiAdapterOptions {
   maxSessionFileBytes?: number;
   /** Optional approval extension path override. */
   approvalExtensionPath?: string;
-  /** Gateway-managed provider (`--extension <gateway file>` + key env), read at every spawn. */
-  injection?: () => { args: string[]; env: Record<string, string> };
+  providers?: CliProviders;
 }
 
-export type PiProviderAdapterOptions = PiAdapterOptions & {
-  /** Encoded `provider/model` the active gateway provider selects; wins over Pi's settings.json default. */
-  injectedDefaultModel?: () => string | undefined;
-};
+export type PiProviderAdapterOptions = PiAdapterOptions;
 
 export interface PiStartTurnResult {
   turnId: string;
@@ -546,6 +543,8 @@ export class PiRpcClient {
   private readonly listeners = new Set<(ev: PiRpcClientEvent) => void>();
   private reqSeq = 0;
   private stderrTail = '';
+  private stderrLine = '';
+  private readonly secrets: string[];
   private started = false;
   private closing = false;
   private exited = false;
@@ -557,6 +556,7 @@ export class PiRpcClient {
     this.piBin = options.piBin;
     this.cwd = options.cwd ?? os.homedir();
     this.env = options.env ?? {};
+    this.secrets = Object.entries(this.env).filter(([key, value]) => /^MAG_PI_|KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(key) && value).map(([, value]) => value);
     this.args = options.args ?? [];
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? DEFAULT_SHUTDOWN_GRACE_MS;
@@ -594,7 +594,7 @@ export class PiRpcClient {
   }
 
   getStderrTail(): string {
-    return this.stderrTail.trim();
+    return this.redact(this.stderrTail.trim());
   }
 
   onEvent(handler: (ev: PiRpcClientEvent) => void): () => void {
@@ -644,11 +644,11 @@ export class PiRpcClient {
     child.stderr?.on('data', (chunk: Buffer | string) => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
       this.stderrTail = (this.stderrTail + text).slice(-4000);
-      if (this.onStderr) {
-        for (const l of text.split(/\r?\n/)) {
-          if (l.trim()) this.onStderr(l);
-        }
-      }
+      this.stderrLine += text;
+      const lines = this.stderrLine.split(/\r?\n/);
+      this.stderrLine = lines.pop() ?? '';
+      for (const line of lines) if (line.trim()) this.onStderr?.(this.redact(line));
+      if (this.stderrLine.length > 65536) this.stderrLine = '';
     });
 
     child.once('error', (err) => {
@@ -779,11 +779,16 @@ export class PiRpcClient {
     });
   }
 
+  private redact(text: string): string {
+    for (const secret of this.secrets) text = text.split(secret).join('[redacted]');
+    return text;
+  }
+
   private handleLine(line: string): void {
     if (!line.trim()) return;
     let msg: unknown;
     try {
-      msg = JSON.parse(line);
+      msg = JSON.parse(line, (_key, value) => typeof value === 'string' ? this.redact(value) : value);
     } catch {
       return;
     }
@@ -826,7 +831,7 @@ export class PiRpcClient {
     const detail = err
       ? `Pi RPC spawn error: ${err.message}`
       : `Pi RPC exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})${tail ? `: ${tail}` : ''}`;
-    const exitErr = new ProviderError('upstream_error', detail, 502, err);
+    const exitErr = new ProviderError('upstream_error', this.redact(detail), 502);
     this.exitError = exitErr;
 
     if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
@@ -842,7 +847,7 @@ export class PiRpcClient {
     }
     this.pending.clear();
 
-    this.emit({ kind: 'exit', code, signal, intentional, error: err ?? exitErr });
+    this.emit({ kind: 'exit', code, signal, intentional, error: exitErr });
     this.resolveExitPromise?.();
   }
 
@@ -991,16 +996,25 @@ export class PiAdapter {
     this.maxSessionFileBytes = options.maxSessionFileBytes !== undefined ? Math.max(0, options.maxSessionFileBytes) : DEFAULT_MAX_SESSION_FILE_BYTES;
     this.settingsPath = options.settingsPath;
     this.approvalExtensionPath = options.approvalExtensionPath ?? DEFAULT_APPROVAL_EXTENSION_PATH;
-    this.injection = options.injection;
+    this.providers = options.providers;
+    this.providerFingerprint = this.providers?.fingerprint();
   }
 
-  private readonly injection?: () => { args: string[]; env: Record<string, string> };
+  private readonly providers?: CliProviders;
+  private providerFingerprint?: string;
+  private readonly clientFingerprints = new WeakMap<PiRpcClient, string | undefined>();
+  private readonly staleClients = new WeakSet<PiRpcClient>();
+  private modelsEpoch = 0;
 
   /** Provider config changed: drop the model catalog and every idle Pi process. */
   async providerChanged(): Promise<void> {
+    this.providerFingerprint = this.providers?.fingerprint();
     this.modelsCache = null;
+    this.modelsInflight = null;
+    this.modelsEpoch++;
     this.thinkingLevelsCache.clear();
     for (const [sid, client] of [...this.processes]) {
+      this.staleClients.add(client);
       const busy = this.activeTurns.has(sid)
         || this.startingSessions.has(sid)
         || this.hasParkedQuestions(sid)
@@ -1122,17 +1136,19 @@ export class PiAdapter {
   // -- Catalogs & Session State ---------------------------------------------
 
   async getAvailableModels(): Promise<PiModelInfo[]> {
+    await this.refreshProviders();
     if (this.modelsCache && Date.now() - this.modelsCache.ts < MODELS_TTL_MS) {
       return this.modelsCache.models;
     }
     if (this.modelsInflight) return this.modelsInflight;
+    const epoch = this.modelsEpoch;
     const inflight = (async () => {
       for (const [, client] of this.processes) {
-        if (client.isAlive) {
+        if (client.isAlive && !this.staleClients.has(client)) {
           try {
             const data = await client.request<{ models?: PiModelInfo[] }>({ type: 'get_available_models' });
             const models = Array.isArray(data?.models) ? data.models : [];
-            this.modelsCache = { ts: Date.now(), models };
+            if (epoch === this.modelsEpoch) this.modelsCache = { ts: Date.now(), models };
             return models;
           } catch {
             // fall through to next client or ephemeral
@@ -1142,11 +1158,11 @@ export class PiAdapter {
       return this.runEphemeralRpc(async (client) => {
         const data = await client.request<{ models?: PiModelInfo[] }>({ type: 'get_available_models' });
         const models = Array.isArray(data?.models) ? data.models : [];
-        this.modelsCache = { ts: Date.now(), models };
+        if (epoch === this.modelsEpoch) this.modelsCache = { ts: Date.now(), models };
         return models;
       });
     })().finally(() => {
-      this.modelsInflight = null;
+      if (this.modelsInflight === inflight) this.modelsInflight = null;
     });
     this.modelsInflight = inflight;
     return inflight;
@@ -1325,7 +1341,7 @@ export class PiAdapter {
         if (modelId) {
           const parsed = decodePiModelId(modelId, this.modelsCache?.models);
           if (parsed) {
-            await client.request({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId }).catch(() => undefined);
+            await client.request({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId });
           }
         }
         const data = await client.request<{ levels?: string[] }>({ type: 'get_available_thinking_levels' });
@@ -1343,6 +1359,13 @@ export class PiAdapter {
   }
 
   async setModel(sessionId: string, encodedModel: string): Promise<PiModelInfo> {
+    await this.refreshProviders();
+    const ref = parseModelRef(encodedModel);
+    if (ref) {
+      const cliModel = this.providers?.cliModelId(encodedModel);
+      if (!cliModel) throw new ProviderError('invalid_request', 'Pi model provider is not in the catalog', 400);
+      encodedModel = cliModel;
+    }
     let known = this.modelsCache?.models;
     let parsed = decodePiModelId(encodedModel, known);
     if (!parsed && !this.modelsCache) {
@@ -1374,16 +1397,15 @@ export class PiAdapter {
       return model;
     }
 
-    if (!known) {
-      known = await this.getAvailableModels().catch(() => undefined);
-    }
-    if (known && known.length > 0) {
-      const match = known.find((m) => m.provider === parsed!.provider && m.id === parsed!.modelId);
-      if (!match) {
-        throw new ProviderError('invalid_request', `Unknown Pi model identifier: ${encodedModel}`, 400);
+    if (!this.providers?.keyForCliProvider(parsed.provider)) {
+      known ??= await this.getAvailableModels();
+      if (known.length && !known.some((m) => m.provider === parsed!.provider && m.id === parsed!.modelId)) {
+        throw new ProviderError('invalid_request', 'Unknown Pi model identifier', 400);
       }
     }
-
+    const validated = await this.runEphemeralRpc((client) => client.request<PiModelInfo>({
+      type: 'set_model', provider: parsed!.provider, modelId: parsed!.modelId,
+    }));
     const resolvedEncoded = encodePiModelId(parsed.provider, parsed.modelId);
     this.sessionModels.set(sessionId, resolvedEncoded);
     const prevApplied = this.appliedPreferences.get(sessionId);
@@ -1396,10 +1418,7 @@ export class PiAdapter {
       }
     }
     const matched = known?.find((m) => m.provider === parsed!.provider && m.id === parsed!.modelId);
-    return matched ?? {
-      provider: parsed.provider,
-      id: parsed.modelId,
-    };
+    return validated ?? matched ?? { provider: parsed.provider, id: parsed.modelId };
   }
 
   async setThinkingLevel(sessionId: string, level: string): Promise<string> {
@@ -2163,6 +2182,7 @@ export class PiAdapter {
     const client = this.processes.get(sessionId);
     this.processes.delete(sessionId);
     if (client) {
+      this.staleClients.delete(client);
       this.clientToSession.delete(client);
       await client.close().catch(() => undefined);
     }
@@ -2204,6 +2224,20 @@ export class PiAdapter {
   }
 
   // -- Internals ------------------------------------------------------------
+
+  private async refreshProviders(): Promise<void> {
+    if (this.providerFingerprint !== this.providers?.fingerprint()) await this.providerChanged();
+  }
+
+  private async recycleStaleClient(sessionId: string): Promise<void> {
+    const client = this.processes.get(sessionId);
+    if (!client) return;
+    if (!this.staleClients.has(client) && this.clientFingerprints.get(client) === this.providers?.fingerprint()) return;
+    if (this.activeTurns.has(sessionId) || this.startingSessions.has(sessionId)
+      || this.hasParkedQuestions(sessionId) || this.hasParkedApprovals(sessionId) || client.hasPendingRequests()) return;
+    this.staleClients.delete(client);
+    await this.close(sessionId);
+  }
 
   private withCapacityLock<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.capacityLock.then(fn, fn);
@@ -2313,7 +2347,7 @@ export class PiAdapter {
     const extArgs = !hasExplicitNoExt && this.approvalExtensionPath && fs.existsSync(this.approvalExtensionPath)
       ? ['--extension', this.approvalExtensionPath]
       : [];
-    const injected = this.injection?.() ?? { args: [], env: {} };
+    const injected = this.providers?.injection() ?? { args: [], env: {} };
     const client = new PiRpcClient({
       piBin: this.getPiBin(),
       cwd,
@@ -2331,9 +2365,11 @@ export class PiAdapter {
         const sid = this.clientToSession.get(client);
         if (sid) {
           this.touchActivity(sid);
+          queueMicrotask(() => { void this.recycleStaleClient(sid); });
         }
       },
     });
+    this.clientFingerprints.set(client, this.providers?.fingerprint());
     // Persistent client-level fallback: any extension_ui_request outside an active
     // unsettled turn fails closed `{ cancelled: true }` (fire-and-forget stays a no-op).
     client.onEvent((ev) => {
@@ -2364,6 +2400,8 @@ export class PiAdapter {
     if (this.disposed) {
       throw new ProviderError('not_found', 'pi adapter disposed', 404);
     }
+    await this.refreshProviders();
+    await this.recycleStaleClient(sessionId);
     const existing = this.processes.get(sessionId);
     if (existing?.isAlive) {
       this.touchActivity(sessionId);
@@ -2400,6 +2438,8 @@ export class PiAdapter {
     if (this.disposed) {
       throw new ProviderError('not_found', 'pi adapter disposed', 404);
     }
+    await this.refreshProviders();
+    await this.recycleStaleClient(sessionId);
     const existing = this.processes.get(sessionId);
     if (existing?.isAlive) {
       this.touchActivity(sessionId);
@@ -2937,10 +2977,10 @@ export class PiAdapter {
     );
     if (shouldSyncModel && desiredModel) {
       const parsed = decodePiModelId(desiredModel, this.modelsCache?.models);
-      if (parsed) {
-        await client.request({ type: 'set_model', provider: parsed.provider, modelId: parsed.modelId }).catch(() => undefined);
-        changed = true;
-      }
+      const resolved = parsed ?? decodePiModelId(desiredModel, await this.getAvailableModels());
+      if (!resolved) throw new ProviderError('invalid_request', 'Unknown Pi model identifier', 400);
+      await client.request({ type: 'set_model', provider: resolved.provider, modelId: resolved.modelId });
+      changed = true;
     }
 
     const shouldSyncThinking = Boolean(
@@ -4164,6 +4204,7 @@ export class PiAdapter {
     }
     this.failCloseSessionQuestions(turn.sessionId);
     this.failCloseSessionApprovals(turn.sessionId);
+    queueMicrotask(() => { void this.recycleStaleClient(turn.sessionId); });
   }
 }
 
@@ -4178,18 +4219,18 @@ export class PiProviderAdapter implements ProviderAdapter {
   private readonly agentDir: string;
   private readonly renames = new Map<string, string>();
   private readonly sessionCwd = new Map<string, string>();
-  private readonly injectedDefaultModel?: () => string | undefined;
+  private readonly providers?: CliProviders;
 
   constructor(options?: PiProviderAdapterOptions) {
-    this.injectedDefaultModel = options?.injectedDefaultModel;
+    this.providers = options?.providers;
     this.settings = new SettingsStore(options?.settingsPath);
     this.agentDir = resolvePiAgentDirForSettings(options?.env ?? {}, options?.sessionsDir);
     this.inner = new PiAdapter({
       ...options,
       resolveSessionPreferences: (sessionId) => ({
-        model: this.settings.getString('model', sessionId)
+        model: this.cliModelId(this.settings.getString('model', sessionId)
           ?? this.settings.getString('model', '__default__')
-          ?? this.injectedDefaultModel?.(),
+          ?? this.providers?.defaultModelRef()),
         thinking: this.settings.getString('thinking', sessionId) ?? this.settings.getString('thinking', '__default__'),
         autoCompaction: this.settings.getBoolean('auto_compaction', sessionId),
       }),
@@ -4202,7 +4243,7 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   private readConfiguredDefaultModel(): string | undefined {
-    const injected = this.injectedDefaultModel?.();
+    const injected = this.providers?.defaultModelRef();
     if (injected) return injected;
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(this.agentDir, 'settings.json'), 'utf8')) as {
@@ -4346,28 +4387,38 @@ export class PiProviderAdapter implements ProviderAdapter {
 
   async listModels(): Promise<NativeModel[]> {
     const models = await this.inner.getAvailableModels();
-    const configuredDefault = this.readConfiguredDefaultModel();
-    const out: NativeModel[] = models.map((m) => {
+    const configuredDefault = this.getModel('__default__');
+    const out: NativeModel[] = models.flatMap((m): NativeModel[] => {
       const encoded = encodePiModelId(m.provider, m.id);
-      const levels = piModelSupportedThinkingLevels(m);
-      const caps: string[] = [];
-      if (Array.isArray(m.input) && m.input.includes('image')) caps.push('vision');
-      if (m.reasoning) caps.push('thinking');
-      if (m.reasoning && !levels.includes('off')) caps.push('always_thinking');
-      const isDefault = configuredDefault !== undefined && (encoded === configuredDefault || m.id === configuredDefault);
-      return {
-        provider: 'pi',
-        model: encoded,
-        display_name: m.name ? `${m.name} (${m.provider})` : encoded,
-        max_context_size: num(m.contextWindow),
-        ...(typeof m.maxTokens === 'number' && m.maxTokens > 0 ? { max_output_tokens: m.maxTokens } : {}),
+      const key = this.providers?.keyForCliProvider(m.provider);
+      const provider = key ? this.providers?.provider(key) : undefined;
+      const catalog = provider?.models.find((entry) => entry.model === m.id);
+      if (provider && !catalog) return [];
+      const id = key ? encodeModelRef(key, m.id) : encoded;
+      const levels = catalog
+        ? (catalog.support_efforts ?? []).filter((level) => VALID_THINKING_LEVELS.has(level))
+        : piModelSupportedThinkingLevels(m);
+      const caps: string[] = catalog ? [...(catalog.capabilities ?? [])] : [];
+      if (!catalog) {
+        if (Array.isArray(m.input) && m.input.includes('image')) caps.push('vision');
+        if (m.reasoning) caps.push('thinking');
+        if (m.reasoning && !levels.includes('off')) caps.push('always_thinking');
+      }
+      const context = catalog ? catalog.max_context_size : m.contextWindow;
+      const maxOutput = catalog ? catalog.max_output_size : m.maxTokens;
+      const defaultEffort = catalog ? catalog.default_effort : levels.includes('medium') ? 'medium' : levels[0];
+      return [{
+        provider: provider?.label ?? m.provider,
+        model: id,
+        display_name: catalog?.display_name ?? m.name ?? m.id,
+        max_context_size: typeof context === 'number' && context > 0 ? context : Number.NaN,
+        ...(typeof maxOutput === 'number' && maxOutput > 0 ? { max_output_tokens: maxOutput } : {}),
         capabilities: caps,
         support_efforts: levels,
-        supportsThinkingOff: levels.includes('off'),
-        ...(levels.length > 0 ? { default_effort: levels.includes('medium') ? 'medium' : levels[0] } : {}),
-        ...(isDefault ? { isDefault: true } : {}),
-        raw: m,
-      };
+        supportsThinkingOff: catalog ? piModelSupportedThinkingLevels(m).includes('off') : levels.includes('off'),
+        ...(defaultEffort && levels.includes(defaultEffort) ? { default_effort: defaultEffort } : {}),
+        ...(configuredDefault === id || configuredDefault === encoded || configuredDefault === m.id ? { isDefault: true } : {}),
+      }];
     });
     const defIdx = out.findIndex((entry) => entry.isDefault === true);
     if (defIdx > 0) {
@@ -4378,22 +4429,42 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   async setModel(sessionId: string, model: string): Promise<void> {
+    const cliModel = this.cliModelId(model)!;
     if (sessionId === '__default__') {
-      this.settings.set('model', '__default__', model);
+      const ref = parseModelRef(model);
+      if (ref && !this.providers?.provider(ref.key)?.models.some((entry) => entry.model === ref.model)) {
+        throw new ProviderError('invalid_request', 'Pi model is not listed by the catalog provider', 400);
+      }
+      await this.inner.setModel(sessionId, cliModel);
+      this.settings.set('model', '__default__', this.catalogModelId(model) ?? model);
       return;
     }
-    const resolved = await this.inner.setModel(sessionId, model);
-    const encoded = encodePiModelId(resolved.provider, resolved.id);
-    this.settings.set('model', sessionId, encoded);
+    const resolved = await this.inner.setModel(sessionId, cliModel);
+    const encoded = this.catalogModelId(encodePiModelId(resolved.provider, resolved.id));
+    this.settings.set('model', sessionId, encoded!);
   }
 
   getModel(sessionId: string): string | undefined {
     return (
-      this.inner.getCachedModel(sessionId) ??
-      this.settings.getString('model', sessionId) ??
+      this.catalogModelId(this.inner.getCachedModel(sessionId)) ??
+      this.catalogModelId(this.settings.getString('model', sessionId)) ??
       this.settings.getString('model', '__default__') ??
       this.readConfiguredDefaultModel()
     );
+  }
+
+  private cliModelId(id: string | undefined): string | undefined {
+    if (!id || !parseModelRef(id)) return id;
+    const model = this.providers?.cliModelId(id);
+    if (!model) throw new ProviderError('invalid_request', 'Pi model provider is not in the catalog', 400);
+    return model;
+  }
+
+  private catalogModelId(id: string | undefined): string | undefined {
+    if (!id) return id;
+    const parsed = decodePiModelId(id);
+    const key = parsed ? this.providers?.keyForCliProvider(parsed.provider) : undefined;
+    return key && parsed ? encodeModelRef(key, parsed.modelId) : id;
   }
 
   async listThinkingLevels(sessionId: string): Promise<string[]> {
@@ -4538,11 +4609,21 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   getUsage(sessionId: string): SessionUsage | undefined {
-    return this.inner.getCachedUsage(sessionId);
+    const usage = this.inner.getCachedUsage(sessionId);
+    return usage && this.withCatalogContext(sessionId, usage);
   }
 
   async refreshUsage(sessionId: string): Promise<SessionUsage> {
-    return this.inner.refreshUsage(sessionId);
+    return this.withCatalogContext(sessionId, await this.inner.refreshUsage(sessionId));
+  }
+
+  private withCatalogContext(sessionId: string, usage: SessionUsage): SessionUsage {
+    const ref = parseModelRef(this.getModel(sessionId));
+    if (!ref) return usage;
+    const context = this.providers?.provider(ref.key)?.models.find((model) => model.model === ref.model)?.max_context_size;
+    return context && context > 0
+      ? { ...usage, context_limit: context }
+      : { ...usage, context_limit: Number.NaN, context_unavailable: true };
   }
 
   getCwd(sessionId: string): string | undefined {
