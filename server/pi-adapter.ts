@@ -4220,6 +4220,7 @@ export class PiProviderAdapter implements ProviderAdapter {
   private readonly renames = new Map<string, string>();
   private readonly sessionCwd = new Map<string, string>();
   private readonly providers?: CliProviders;
+  private nativeModelIds = new Set<string>();
 
   constructor(options?: PiProviderAdapterOptions) {
     this.providers = options?.providers;
@@ -4228,9 +4229,9 @@ export class PiProviderAdapter implements ProviderAdapter {
     this.inner = new PiAdapter({
       ...options,
       resolveSessionPreferences: (sessionId) => ({
-        model: this.cliModelId(this.settings.getString('model', sessionId)
+        model: this.cliModelId(this.catalogModelId(this.settings.getString('model', sessionId)
           ?? this.settings.getString('model', '__default__')
-          ?? this.providers?.defaultModelRef()),
+          ?? this.providers?.defaultModelRef())),
         thinking: this.settings.getString('thinking', sessionId) ?? this.settings.getString('thinking', '__default__'),
         autoCompaction: this.settings.getBoolean('auto_compaction', sessionId),
       }),
@@ -4387,6 +4388,11 @@ export class PiProviderAdapter implements ProviderAdapter {
 
   async listModels(): Promise<NativeModel[]> {
     const models = await this.inner.getAvailableModels();
+    this.nativeModelIds = new Set(
+      models
+        .filter((m) => !this.providers?.keyForCliProvider(m.provider))
+        .map((m) => encodePiModelId(m.provider, m.id)),
+    );
     const configuredDefault = this.getModel('__default__');
     const out: NativeModel[] = models.flatMap((m): NativeModel[] => {
       const encoded = encodePiModelId(m.provider, m.id);
@@ -4448,7 +4454,7 @@ export class PiProviderAdapter implements ProviderAdapter {
     return (
       this.catalogModelId(this.inner.getCachedModel(sessionId)) ??
       this.catalogModelId(this.settings.getString('model', sessionId)) ??
-      this.settings.getString('model', '__default__') ??
+      this.catalogModelId(this.settings.getString('model', '__default__')) ??
       this.readConfiguredDefaultModel()
     );
   }
@@ -4461,10 +4467,17 @@ export class PiProviderAdapter implements ProviderAdapter {
   }
 
   private catalogModelId(id: string | undefined): string | undefined {
-    if (!id) return id;
+    if (!id || parseModelRef(id)) return id;
     const parsed = decodePiModelId(id);
     const key = parsed ? this.providers?.keyForCliProvider(parsed.provider) : undefined;
-    return key && parsed ? encodeModelRef(key, parsed.modelId) : id;
+    if (key && parsed) return encodeModelRef(key, parsed.modelId);
+    if (parsed) {
+      const encoded = encodePiModelId(parsed.provider, parsed.modelId);
+      if (!this.nativeModelIds.has(encoded) && this.providers?.provider(parsed.provider)?.models.some((m) => m.model === parsed.modelId)) {
+        return encodeModelRef(parsed.provider, parsed.modelId);
+      }
+    }
+    return id;
   }
 
   async listThinkingLevels(sessionId: string): Promise<string[]> {

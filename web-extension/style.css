@@ -4,24 +4,26 @@
 .multi-agent-provider-wrap {
   position: relative;
   flex: none;
+  box-sizing: border-box;
   width: 100%;
-  padding: var(--space-2) var(--sb-inset, 12px) 0;
+  padding: var(--space-1, 4px) var(--sb-inset, 8px) var(--space-2, 8px);
 }
 
 /* 0.39 账号行在横向 .side-footer 里:选择器若只能插到 trigger 旁,不要再叠一层 inset。 */
 .side-footer .multi-agent-provider-wrap,
 .side-footer-account .multi-agent-provider-wrap {
-  padding: var(--space-1, 4px) 0 0;
+  padding: var(--space-1, 4px) 0;
 }
 
-/* 移动端 BottomSheet:与官方 .view-tabs 的 padding 对齐。 */
+/* 移动端 BottomSheet:与官方 .view-tabs 的 padding 对齐并留出底部间距。 */
 .sheet-panel .multi-agent-provider-wrap,
 .sheet-body .multi-agent-provider-wrap {
-  padding: var(--space-1, 4px) var(--space-2, 8px) 0;
+  padding: var(--space-1, 4px) var(--space-2, 8px) var(--space-1, 4px);
 }
 
 .multi-agent-provider-seg {
   width: 100%;
+  box-sizing: border-box;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2px;
@@ -29,12 +31,13 @@
 
 .multi-agent-provider-seg.ui-seg {
   position: relative;
+  box-sizing: border-box;
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 2px;
   padding: 2px;
   background: var(--color-surface-sunken);
-  border: 0.5px solid var(--color-line);
+  border: var(--p-hairline, 0.5px) solid var(--color-line);
   border-radius: var(--radius-md);
 }
 
@@ -124,6 +127,7 @@
 }
 
 [data-multi-agent-hidden],
+[data-multi-agent-action-hidden],
 [data-multi-agent-slash-hidden],
 [data-multi-agent-qhidden] {
   display: none !important;

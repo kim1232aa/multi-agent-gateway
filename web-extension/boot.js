@@ -963,13 +963,20 @@
   function clearCrossProviderState(pinia) {
     var sessionsStore = getPiniaStore(pinia, 'kimi.sessions');
     var workspacesStore = getPiniaStore(pinia, 'kimi.workspaces');
+    var sessionListStore = getPiniaStore(pinia, 'kimi.sessionList');
     var modelsStore = getPiniaStore(pinia, 'kimi.models');
     var modeStore = getPiniaStore(pinia, 'kimi.mode');
+    if (sessionListStore && typeof sessionListStore.cancelBackgroundReads === 'function') {
+      try { sessionListStore.cancelBackgroundReads(); } catch (_) {}
+    }
     if (sessionsStore && typeof sessionsStore.setActiveSessionId === 'function') {
       sessionsStore.setActiveSessionId(undefined);
     }
     if (sessionsStore && typeof sessionsStore.setSessions === 'function') {
       sessionsStore.setSessions([]);
+    }
+    if (workspacesStore && typeof workspacesStore.clearActiveSession === 'function') {
+      try { workspacesStore.clearActiveSession(); } catch (_) {}
     }
     if (workspacesStore && Array.isArray(workspacesStore.workspaces)) {
       workspacesStore.workspaces = [];
@@ -1290,6 +1297,12 @@
       requestAnimationFrame(function () { updateSegIndicator(seg); });
     } else {
       setTimeout(function () { updateSegIndicator(seg); }, 0);
+    }
+    if (typeof ResizeObserver === 'function') {
+      try {
+        var ro = new ResizeObserver(function () { updateSegIndicator(seg); });
+        ro.observe(seg);
+      } catch (_) {}
     }
     return seg;
   }

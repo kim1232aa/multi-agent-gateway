@@ -432,6 +432,7 @@ export class DshAdapter {
     let userMsgCount = 0;
     const messages: Message[] = [];
     let msgIndex = 0;
+    let turnHasMessage = false;
 
     for (const line of lines) {
       let ev: any;
@@ -480,6 +481,7 @@ export class DshAdapter {
           content: [{ type: 'text', text }],
           created_at: createdAt,
         });
+        turnHasMessage = true;
       } else if (ev.type === 'assistant/message') {
         const parts: MessageContentPart[] = [];
         let text = '';
@@ -548,6 +550,28 @@ export class DshAdapter {
             },
           ],
           created_at: createdAt,
+        });
+      } else if (ev.type === 'turn/end') {
+        const reason = ev.data?.reason;
+        const kind = reason?.kind;
+        const hadVisibleMessage = turnHasMessage;
+        turnHasMessage = false;
+        if (!hadVisibleMessage || (kind !== 'error' && kind !== 'aborted')) continue;
+        const errMsg = typeof reason?.error?.message === 'string' ? reason.error.message.slice(0, 2000) : '';
+        const errCode = typeof reason?.error?.code === 'string' ? reason.error.code : '';
+        const turnError = {
+          ...(errMsg ? { message: errMsg } : {}),
+          ...(errCode ? { code: errCode } : {}),
+        };
+        messages.push({
+          id: ev.seq != null ? `msg_end_${ev.seq}` : `msg_end_${msgIndex++}`,
+          session_id: sessionId,
+          role: 'assistant',
+          content: [],
+          created_at: createdAt,
+          metadata: kind === 'error'
+            ? { is_error: true, turn_outcome: 'failed', ...(errMsg || errCode ? { turn_error: turnError } : {}) }
+            : { turn_outcome: 'interrupted' },
         });
       }
     }

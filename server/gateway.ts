@@ -7918,6 +7918,7 @@ function buildTurnsFromHistoryMessages(history: Message[]): Array<Record<string,
     kind: 'agent';
     status: 'ended' | 'running';
     outcome?: string;
+    error?: Record<string, unknown>;
     started_at?: string;
     ended_at?: string;
     steps: Array<{ index: number }>;
@@ -8026,6 +8027,15 @@ function buildTurnsFromHistoryMessages(history: Message[]): Array<Record<string,
 
     const target = ensureTurn(msg.id, msg.created_at);
     target.ended_at = msg.created_at;
+
+    const turnOutcome = msg.metadata?.turn_outcome;
+    if ((turnOutcome === 'failed' || turnOutcome === 'interrupted') && target.outcome !== 'failed') {
+      target.outcome = turnOutcome;
+      const turnError = msg.metadata?.turn_error;
+      if (turnOutcome === 'failed' && turnError && typeof turnError === 'object') {
+        target.error = turnError as Record<string, unknown>;
+      }
+    }
 
     if (isBashCard) {
       const card = (typeof msg.metadata?.bash_card === 'object' && msg.metadata.bash_card !== null
@@ -8570,6 +8580,7 @@ function transcriptMarkdown(session: Session, messages: Message[], provider: Pro
     '',
   ];
   for (const m of messages) {
+    if (m.content.length === 0 && m.metadata?.turn_outcome !== undefined) continue;
     lines.push(m.role === 'user' ? '## 👤 User' : '## 🤖 Assistant', '');
     for (const part of m.content) {
       if (part.type === 'text' && part.text) lines.push(part.text, '');

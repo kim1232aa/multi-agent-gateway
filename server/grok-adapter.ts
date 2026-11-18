@@ -1548,13 +1548,25 @@ export class GrokProviderAdapter implements ProviderAdapter {
     return JSON.stringify([key ?? null, alwaysApprove]);
   }
 
+  private nativeModels = new Set<string>();
+
+  private normalizeStoredModel(id?: string): string | undefined {
+    if (!id || parseModelRef(id)) return id;
+    if (this.nativeModels.has(id)) return id;
+    const defaultRef = this.providers?.defaultModelRef();
+    if (defaultRef && parseModelRef(defaultRef)?.model === id) return defaultRef;
+    const matches = (this.providers?.catalog() ?? []).filter((p) => p.models.some((m) => m.model === id));
+    return matches.length === 1 ? encodeModelRef(matches[0]!.key, id) : id;
+  }
+
   private resolveModel(id?: string): { key?: string; model?: string } {
-    const ref = parseModelRef(id);
-    if (!ref) return { model: id };
+    const normalized = this.normalizeStoredModel(id);
+    const ref = parseModelRef(normalized);
+    if (!ref) return { model: normalized };
     if (!this.providers?.provider(ref.key)) {
       throw new ProviderError('invalid_request', 'grok-adapter: selected provider is no longer in the catalog', 400);
     }
-    return { key: ref.key, model: this.providers.cliModelId(id!) ?? ref.model };
+    return { key: ref.key, model: this.providers.cliModelId(normalized!) ?? ref.model };
   }
 
   private safeError(err: unknown): string {
@@ -2213,10 +2225,12 @@ export class GrokProviderAdapter implements ProviderAdapter {
   }
 
   getModel(sessionId: string): string | undefined {
-    return this.settings.getString('model', sessionId)
+    return this.normalizeStoredModel(
+      this.settings.getString('model', sessionId)
       ?? this.settings.getString('model', '__default__')
       ?? this.providers?.defaultModelRef()
-      ?? this.defaultModel;
+      ?? this.defaultModel,
+    );
   }
 
   private defaultEffortForModel(client: GrokAcpClient, modelId?: string): string | undefined {
@@ -2327,10 +2341,11 @@ export class GrokProviderAdapter implements ProviderAdapter {
     }
     if (cli) this.lastCliModels = cli;
     this.defaultModel = cli?.defaultModel ?? this.defaultModel ?? liveState?.currentModelId;
-    const selectedDefault = this.getModel('__default__');
-    const out: NativeModel[] = [];
     const native = new Map((liveState?.availableModels ?? []).map((info) => [info.modelId, info]));
     for (const model of cli?.models ?? []) if (!native.has(model)) native.set(model, { modelId: model });
+    this.nativeModels = new Set(native.keys());
+    const selectedDefault = this.getModel('__default__');
+    const out: NativeModel[] = [];
     for (const [model, info] of native) {
       const efforts = info.supportsReasoningEffort === false ? [] : supportedGrokEfforts(info.reasoningEfforts?.map((e) => e.value));
       const defaultEffort = info.reasoningEffort ?? info.reasoningEfforts?.find((e) => e.default)?.value;

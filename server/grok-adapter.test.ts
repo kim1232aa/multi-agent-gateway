@@ -2858,3 +2858,17 @@ test('model config option fallback is committed only after its successful RPC', 
     assert.equal(adapter.getModel('s'), 'next');
   } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
 });
+
+test('Grok legacy bare model names resolve to gateway catalog refs once removed from native config', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'grok-legacy-ref-'));
+  const settingsPath = join(base, 'settings.json');
+  await writeFile(settingsPath, JSON.stringify({ model: { __default__: 'shared' } }));
+  const store = grokProviders(base);
+  const adapter = new GrokProviderAdapter({ providers: store.forCli('grok'), settingsPath });
+  (adapter as any).inner.listModels = async () => ({ defaultModel: 'grok-4.6', models: ['grok-4.6'] });
+  try {
+    await adapter.listModels();
+    assert.equal(adapter.getModel('old-session'), '@alpha:shared');
+    assert.deepEqual((adapter as any).resolveModel('shared'), { key: 'alpha', model: 'shared' });
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});

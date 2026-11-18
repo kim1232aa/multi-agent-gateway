@@ -793,6 +793,41 @@ test('maps local history blocks to the Kimi Web message wire', async () => {
   }
 });
 
+test('history turn outcome markers map to failed/interrupted v2.6.2 turns; other turns stay completed', async () => {
+  const codex = fakeAdapter('codex');
+  codex.getHistory = async () => [
+    { id: 'u1', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'one' }], created_at: '2026-01-01T00:00:01.000Z' },
+    { id: 'e1', session_id: 'codex-native', role: 'assistant', content: [], created_at: '2026-01-01T00:00:02.000Z', metadata: { is_error: true, turn_outcome: 'failed', turn_error: { message: '402: Insufficient Balance', code: 'QUOTA' } } },
+    { id: 'u2', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'two' }], created_at: '2026-01-01T00:00:03.000Z' },
+    { id: 'e2', session_id: 'codex-native', role: 'assistant', content: [], created_at: '2026-01-01T00:00:04.000Z', metadata: { turn_outcome: 'interrupted' } },
+    { id: 'u3', session_id: 'codex-native', role: 'user', content: [{ type: 'text', text: 'three' }], created_at: '2026-01-01T00:00:05.000Z' },
+    { id: 'a3', session_id: 'codex-native', role: 'assistant', content: [{ type: 'text', text: 'ok' }], created_at: '2026-01-01T00:00:06.000Z', metadata: { is_error: true } },
+  ];
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    codex: codex as any,
+    claude: fakeAdapter('claude') as any, grok: fakeAdapter('grok') as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  try {
+    const response = await fetch(`${gateway.url}/api/v1/sessions/codex_codex-native/agents/main/turns`, {
+      headers: { authorization: 'Bearer gateway-token' },
+    });
+    assert.equal(response.status, 200);
+    const turns = (await response.json() as any).data.turns as any[];
+    assert.deepEqual(turns.map((t) => t.outcome), ['failed', 'interrupted', 'completed']);
+    assert.deepEqual(turns[0].error, { message: '402: Insufficient Balance', code: 'QUOTA' });
+    assert.equal(turns[1].error, undefined);
+    assert.equal(turns[2].error, undefined);
+    assert.deepEqual(turns[0].items.map((it: any) => it.type), ['user_message']);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test('tunnels Kimi WebSocket upgrade with upstream authorization and the browser protocol', async () => {
   let upgrade:
     | { path: string; authorization: string | undefined; protocol: string | undefined }

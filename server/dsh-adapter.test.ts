@@ -665,6 +665,44 @@ test('review regression: real DSH session disk format parses user content, filte
   }
 });
 
+test('DSH turn/end error and abort reasons become turn outcome markers in history', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'dsh-test-turn-end-'));
+  try {
+    const sessionId = 'turn-end-sess-1';
+    const sessionDir = join(tempDir, '--test-workspace--', sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    const lines = [
+      JSON.stringify({ type: 'session', version: 4, id: sessionId, createdAt: 1700000000000, cwd: '/workspace' }),
+      JSON.stringify({ type: 'user/message', seq: 9, time: 1795003011533, data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' }, role: 'user', id: 'u1' } }),
+      JSON.stringify({ type: 'turn/end', seq: 16, time: 1795003012199, data: { turn: 1, reason: { kind: 'error', error: { message: '402: Insufficient Balance', code: 'QUOTA' } } } }),
+      JSON.stringify({ type: 'turn/start', seq: 19, time: 1795003020000, data: { turn: 2 } }),
+      JSON.stringify({ type: 'turn/end', seq: 21, time: 1795003020001, data: { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } } }),
+      JSON.stringify({ type: 'user/message', seq: 23, time: 1795003021130, data: { content: [{ type: 'text', text: 'go on' }], source: { kind: 'user' }, role: 'user', id: 'u2' } }),
+      JSON.stringify({ type: 'turn/end', seq: 29, time: 1795003023435, data: { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } } }),
+      JSON.stringify({ type: 'user/message', seq: 40, time: 1795003030000, data: { content: [{ type: 'text', text: 'again' }], source: { kind: 'user' }, role: 'user', id: 'u3' } }),
+      JSON.stringify({ type: 'assistant/message', seq: 41, time: 1795003031000, data: { message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } } }),
+      JSON.stringify({ type: 'turn/end', seq: 42, time: 1795003031001, data: { turn: 3, reason: { kind: 'completed' } } }),
+    ].join('\n');
+    await writeFile(join(sessionDir, 'session.v4.jsonl.zstd'), zlib.zstdCompressSync(Buffer.from(lines, 'utf8')));
+
+    const adapter = new DshAdapter({ sessionsDir: tempDir });
+    const history = adapter.getHistoryMessages(sessionId);
+    assert.deepEqual(history.map((m) => m.role), ['user', 'assistant', 'user', 'assistant', 'user', 'assistant']);
+    assert.deepEqual(history[1]?.content, []);
+    assert.deepEqual(history[1]?.metadata, {
+      is_error: true,
+      turn_outcome: 'failed',
+      turn_error: { message: '402: Insufficient Balance', code: 'QUOTA' },
+    });
+    assert.deepEqual(history[3]?.content, []);
+    assert.deepEqual(history[3]?.metadata, { turn_outcome: 'interrupted' });
+    assert.equal(history[5]?.metadata, undefined);
+    assert.equal(adapter.listSessionsFromDisk()[0]?.messageCount, 3);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('review regression: listModels removes hardcoded fake DeepSeek models and setModel rejects obsolete models', { timeout: 2000 }, async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'dsh-test-fake-models-'));
   try {

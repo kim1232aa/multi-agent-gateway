@@ -3400,3 +3400,19 @@ test('Pi usage uses catalog context instead of extension fallback context', asyn
     assert.equal((await adapter.refreshUsage('session')).context_limit, 98765);
   } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
 });
+
+test('Pi legacy native provider/model refs resolve to gateway catalog refs once removed from native models.json', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'pi-legacy-ref-'));
+  const store = await piCatalogFixture(base);
+  const settingsPath = join(base, 'settings.json');
+  await writeFile(settingsPath, JSON.stringify({ model: { __default__: 'first/shared' } }));
+  const adapter = new PiProviderAdapter({ providers: store.forCli('pi'), settingsPath });
+  (adapter as any).inner.getAvailableModels = async () => [
+    { provider: 'anthropic', id: 'own', contextWindow: 200000 },
+    { provider: 'gw-first', id: 'shared', contextWindow: 128000 },
+  ];
+  try {
+    await adapter.listModels();
+    assert.equal(adapter.getModel('new-session'), '@first:shared');
+  } finally { await adapter.dispose(); await rm(base, { recursive: true, force: true }); }
+});
