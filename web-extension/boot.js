@@ -86,6 +86,16 @@
   }
   var STORAGE_KEY = 'multi-agent-gateway.provider.v1';
   var EXPLICIT_KEY = 'multi-agent-gateway.explicitProvider.v1';
+  var WS_BUCKETS_KEY = 'multi-agent-gateway.workspacesByProvider.v1';
+  var WS_OWNER_KEY = 'multi-agent-gateway.wsStorageProvider.v1';
+  var WS_RAW_SPECS = [
+    { key: 'kimi-active-workspace', def: null },
+    { key: 'kimi-web.workspace-order', def: '[]' },
+    { key: 'kimi-web.workspace-recency-floor', def: '{}' },
+    { key: 'kimi-web.workspace-sort', def: null },
+    { key: 'kimi-web.hidden-workspace-ids', def: '[]' },
+    { key: 'kimi-web.collapsed-workspaces', def: '[]' },
+  ];
   var WS_STALE_WAKE_MS = 45000;
   var WS_WAKE_PROBE_AFTER_MS = 10000;
   var WS_WAKE_PONG_TIMEOUT_MS = 3000;
@@ -148,8 +158,81 @@
     return runtimeProvider || explicitProvider() || 'kimi';
   }
 
+  function lsGet(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+  }
+
+  function lsSet(key, val) {
+    try { localStorage.setItem(key, val); } catch (_) {}
+  }
+
+  function lsRemove(key) {
+    try {
+      if (typeof localStorage.removeItem === 'function') localStorage.removeItem(key);
+      else if (localStorage.getItem(key) !== null) localStorage.setItem(key, '');
+    } catch (_) {}
+  }
+
+  function readWorkspaceBuckets() {
+    try {
+      var parsed = JSON.parse(lsGet(WS_BUCKETS_KEY) || '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function writeWorkspaceBuckets(buckets) {
+    try { lsSet(WS_BUCKETS_KEY, JSON.stringify(buckets)); } catch (_) {}
+  }
+
+  function readCurrentRawWorkspaceState() {
+    var out = {};
+    for (var i = 0; i < WS_RAW_SPECS.length; i += 1) {
+      var key = WS_RAW_SPECS[i].key;
+      out[key] = lsGet(key);
+    }
+    return out;
+  }
+
+  function applyRawWorkspaceState(bucket) {
+    for (var i = 0; i < WS_RAW_SPECS.length; i += 1) {
+      var spec = WS_RAW_SPECS[i];
+      var val = bucket && Object.prototype.hasOwnProperty.call(bucket, spec.key)
+        ? bucket[spec.key]
+        : spec.def;
+      if (val === null || val === undefined) lsRemove(spec.key);
+      else lsSet(spec.key, String(val));
+    }
+  }
+
+  function saveWorkspaceBucket(provider) {
+    if (!isProvider(provider)) return;
+    var buckets = readWorkspaceBuckets();
+    buckets[provider] = readCurrentRawWorkspaceState();
+    writeWorkspaceBuckets(buckets);
+  }
+
+  function readProviderWorkspaceBucket(provider) {
+    var buckets = readWorkspaceBuckets();
+    return isProvider(provider) && buckets[provider] && typeof buckets[provider] === 'object'
+      ? buckets[provider]
+      : null;
+  }
+
+  function syncWorkspaceStorageForProvider(nextProvider) {
+    if (!isProvider(nextProvider)) return;
+    var owner = lsGet(WS_OWNER_KEY);
+    if (!isProvider(owner)) owner = 'kimi';
+    if (owner === nextProvider) return;
+    saveWorkspaceBucket(owner);
+    applyRawWorkspaceState(readProviderWorkspaceBucket(nextProvider));
+    lsSet(WS_OWNER_KEY, nextProvider);
+  }
+
   function setProvider(provider) {
     if (!isProvider(provider)) return;
+    syncWorkspaceStorageForProvider(provider);
     runtimeProvider = provider;
     try {
       localStorage.setItem(STORAGE_KEY, provider);
@@ -948,6 +1031,45 @@
     }
   }
 
+  function setStoreProp(store, prop, val) {
+    if (!store || store[prop] === undefined) return;
+    if (store[prop] && typeof store[prop] === 'object' && 'value' in store[prop]) {
+      store[prop].value = val;
+    } else {
+      store[prop] = val;
+    }
+  }
+
+  function parseJsonStorage(raw, fallback) {
+    if (typeof raw !== 'string' || !raw) return fallback;
+    try {
+      var parsed = JSON.parse(raw);
+      if (Array.isArray(fallback)) return Array.isArray(parsed) ? parsed : fallback;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  function hydrateWorkspacesStoreFromBucket(workspacesStore, bucket) {
+    if (!workspacesStore) return;
+    var activeRaw = bucket ? bucket['kimi-active-workspace'] : lsGet('kimi-active-workspace');
+    var orderRaw = bucket ? bucket['kimi-web.workspace-order'] : lsGet('kimi-web.workspace-order');
+    var floorRaw = bucket ? bucket['kimi-web.workspace-recency-floor'] : lsGet('kimi-web.workspace-recency-floor');
+    var sortRaw = bucket ? bucket['kimi-web.workspace-sort'] : lsGet('kimi-web.workspace-sort');
+    var hiddenRaw = bucket ? bucket['kimi-web.hidden-workspace-ids'] : lsGet('kimi-web.hidden-workspace-ids');
+    var activeVal = activeRaw ? String(activeRaw) : null;
+    if ('storedActiveWorkspaceId' in workspacesStore) {
+      setStoreProp(workspacesStore, 'storedActiveWorkspaceId', activeVal);
+    } else if (typeof workspacesStore.activeWorkspaceId === 'string' || workspacesStore.activeWorkspaceId === null) {
+      workspacesStore.activeWorkspaceId = activeVal;
+    }
+    setStoreProp(workspacesStore, 'workspaceOrder', parseJsonStorage(orderRaw, []));
+    setStoreProp(workspacesStore, 'workspaceRecencyFloor', parseJsonStorage(floorRaw, {}));
+    setStoreProp(workspacesStore, 'hiddenWorkspaceIds', parseJsonStorage(hiddenRaw, []));
+    setStoreProp(workspacesStore, 'workspaceSortMode', sortRaw === 'recent' ? 'recent' : 'manual');
+  }
+
   function reconcileWorkspaceSelection(workspacesStore) {
     if (!workspacesStore) return;
     var list = unwrapRef(workspacesStore.workspaces);
@@ -978,11 +1100,12 @@
     if (workspacesStore && typeof workspacesStore.clearActiveSession === 'function') {
       try { workspacesStore.clearActiveSession(); } catch (_) {}
     }
-    if (workspacesStore && Array.isArray(workspacesStore.workspaces)) {
-      workspacesStore.workspaces = [];
-    }
-    if (workspacesStore && typeof workspacesStore.selectWorkspace === 'function') {
-      workspacesStore.selectWorkspace(null);
+    if (workspacesStore) {
+      if (Array.isArray(unwrapRef(workspacesStore.workspaces))) {
+        setStoreProp(workspacesStore, 'workspaces', []);
+      }
+      // 不调 selectWorkspace(null):官方 selectWorkspace 会改写 localStorage['kimi-active-workspace']。
+      hydrateWorkspacesStoreFromBucket(workspacesStore, null);
     }
     if (modelsStore && typeof modelsStore.setModels === 'function') {
       modelsStore.setModels([]);
@@ -1120,6 +1243,7 @@
       if (workspacesStore && typeof workspacesStore.resetSessionGroupPagination === 'function') {
         workspacesStore.resetSessionGroupPagination();
       }
+      var savedBucket = readProviderWorkspaceBucket(provider) || readCurrentRawWorkspaceState();
       if (
         sessionListStore
         && typeof sessionListStore.fireFirstSessionGroupPage === 'function'
@@ -1131,6 +1255,8 @@
           : Promise.resolve();
         return wsPromise.then(function () {
           if (provider !== selectedProvider()) return null;
+          applyRawWorkspaceState(savedBucket);
+          hydrateWorkspacesStoreFromBucket(workspacesStore, savedBucket);
           reconcileWorkspaceSelection(workspacesStore);
           var activeWsId = unwrapRef(workspacesStore && workspacesStore.activeWorkspaceId);
           if (activeWsId && modelsStore && typeof modelsStore.loadSkillsForWorkspace === 'function') {
@@ -1154,6 +1280,8 @@
         : Promise.resolve();
       return wsFallback.then(function () {
         if (provider !== selectedProvider()) return;
+        applyRawWorkspaceState(savedBucket);
+        hydrateWorkspacesStoreFromBucket(workspacesStore, savedBucket);
         reconcileWorkspaceSelection(workspacesStore);
         var activeWsId = unwrapRef(workspacesStore && workspacesStore.activeWorkspaceId);
         if (activeWsId && modelsStore && typeof modelsStore.loadSkillsForWorkspace === 'function') {
@@ -1844,6 +1972,7 @@
     var nextProvider = selectedProvider();
     if (nextProvider !== lastRouteProvider) {
       lastRouteProvider = nextProvider;
+      syncWorkspaceStorageForProvider(nextProvider);
       closeProviderSockets('route-provider-change');
       refreshProviderData();
     }
@@ -2024,6 +2153,7 @@
     if (records.some(mutationAffectsUi)) scheduleSyncUi();
   });
   if (document.documentElement) observer.observe(document.documentElement, { childList: true, subtree: true });
+  syncWorkspaceStorageForProvider(selectedProvider());
   if (document.readyState !== 'loading') syncUi();
   loadAvailableProviders();
 

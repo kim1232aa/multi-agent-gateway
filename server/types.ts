@@ -758,7 +758,7 @@ export interface ProviderAdapter {
   delete?(sessionId: string): Promise<void>;
 
   /** 分叉会话,返回新会话。 */
-  fork?(sessionId: string): Promise<Session>;
+  fork?(sessionId: string, options?: { model?: string }): Promise<Session>;
 
   /** 克隆当前分支为新会话(如 Pi clone)。 */
   clone?(sessionId: string): Promise<Session>;

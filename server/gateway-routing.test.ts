@@ -3394,6 +3394,81 @@ test('GET grok session status reports an unknown context window as 0 instead of 
   }
 });
 
+test('each local agent gets its own workspace id for the same directory, and sessions/groups use it', async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), 'mag-ws-scoped-'));
+  const settingsDir = await mkdtemp(join(tmpdir(), 'mag-ws-settings-'));
+  const shared = join(scratchDir, 'shared');
+  await mkdir(shared, { recursive: true });
+  const legacyRoot = join(scratchDir, 'legacy');
+  await mkdir(legacyRoot, { recursive: true });
+  const session = (provider: 'grok' | 'claude', id: string) => ({
+    id,
+    workspace_id: '',
+    title: id,
+    created_at: '2026-08-24T01:00:00.000Z',
+    updated_at: '2026-08-24T03:00:00.000Z',
+    busy: false,
+    metadata: { cwd: shared },
+    extras: { last_prompt: id },
+    provider,
+  });
+  const grok = fakeAdapter('grok');
+  grok.list = async () => ({ items: [session('grok', 'g1')] });
+  const claude = fakeAdapter('claude');
+  claude.list = async () => ({ items: [session('claude', 'c1')] });
+  const legacyId = (() => {
+    const normalized = legacyRoot.replace(/[\\/]+$/, '');
+    const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
+    const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
+    return `wd_${slug.slice(0, Math.max(1, 60 - 3 - 1 - hash.length))}_${hash}`;
+  })();
+  await writeFile(join(settingsDir, 'workspaces.json'), JSON.stringify({
+    claude: { [legacyId]: JSON.stringify({ id: legacyId, root: legacyRoot, name: 'legacy', kind: 'managed', additional_dirs: [] }) },
+  }));
+  const gateway = await startGateway({
+    port: 0,
+    token: 'gateway-token',
+    kimi: 'off',
+    settingsDir,
+    codex: fakeAdapter('codex') as any,
+    claude: claude as any,
+    grok: grok as any,
+    pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const get = async (p: string) => (await (await fetch(`${gateway.url}${p}`, { headers: { authorization: 'Bearer gateway-token' } })).json() as any).data;
+  try {
+    const grokWs = (await get('/api/v1/workspaces?provider=grok')).items as any[];
+    const claudeWs = (await get('/api/v1/workspaces?provider=claude')).items as any[];
+    const grokShared = grokWs.find((w) => w.root === shared);
+    const claudeShared = claudeWs.find((w) => w.root === shared);
+    assert.match(grokShared.id, /^wd_grok_/);
+    assert.match(claudeShared.id, /^wd_claude_/);
+    assert.notEqual(grokShared.id, claudeShared.id);
+
+    const legacy = claudeWs.find((w) => w.root === legacyRoot);
+    assert.match(legacy.id, /^wd_claude_/, 'stored legacy shared id is re-keyed per agent');
+    assert.equal(legacy.name, 'legacy');
+
+    const grokSessions = (await get('/api/v1/sessions?provider=grok')).items as any[];
+    assert.equal(grokSessions[0].workspace_id, grokShared.id);
+    const claudeGroups = (await get('/api/v2/sessions?view=by_workspace&provider=claude')).groups as any[];
+    const sharedGroup = claudeGroups.find((g) => (g.workspace_id ?? g.workspace?.id) === claudeShared.id);
+    assert.ok(sharedGroup, 'claude session is grouped under the claude-scoped workspace id');
+
+    const created = await (await fetch(`${gateway.url}/api/v1/workspaces?provider=grok`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer gateway-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ root: shared }),
+    })).json() as any;
+    assert.equal(created.data.id, grokShared.id, 'creating a workspace yields the same id the list returns');
+  } finally {
+    await gateway.close();
+    await rm(scratchDir, { recursive: true, force: true });
+    await rm(settingsDir, { recursive: true, force: true });
+  }
+});
+
 test('GET /api/v2/sessions?view=by_workspace returns groups for local providers', async () => {
   const scratchDir = await mkdtemp(join(tmpdir(), 'mag-ws-v2-'));
   const dirA = join(scratchDir, 'a');
@@ -6802,6 +6877,171 @@ test('adapter-emitted cancelled turn settles as interrupted without fallback com
     assert.equal(turnEnds[0]?.turn?.outcome, 'interrupted');
   } finally {
     ws?.close();
+    await gateway.close();
+  }
+});
+
+test('subscribe sends agent state before turns and preserves client prompt_id across completed turns and upstream failures', async () => {
+  const claude = fakeAdapter('claude');
+  const diskHistory: any[] = [
+    {
+      id: 'hist-user-0',
+      session_id: 'claude-native',
+      role: 'user',
+      content: [{ type: 'text', text: '旧消息' }],
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+    },
+    {
+      id: 'hist-asst-0',
+      session_id: 'claude-native',
+      role: 'assistant',
+      content: [{ type: 'text', text: '旧回复' }],
+      created_at: new Date(Date.now() - 55_000).toISOString(),
+    },
+  ];
+  claude.getHistory = async () => [...diskHistory];
+  let turnSeq = 0;
+  claude.startTurn = async (input) => {
+    turnSeq += 1;
+    const text = typeof input.input === 'string'
+      ? input.input
+      : input.input.map((p: any) => (p.type === 'text' ? p.text : '')).join('');
+    if (turnSeq === 1) {
+      // Simulate CLI writing user+assistant to disk without Kimi Web's client prompt_id.
+      const now = Date.now();
+      diskHistory.push(
+        {
+          id: 'disk-user-1',
+          session_id: 'claude-native',
+          role: 'user',
+          content: [{ type: 'text', text }],
+          created_at: new Date(now).toISOString(),
+        },
+        {
+          id: 'disk-asst-1',
+          session_id: 'claude-native',
+          role: 'assistant',
+          content: [{ type: 'text', text: '好的，有需要随时说' }],
+          created_at: new Date(now + 200).toISOString(),
+        },
+      );
+      return {
+        turnId: 't-ok',
+        events: (async function* () {
+          yield { sessionId: 'claude-native', turnId: 't-ok', kind: 'message', status: 'delta', timestamp: now, payload: { delta: '好的，有需要随时说' } } as any;
+          yield { sessionId: 'claude-native', turnId: 't-ok', kind: 'turn', status: 'completed', timestamp: now + 200, payload: { reason: 'completed' } } as any;
+        })(),
+      };
+    }
+    return {
+      turnId: 't-err',
+      events: (async function* () {
+        yield {
+          sessionId: 'claude-native', turnId: 't-err', kind: 'turn', status: 'failed',
+          timestamp: Date.now(), payload: { reason: 'failed', error: 'HTTP 402 insufficient balance' },
+        } as any;
+      })(),
+    };
+  };
+
+  const gateway = await startGateway({
+    host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off',
+    codex: fakeAdapter('codex') as any, claude: claude as any,
+    grok: fakeAdapter('grok') as any, pi: fakeAdapter('pi') as any, dsh: fakeAdapter('dsh') as any,
+    availableProviders: ['kimi', 'claude'],
+  });
+
+  const readSubscribe = async () => {
+    const frames: Array<Record<string, any>> = [];
+    const ws = new WebSocket(
+      `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=claude`,
+      ['kimi-code.bearer.test-token'],
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('subscribe timeout')), 1500);
+        ws.onopen = () => ws.send(JSON.stringify({
+          type: 'subscribe', request_id: 'sub-order', session_id: 'claude_claude-native', agent_ids: ['main'],
+        }));
+        ws.onmessage = (ev) => {
+          const f = JSON.parse(String(ev.data)) as Record<string, any>;
+          frames.push(f);
+          if (f.type === 'task.list') {
+            clearTimeout(t);
+            resolve();
+          }
+        };
+      });
+      return frames;
+    } finally {
+      ws.close();
+    }
+  };
+
+  try {
+    // 1) Completed turn: submit with client prompt_id, then open a fresh WS subscribe after turn finishes.
+    const clientPromptId = 'msg_0123456789abcdef0123456789abcdef';
+    const res1 = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/prompts`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt_id: clientPromptId, content: [{ type: 'text', text: '好的' }] }),
+    });
+    assert.equal(res1.status, 200);
+    await new Promise((r) => setTimeout(r, 80));
+
+    const frames1 = await readSubscribe();
+    const agentIdx = frames1.findIndex((f) => f.type === 'agent');
+    const turnsIdx = frames1.findIndex((f) => f.type === 'turns');
+    assert.ok(agentIdx >= 0 && turnsIdx > agentIdx, 'agent idle frame must arrive before turns snapshot');
+    assert.equal(frames1[agentIdx]?.status, 'idle');
+    const lastTurn = frames1[turnsIdx]?.turns?.at(-1);
+    const opener = lastTurn?.items?.find((it: any) => it.type === 'user_message');
+    assert.ok(Array.isArray(opener?.prompt_ids) && opener.prompt_ids.includes(clientPromptId), 'recorded client prompt_id must survive disk history reload');
+
+    // 2) Upstream error turn (e.g. 402): turn must end cleanly and go back to idle.
+    const wsLive = new WebSocket(
+      `${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=claude`,
+      ['kimi-code.bearer.test-token'],
+    );
+    const liveFrames: Array<Record<string, any>> = [];
+    let resolveIdleAfterFail!: () => void;
+    const idleAfterFail = new Promise<void>((r) => { resolveIdleAfterFail = r; });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('live subscribe timeout')), 1500);
+        wsLive.onopen = () => wsLive.send(JSON.stringify({
+          type: 'subscribe', request_id: 'sub-fail', session_id: 'claude_claude-native', agent_ids: ['main'],
+        }));
+        wsLive.onmessage = (ev) => {
+          const f = JSON.parse(String(ev.data)) as Record<string, any>;
+          liveFrames.push(f);
+          if (f.type === 'turns') { clearTimeout(t); resolve(); }
+          if (f.type === 'agent' && f.status === 'idle' && liveFrames.some((x) => x.type === 'turn.ended')) {
+            resolveIdleAfterFail();
+          }
+        };
+      });
+
+      const failPromptId = 'msg_abcdefabcdefabcdefabcdefabcdefab';
+      const res2 = await fetch(`${gateway.url}/api/v1/sessions/claude_claude-native/prompts`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ prompt_id: failPromptId, content: [{ type: 'text', text: '再试' }] }),
+      });
+      assert.equal(res2.status, 200);
+      await Promise.race([
+        idleAfterFail,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('idle after failed turn timeout')), 1500)),
+      ]);
+      const ended = liveFrames.find((f) => f.type === 'turn.ended');
+      assert.equal(ended?.turn?.outcome, 'failed');
+      assert.match(String(ended?.turn?.error?.message ?? ''), /402/);
+      const itemEnd = liveFrames.find((f) => f.type === 'item.ended' && f.item?.type === 'user_message');
+      assert.ok(itemEnd?.item?.prompt_ids?.includes(failPromptId));
+    } finally {
+      wsLive.close();
+    }
+  } finally {
     await gateway.close();
   }
 });

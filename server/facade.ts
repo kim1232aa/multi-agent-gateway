@@ -1723,11 +1723,17 @@ export class CodexProviderAdapter implements ProviderAdapter {
     this.invalidateListCache();
   }
 
-  async fork(sessionId: string): Promise<Session> {
-    const thread = await this.inner.forkThread(sessionId);
+  async fork(sessionId: string, options?: { model?: string }): Promise<Session> {
+    const thread = await this.inner.forkThread(sessionId, options);
     const forkedId = typeof thread.id === 'string' ? thread.id : '';
     this.settings.copySession(sessionId, forkedId);
     this.settings.delete('nativeThreadId', forkedId);
+    const appliedModelRef = forkedId && typeof this.inner.consumeForkModelRef === 'function'
+      ? this.inner.consumeForkModelRef(forkedId)
+      : undefined;
+    if (appliedModelRef && forkedId) {
+      this.settings.set('model', forkedId, appliedModelRef);
+    }
     this.invalidateListCache();
     return this.toSession(thread);
   }

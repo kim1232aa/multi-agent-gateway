@@ -3018,3 +3018,119 @@ test('gates message undo/fork buttons, session menu fork items, and right-panel 
   assert.equal(forkMsgBtnZh.style.display, '');
   assert.equal(sideChatBtn.style.display, '');
 });
+
+test('isolates workspace order, recency floor, active workspace, and collapse keys per provider across switches', async () => {
+  const source = await readFile(
+    existsSync(join(process.cwd(), '../web-extension/boot.js'))
+      ? join(process.cwd(), '../web-extension/boot.js')
+      : join(process.cwd(), 'web-extension/boot.js'),
+    'utf8',
+  );
+  const storage = new Map<string, string>([
+    ['kimi-active-workspace', 'wd_kimi_main'],
+    ['kimi-web.workspace-order', JSON.stringify(['wd_kimi_main', 'wd_kimi_other'])],
+    ['kimi-web.workspace-recency-floor', JSON.stringify({ wd_kimi_main: 1700000000 })],
+    ['kimi-web.workspace-sort', 'manual'],
+    ['kimi-web.hidden-workspace-ids', JSON.stringify(['wd_kimi_hidden'])],
+    ['kimi-web.collapsed-workspaces', JSON.stringify(['wd_kimi_main'])],
+  ]);
+  const workspacesStore: any = {
+    workspaces: [{ id: 'wd_kimi_main', root: '/home/pi' }],
+    storedActiveWorkspaceId: { value: 'wd_kimi_main' },
+    activeWorkspaceId: { value: 'wd_kimi_main' },
+    workspaceOrder: { value: ['wd_kimi_main', 'wd_kimi_other'] },
+    workspaceRecencyFloor: { value: { wd_kimi_main: 1700000000 } },
+    hiddenWorkspaceIds: { value: ['wd_kimi_hidden'] },
+    workspaceSortMode: { value: 'manual' },
+    selectWorkspaceCalledWith: [] as Array<string | null>,
+    selectWorkspace(id: string | null) {
+      this.selectWorkspaceCalledWith.push(id);
+      this.storedActiveWorkspaceId.value = id;
+      this.activeWorkspaceId.value = id;
+      if (id) storage.set('kimi-active-workspace', id);
+      else storage.delete('kimi-active-workspace');
+    },
+    clearActiveSession() {},
+    resetSessionGroupPagination() {},
+    loadWorkspaces: async () => {
+      const p = storage.get('multi-agent-gateway.wsStorageProvider.v1') ?? 'kimi';
+      // Simulate Vue watch wiping recency-floor while workspaces list is temporarily empty.
+      storage.set('kimi-web.workspace-recency-floor', '{}');
+      workspacesStore.workspaces = p === 'grok'
+        ? [{ id: 'wd_grok_home-pi_1c4d3877bf4f', root: '/home/pi' }]
+        : [{ id: 'wd_kimi_main', root: '/home/pi' }];
+    },
+  };
+  const piniaStores = new Map<string, any>([
+    ['kimi.config', { refreshServerMeta: async () => {}, loadConfig: async () => {} }],
+    ['kimi.models', { models: { value: [] }, setModels() {}, setDraftModel() {}, setDefaultModel() {} }],
+    ['kimi.workspaces', workspacesStore],
+    ['kimi.sessions', { setActiveSessionId() {}, setSessions() {} }],
+    ['kimi.sessionList', { cancelBackgroundReads() {}, resetSessionList() {}, ensureFlatSessions: async () => {} }],
+  ]);
+  const documentObject: any = {
+    readyState: 'complete',
+    documentElement: {},
+    querySelector: (sel: string) => (sel === '#app' ? { __vue_app__: { config: { globalProperties: { $pinia: { _s: piniaStores } } } } } : null),
+    querySelectorAll: () => [],
+    addEventListener: () => {},
+    createElement: () => ({}),
+  };
+  const windowObject: any = {
+    location: { origin: 'http://localhost:58630', pathname: '/', search: '', hash: '' },
+    localStorage: {
+      getItem: (k: string) => storage.get(k) ?? null,
+      setItem: (k: string, v: string) => storage.set(k, v),
+      removeItem: (k: string) => storage.delete(k),
+    },
+    sessionStorage: {
+      getItem: (k: string) => storage.get(`session:${k}`) ?? null,
+      setItem: (k: string, v: string) => storage.set(`session:${k}`, v),
+      removeItem: (k: string) => storage.delete(`session:${k}`),
+    },
+    addEventListener: () => {},
+    history: { pushState() {}, replaceState() {} },
+  };
+  vm.runInNewContext(source, {
+    window: windowObject,
+    document: documentObject,
+    location: windowObject.location,
+    localStorage: windowObject.localStorage,
+    sessionStorage: windowObject.sessionStorage,
+    URL,
+    Request,
+    MutationObserver: class { observe() {} disconnect() {} },
+    fetch: async () => new Response(JSON.stringify({ code: 0, data: { items: [], providers: ['kimi', 'grok'] } })),
+    console,
+    setTimeout,
+    clearTimeout,
+  }, { filename: 'boot.js' });
+
+  const api = windowObject.__multiAgent;
+  // Switch to Grok: clearCrossProviderState must not call selectWorkspace(null) to clobber kimi's key.
+  api.switchProvider('grok');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(workspacesStore.selectWorkspaceCalledWith.includes(null), false);
+  assert.equal(storage.get('kimi-active-workspace'), 'wd_grok_home-pi_1c4d3877bf4f');
+  assert.deepEqual(JSON.parse(storage.get('kimi-web.collapsed-workspaces') ?? '[]'), []);
+
+  // Mutate Grok's own workspace state, then switch back to Kimi.
+  storage.set('kimi-web.workspace-order', JSON.stringify(['wd_grok_home-pi_1c4d3877bf4f']));
+  storage.set('kimi-web.collapsed-workspaces', JSON.stringify(['wd_grok_home-pi_1c4d3877bf4f']));
+  storage.set('kimi-web.workspace-sort', 'recent');
+
+  api.switchProvider('kimi');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(storage.get('kimi-active-workspace'), 'wd_kimi_main');
+  assert.deepEqual(JSON.parse(storage.get('kimi-web.workspace-order') ?? '[]'), ['wd_kimi_main', 'wd_kimi_other']);
+  assert.deepEqual(JSON.parse(storage.get('kimi-web.workspace-recency-floor') ?? '{}'), { wd_kimi_main: 1700000000 });
+  assert.equal(storage.get('kimi-web.workspace-sort'), 'manual');
+  assert.deepEqual(JSON.parse(storage.get('kimi-web.hidden-workspace-ids') ?? '[]'), ['wd_kimi_hidden']);
+  assert.deepEqual(JSON.parse(storage.get('kimi-web.collapsed-workspaces') ?? '[]'), ['wd_kimi_main']);
+
+  // Switching back to Grok restores Grok's own sort & collapsed state.
+  api.switchProvider('grok');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(storage.get('kimi-web.workspace-sort'), 'recent');
+  assert.deepEqual(JSON.parse(storage.get('kimi-web.collapsed-workspaces') ?? '[]'), ['wd_grok_home-pi_1c4d3877bf4f']);
+});

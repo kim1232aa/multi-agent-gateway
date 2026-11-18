@@ -2040,3 +2040,52 @@ test('review regression: history fileChange items render as unified diff output'
     `delete diff wrong: ${text}`,
   );
 });
+
+test('Codex cross-provider mismatch gives actionable provider hint and forkThread adopts the remembered or explicit target', async () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), 'codex-fork-target-'));
+  const store = new ProviderStore(dir);
+  store.upsert('codex', { id: 'relay_a', type: 'openai_responses', base_url: 'https://a.example.invalid/v1', api_key: 'sec-a', models: [{ model: 'gpt-a' }] });
+  store.upsert('codex', { id: 'relay_b', type: 'openai_responses', base_url: 'https://b.example.invalid/v1', api_key: 'sec-b', models: [{ model: 'gpt-b' }] });
+  const adapter = new CodexAdapter({ providers: store.forCli('codex') } as any);
+  (adapter as any).connect = async () => {};
+  const forkCalls: any[] = [];
+  (adapter as any).request = async (method: string, params: any) => {
+    if (method === 'thread/read') return { thread: { id: params.threadId, modelProvider: 'relay_a', turns: [{ id: 't1', status: 'completed' }] } };
+    if (method === 'thread/fork') {
+      forkCalls.push(params);
+      return { thread: { id: `forked-${forkCalls.length}`, modelProvider: params.modelProvider ?? 'relay_a' } };
+    }
+    return {};
+  };
+
+  try {
+    await assert.rejects(
+      () => adapter.setModel('thread-a', '@relay_b:gpt-b'),
+      (err: unknown) => err instanceof ProviderError
+        && err.httpStatus === 400
+        && err.message.includes('relay_a')
+        && err.message.includes('relay_b')
+        && err.message.includes('@relay_b:gpt-b')
+        && /\/fork/.test(err.message),
+    );
+
+    // Immediately forking without passing a model adopts the remembered cross-provider target.
+    const forked1 = await adapter.forkThread('thread-a');
+    assert.equal(forkCalls[0].threadId, 'thread-a');
+    assert.equal(forkCalls[0].model, 'gpt-b');
+    assert.equal(forkCalls[0].modelProvider, 'relay_b');
+    assert.equal(forked1.modelProvider, 'relay_b');
+    assert.equal(adapter.consumeForkModelRef('forked-1'), '@relay_b:gpt-b');
+
+    // A second plain fork does not carry stale pending target.
+    await adapter.forkThread('thread-a');
+    assert.equal(forkCalls[1].modelProvider, undefined);
+
+    // Explicit model overrides thread provider on fork.
+    await adapter.forkThread('thread-a', { model: '@relay_b:gpt-b' });
+    assert.equal(forkCalls[2].model, 'gpt-b');
+    assert.equal(forkCalls[2].modelProvider, 'relay_b');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

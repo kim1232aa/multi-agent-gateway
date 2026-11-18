@@ -253,3 +253,112 @@ test('forCli binds every helper to one CLI', () => withStore((store) => {
   assert.equal(view.cliProviderId('relay'), 'gw-relay');
   assert.equal(view.fingerprint(), store.catalogFingerprint('pi'));
 }));
+
+test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, cache results, and expose diagnostics', async () => {
+  const { createServer } = await import('node:http');
+  let probeHits = 0;
+  const server = createServer((req, res) => {
+    probeHits += 1;
+    const url = req.url ?? '/';
+    if (url.startsWith('/multi/v1/')) {
+      // Simulates relays like a9/avt supporting all 3 protocols.
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Missing model' } }));
+      return;
+    }
+    if (url.startsWith('/ds/v1/')) {
+      if (url.endsWith('/messages')) {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('Not Found');
+        return;
+      }
+      res.writeHead(422, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'model required' }));
+      return;
+    }
+    if (url.startsWith('/multi/') || url.startsWith('/ds/')) {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      res.end('Not Found');
+      return;
+    }
+    res.writeHead(403, { 'content-type': 'text/html' });
+    res.end('<html><title>Attention Required! | Cloudflare</title></html>');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  const payload = {
+    providers: {
+      a9: { baseUrl: `http://127.0.0.1:${port}/multi`, type: 'anthropic', apiKey: 'sk-a9' },
+      ds: { baseUrl: `http://127.0.0.1:${port}/ds`, type: 'openai', apiKey: 'sk-ds' },
+      cf: { baseUrl: `http://127.0.0.1:${port}/cf/v1`, type: 'openai', apiKey: 'sk-cf' },
+    },
+    models: {
+      'a9/gemini-3.8-flash': { provider: 'a9', model: 'gemini-3.8-flash', maxContextSize: 1000000 },
+      'ds/deepseek-chat': { provider: 'ds', model: 'deepseek-chat', maxContextSize: 64000 },
+      'cf/gpt-5': { provider: 'cf', model: 'gpt-5', maxContextSize: 128000 },
+    },
+  };
+
+  try {
+    const dir = await mkdtemp(join(tmpdir(), 'mag-probe-cache-'));
+    try {
+      const source1 = new KimiProviderSource({
+        home: '/nonexistent-kimi-home',
+        run: async () => JSON.stringify(payload),
+        probe: undefined,
+      });
+      // Constructor skipped default live probe when `run` is passed; test live HTTP probe via defaultProbeKimiProvider.
+      const { defaultProbeKimiProvider } = await import('./provider-store.js');
+      const liveProbed = new KimiProviderSource({
+        home: '/nonexistent-kimi-home',
+        run: async () => JSON.stringify(payload),
+        probe: (t) => defaultProbeKimiProvider(t, 2_000),
+      });
+      const store = new ProviderStore(dir, { kimi: liveProbed });
+      await store.ready(5_000);
+
+      // a9 (declared anthropic) probed all 3 -> available in codex, claude, grok, pi, dsh!
+      assert.deepEqual(store.catalog('claude').map((p) => p.key), ['kimi.a9']);
+      assert.deepEqual(store.catalog('codex').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds']);
+      assert.deepEqual(store.catalog('grok').map((p) => p.key).sort(), ['kimi.a9', 'kimi.cf', 'kimi.ds']);
+
+      // Check per-protocol URL resolution (multi without /v1 -> /v1 for OpenAI/Responses, stripped for Anthropic).
+      const codexA9 = store.catalog('codex').find((p) => p.key === 'kimi.a9')!;
+      assert.equal(codexA9.type, 'openai_responses');
+      assert.equal(codexA9.base_url, `http://127.0.0.1:${port}/multi/v1`);
+      const grokA9 = store.catalog('grok').find((p) => p.key === 'kimi.a9')!;
+      assert.equal(grokA9.type, 'openai');
+      assert.equal(grokA9.base_url, `http://127.0.0.1:${port}/multi/v1`);
+      const claudeA9 = store.catalog('claude').find((p) => p.key === 'kimi.a9')!;
+      assert.equal(claudeA9.type, 'anthropic');
+      assert.equal(claudeA9.base_url, `http://127.0.0.1:${port}/multi`);
+
+      // Cloudflare-blocked provider keeps declared type fallback + diagnostic warning.
+      const cf = store.catalog('grok').find((p) => p.key === 'kimi.cf')!;
+      assert.match(cf.probe_warning ?? '', /Cloudflare/i);
+
+      // Cache file exists with 0600 permissions and contains no raw API keys; second store reuses cache with 0 probe hits.
+      const cachePath = join(dir, 'providers', 'kimi-probe-cache.json');
+      assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
+      assert.ok(!(await readFile(cachePath, 'utf8')).includes('sk-a9'));
+
+      const hitsBeforeReload = probeHits;
+      const sourceCached = new KimiProviderSource({
+        home: '/nonexistent-kimi-home',
+        run: async () => JSON.stringify(payload),
+        probe: (t) => defaultProbeKimiProvider(t, 2_000),
+      });
+      const store2 = new ProviderStore(dir, { kimi: sourceCached });
+      await store2.ready(5_000);
+      assert.equal(probeHits, hitsBeforeReload, 'second load reuses persisted probe cache');
+      assert.deepEqual(store2.catalog('codex').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds']);
+
+      void source1;
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

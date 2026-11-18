@@ -429,7 +429,11 @@ export class SessionHub {
   private readonly replay = new Map<string, { seq: number; frame: Record<string, unknown> }[]>();
   /** 每会话最近被挤出的帧 seq:客户端 cursor 比它还旧 = 有缺口,要 resync。 */
   private readonly evictedSeq = new Map<string, number>();
+  /** 保留客户端提交的 promptId，防止磁盘历史重读时丢失 msg_<hex> 标识导致乐观气泡卡在末尾「请求中…」。 */
+  private readonly promptHistory = new Map<string, Array<{ promptId: string; text: string; createdAtMs: number }>>();
   private static readonly REPLAY_CAP = 200;
+  private static readonly PROMPT_HISTORY_CAP = 50;
+  private static readonly PROMPT_HISTORY_SESSIONS_CAP = 500;
   private seq = 0;
   readonly epoch = randomBytes(8).toString('base64url');
 
@@ -522,11 +526,80 @@ export class SessionHub {
     return { frames: buf.filter((f) => f.seq > cursor).map((f) => f.frame), resync: false };
   }
 
+  recordPrompt(sessionId: string, promptId: string, text: string, createdAt: string): void {
+    if (!sessionId || !promptId) return;
+    let list = this.promptHistory.get(sessionId);
+    if (!list) {
+      if (this.promptHistory.size >= SessionHub.PROMPT_HISTORY_SESSIONS_CAP) {
+        const oldest = this.promptHistory.keys().next().value;
+        if (oldest !== undefined) this.promptHistory.delete(oldest);
+      }
+      list = [];
+      this.promptHistory.set(sessionId, list);
+    }
+    if (list.some((r) => r.promptId === promptId)) return;
+    list.push({
+      promptId,
+      text: text.trim(),
+      createdAtMs: Date.parse(createdAt) || Date.now(),
+    });
+    if (list.length > SessionHub.PROMPT_HISTORY_CAP) {
+      list.splice(0, list.length - SessionHub.PROMPT_HISTORY_CAP);
+    }
+  }
+
+  applyRecordedPromptIds(sessionId: string, turns: Array<Record<string, unknown>>): void {
+    const recorded = this.promptHistory.get(sessionId);
+    if (!recorded || recorded.length === 0 || turns.length === 0) return;
+    const userItems: Array<{ item: Record<string, unknown>; text: string; createdAtMs: number; promptIds: string[] }> = [];
+    const present = new Set<string>();
+    for (const turn of turns) {
+      const items = Array.isArray(turn.items) ? (turn.items as Array<Record<string, unknown>>) : [];
+      for (const item of items) {
+        if (item?.type !== 'user_message') continue;
+        const pids = Array.isArray(item.prompt_ids)
+          ? item.prompt_ids.filter((x): x is string => typeof x === 'string')
+          : [];
+        for (const pid of pids) present.add(pid);
+        userItems.push({
+          item,
+          text: typeof item.text === 'string' ? item.text.trim() : '',
+          createdAtMs: typeof item.created_at === 'string' ? (Date.parse(item.created_at) || 0) : 0,
+          promptIds: pids,
+        });
+      }
+    }
+    if (userItems.length === 0) return;
+    const matchedItems = new Set<object>();
+    for (let i = recorded.length - 1; i >= 0; i--) {
+      const rec = recorded[i]!;
+      if (present.has(rec.promptId)) continue;
+      let best: (typeof userItems)[number] | null = null;
+      let bestDelta = Number.POSITIVE_INFINITY;
+      for (const candidate of userItems) {
+        if (matchedItems.has(candidate.item)) continue;
+        if (candidate.text !== rec.text) continue;
+        const delta = candidate.createdAtMs > 0 ? Math.abs(candidate.createdAtMs - rec.createdAtMs) : 0;
+        if (delta > 180_000) continue;
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          best = candidate;
+        }
+      }
+      if (!best) continue;
+      matchedItems.add(best.item);
+      present.add(rec.promptId);
+      best.item.prompt_ids = [...best.promptIds, rec.promptId];
+      best.promptIds.push(rec.promptId);
+    }
+  }
+
   /** 删除/归档会话后清残留态:队列、回放缓冲、缺口水位(不动进行中的 turn)。 */
   drop(sessionId: string): void {
     this.queued.delete(sessionId);
     this.replay.delete(sessionId);
     this.evictedSeq.delete(sessionId);
+    this.promptHistory.delete(sessionId);
     this.listeners.delete(sessionId);
     this.v262Listeners.delete(sessionId);
     this.transcript.drop(sessionId);
@@ -554,6 +627,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       ? path.join(settingsDir, 'workspaces.json')
       : undefined,
   );
+  migrateStoredWorkspaceIds(workspaceStore);
   const grokRecycleGraceMs = process.env.GATEWAY_GROK_IDLE_TIMEOUT_MS !== undefined
     ? Number(process.env.GATEWAY_GROK_IDLE_TIMEOUT_MS)
     : 3 * 60_000;
@@ -1263,6 +1337,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
     if (isLocalProvider(provider) && isProviderRefreshRoute(sub) && req.method === 'POST') {
       try {
+        await providerStore.refreshKimi(true);
         await adapters[provider].listModels?.();
         return ok(res, { changed: [], unchanged: [provider], failed: [] }, requestId);
       } catch (error) {
@@ -1399,7 +1474,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
             last_opened_at: new Date().toISOString(),
           }
         : {
-            ...workspaceDto(root || os.homedir(), nextName, { kind: 'managed', additionalDirs: existingDirs }),
+            ...workspaceDto(root || os.homedir(), nextName, { kind: 'managed', additionalDirs: existingDirs }, provider),
             id: wid,
             root,
           };
@@ -1429,7 +1504,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       const additionalDirs = Array.isArray(body.additional_dirs)
         ? body.additional_dirs.filter((d): d is string => typeof d === 'string' && d.trim().length > 0)
         : [];
-      const baseDto = workspaceDto(root, name, { kind: 'managed', additionalDirs });
+      const baseDto = workspaceDto(root, name, { kind: 'managed', additionalDirs }, provider);
       if (isLocalProvider(provider)) {
         const all = await listWorkspaces(adapters, kimiFetch, provider, demoActive, workspaceStore).catch(() => ({ items: [] }));
         const existing = ((all as { items?: Array<Record<string, unknown>> }).items ?? []).find((w) => w.id === baseDto.id);
@@ -1485,7 +1560,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
               last_opened_at: now,
             }
           : {
-              ...workspaceDto('', nextName || wid, { kind: 'managed', additionalDirs: nextDirs }),
+              ...workspaceDto('', nextName || wid, { kind: 'managed', additionalDirs: nextDirs }, provider),
               id: wid,
               root: '',
               name: nextName,
@@ -1607,7 +1682,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
         hub.transcript.invalidateHistory(sid);
         const history = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
         if (history !== null) {
-          const page = sliceV262Turns(turnsFromHistory(history, hub.busy.get(sid)), undefined, 20);
+          const page = sliceV262Turns(turnsFromHistory(history, hub.busy.get(sid), hub, sid), undefined, 20);
           hub.broadcastV262(sid, { type: 'turns', session_id: sid, agent_id: 'main', turns: page.turns, has_more: page.has_more });
         }
         return ok(res, sessionDto(session, adapter.getModel?.(nativeId), adapter.getUsage?.(nativeId), hub.busy.has(sid)), requestId);
@@ -1716,8 +1791,9 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
       }
       if (tail === ':fork' && req.method === 'POST') {
         if (caps.fork === false || !adapter.fork) throw new ProviderError('unsupported', `${sp} 不支持分叉`, 400);
-        const body = (await readBody(req).catch(() => ({}))) as { title?: string; turn_index?: number };
-        const forked = await adapter.fork(nativeId);
+        const body = (await readBody(req).catch(() => ({}))) as { title?: string; turn_index?: number; model?: string };
+        const requestedModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : undefined;
+        const forked = await adapter.fork(nativeId, requestedModel ? { model: requestedModel } : undefined);
         if (typeof body.title === 'string' && body.title.trim()) {
           const newTitle = body.title.trim();
           if (adapter.rename) {
@@ -2008,7 +2084,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           return ok(res, sliceV262Turns(subTurns, Number.isFinite(beforeOrdinal) ? beforeOrdinal : undefined, pageSize), requestId);
         }
         const history = await tryHistoryWithDemo(adapter, sp, nativeId, demoActive);
-        const allTurns = turnsFromHistory(history ?? [], hub.busy.get(sid));
+        const allTurns = turnsFromHistory(history ?? [], hub.busy.get(sid), hub, sid);
         return ok(res, sliceV262Turns(allTurns, Number.isFinite(beforeOrdinal) ? beforeOrdinal : undefined, pageSize), requestId);
       }
       if (tail === '/transcript' && req.method === 'GET') {
@@ -2236,6 +2312,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
           steered.push(id);
           const msgContent = queuedContentBlocks(q.text, attachments);
           steeredContent.push(...msgContent);
+          hub.recordPrompt(sid, id, q.text, new Date().toISOString());
           emitV262SteerUserItem(hub, sid, active, id, q.text, attachments);
           // 用户消息回显:前端靠 messageCreated(prompt_id 匹配)落乐观气泡。
           hub.broadcast(sid, frame(sid, hub, 'event.message.created', {
@@ -2548,6 +2625,8 @@ function kimiCatalogProviderDto(
     native: false,
     read_only: true,
     source: 'kimi',
+    ...(entry.detected_types ? { detected_types: entry.detected_types } : {}),
+    ...(entry.probe_warning ? { probe_warning: entry.probe_warning } : {}),
   };
 }
 
@@ -3271,6 +3350,19 @@ function upsertStoredWorkspace(
   store.set(provider, record.id, JSON.stringify(record));
 }
 
+/** Re-key stored local workspaces saved under the old shared `wd_<slug>_<hash>` id. */
+function migrateStoredWorkspaceIds(store: SettingsStore): void {
+  for (const provider of LOCAL_PROVIDERS) {
+    for (const stored of readStoredWorkspaces(store, provider)) {
+      const legacy = workspaceIdFor(stored.root);
+      const scoped = workspaceIdFor(stored.root, provider);
+      if (stored.id !== legacy || legacy === scoped) continue;
+      store.delete(provider, stored.id);
+      upsertStoredWorkspace(store, provider, { ...stored, id: scoped });
+    }
+  }
+}
+
 function buildStoredWorkspaceIdMap(
   store: SettingsStore | undefined,
   provider?: ProviderName,
@@ -3315,16 +3407,28 @@ function isExistingDir(dirPath: unknown): boolean {
   return exists;
 }
 
-function workspaceDto(root: string, name?: string, opts?: WorkspaceDtoOptions): Record<string, unknown> {
+/**
+ * Workspace id for a root. Local agents get their own id per root (`wd_<provider>_…`):
+ * Kimi Web keys sidebar collapse/order/recency by workspace id in one shared localStorage
+ * bucket, so a shared id let collapsing a folder in one agent hide it in every other agent.
+ */
+function workspaceIdFor(root: string, provider?: ProviderName): string {
   const normalized = normalizeWorkspaceRoot(root) || root;
   const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
   const hash = createHash('sha256').update(normalized).digest('hex').slice(0, 12);
-  const maxSlug = Math.max(1, 60 - 'wd_'.length - 1 - hash.length);
+  const prefix = provider && isLocalProvider(provider) ? `wd_${provider}_` : 'wd_';
+  const maxSlug = Math.max(1, 60 - prefix.length - 1 - hash.length);
+  return `${prefix}${slug.slice(0, maxSlug)}_${hash}`;
+}
+
+function workspaceDto(root: string, name?: string, opts?: WorkspaceDtoOptions, provider?: ProviderName): Record<string, unknown> {
+  const normalized = normalizeWorkspaceRoot(root) || root;
+  const slug = normalized.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'root';
   const now = new Date().toISOString();
   const baseName = normalized ? path.posix.basename(normalized.replace(/\\/g, '/')) : '';
   const fallbackName = baseName || slug;
   return {
-    id: `wd_${slug.slice(0, maxSlug)}_${hash}`,
+    id: workspaceIdFor(root, provider),
     root,
     name: name && name.trim() ? name.trim() : fallbackName,
     kind: opts?.kind ?? 'implicit',
@@ -3397,7 +3501,7 @@ async function listWorkspaces(
           createdAt: stored.created_at,
           lastOpenedAt: stored.last_opened_at,
           sessionCount: 0,
-        });
+        }, provider);
         dto.id = stored.id;
         roots.set(norm, dto);
       }
@@ -3423,7 +3527,7 @@ async function listWorkspaces(
       const ownerNorm = dirToOwner.get(norm) ?? norm;
       if (!roots.has(ownerNorm)) {
         if (isExistingDir(cwd)) {
-          roots.set(ownerNorm, workspaceDto(cwd));
+          roots.set(ownerNorm, workspaceDto(cwd, undefined, undefined, provider));
         }
       }
       if (roots.has(ownerNorm)) {
@@ -3446,6 +3550,7 @@ function sessionDto(
   usage?: SessionUsage,
   busy?: boolean,
   storedWsIdMap?: Map<string, string>,
+  sharedWorkspaceIds = false,
 ): Record<string, unknown> {
   // facade 的 Session.busy 是硬编码 false(适配器默认不跟踪网关 live turn 状态);
   // 真值只能从网关 hub(turn 登记处)拿,调用方有 hub 就传 busy 覆盖——否则
@@ -3454,7 +3559,7 @@ function sessionDto(
   const cwd = s.metadata?.cwd ? String(s.metadata.cwd) : undefined;
   const normCwd = cwd ? (normalizeWorkspaceRoot(cwd) || cwd) : undefined;
   const storedId = normCwd && storedWsIdMap ? storedWsIdMap.get(normCwd) : undefined;
-  const wsId = storedId ?? (cwd ? (workspaceDto(cwd).id as string) : s.workspace_id);
+  const wsId = storedId ?? (cwd ? workspaceIdFor(cwd, sharedWorkspaceIds ? undefined : s.provider) : s.workspace_id);
   return {
     id: prefixedId(s.provider, s.id),
     // workspace_id 优先按 normalized cwd 关联存储项目 ID(防换 primary 根后 ID 漂移导致分组被吞),
@@ -3773,7 +3878,7 @@ async function listSessions(
         const cwd = typeof s.metadata?.cwd === 'string' ? String(s.metadata.cwd) : '';
         if (normalizeWorkspaceRoot(cwd) !== rootNorm) continue;
       }
-      const dto = sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id)), storedMap);
+      const dto = sessionDto(s, adapters[p].getModel?.(s.id) ?? getDemoModel(p, s.id), adapters[p].getUsage?.(s.id), busyOf(prefixedId(p, s.id)), storedMap, true);
       if (excludeEmpty && isEmptyPlaceholderSession(dto, Boolean(dto.busy))) continue;
       items.push(dto);
     }
@@ -4277,6 +4382,14 @@ async function submitPrompt(
       );
     }
   }
+  if (cmd && isLocalProvider(provider) && cmd[1] === 'fork' && (cmd[2] ?? '').trim()) {
+    const caps = adapter.capabilities();
+    if (caps.fork === false || !adapter.fork) {
+      throw new ProviderError('unsupported', `${provider} 不支持 /fork`, 400);
+    }
+    if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
+    return runLocalGatewayCommand(adapter, provider, nativeId, 'fork', (cmd[2] ?? '').trim(), hub, requestedPromptId, demoActive, uploadStore);
+  }
   if (cmd && provider === 'codex' && codexGatewayCommandNames().has(cmd[1])) {
     if (hub.busy.has(sid)) throw new ProviderError('busy', 'session busy: 当前 turn 结束后再执行命令', 409);
     const [, name, rawArgs] = cmd;
@@ -4434,6 +4547,7 @@ async function steerDirectPrompt(
       content: msgContent, created_at: createdAt,
     },
   }));
+  hub.recordPrompt(sid, promptId, text, createdAt);
   hub.transcript.submitPrompt(sid, promptId, 'queued', msgContent, createdAt);
   hub.transcript.steerPrompts(sid, active.promptId, [promptId], msgContent);
   return {
@@ -4464,10 +4578,24 @@ async function driveTurn(
 ): Promise<Record<string, unknown>> {
   const sid = prefixedId(provider, nativeId);
   const turn = newActiveTurn(nativeId, promptId);
-  hub.busy.set(sid, turn);
   const startedAt = Date.now();
   const createdAt = new Date(startedAt).toISOString();
   turn.v262StartedAt = createdAt;
+  const openerItem: Record<string, unknown> = {
+    item_id: `${promptId}_user`,
+    type: 'user_message',
+    placement: 'opener',
+    origin: { kind: 'user' },
+    text,
+    prompt_ids: [promptId],
+    attachments: [],
+    skills: [],
+    created_at: createdAt,
+  };
+  turn.v262Items.push(openerItem);
+  turn.v262ItemMap.set(String(openerItem.item_id), openerItem);
+  hub.busy.set(sid, turn);
+  hub.recordPrompt(sid, promptId, text, createdAt);
   hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text }], createdAt);
   // startTurn 与历史读取并行。用 settled 结果承接 rejection，避免历史较慢时
   // acquire 的拒绝先变成未处理 Promise。
@@ -4494,19 +4622,6 @@ async function driveTurn(
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
     emit('turn.started', { turnId: 0, origin: { kind: 'user' }, prompt: text });
 
-    const openerItem: Record<string, unknown> = {
-      item_id: `${promptId}_user`,
-      type: 'user_message',
-      placement: 'opener',
-      origin: { kind: 'user' },
-      text,
-      prompt_ids: [promptId],
-      attachments: [],
-      skills: [],
-      created_at: createdAt,
-    };
-    turn.v262Items.push(openerItem);
-    turn.v262ItemMap.set(String(openerItem.item_id), openerItem);
     hub.broadcastV262(sid, {
       type: 'turn.started',
       session_id: sid,
@@ -4777,6 +4892,7 @@ async function runLocalGatewayCommand(
     }
     const ordinal = history ? turnsFromHistory(history).length : 0;
     const v262TurnId = `turn_${promptId}`;
+    hub.recordPrompt(sid, promptId, promptText, createdAt);
     hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text: promptText }], createdAt);
     const transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
     emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
@@ -4815,7 +4931,17 @@ async function runLocalGatewayCommand(
     let reason: 'completed' | 'failed' = 'completed';
     try {
       output = await (
-        provider === 'grok'
+        name === 'fork' && argsText
+          ? (async () => {
+              const forked = await adapter.fork!(nativeId, { model: argsText });
+              const forkedSid = prefixedId(provider, forked.id);
+              hub.broadcast(forkedSid, frame(forkedSid, hub, 'event.session.created', {
+                session: sessionDto(forked, adapter.getModel?.(forked.id), adapter.getUsage?.(forked.id)),
+              }));
+              const modelName = adapter.getModel?.(forked.id) ?? argsText;
+              return `✓ 已从当前会话分叉创建新会话 \`${forkedSid}\`${modelName ? `（模型：${modelName}）` : ''}，可在左侧边栏切换打开。`;
+            })()
+          : provider === 'grok'
           ? executeGrokCommand(adapter, nativeId, name, argsText)
           : provider === 'pi'
             ? executePiCommand(adapter, nativeId, name, argsText)
@@ -5005,6 +5131,7 @@ async function beginLocalInteractiveTurn(
   }
   turn.transcript = hub.transcript.beginTurn(sid, promptText, createdAt);
   turn.v262Ordinal = Math.max(0, turn.transcript.ordinal - 1);
+  hub.recordPrompt(sid, promptId, promptText, createdAt);
   hub.transcript.submitPrompt(sid, promptId, 'running', [{ type: 'text', text: promptText }], createdAt);
   emit('session.meta.updated', { patch: { lastPrompt: promptText } });
   emit('event.session.work_changed', { busy: true, main_turn_active: true, pending_interaction: 'none' });
@@ -6360,18 +6487,17 @@ function emitV262SteerUserItem(
   });
 }
 
-function emitV262AgentState(
-  hub: SessionHub,
+function v262AgentStateFrame(
   adapter: ProviderAdapter,
-  provider: ProviderName,
+  _provider: ProviderName,
   nativeId: string,
   sid: string,
   status: 'idle' | 'running',
   compacting = false,
-): void {
+): Record<string, unknown> {
   const caps = adapter.capabilities();
   const thinking = adapter.getThinking?.(nativeId);
-  hub.broadcastV262(sid, {
+  return {
     type: 'agent',
     session_id: sid,
     agent_id: 'main',
@@ -6383,7 +6509,19 @@ function emitV262AgentState(
     plan_mode: caps.planMode === false ? false : (adapter.getPlanMode?.(nativeId) ?? false),
     swarm_mode: false,
     tower_mode: false,
-  });
+  };
+}
+
+function emitV262AgentState(
+  hub: SessionHub,
+  adapter: ProviderAdapter,
+  provider: ProviderName,
+  nativeId: string,
+  sid: string,
+  status: 'idle' | 'running',
+  compacting = false,
+): void {
+  hub.broadcastV262(sid, v262AgentStateFrame(adapter, provider, nativeId, sid, status, compacting));
 }
 
 function emitV262Usage(
@@ -7472,11 +7610,16 @@ function attachGatewayWebSocket(
         const active = hub.busy.get(sid);
         let wireTasks: Array<Record<string, unknown>> = [];
         if (wantsMain) {
+          // 必须先发 agent 状态（idle/running），再发 turns 快照：前端 Utt 在收到 turns 时
+          // 若仍认为 eA(sid)===true，会保留未能匹配 prompt_id 的乐观消息并卡在「请求中…」。
+          if (adapter) {
+            sendObj(v262AgentStateFrame(adapter, socketProvider, split.nativeId, sid, active ? 'running' : 'idle'));
+          }
           if (history && !hub.transcript.hasObservedHistory(sid)) {
             const historyPrior = active ? filterHistoryPriorToActive(history, active) : history;
             hub.transcript.observeHistory(sid, historyPrior);
           }
-          const allTurns = turnsFromHistory(history ?? [], active);
+          const allTurns = turnsFromHistory(history ?? [], active, hub, sid);
           const page = sliceV262Turns(allTurns, undefined, 20);
           sendObj({
             type: 'turns',
@@ -7489,7 +7632,6 @@ function attachGatewayWebSocket(
         if (adapter) {
           wireTasks = await collectSessionWireTasks(adapter, split.nativeId, sid, hub);
           if (wantsMain) {
-            emitV262AgentState(hub, adapter, socketProvider, split.nativeId, sid, active ? 'running' : 'idle');
             emitV262Usage(hub, adapter, socketProvider, split.nativeId, sid);
             const extUi = (adapter as { getExtensionUiState?: (id: string) => Record<string, unknown> | undefined }).getExtensionUiState?.(split.nativeId);
             if (extUi) {
@@ -8478,9 +8620,16 @@ function mergeActiveTurnItems(
   return mergedItems;
 }
 
-function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record<string, unknown>> {
+function turnsFromHistory(
+  history: Message[],
+  active?: ActiveTurn,
+  hub?: SessionHub,
+  sid?: string,
+): Array<Record<string, unknown>> {
   if (!active) {
-    return buildTurnsFromHistoryMessages(history);
+    const turns = buildTurnsFromHistoryMessages(history);
+    if (hub && sid) hub.applyRecordedPromptIds(sid, turns);
+    return turns;
   }
   const activeStartIdx = findActiveTurnHistoryStartIndex(history, active);
   if (activeStartIdx < 0) {
@@ -8495,6 +8644,7 @@ function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record
       steps: Array.from({ length: Math.max(1, active.v262StepIndex + 1) }, (_, idx) => ({ index: idx })),
       items: active.v262Items.map((item) => ({ ...item })),
     });
+    if (hub && sid) hub.applyRecordedPromptIds(sid, turns);
     return turns;
   }
 
@@ -8512,6 +8662,7 @@ function turnsFromHistory(history: Message[], active?: ActiveTurn): Array<Record
     steps: Array.from({ length: Math.max(1, active.v262StepIndex + 1) }, (_, idx) => ({ index: idx })),
     items: mergedItems,
   });
+  if (hub && sid) hub.applyRecordedPromptIds(sid, turns);
   return turns;
 }
 

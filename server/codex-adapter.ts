@@ -1206,7 +1206,24 @@ export class CodexAdapter {
   private readonly threadProviders = new Map<string, string>();
   private readonly threadAliases = new Map<string, string>();
   private readonly draftOptions = new Map<string, ThreadStartOptions>();
+  private readonly pendingForkTargets = new Map<string, { modelRef: string; model: string; modelProvider: string; at: number }>();
+  private readonly appliedForkModelRefs = new Map<string, string>();
   private debugModelsCache: Promise<Map<string, number>> | undefined;
+
+  private static readonly FORK_TARGET_TTL_MS = 5 * 60_000;
+
+  private providerLabel(cliId: string): string {
+    const key = this.opts.providers?.keyForCliProvider(cliId);
+    if (key) return key;
+    if (cliId === 'openai') return 'openai (Codex 默认)';
+    return cliId;
+  }
+
+  consumeForkModelRef(forkedThreadId: string): string | undefined {
+    const ref = this.appliedForkModelRefs.get(forkedThreadId);
+    if (ref !== undefined) this.appliedForkModelRefs.delete(forkedThreadId);
+    return ref;
+  }
 
   nativeThreadId(id: string): string | undefined {
     return this.threadAliases.get(id);
@@ -1271,12 +1288,23 @@ export class CodexAdapter {
       const draft = this.draftOptions.get(threadId);
       const persisted = draft ? Boolean(await this.locateRollout(threadId)) : true;
       if (!draft || persisted) {
-        throw new ProviderError('invalid_request', 'Codex 已有会话不能跨供应商切换，请新建会话或使用 /fork。', 400);
+        this.pendingForkTargets.set(threadId, {
+          modelRef: id,
+          model: selected.model,
+          modelProvider: target,
+          at: Date.now(),
+        });
+        throw new ProviderError(
+          'invalid_request',
+          `Codex 已有会话绑定在供应商「${this.providerLabel(current)}」下，不支持跨供应商直接切换到「${this.providerLabel(target)}」（${id}）。请新建会话，或使用 /fork（已记住目标 ${id}，现在点「分叉会话」或输入 /fork 即可带着当前对话切换过去）。`,
+          400,
+        );
       }
       const replacement = await this.create({ ...draft, ...selected, modelProvider: target });
       this.adoptDraft(threadId, replacement.id);
       return this.actualThreadId(threadId);
     }
+    this.pendingForkTargets.delete(threadId);
     if (this.draftOptions.has(threadId)) {
       this.threadModels.set(threadId, selected.model);
       this.draftOptions.set(threadId, { ...this.draftOptions.get(threadId), ...selected, modelProvider: target });
@@ -3633,11 +3661,46 @@ export class CodexAdapter {
     await this.request('thread/name/set', { threadId, name });
   }
 
-  /** 分叉线程(thread/fork),返回新 thread。 */
-  async forkThread(threadId: string): Promise<Record<string, unknown>> {
+  /** 分叉线程(thread/fork),返回新 thread。支持指定目标模型或继承最近一次被拒绝的跨供应商切换目标。 */
+  async forkThread(threadId: string, options?: { model?: string }): Promise<Record<string, unknown>> {
     await this.connect();
-    const raw = await this.request('thread/fork', { threadId });
-    return (raw as { thread?: Record<string, unknown> }).thread ?? (raw as Record<string, unknown>);
+    let forkTarget: { modelRef: string; model: string; modelProvider: string } | undefined;
+    const explicitModel = typeof options?.model === 'string' && options.model.trim() ? options.model.trim() : undefined;
+    if (explicitModel) {
+      const selected = this.resolveModel(explicitModel);
+      let targetProvider = selected.modelProvider;
+      if (!targetProvider) {
+        const cfg = (await this.request('config/read', {}).catch(() => ({}))) as { config?: { model_provider?: string } };
+        targetProvider = cfg.config?.model_provider ?? 'openai';
+      }
+      forkTarget = { modelRef: explicitModel, model: selected.model, modelProvider: targetProvider };
+      this.pendingForkTargets.delete(threadId);
+    } else {
+      const pending = this.pendingForkTargets.get(threadId);
+      this.pendingForkTargets.delete(threadId);
+      if (pending && Date.now() - pending.at <= CodexAdapter.FORK_TARGET_TTL_MS) {
+        forkTarget = pending;
+      }
+    }
+
+    const raw = await this.request('thread/fork', {
+      threadId,
+      ...(forkTarget ? { model: forkTarget.model, modelProvider: forkTarget.modelProvider } : {}),
+    });
+    const thread = (raw as { thread?: Record<string, unknown> }).thread ?? (raw as Record<string, unknown>);
+    const forkedId = typeof thread.id === 'string' ? thread.id : '';
+    if (forkedId) {
+      this.liveThreads.add(forkedId);
+      const actualProvider = typeof thread.modelProvider === 'string' && thread.modelProvider
+        ? thread.modelProvider
+        : forkTarget?.modelProvider;
+      if (actualProvider) this.threadProviders.set(forkedId, actualProvider);
+      if (forkTarget) {
+        this.threadModels.set(forkedId, forkTarget.model);
+        this.appliedForkModelRefs.set(forkedId, forkTarget.modelRef);
+      }
+    }
+    return thread;
   }
 
   private mapRevertError(err: unknown): ProviderError | null {
