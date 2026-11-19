@@ -25,8 +25,6 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { Agent as HttpAgent, request as httpRequest } from 'node:http';
-import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -118,15 +116,12 @@ export interface CatalogProvider {
   base_url: string;
   models: InjectedModel[];
   default_model?: string;
-  /** Protocols verified to respond on this endpoint (Kimi source probing). */
-  detected_types?: WireProviderType[];
-  /** Non-fatal diagnostic from endpoint probing (e.g. Cloudflare 403 or 401). */
-  probe_warning?: string;
+  /** For a Kimi provider: the type Kimi declares, when this CLI speaks another protocol to it. */
+  declared_type?: WireProviderType;
 }
 
 interface ResolvedProvider extends CatalogProvider {
   apiKey: string;
-  protocols?: Partial<Record<WireProviderType, string>>;
 }
 
 export interface ProviderInput {
@@ -245,224 +240,12 @@ function inputModes(m: InjectedModel): string[] {
 // Kimi source: `kimi provider list --json`, read-only, refreshed when config.toml changes.
 // ---------------------------------------------------------------------------
 
-export interface KimiProtocolSupport {
-  type: WireProviderType;
-  base_url: string;
-}
-
-export interface KimiProbeReport {
-  supported: KimiProtocolSupport[];
-  blocked_reason?: string;
-  checked_at: number;
-}
-
-export type KimiProbeFn = (target: {
-  id: string;
-  declaredType: WireProviderType;
-  baseUrl: string;
-  apiKey: string;
-}) => Promise<KimiProbeReport>;
-
 export interface KimiProviderSourceOptions {
   bin?: string;
   home?: string;
   /** Replace the CLI call (tests). Must resolve to the command's stdout. */
   run?: () => Promise<string>;
   timeoutMs?: number;
-  /** Replace or disable (`false`) protocol endpoint probing; defaults to live HTTP probing when `run` is not mocked. */
-  probe?: KimiProbeFn | false;
-  probeTimeoutMs?: number;
-  cacheFile?: string;
-}
-
-const PROBE_OK_TTL_MS = 6 * 60 * 60_000;
-const PROBE_WARN_TTL_MS = 10 * 60_000;
-/** Bumped when the probe logic changes, so cached verdicts from older logic are not reused. */
-const PROBE_VERSION = 'v2';
-type HttpProbeType = 'openai' | 'openai_responses' | 'anthropic';
-const HTTP_PROBE_TYPES: readonly HttpProbeType[] = ['openai', 'openai_responses', 'anthropic'];
-const PROBE_SUFFIX: Record<HttpProbeType, string> = {
-  openai: '/chat/completions',
-  openai_responses: '/responses',
-  anthropic: '/v1/messages',
-};
-const BALANCE_RE = /insufficient|balance|quota|credit|余额|欠费/i;
-const CLOUDFLARE_RE = /cloudflare|attention required|just a moment|error code: 10\d\d/i;
-
-type ProbeOutcome = 'supported' | 'unsupported' | 'blocked';
-
-/**
- * The CLIs reach providers through the user's HTTP(S)_PROXY, so the probe must too: relays
- * behind Cloudflare often block the direct egress IP and admit the proxy one. Global `fetch`
- * ignores those variables unless NODE_USE_ENV_PROXY is set; an agent with `proxyEnv`
- * (Node ≥ 22.21 / 24.5) honours HTTP(S)_PROXY and NO_PROXY per request. Older Node ignores
- * the option and connects directly.
- */
-let probeAgents: { http: HttpAgent; https: HttpsAgent } | undefined;
-
-function probeAgentFor(protocol: string): HttpAgent | HttpsAgent {
-  probeAgents ??= {
-    http: new HttpAgent({ proxyEnv: process.env }),
-    https: new HttpsAgent({ proxyEnv: process.env }),
-  };
-  return protocol === 'https:' ? probeAgents.https : probeAgents.http;
-}
-
-function probePost(
-  url: string,
-  headers: Record<string, string>,
-  timeoutMs: number,
-): Promise<{ status: number; contentType: string; body: string }> {
-  return new Promise((resolve, reject) => {
-    const target = new URL(url);
-    const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
-    const req = send(target, {
-      method: 'POST',
-      headers: { ...headers, 'content-length': '2' },
-      agent: probeAgentFor(target.protocol),
-      signal: AbortSignal.timeout(timeoutMs),
-    }, (res) => {
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk: string) => {
-        if (body.length < 4096) body += chunk;
-      });
-      res.on('end', () => resolve({
-        status: res.statusCode ?? 0,
-        contentType: String(res.headers['content-type'] ?? ''),
-        body: body.slice(0, 4096),
-      }));
-      res.on('error', reject);
-    });
-    req.on('error', reject);
-    req.end('{}');
-  });
-}
-
-function looksLikeJson(contentType: string, body: string): boolean {
-  if (/json/i.test(contentType)) return true;
-  const t = body.trimStart();
-  if (!t.startsWith('{') && !t.startsWith('[')) return false;
-  try { JSON.parse(body); return true; } catch { return false; }
-}
-
-/**
- * POST `{}` and read the verdict from the reply. Only a JSON reply proves an API answered:
- * reverse proxies and web front-ends answer unknown paths with HTML 401/404/200 pages, which
- * say nothing about the protocol.
- */
-async function probeSingleWireEndpoint(
-  url: string,
-  protocol: HttpProbeType,
-  apiKey: string,
-  timeoutMs: number,
-): Promise<{ outcome: ProbeOutcome; warning?: string }> {
-  const headers: Record<string, string> = { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` };
-  if (protocol === 'anthropic') {
-    headers['x-api-key'] = apiKey;
-    headers['anthropic-version'] = '2023-06-01';
-  }
-  let status: number;
-  let contentType: string;
-  let body: string;
-  try {
-    ({ status, contentType, body } = await probePost(url, headers, timeoutMs));
-  } catch {
-    return { outcome: 'blocked', warning: '探测超时或网络不可达' };
-  }
-  if (status === 404 || status === 405 || status === 501) return { outcome: 'unsupported' };
-  const json = looksLikeJson(contentType, body);
-  if (!json) {
-    if (status === 403 && CLOUDFLARE_RE.test(body)) {
-      return {
-        outcome: 'blocked',
-        warning: '站点防火墙拦截了网关的探测请求 (HTTP 403，常见原因是出口 IP 或 User-Agent)，协议未验证；CLI 走自己的网络和代理，可能不受影响',
-      };
-    }
-    if (status >= 500) return { outcome: 'blocked', warning: `上游暂时不可用 (HTTP ${status})` };
-    return { outcome: 'unsupported' };
-  }
-  if (status >= 200 && status < 300) return { outcome: 'supported' };
-  if (status === 400 || status === 422) return { outcome: 'supported' };
-  if (status === 402 || ((status === 403 || status === 429) && BALANCE_RE.test(body))) {
-    return { outcome: 'supported', warning: `账户余额不足 (HTTP ${status})` };
-  }
-  if (status === 429) return { outcome: 'supported', warning: '被限流 (HTTP 429)' };
-  if (status === 401) return { outcome: 'blocked', warning: 'API Key 未授权 (HTTP 401)' };
-  if (status === 403) return { outcome: 'blocked', warning: 'HTTP 403 访问被拒' };
-  return { outcome: 'blocked', warning: `HTTP ${status}` };
-}
-
-/**
- * Base URLs to try for one protocol, most likely first. OpenAI-style endpoints live at the
- * configured path (or under `/v1`). Anthropic-compatible endpoints are often mounted beside the
- * OpenAI one under an `anthropic` segment, so every ancestor of the configured path is tried
- * both bare and with `/anthropic` appended. No vendor names: any relay following the
- * convention is found.
- */
-function probeBases(clean: string, protocol: HttpProbeType): string[] {
-  const out: string[] = [];
-  const add = (u: string) => { if (!out.includes(u)) out.push(u); };
-  if (protocol !== 'anthropic') {
-    const primary = baseUrlForWireType(clean, protocol);
-    add(primary);
-    if (!/\/v\d+$/.test(primary)) add(`${stripV1(primary)}/v1`);
-    return out;
-  }
-  let url: URL;
-  try { url = new URL(clean); } catch { return [stripV1(clean)]; }
-  const segments = url.pathname.replace(/\/+$/, '').replace(/\/v\d+$/i, '').split('/').filter(Boolean);
-  for (let depth = segments.length; depth >= 0; depth--) {
-    const prefix = `${url.origin}${segments.slice(0, depth).map((s) => `/${s}`).join('')}`;
-    add(prefix);
-    if (segments[depth - 1]?.toLowerCase() !== 'anthropic') add(`${prefix}/anthropic`);
-  }
-  return out.slice(0, 6);
-}
-
-export async function defaultProbeKimiProvider(
-  target: { baseUrl: string; apiKey: string },
-  timeoutMs = 3_500,
-): Promise<KimiProbeReport> {
-  const clean = target.baseUrl.trim().replace(/\/+$/, '');
-  // Control request: a server that answers a made-up path with a "supported" verdict would make
-  // every real probe meaningless, so its 4xx replies cannot be trusted.
-  const control = await probeSingleWireEndpoint(
-    `${baseUrlForWireType(clean, 'openai')}/__mag_probe_${randomBytes(4).toString('hex')}`,
-    'openai',
-    target.apiKey,
-    timeoutMs,
-  );
-  if (control.outcome === 'supported') {
-    const reason = control.warning?.includes('余额')
-      ? control.warning
-      : '该地址对任意路径都返回相同响应，无法判定协议，按声明类型使用';
-    return { supported: [], blocked_reason: reason, checked_at: Date.now() };
-  }
-  const tasks = HTTP_PROBE_TYPES.map(async (protocol) => {
-    const bases = probeBases(clean, protocol);
-    const results = await Promise.all(bases.map((base) =>
-      probeSingleWireEndpoint(`${base}${PROBE_SUFFIX[protocol]}`, protocol, target.apiKey, timeoutMs)));
-    const hit = results.findIndex((r) => r.outcome === 'supported');
-    if (hit >= 0) return { protocol, base: bases[hit]!, ...results[hit]! };
-    return { protocol, base: bases[0]!, ...(results.find((r) => r.outcome === 'blocked') ?? results[0]!) };
-  });
-
-  const results = await Promise.all(tasks);
-  const supported: KimiProtocolSupport[] = [];
-  const warnings: string[] = [];
-  for (const r of results) {
-    if (r.outcome === 'supported') supported.push({ type: r.protocol, base_url: r.base });
-    if (r.warning && !warnings.includes(r.warning)) warnings.push(r.warning);
-  }
-  const blocked_reason = supported.length === 0
-    ? (warnings[0] ?? '未探测到可用的协议接口，按声明类型使用')
-    : warnings.find((w) => w.includes('余额') || w.includes('限流'));
-  return {
-    supported,
-    ...(blocked_reason ? { blocked_reason } : {}),
-    checked_at: Date.now(),
-  };
 }
 
 /** Turn the `kimi provider list --json` payload into providers; drops ones without a usable key. */
@@ -516,10 +299,6 @@ export class KimiProviderSource {
   private readonly bin: string;
   private readonly configFile: string;
   private readonly run: () => Promise<string>;
-  private readonly probeFn: KimiProbeFn | null;
-  private cacheFile: string | undefined;
-  private cacheLoaded = false;
-  private readonly probeCache = new Map<string, KimiProbeReport>();
   private providers: ResolvedProvider[] = [];
   private seenMtime: number | null = null;
   private inflight: Promise<void> | null = null;
@@ -539,54 +318,6 @@ export class KimiProviderSource {
         else resolve(stdout);
       });
     }));
-    const probeTimeout = options.probeTimeoutMs ?? 3_500;
-    if (options.probe === false) {
-      this.probeFn = null;
-    } else if (typeof options.probe === 'function') {
-      this.probeFn = options.probe;
-    } else if (options.run) {
-      this.probeFn = null;
-    } else {
-      this.probeFn = (target) => defaultProbeKimiProvider(target, probeTimeout);
-    }
-    this.cacheFile = options.cacheFile;
-  }
-
-  /** Attach a gateway-owned cache file for probe results (never writes inside ~/.kimi-code). */
-  setCacheFile(file: string): void {
-    if (this.cacheFile === file) return;
-    this.cacheFile = file;
-    this.cacheLoaded = false;
-  }
-
-  private ensureCacheLoaded(): void {
-    if (this.cacheLoaded) return;
-    this.cacheLoaded = true;
-    if (!this.cacheFile) return;
-    try {
-      const raw = JSON.parse(readFileSync(this.cacheFile, 'utf8')) as Record<string, unknown>;
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
-      for (const [k, v] of Object.entries(raw)) {
-        if (!v || typeof v !== 'object') continue;
-        const entry = v as Partial<KimiProbeReport>;
-        if (!Array.isArray(entry.supported) || typeof entry.checked_at !== 'number') continue;
-        this.probeCache.set(k, {
-          supported: entry.supported.filter((s): s is KimiProtocolSupport =>
-            Boolean(s && typeof s.type === 'string' && typeof s.base_url === 'string')),
-          ...(typeof entry.blocked_reason === 'string' ? { blocked_reason: entry.blocked_reason } : {}),
-          checked_at: entry.checked_at,
-        });
-      }
-    } catch { /* missing or corrupt cache: re-probe cleanly */ }
-  }
-
-  private saveCache(): void {
-    if (!this.cacheFile) return;
-    try {
-      const obj = Object.fromEntries(this.probeCache.entries());
-      mkdirSync(join(this.cacheFile, '..'), { recursive: true, mode: 0o700 });
-      atomicWrite(this.cacheFile, JSON.stringify(obj, null, 2));
-    } catch { /* best-effort cache */ }
   }
 
   onChange(listener: () => void): () => void {
@@ -607,90 +338,19 @@ export class KimiProviderSource {
     void this.refresh().catch(() => undefined);
   }
 
-  refresh(forceProbe = false): Promise<void> {
-    if (this.inflight) {
-      if (!forceProbe) return this.inflight;
-      return this.inflight.catch(() => undefined).then(() => this.refresh(true));
-    }
+  refresh(): Promise<void> {
+    if (this.inflight) return this.inflight;
     let mtime: number;
     try { mtime = statSync(this.configFile).mtimeMs; } catch { mtime = 0; }
     this.inflight = this.run()
-      .then(async (stdout) => {
+      .then((stdout) => {
         const before = fingerprint(this.providers);
-        const parsed = parseKimiProviderList(JSON.parse(stdout));
-        const probeFn = this.probeFn;
-        let cacheDirty = false;
-        const liveKeys = new Set<string>();
-        if (probeFn) this.ensureCacheLoaded();
-
-        const nextProviders = await Promise.all(parsed.map(async (p) => {
-          const baseProto: Partial<Record<WireProviderType, string>> = {
-            [p.type]: baseUrlForWireType(p.base_url, p.type),
-          };
-          if (!probeFn) {
-            return {
-              ...p,
-              key: `kimi.${p.id}`,
-              label: `kimi.${p.id}`,
-              source: 'kimi' as const,
-              protocols: baseProto,
-            };
-          }
-          const cacheKey = createHash('sha256')
-            .update(`${PROBE_VERSION}\0${p.id}\0${p.type}\0${p.base_url}\0${p.apiKey}`)
-            .digest('hex');
-          liveKeys.add(cacheKey);
-          const cached = !forceProbe ? this.probeCache.get(cacheKey) : undefined;
-          const now = Date.now();
-          const ttl = cached && (cached.blocked_reason || cached.supported.length === 0) ? PROBE_WARN_TTL_MS : PROBE_OK_TTL_MS;
-          let report: KimiProbeReport;
-          if (cached && now - cached.checked_at < ttl) {
-            report = cached;
-          } else {
-            report = await probeFn({
-              id: p.id,
-              declaredType: p.type,
-              baseUrl: p.base_url,
-              apiKey: p.apiKey,
-            }).catch(() => ({ supported: [], checked_at: now }));
-            this.probeCache.set(cacheKey, report);
-            cacheDirty = true;
-          }
-
-          const protocols: Partial<Record<WireProviderType, string>> = {};
-          for (const item of report.supported) {
-            protocols[item.type] = item.base_url;
-          }
-          if (p.type === 'google-genai' || p.type === 'vertexai') {
-            protocols[p.type] = baseUrlForWireType(p.base_url, p.type);
-          }
-          if (Object.keys(protocols).length === 0) {
-            protocols[p.type] = baseUrlForWireType(p.base_url, p.type);
-          }
-          const detectedTypes = report.supported.length > 0
-            ? report.supported.map((s) => s.type)
-            : undefined;
-          return {
-            ...p,
-            key: `kimi.${p.id}`,
-            label: `kimi.${p.id}`,
-            source: 'kimi' as const,
-            protocols,
-            ...(detectedTypes ? { detected_types: detectedTypes } : {}),
-            ...(report.blocked_reason ? { probe_warning: report.blocked_reason } : {}),
-          };
+        this.providers = parseKimiProviderList(JSON.parse(stdout)).map((p) => ({
+          ...p,
+          key: `kimi.${p.id}`,
+          label: `kimi.${p.id}`,
+          source: 'kimi' as const,
         }));
-
-        if (probeFn) {
-          for (const key of [...this.probeCache.keys()]) {
-            if (!liveKeys.has(key)) {
-              this.probeCache.delete(key);
-              cacheDirty = true;
-            }
-          }
-        }
-        if (cacheDirty) this.saveCache();
-        this.providers = nextProviders;
         this.error = undefined;
         this.seenMtime = mtime;
         if (fingerprint(this.providers) !== before) for (const fn of this.listeners) fn();
@@ -708,7 +368,7 @@ export class KimiProviderSource {
 function fingerprint(list: readonly ResolvedProvider[]): string {
   const h = createHash('sha256');
   for (const p of list) {
-    h.update(JSON.stringify([p.key, p.type, p.base_url, p.models, p.default_model ?? '', p.detected_types ?? [], p.probe_warning ?? '']));
+    h.update(JSON.stringify([p.key, p.type, p.base_url, p.models, p.default_model ?? '']));
     h.update(createHash('sha256').update(p.apiKey).digest('hex'));
   }
   return h.digest('hex');
@@ -738,7 +398,6 @@ export class ProviderStore {
     this.file = join(this.dir, 'providers.json');
     this.keysFile = join(this.dir, 'provider-keys.json');
     this.kimi = options.kimi ?? null;
-    this.kimi?.setCacheFile(join(this.dir, 'kimi-probe-cache.json'));
     try {
       const parsed = FileSchema.safeParse(JSON.parse(readFileSync(this.file, 'utf8')));
       if (parsed.success) this.data = parsed.data;
@@ -762,9 +421,9 @@ export class ProviderStore {
     for (const cli of CLIS) this.lastPrint.set(cli, fingerprint(this.resolved(cli)));
   }
 
-  async refreshKimi(forceProbe = false): Promise<void> {
+  async refreshKimi(): Promise<void> {
     if (!this.kimi) return;
-    await this.kimi.refresh(forceProbe).catch(() => undefined);
+    await this.kimi.refresh().catch(() => undefined);
     this.emitChanges();
   }
 
@@ -919,16 +578,19 @@ export class ProviderStore {
         apiKey,
       });
     }
+    // Kimi providers go to every CLI, which speaks its own protocol to the configured URL (only
+    // the `/v1` segment is normalized per protocol). Kimi's declared type is not a capability
+    // list: many relays answer several protocols. One that does not answer this CLI's protocol
+    // fails at request time with the relay's own error, shown in the turn.
+    // Vertex AI is the exception: it authenticates with a Google Cloud project, not a URL + key.
     for (const p of this.kimi?.snapshot() ?? []) {
-      const protocols = p.protocols ?? { [p.type]: baseUrlForWireType(p.base_url, p.type) };
-      const chosenType = (supported as readonly string[]).includes(p.type) && protocols[p.type] !== undefined
-        ? p.type
-        : supported.find((t) => protocols[t] !== undefined);
-      if (!chosenType) continue;
+      if (p.type === 'vertexai' && !(supported as readonly string[]).includes(p.type)) continue;
+      const type = (supported as readonly string[]).includes(p.type) ? p.type : supported[0]!;
       out.push({
         ...p,
-        type: chosenType,
-        base_url: protocols[chosenType]!,
+        type,
+        base_url: baseUrlForWireType(p.base_url, type),
+        ...(type !== p.type ? { declared_type: p.type } : {}),
       });
     }
     return out;
@@ -936,7 +598,7 @@ export class ProviderStore {
 
   /** Providers this CLI can use, gateway first. Contains no keys. */
   catalog(cli: InjectableCli): CatalogProvider[] {
-    return this.resolved(cli).map(({ apiKey: _key, protocols: _protocols, ...rest }) => rest);
+    return this.resolved(cli).map(({ apiKey: _key, ...rest }) => rest);
   }
 
   provider(cli: InjectableCli, key: string): CatalogProvider | undefined {

@@ -436,6 +436,8 @@ export class SessionHub {
   private static readonly PROMPT_HISTORY_SESSIONS_CAP = 500;
   private seq = 0;
   readonly epoch = randomBytes(8).toString('base64url');
+  /** Extra explanation appended to a failed turn (e.g. the CLI spoke another protocol than the provider declares). */
+  failureHint?: (provider: ProviderName, nativeId: string, adapter: ProviderAdapter) => string | undefined;
 
   nextSeq(): number {
     return ++this.seq;
@@ -693,6 +695,12 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
   const providerStoreOff = providerStore.onChange((cli) => { void notifyProviderChanged(adapters[cli]); });
   const availableProviders = options.availableProviders ?? detectAvailableProviders();
   const hub = new SessionHub();
+  hub.failureHint = (provider, nativeId, adapter) => {
+    if (!isLocalProvider(provider)) return undefined;
+    const ref = parseModelRef(adapter.getModel?.(nativeId));
+    const entry = ref ? providerStore.provider(provider, ref.key) : undefined;
+    return entry ? protocolMismatchHint(provider, entry) : undefined;
+  };
   const subagentOffs = Object.values(adapters).map((adapter) => adapter.onSubagentUpdate?.((nativeId, child) => {
     const sid = `${adapter.name}_${nativeId}`;
     const existing = hub.transcript.currentTasks(sid).find((task) => task.agentId === child.agentId || task.taskId === child.agentId);
@@ -1337,7 +1345,7 @@ export async function startGateway(options: GatewayOptions = {}): Promise<{
     }
     if (isLocalProvider(provider) && isProviderRefreshRoute(sub) && req.method === 'POST') {
       try {
-        await providerStore.refreshKimi(true);
+        await providerStore.refreshKimi();
         await adapters[provider].listModels?.();
         return ok(res, { changed: [], unchanged: [provider], failed: [] }, requestId);
       } catch (error) {
@@ -2608,6 +2616,21 @@ function injectedProviderDto(
   };
 }
 
+const CLI_LABEL: Record<LocalProviderName, string> = {
+  claude: 'Claude', codex: 'Codex', grok: 'Grok', pi: 'Pi', dsh: 'DSH',
+};
+
+/**
+ * Shown under a failed turn when the CLI spoke another protocol than the Kimi provider
+ * declares: CLIs word the relay's 404 as "model not found", which points the wrong way.
+ */
+export function protocolMismatchHint(provider: LocalProviderName, entry: CatalogProvider): string | undefined {
+  if (!entry.declared_type || entry.declared_type === entry.type) return undefined;
+  return `ℹ ${entry.key} 在 Kimi 里声明的协议是 ${entry.declared_type}，${CLI_LABEL[provider]} 只能用 ${entry.type} 协议访问 ${entry.base_url}。`
+    + '如果上面是 404 或「模型不存在」，多半是这个地址不支持该协议；'
+    + '可以换用其他供应商，或在 Kimi 里把该协议的地址另配成一个供应商。';
+}
+
 /** A provider reused from Kimi Code's own config: listed and selectable, never editable here. */
 function kimiCatalogProviderDto(
   provider: LocalProviderName,
@@ -2625,8 +2648,7 @@ function kimiCatalogProviderDto(
     native: false,
     read_only: true,
     source: 'kimi',
-    ...(entry.detected_types ? { detected_types: entry.detected_types } : {}),
-    ...(entry.probe_warning ? { probe_warning: entry.probe_warning } : {}),
+    ...(entry.declared_type ? { declared_type: entry.declared_type } : {}),
   };
 }
 
@@ -4762,6 +4784,11 @@ async function driveTurn(
       if (turnTruncated) {
         const truncMsg = '⚠ 模型输出达到 token 上限已截断。';
         emitAssistantDeltaText(turn.assistantText ? `\n\n${truncMsg}` : truncMsg, turn, emit, ensureStep, sid, hub);
+      }
+      if (reason === 'failed') {
+        let hint: string | undefined;
+        try { hint = hub.failureHint?.(provider, nativeId, adapter); } catch { hint = undefined; }
+        if (hint) emitAssistantDeltaText(turn.assistantText ? `\n\n${hint}` : hint, turn, emit, ensureStep, sid, hub);
       }
       completeStep(reason === 'failed' ? 'failed' : 'completed');
       closeV262Thinking(hub, sid, turn);

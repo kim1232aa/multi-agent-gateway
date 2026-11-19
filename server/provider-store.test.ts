@@ -172,13 +172,27 @@ test('dsh patch declares every provider under llm-pi-ai with model `name`', () =
   assert.equal(store.cliModelId('dsh', '@kimi.sx:gemini-3.8-flash'), '["mag_kimi_sx","gemini-3.8-flash"]');
 }, kimiSource()));
 
-test('kimi providers are filtered by protocol per CLI', () => withStore((store) => {
-  assert.deepEqual(store.catalog('claude').map((p) => p.key), ['kimi.a9']);
-  assert.deepEqual(store.catalog('grok').map((p) => p.key), ['kimi.sx']);
-  assert.deepEqual(store.catalog('codex').map((p) => p.key), []);
-  assert.deepEqual(store.catalog('pi').map((p) => p.key).sort(), ['kimi.a9', 'kimi.sx']);
+test('kimi providers reach every CLI, each speaking its own protocol to the configured URL', () => withStore((store) => {
+  for (const cli of ['claude', 'grok', 'codex', 'pi', 'dsh'] as const) {
+    assert.deepEqual(store.catalog(cli).map((p) => p.key).sort(), ['kimi.a9', 'kimi.sx'], `${cli}: vertexai is skipped, the rest are listed`);
+  }
+  const claudeSx = store.provider('claude', 'kimi.sx')!;
+  assert.equal(claudeSx.type, 'anthropic');
+  assert.equal(claudeSx.base_url, 'https://sx.example', 'anthropic drops the /v1 segment');
+  assert.equal(claudeSx.declared_type, 'openai');
+  const grokA9 = store.provider('grok', 'kimi.a9')!;
+  assert.equal(grokA9.type, 'openai');
+  assert.equal(grokA9.base_url, 'https://a9.example/v1', 'openai adds /v1 to a bare origin');
+  assert.equal(grokA9.declared_type, 'anthropic');
+  const codexSx = store.provider('codex', 'kimi.sx')!;
+  assert.equal(codexSx.type, 'openai_responses');
+  assert.equal(codexSx.base_url, 'https://sx.example/v1');
+  const piA9 = store.provider('pi', 'kimi.a9')!;
+  assert.equal(piA9.type, 'anthropic', 'a CLI that speaks the declared type keeps it');
+  assert.equal(piA9.declared_type, undefined);
   assert.ok(!JSON.stringify(store.catalog('pi')).includes('sk-kimi'));
   assert.equal(store.injectionFor('claude', 'kimi.a9').args[0], '--settings');
+  assert.equal(store.injectionFor('grok', 'kimi.a9').env.GROK_MODELS_BASE_URL, 'https://a9.example/v1');
 }, kimiSource()));
 
 test('kimi load failure leaves the gateway catalog usable', async () => {
@@ -253,215 +267,3 @@ test('forCli binds every helper to one CLI', () => withStore((store) => {
   assert.equal(view.cliProviderId('relay'), 'gw-relay');
   assert.equal(view.fingerprint(), store.catalogFingerprint('pi'));
 }));
-
-test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, cache results, and expose diagnostics', async () => {
-  const { createServer } = await import('node:http');
-  let probeHits = 0;
-  const server = createServer((req, res) => {
-    probeHits += 1;
-    const url = req.url ?? '/';
-    if (url.startsWith('/multi/v1/') && !url.includes('__mag_probe_')) {
-      // Simulates relays like a9/avt supporting all 3 protocols.
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: 'Missing model' } }));
-      return;
-    }
-    if (url === '/ds/anthropic/v1/messages') {
-      // Anthropic-compatible API mounted beside the OpenAI one (DeepSeek-style layout).
-      res.writeHead(422, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error' } }));
-      return;
-    }
-    if (url.startsWith('/ds/v1/')) {
-      if (url.endsWith('/messages') || url.includes('__mag_probe_')) {
-        res.writeHead(404, { 'content-type': 'application/json' });
-        res.end('Not Found');
-        return;
-      }
-      res.writeHead(422, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ detail: 'model required' }));
-      return;
-    }
-    if (url.startsWith('/html/')) {
-      // Front proxy that answers every path with an HTML auth page: proves nothing.
-      res.writeHead(401, { 'content-type': 'text/html' });
-      res.end('<html><head><title>401 Authorization Required</title></head></html>');
-      return;
-    }
-    if (url.startsWith('/broke/v1/')) {
-      res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ code: 'INSUFFICIENT_BALANCE', message: 'Insufficient account balance' }));
-      return;
-    }
-    if (url.startsWith('/any/')) {
-      // Answers every path, made-up ones included, with the same JSON 400.
-      res.writeHead(400, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'bad request' }));
-      return;
-    }
-    if (url.startsWith('/flaky/')) {
-      res.writeHead(502, { 'content-type': 'text/html' });
-      res.end('<html><head><title>502 Bad Gateway</title></head></html>');
-      return;
-    }
-    if (url.startsWith('/cf/')) {
-      res.writeHead(403, { 'content-type': 'text/html' });
-      res.end('<html><title>Attention Required! | Cloudflare</title></html>');
-      return;
-    }
-    res.writeHead(404, { 'content-type': 'text/plain' });
-    res.end('Not Found');
-  });
-
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  const payload = {
-    providers: {
-      a9: { baseUrl: `http://127.0.0.1:${port}/multi`, type: 'anthropic', apiKey: 'sk-a9' },
-      ds: { baseUrl: `http://127.0.0.1:${port}/ds`, type: 'openai', apiKey: 'sk-ds' },
-      cf: { baseUrl: `http://127.0.0.1:${port}/cf/v1`, type: 'openai', apiKey: 'sk-cf' },
-      html: { baseUrl: `http://127.0.0.1:${port}/html`, type: 'anthropic', apiKey: 'sk-html' },
-      broke: { baseUrl: `http://127.0.0.1:${port}/broke/v1`, type: 'openai', apiKey: 'sk-broke' },
-      any: { baseUrl: `http://127.0.0.1:${port}/any/v1`, type: 'openai', apiKey: 'sk-any' },
-      flaky: { baseUrl: `http://127.0.0.1:${port}/flaky/v1`, type: 'openai', apiKey: 'sk-flaky' },
-    },
-    models: {
-      'a9/gemini-3.8-flash': { provider: 'a9', model: 'gemini-3.8-flash', maxContextSize: 1000000 },
-      'ds/deepseek-chat': { provider: 'ds', model: 'deepseek-chat', maxContextSize: 64000 },
-      'cf/gpt-5': { provider: 'cf', model: 'gpt-5', maxContextSize: 128000 },
-      'html/m': { provider: 'html', model: 'm' },
-      'broke/m': { provider: 'broke', model: 'm' },
-      'any/m': { provider: 'any', model: 'm' },
-      'flaky/m': { provider: 'flaky', model: 'm' },
-    },
-  };
-
-  try {
-    const dir = await mkdtemp(join(tmpdir(), 'mag-probe-cache-'));
-    try {
-      const source1 = new KimiProviderSource({
-        home: '/nonexistent-kimi-home',
-        run: async () => JSON.stringify(payload),
-        probe: undefined,
-      });
-      // Constructor skipped default live probe when `run` is passed; test live HTTP probe via defaultProbeKimiProvider.
-      const { defaultProbeKimiProvider } = await import('./provider-store.js');
-      const liveProbed = new KimiProviderSource({
-        home: '/nonexistent-kimi-home',
-        run: async () => JSON.stringify(payload),
-        probe: (t) => defaultProbeKimiProvider(t, 2_000),
-      });
-      const store = new ProviderStore(dir, { kimi: liveProbed });
-      await store.ready(5_000);
-
-      // a9 (declared anthropic) probed all 3 -> available in codex, claude, grok, pi, dsh!
-      // ds (declared openai) also serves Anthropic under /anthropic -> joins claude too.
-      // html/any/broke prove nothing, so they keep their declared type with a warning.
-      assert.deepEqual(store.catalog('claude').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds', 'kimi.html']);
-      assert.deepEqual(store.catalog('codex').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds']);
-      assert.deepEqual(store.catalog('grok').map((p) => p.key).sort(), ['kimi.a9', 'kimi.any', 'kimi.broke', 'kimi.cf', 'kimi.ds', 'kimi.flaky']);
-      assert.match(store.catalog('grok').find((p) => p.key === 'kimi.flaky')!.probe_warning ?? '', /502/, 'a 5xx page is a transient failure, not "unsupported"');
-
-      const claudeDs = store.catalog('claude').find((p) => p.key === 'kimi.ds')!;
-      assert.equal(claudeDs.base_url, `http://127.0.0.1:${port}/ds/anthropic`);
-      assert.deepEqual(claudeDs.detected_types, ['openai', 'openai_responses', 'anthropic']);
-      assert.equal(store.catalog('grok').find((p) => p.key === 'kimi.ds')!.base_url, `http://127.0.0.1:${port}/ds/v1`);
-
-      const html = store.catalog('claude').find((p) => p.key === 'kimi.html')!;
-      assert.equal(html.detected_types, undefined, 'HTML auth pages are not protocol evidence');
-      assert.match(html.probe_warning ?? '', /未探测/);
-      assert.match(store.catalog('grok').find((p) => p.key === 'kimi.broke')!.probe_warning ?? '', /余额/);
-      assert.match(store.catalog('grok').find((p) => p.key === 'kimi.any')!.probe_warning ?? '', /任意路径/);
-
-      // Check per-protocol URL resolution (multi without /v1 -> /v1 for OpenAI/Responses, stripped for Anthropic).
-      const codexA9 = store.catalog('codex').find((p) => p.key === 'kimi.a9')!;
-      assert.equal(codexA9.type, 'openai_responses');
-      assert.equal(codexA9.base_url, `http://127.0.0.1:${port}/multi/v1`);
-      const grokA9 = store.catalog('grok').find((p) => p.key === 'kimi.a9')!;
-      assert.equal(grokA9.type, 'openai');
-      assert.equal(grokA9.base_url, `http://127.0.0.1:${port}/multi/v1`);
-      const claudeA9 = store.catalog('claude').find((p) => p.key === 'kimi.a9')!;
-      assert.equal(claudeA9.type, 'anthropic');
-      assert.equal(claudeA9.base_url, `http://127.0.0.1:${port}/multi`);
-
-      // Cloudflare-blocked provider keeps declared type fallback + diagnostic warning.
-      const cf = store.catalog('grok').find((p) => p.key === 'kimi.cf')!;
-      assert.match(cf.probe_warning ?? '', /防火墙/);
-
-      // Cache file exists with 0600 permissions and contains no raw API keys; second store reuses cache with 0 probe hits.
-      const cachePath = join(dir, 'providers', 'kimi-probe-cache.json');
-      assert.equal((await stat(cachePath)).mode & 0o777, 0o600);
-      assert.ok(!(await readFile(cachePath, 'utf8')).includes('sk-a9'));
-
-      const hitsBeforeReload = probeHits;
-      const sourceCached = new KimiProviderSource({
-        home: '/nonexistent-kimi-home',
-        run: async () => JSON.stringify(payload),
-        probe: (t) => defaultProbeKimiProvider(t, 2_000),
-      });
-      const store2 = new ProviderStore(dir, { kimi: sourceCached });
-      await store2.ready(5_000);
-      assert.equal(probeHits, hitsBeforeReload, 'second load reuses persisted probe cache');
-      assert.deepEqual(store2.catalog('codex').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds']);
-
-      void source1;
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
-
-test('probe honours HTTP_PROXY like the CLIs do (relays may block the direct egress)', async () => {
-  const { createServer } = await import('node:http');
-  const seen: string[] = [];
-  // Plays both roles: as a forward proxy it receives absolute-form request targets.
-  const proxy = createServer((req, res) => {
-    seen.push(req.url ?? '');
-    const viaProxy = /^http:\/\//.test(req.url ?? '');
-    const path = viaProxy ? new URL(req.url!).pathname : (req.url ?? '');
-    if (!viaProxy) {
-      res.writeHead(403, { 'content-type': 'text/html' });
-      res.end('<html><title>Attention Required! | Cloudflare</title></html>');
-      return;
-    }
-    if (path.includes('__mag_probe_') || path.endsWith('/messages')) {
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end('{}');
-      return;
-    }
-    res.writeHead(400, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: 'model required' }));
-  });
-  await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
-  const port = (proxy.address() as { port: number }).port;
-  const { spawn } = await import('node:child_process');
-  // A fresh process: probe agents read process.env once, and NO_PROXY must not cover the target.
-  const script = `
-    import { defaultProbeKimiProvider } from ${JSON.stringify(new URL('./provider-store.js', import.meta.url).href)};
-    const r = await defaultProbeKimiProvider({ baseUrl: 'http://relay.invalid/v1', apiKey: 'k' }, 2000);
-    process.stdout.write(JSON.stringify(r));
-  `;
-  try {
-    const out = await new Promise<string>((resolve, reject) => {
-      const env = { ...process.env, HTTP_PROXY: `http://127.0.0.1:${port}`, http_proxy: `http://127.0.0.1:${port}`, NO_PROXY: '', no_proxy: '' };
-      const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-      let stdout = '';
-      let stderr = '';
-      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('probe child timed out')); }, 15_000);
-      child.stdout.on('data', (c) => { stdout += c; });
-      child.stderr.on('data', (c) => { stderr += c; });
-      child.on('close', (code) => {
-        clearTimeout(timer);
-        if (code === 0) resolve(stdout);
-        else reject(new Error(`probe child exited ${code}: ${stderr}`));
-      });
-    });
-    const report = JSON.parse(out) as { supported: Array<{ type: string }> };
-    assert.deepEqual(report.supported.map((s) => s.type).sort(), ['openai', 'openai_responses']);
-    assert.ok(seen.length > 0 && seen.every((u) => u.startsWith('http://relay.invalid/')), `all probe requests went through the proxy: ${seen.join(', ')}`);
-  } finally {
-    await new Promise<void>((resolve) => proxy.close(() => resolve()));
-  }
-});

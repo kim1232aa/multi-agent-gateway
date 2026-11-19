@@ -12,7 +12,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 import type { ProviderAdapter, ProviderCapabilities, NativeModel, NativeCommand, Session, SessionPage, Message, StartTurnInput, TurnHandle, ApprovalDecision, HistoryQuery, ListSessionsQuery, CreateSessionInput, SubagentInfo } from './types.js';
 import type { TranscriptTask } from './local-transcript.js';
-import { activeKimiTier1Names, collectSessionWireTasks, detectAvailableProviders, executeCodexCommand, formatCodexAccountUsage, parseWireThinkingPatch, renderCodexUsage, SessionHub, skillDto, startGateway } from './gateway.js';
+import { activeKimiTier1Names, collectSessionWireTasks, detectAvailableProviders, executeCodexCommand, formatCodexAccountUsage, parseWireThinkingPatch, protocolMismatchHint, renderCodexUsage, SessionHub, skillDto, startGateway } from './gateway.js';
 import { KimiProviderSource } from './provider-store.js';
 
 const capabilities: ProviderCapabilities = { streaming: true, thinking: true, tools: true, approvals: false, questions: false, interrupt: true, history: true };
@@ -1148,6 +1148,75 @@ test('streams local assistant deltas with official offsets reset for each step',
   } finally {
     ws?.close();
     await gateway.close();
+  }
+});
+
+test('a failed turn on a Kimi provider spoken in another protocol gets a mismatch hint; others do not', async () => {
+  const settingsDir = await mkdtemp(join(tmpdir(), 'multi-agent-mismatch-hint-'));
+  const grok = fakeAdapter('grok') as any;
+  grok.startTurn = async (): Promise<TurnHandle> => ({
+    turnId: 'fail-turn',
+    events: (async function* () {
+      const base = { sessionId: 'grok-native', turnId: 'fail-turn', timestamp: Date.now() };
+      yield { ...base, kind: 'turn', status: 'failed', payload: { reason: 'failed', error: 'HTTP 404 Not Found' } } as any;
+    })(),
+  });
+  const kimiProviders = new KimiProviderSource({
+    home: settingsDir,
+    run: async () => JSON.stringify({
+      providers: { a9: { type: 'anthropic', baseUrl: 'https://a9.example', apiKey: 'sk-kimi-secret' } },
+      models: { 'a9/m-one': { provider: 'a9', model: 'm-one', maxContextSize: 200000 } },
+    }),
+  });
+  const gateway = await startGateway({
+    host: '127.0.0.1', port: 0, token: 'test-token', kimi: 'off', settingsDir, kimiProviders,
+    codex: fakeAdapter('codex') as any, claude: fakeAdapter('claude') as any, grok, pi: fakeAdapter('pi') as any,
+    availableProviders: ['kimi', 'claude', 'codex', 'grok', 'pi'],
+  });
+  const runFailedTurn = async (): Promise<string[]> => {
+    const frames: Array<Record<string, any>> = [];
+    const ws = new WebSocket(`${gateway.url.replace(/^http/, 'ws')}/api/v1/ws?provider=grok`, ['kimi-code.bearer.test-token']);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('subscribe timed out')), 1_500);
+        ws.onopen = () => ws.send(JSON.stringify({ type: 'client_hello', id: 'sub', payload: { client_id: 'hint-test', subscriptions: ['grok_grok-native'] } }));
+        ws.onmessage = (event) => {
+          const frame = JSON.parse(String(event.data)) as Record<string, any>;
+          frames.push(frame);
+          if (frame.type === 'ack' && frame.id === 'sub') { clearTimeout(t); resolve(); }
+        };
+      });
+      const ended = new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('turn timed out')), 1_500);
+        const prev = ws.onmessage!;
+        ws.onmessage = (event) => {
+          prev.call(ws, event);
+          if (JSON.parse(String(event.data)).type === 'turn.ended') { clearTimeout(t); resolve(); }
+        };
+      });
+      const response = await fetch(`${gateway.url}/api/v1/sessions/grok_grok-native/prompts`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+        body: JSON.stringify({ content: [{ type: 'text', text: 'hi' }] }),
+      });
+      assert.equal(response.status, 200);
+      await ended;
+      return frames.filter((f) => f.type === 'assistant.delta').map((f) => String(f.payload.delta));
+    } finally {
+      ws.close();
+    }
+  };
+  try {
+    await grok.setModel('grok-native', '@kimi.a9:m-one');
+    const withHint = (await runFailedTurn()).join('');
+    assert.match(withHint, /kimi\.a9 在 Kimi 里声明的协议是 anthropic，Grok 只能用 openai 协议访问 https:\/\/a9\.example\/v1/);
+
+    await grok.setModel('grok-native', 'grok-4.6');
+    const native = (await runFailedTurn()).join('');
+    assert.doesNotMatch(native, /声明的协议/, 'the CLI\'s own model gets no protocol hint');
+  } finally {
+    await gateway.close();
+    await rm(settingsDir, { recursive: true, force: true });
   }
 });
 
@@ -2872,9 +2941,18 @@ test('kimi providers are listed read-only, selectable as default, and never leak
     assert.ok(!JSON.stringify(picked.body).includes('sk-kimi-secret'));
     assert.equal(changed, 1);
 
-    // grok 只能用 openai 协议,anthropic 的 Kimi 供应商不出现。
+    // Kimi 供应商不按声明类型过滤:grok 用自己的 openai 协议访问同一个 URL,协议不通由中转站报错。
     const grokList = await call('GET', '/providers?provider=grok');
-    assert.deepEqual(grokList.body.data.items.map((p: any) => p.id), ['grok']);
+    assert.deepEqual(grokList.body.data.items.map((p: any) => p.id), ['grok', 'kimi.a9']);
+    const grokA9 = grokList.body.data.items[1];
+    assert.equal(grokA9.type, 'openai');
+    assert.equal(grokA9.base_url, 'https://a9.example/v1');
+    assert.equal(grokA9.declared_type, 'anthropic');
+
+    // A failed turn on that provider explains the protocol mismatch under the CLI's own error.
+    const hint = protocolMismatchHint('grok', { key: 'kimi.a9', source: 'kimi', id: 'a9', label: 'kimi.a9', type: 'openai', base_url: 'https://a9.example/v1', models: [], declared_type: 'anthropic' });
+    assert.match(hint ?? '', /kimi\.a9.*anthropic.*Grok.*openai.*https:\/\/a9\.example\/v1/s);
+    assert.equal(protocolMismatchHint('claude', { key: 'kimi.a9', source: 'kimi', id: 'a9', label: 'kimi.a9', type: 'anthropic', base_url: 'https://a9.example', models: [] }), undefined, 'declared protocol: no hint');
   } finally {
     await gateway.close();
     await rm(settingsDir, { recursive: true, force: true });
