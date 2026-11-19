@@ -25,6 +25,8 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { Agent as HttpAgent, request as httpRequest } from 'node:http';
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -289,6 +291,54 @@ const CLOUDFLARE_RE = /cloudflare|attention required|just a moment|error code: 1
 
 type ProbeOutcome = 'supported' | 'unsupported' | 'blocked';
 
+/**
+ * The CLIs reach providers through the user's HTTP(S)_PROXY, so the probe must too: relays
+ * behind Cloudflare often block the direct egress IP and admit the proxy one. Global `fetch`
+ * ignores those variables unless NODE_USE_ENV_PROXY is set; an agent with `proxyEnv`
+ * (Node ≥ 22.21 / 24.5) honours HTTP(S)_PROXY and NO_PROXY per request. Older Node ignores
+ * the option and connects directly.
+ */
+let probeAgents: { http: HttpAgent; https: HttpsAgent } | undefined;
+
+function probeAgentFor(protocol: string): HttpAgent | HttpsAgent {
+  probeAgents ??= {
+    http: new HttpAgent({ proxyEnv: process.env }),
+    https: new HttpsAgent({ proxyEnv: process.env }),
+  };
+  return protocol === 'https:' ? probeAgents.https : probeAgents.http;
+}
+
+function probePost(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<{ status: number; contentType: string; body: string }> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
+    const req = send(target, {
+      method: 'POST',
+      headers: { ...headers, 'content-length': '2' },
+      agent: probeAgentFor(target.protocol),
+      signal: AbortSignal.timeout(timeoutMs),
+    }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => {
+        if (body.length < 4096) body += chunk;
+      });
+      res.on('end', () => resolve({
+        status: res.statusCode ?? 0,
+        contentType: String(res.headers['content-type'] ?? ''),
+        body: body.slice(0, 4096),
+      }));
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.end('{}');
+  });
+}
+
 function looksLikeJson(contentType: string, body: string): boolean {
   if (/json/i.test(contentType)) return true;
   const t = body.trimStart();
@@ -316,10 +366,7 @@ async function probeSingleWireEndpoint(
   let contentType: string;
   let body: string;
   try {
-    const res = await fetch(url, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(timeoutMs) });
-    status = res.status;
-    contentType = res.headers.get('content-type') ?? '';
-    body = (await res.text().catch(() => '')).slice(0, 4096);
+    ({ status, contentType, body } = await probePost(url, headers, timeoutMs));
   } catch {
     return { outcome: 'blocked', warning: '探测超时或网络不可达' };
   }
@@ -327,7 +374,10 @@ async function probeSingleWireEndpoint(
   const json = looksLikeJson(contentType, body);
   if (!json) {
     if (status === 403 && CLOUDFLARE_RE.test(body)) {
-      return { outcome: 'blocked', warning: 'Cloudflare 拦截了网关的探测请求 (HTTP 403)，协议未验证' };
+      return {
+        outcome: 'blocked',
+        warning: '站点防火墙拦截了网关的探测请求 (HTTP 403，常见原因是出口 IP 或 User-Agent)，协议未验证；CLI 走自己的网络和代理，可能不受影响',
+      };
     }
     if (status >= 500) return { outcome: 'blocked', warning: `上游暂时不可用 (HTTP ${status})` };
     return { outcome: 'unsupported' };

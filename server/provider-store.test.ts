@@ -386,7 +386,7 @@ test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, ca
 
       // Cloudflare-blocked provider keeps declared type fallback + diagnostic warning.
       const cf = store.catalog('grok').find((p) => p.key === 'kimi.cf')!;
-      assert.match(cf.probe_warning ?? '', /Cloudflare/i);
+      assert.match(cf.probe_warning ?? '', /防火墙/);
 
       // Cache file exists with 0600 permissions and contains no raw API keys; second store reuses cache with 0 probe hits.
       const cachePath = join(dir, 'providers', 'kimi-probe-cache.json');
@@ -410,5 +410,58 @@ test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, ca
     }
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('probe honours HTTP_PROXY like the CLIs do (relays may block the direct egress)', async () => {
+  const { createServer } = await import('node:http');
+  const seen: string[] = [];
+  // Plays both roles: as a forward proxy it receives absolute-form request targets.
+  const proxy = createServer((req, res) => {
+    seen.push(req.url ?? '');
+    const viaProxy = /^http:\/\//.test(req.url ?? '');
+    const path = viaProxy ? new URL(req.url!).pathname : (req.url ?? '');
+    if (!viaProxy) {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><title>Attention Required! | Cloudflare</title></html>');
+      return;
+    }
+    if (path.includes('__mag_probe_') || path.endsWith('/messages')) {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{}');
+      return;
+    }
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'model required' }));
+  });
+  await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  const port = (proxy.address() as { port: number }).port;
+  const { spawn } = await import('node:child_process');
+  // A fresh process: probe agents read process.env once, and NO_PROXY must not cover the target.
+  const script = `
+    import { defaultProbeKimiProvider } from ${JSON.stringify(new URL('./provider-store.js', import.meta.url).href)};
+    const r = await defaultProbeKimiProvider({ baseUrl: 'http://relay.invalid/v1', apiKey: 'k' }, 2000);
+    process.stdout.write(JSON.stringify(r));
+  `;
+  try {
+    const out = await new Promise<string>((resolve, reject) => {
+      const env = { ...process.env, HTTP_PROXY: `http://127.0.0.1:${port}`, http_proxy: `http://127.0.0.1:${port}`, NO_PROXY: '', no_proxy: '' };
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('probe child timed out')); }, 15_000);
+      child.stdout.on('data', (c) => { stdout += c; });
+      child.stderr.on('data', (c) => { stderr += c; });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve(stdout);
+        else reject(new Error(`probe child exited ${code}: ${stderr}`));
+      });
+    });
+    const report = JSON.parse(out) as { supported: Array<{ type: string }> };
+    assert.deepEqual(report.supported.map((s) => s.type).sort(), ['openai', 'openai_responses']);
+    assert.ok(seen.length > 0 && seen.every((u) => u.startsWith('http://relay.invalid/')), `all probe requests went through the proxy: ${seen.join(', ')}`);
+  } finally {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
   }
 });
