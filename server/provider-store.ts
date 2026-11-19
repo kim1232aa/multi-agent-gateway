@@ -36,7 +36,12 @@ const CLIS: readonly InjectableCli[] = ['codex', 'claude', 'grok', 'pi', 'dsh'];
 /** Wire protocol names the Kimi Web provider form offers (Z4e in the bundle). */
 export type WireProviderType = 'kimi' | 'openai' | 'openai_responses' | 'anthropic' | 'google-genai' | 'vertexai';
 
-/** Which protocols each CLI can actually speak through its injection surface (verified per CLI). */
+/**
+ * Which protocols each CLI can actually speak through its injection surface (verified per CLI).
+ * Grok's `responses`/`messages` backends exist, but only as `[model.*]` tables, which the
+ * `GROK_CONFIG` overlay drops (user-guide/05-configuration.md allowlist); without editing
+ * ~/.grok/config.toml the reachable surface is `GROK_MODELS_BASE_URL`, i.e. chat completions.
+ */
 export const SUPPORTED_TYPES: Record<InjectableCli, readonly WireProviderType[]> = {
   codex: ['openai_responses'],
   claude: ['anthropic'],
@@ -270,53 +275,99 @@ export interface KimiProviderSourceOptions {
 
 const PROBE_OK_TTL_MS = 6 * 60 * 60_000;
 const PROBE_WARN_TTL_MS = 10 * 60_000;
-const HTTP_PROBE_TYPES: readonly ('openai' | 'openai_responses' | 'anthropic')[] = ['openai', 'openai_responses', 'anthropic'];
+/** Bumped when the probe logic changes, so cached verdicts from older logic are not reused. */
+const PROBE_VERSION = 'v2';
+type HttpProbeType = 'openai' | 'openai_responses' | 'anthropic';
+const HTTP_PROBE_TYPES: readonly HttpProbeType[] = ['openai', 'openai_responses', 'anthropic'];
+const PROBE_SUFFIX: Record<HttpProbeType, string> = {
+  openai: '/chat/completions',
+  openai_responses: '/responses',
+  anthropic: '/v1/messages',
+};
+const BALANCE_RE = /insufficient|balance|quota|credit|余额|欠费/i;
+const CLOUDFLARE_RE = /cloudflare|attention required|just a moment|error code: 10\d\d/i;
 
+type ProbeOutcome = 'supported' | 'unsupported' | 'blocked';
+
+function looksLikeJson(contentType: string, body: string): boolean {
+  if (/json/i.test(contentType)) return true;
+  const t = body.trimStart();
+  if (!t.startsWith('{') && !t.startsWith('[')) return false;
+  try { JSON.parse(body); return true; } catch { return false; }
+}
+
+/**
+ * POST `{}` and read the verdict from the reply. Only a JSON reply proves an API answered:
+ * reverse proxies and web front-ends answer unknown paths with HTML 401/404/200 pages, which
+ * say nothing about the protocol.
+ */
 async function probeSingleWireEndpoint(
   url: string,
-  protocol: 'openai' | 'openai_responses' | 'anthropic',
+  protocol: HttpProbeType,
   apiKey: string,
   timeoutMs: number,
-): Promise<{ outcome: 'supported' | 'unsupported' | 'blocked'; warning?: string }> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+): Promise<{ outcome: ProbeOutcome; warning?: string }> {
+  const headers: Record<string, string> = { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` };
   if (protocol === 'anthropic') {
     headers['x-api-key'] = apiKey;
     headers['anthropic-version'] = '2023-06-01';
-    headers.authorization = `Bearer ${apiKey}`;
-  } else {
-    headers.authorization = `Bearer ${apiKey}`;
   }
+  let status: number;
+  let contentType: string;
+  let body: string;
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: '{}',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (res.status === 200 || res.status === 400 || res.status === 422) {
-      return { outcome: 'supported' };
-    }
-    if (res.status === 402) {
-      return { outcome: 'supported', warning: '账户余额不足 (HTTP 402)' };
-    }
-    if (res.status === 404 || res.status === 405 || res.status === 501) {
-      return { outcome: 'unsupported' };
-    }
-    const snippet = await res.text().catch(() => '');
-    const lower = snippet.slice(0, 1024).toLowerCase();
-    if (res.status === 403 && (lower.includes('cloudflare') || lower.includes('attention required') || lower.includes('just a moment'))) {
-      return { outcome: 'blocked', warning: 'Cloudflare 人机拦截 (HTTP 403)' };
-    }
-    if (res.status === 401) {
-      return { outcome: 'blocked', warning: 'API Key 未授权 (HTTP 401)' };
-    }
-    if (res.status === 403) {
-      return { outcome: 'blocked', warning: 'HTTP 403 访问被拒' };
-    }
-    return { outcome: 'blocked', warning: `HTTP ${res.status}` };
+    const res = await fetch(url, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(timeoutMs) });
+    status = res.status;
+    contentType = res.headers.get('content-type') ?? '';
+    body = (await res.text().catch(() => '')).slice(0, 4096);
   } catch {
     return { outcome: 'blocked', warning: '探测超时或网络不可达' };
   }
+  if (status === 404 || status === 405 || status === 501) return { outcome: 'unsupported' };
+  const json = looksLikeJson(contentType, body);
+  if (!json) {
+    if (status === 403 && CLOUDFLARE_RE.test(body)) {
+      return { outcome: 'blocked', warning: 'Cloudflare 拦截了网关的探测请求 (HTTP 403)，协议未验证' };
+    }
+    if (status >= 500) return { outcome: 'blocked', warning: `上游暂时不可用 (HTTP ${status})` };
+    return { outcome: 'unsupported' };
+  }
+  if (status >= 200 && status < 300) return { outcome: 'supported' };
+  if (status === 400 || status === 422) return { outcome: 'supported' };
+  if (status === 402 || ((status === 403 || status === 429) && BALANCE_RE.test(body))) {
+    return { outcome: 'supported', warning: `账户余额不足 (HTTP ${status})` };
+  }
+  if (status === 429) return { outcome: 'supported', warning: '被限流 (HTTP 429)' };
+  if (status === 401) return { outcome: 'blocked', warning: 'API Key 未授权 (HTTP 401)' };
+  if (status === 403) return { outcome: 'blocked', warning: 'HTTP 403 访问被拒' };
+  return { outcome: 'blocked', warning: `HTTP ${status}` };
+}
+
+/**
+ * Base URLs to try for one protocol, most likely first. OpenAI-style endpoints live at the
+ * configured path (or under `/v1`). Anthropic-compatible endpoints are often mounted beside the
+ * OpenAI one under an `anthropic` segment, so every ancestor of the configured path is tried
+ * both bare and with `/anthropic` appended. No vendor names: any relay following the
+ * convention is found.
+ */
+function probeBases(clean: string, protocol: HttpProbeType): string[] {
+  const out: string[] = [];
+  const add = (u: string) => { if (!out.includes(u)) out.push(u); };
+  if (protocol !== 'anthropic') {
+    const primary = baseUrlForWireType(clean, protocol);
+    add(primary);
+    if (!/\/v\d+$/.test(primary)) add(`${stripV1(primary)}/v1`);
+    return out;
+  }
+  let url: URL;
+  try { url = new URL(clean); } catch { return [stripV1(clean)]; }
+  const segments = url.pathname.replace(/\/+$/, '').replace(/\/v\d+$/i, '').split('/').filter(Boolean);
+  for (let depth = segments.length; depth >= 0; depth--) {
+    const prefix = `${url.origin}${segments.slice(0, depth).map((s) => `/${s}`).join('')}`;
+    add(prefix);
+    if (segments[depth - 1]?.toLowerCase() !== 'anthropic') add(`${prefix}/anthropic`);
+  }
+  return out.slice(0, 6);
 }
 
 export async function defaultProbeKimiProvider(
@@ -324,40 +375,39 @@ export async function defaultProbeKimiProvider(
   timeoutMs = 3_500,
 ): Promise<KimiProbeReport> {
   const clean = target.baseUrl.trim().replace(/\/+$/, '');
+  // Control request: a server that answers a made-up path with a "supported" verdict would make
+  // every real probe meaningless, so its 4xx replies cannot be trusted.
+  const control = await probeSingleWireEndpoint(
+    `${baseUrlForWireType(clean, 'openai')}/__mag_probe_${randomBytes(4).toString('hex')}`,
+    'openai',
+    target.apiKey,
+    timeoutMs,
+  );
+  if (control.outcome === 'supported') {
+    const reason = control.warning?.includes('余额')
+      ? control.warning
+      : '该地址对任意路径都返回相同响应，无法判定协议，按声明类型使用';
+    return { supported: [], blocked_reason: reason, checked_at: Date.now() };
+  }
   const tasks = HTTP_PROBE_TYPES.map(async (protocol) => {
-    const primaryBase = baseUrlForWireType(clean, protocol);
-    const suffix = protocol === 'openai'
-      ? '/chat/completions'
-      : protocol === 'openai_responses'
-        ? '/responses'
-        : '/v1/messages';
-    let baseUsed = primaryBase;
-    let res = await probeSingleWireEndpoint(`${primaryBase}${suffix}`, protocol, target.apiKey, timeoutMs);
-    if (res.outcome === 'unsupported' && protocol !== 'anthropic' && !/\/v\d+$/.test(primaryBase)) {
-      const withV1 = `${stripV1(primaryBase)}/v1`;
-      const retry = await probeSingleWireEndpoint(`${withV1}${suffix}`, protocol, target.apiKey, timeoutMs);
-      if (retry.outcome !== 'unsupported') {
-        baseUsed = withV1;
-        res = retry;
-      }
-    }
-    return { protocol, baseUsed, ...res };
+    const bases = probeBases(clean, protocol);
+    const results = await Promise.all(bases.map((base) =>
+      probeSingleWireEndpoint(`${base}${PROBE_SUFFIX[protocol]}`, protocol, target.apiKey, timeoutMs)));
+    const hit = results.findIndex((r) => r.outcome === 'supported');
+    if (hit >= 0) return { protocol, base: bases[hit]!, ...results[hit]! };
+    return { protocol, base: bases[0]!, ...(results.find((r) => r.outcome === 'blocked') ?? results[0]!) };
   });
 
   const results = await Promise.all(tasks);
   const supported: KimiProtocolSupport[] = [];
   const warnings: string[] = [];
   for (const r of results) {
-    if (r.outcome === 'supported') {
-      supported.push({ type: r.protocol, base_url: r.baseUsed });
-    }
-    if (r.warning && !warnings.includes(r.warning)) {
-      warnings.push(r.warning);
-    }
+    if (r.outcome === 'supported') supported.push({ type: r.protocol, base_url: r.base });
+    if (r.warning && !warnings.includes(r.warning)) warnings.push(r.warning);
   }
   const blocked_reason = supported.length === 0
-    ? (warnings[0] ?? undefined)
-    : warnings.find((w) => w.includes('402'));
+    ? (warnings[0] ?? '未探测到可用的协议接口，按声明类型使用')
+    : warnings.find((w) => w.includes('余额') || w.includes('限流'));
   return {
     supported,
     ...(blocked_reason ? { blocked_reason } : {}),
@@ -520,6 +570,7 @@ export class KimiProviderSource {
         const parsed = parseKimiProviderList(JSON.parse(stdout));
         const probeFn = this.probeFn;
         let cacheDirty = false;
+        const liveKeys = new Set<string>();
         if (probeFn) this.ensureCacheLoaded();
 
         const nextProviders = await Promise.all(parsed.map(async (p) => {
@@ -536,8 +587,9 @@ export class KimiProviderSource {
             };
           }
           const cacheKey = createHash('sha256')
-            .update(`${p.id}\0${p.type}\0${p.base_url}\0${p.apiKey}`)
+            .update(`${PROBE_VERSION}\0${p.id}\0${p.type}\0${p.base_url}\0${p.apiKey}`)
             .digest('hex');
+          liveKeys.add(cacheKey);
           const cached = !forceProbe ? this.probeCache.get(cacheKey) : undefined;
           const now = Date.now();
           const ttl = cached && (cached.blocked_reason || cached.supported.length === 0) ? PROBE_WARN_TTL_MS : PROBE_OK_TTL_MS;
@@ -579,6 +631,14 @@ export class KimiProviderSource {
           };
         }));
 
+        if (probeFn) {
+          for (const key of [...this.probeCache.keys()]) {
+            if (!liveKeys.has(key)) {
+              this.probeCache.delete(key);
+              cacheDirty = true;
+            }
+          }
+        }
         if (cacheDirty) this.saveCache();
         this.providers = nextProviders;
         this.error = undefined;

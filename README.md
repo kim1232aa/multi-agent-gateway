@@ -69,7 +69,14 @@
 | Pi | openai / anthropic / google | 生成 `--extension` 脚本，用 `registerProvider` 一次注册所有供应商 | RPC `set_model` 随时切换 |
 | DSH | openai / anthropic | 合并补丁（见下） | ACP `session/set_config_option` 随时切换 |
 
-同一个中转站同时提供两种协议时（例如 DeepSeek 的 OpenAI 地址 `https://api.deepseek.com` 和 Anthropic 地址 `https://api.deepseek.com/anthropic`），在 Kimi 或网关里按两个供应商各配一次即可，Claude 会看到 anthropic 那个，Grok 看到 openai 那个。
+**Kimi 供应商的协议自动探测**：Kimi 里填的类型只是声明，很多中转站同一个地址能说好几种协议。网关对每个 Kimi 供应商用空请求探测三个接口：`/chat/completions`、`/responses` 和 Anthropic 的 `/v1/messages`；Anthropic 接口会沿配置地址的每一级路径试一次带 `/anthropic` 和不带的版本（例如 DeepSeek 的 `https://api.deepseek.com/anthropic`）。规则是通用的，不认厂商名，增删供应商后自动重新探测。判定依据：
+
+- 只有返回 JSON 的 2xx / 400 / 422 才算支持；HTML 页面（反向代理的 401/404 页）不算证据。
+- 先请求一个随机的不存在路径做对照；对任意路径都回同样错误的服务器不可信，按声明类型使用。
+- 402，或带 balance / quota 字样的 403/429，算「协议支持但余额不足」，供应商照常列出并附提示。
+- Cloudflare 拦截、5xx、超时都算「暂时无法验证」，按声明类型使用，10 分钟后重新探测；探测成功的结果缓存 6 小时。
+
+结果缓存在 `<settingsDir>/providers/kimi-probe-cache.json`（0600，只存哈希，不存 key）。设置页的「刷新」会强制重新探测。网关自己添加的供应商不做探测，按填写的类型使用；同一个中转站有两种协议地址时，按两个供应商各配一次即可。
 
 DSH 的补丁层会整段替换某个条目的 `config`，所以网关不能直接用 `--patch` 覆盖 `llm-pi-ai`，否则用户在 DSH 里自己配的供应商会消失。网关的做法是：每次启动 DSH 前，用官方只读命令 `dsh --profile acp --dump-config` 读出用户当前的 `llm-pi-ai` 配置，把网关供应商合并进去（同名时以用户为准，`!!js` 表达式原样保留），写到网关自己的目录后再用 `--patch` 叠加。读取失败时，这次不注入网关供应商并记录日志，绝不覆盖用户配置。
 

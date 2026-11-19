@@ -260,14 +260,20 @@ test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, ca
   const server = createServer((req, res) => {
     probeHits += 1;
     const url = req.url ?? '/';
-    if (url.startsWith('/multi/v1/')) {
+    if (url.startsWith('/multi/v1/') && !url.includes('__mag_probe_')) {
       // Simulates relays like a9/avt supporting all 3 protocols.
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'Missing model' } }));
       return;
     }
+    if (url === '/ds/anthropic/v1/messages') {
+      // Anthropic-compatible API mounted beside the OpenAI one (DeepSeek-style layout).
+      res.writeHead(422, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error' } }));
+      return;
+    }
     if (url.startsWith('/ds/v1/')) {
-      if (url.endsWith('/messages')) {
+      if (url.endsWith('/messages') || url.includes('__mag_probe_')) {
         res.writeHead(404, { 'content-type': 'application/json' });
         res.end('Not Found');
         return;
@@ -276,13 +282,35 @@ test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, ca
       res.end(JSON.stringify({ detail: 'model required' }));
       return;
     }
-    if (url.startsWith('/multi/') || url.startsWith('/ds/')) {
-      res.writeHead(404, { 'content-type': 'text/plain' });
-      res.end('Not Found');
+    if (url.startsWith('/html/')) {
+      // Front proxy that answers every path with an HTML auth page: proves nothing.
+      res.writeHead(401, { 'content-type': 'text/html' });
+      res.end('<html><head><title>401 Authorization Required</title></head></html>');
       return;
     }
-    res.writeHead(403, { 'content-type': 'text/html' });
-    res.end('<html><title>Attention Required! | Cloudflare</title></html>');
+    if (url.startsWith('/broke/v1/')) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code: 'INSUFFICIENT_BALANCE', message: 'Insufficient account balance' }));
+      return;
+    }
+    if (url.startsWith('/any/')) {
+      // Answers every path, made-up ones included, with the same JSON 400.
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'bad request' }));
+      return;
+    }
+    if (url.startsWith('/flaky/')) {
+      res.writeHead(502, { 'content-type': 'text/html' });
+      res.end('<html><head><title>502 Bad Gateway</title></head></html>');
+      return;
+    }
+    if (url.startsWith('/cf/')) {
+      res.writeHead(403, { 'content-type': 'text/html' });
+      res.end('<html><title>Attention Required! | Cloudflare</title></html>');
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('Not Found');
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -292,11 +320,19 @@ test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, ca
       a9: { baseUrl: `http://127.0.0.1:${port}/multi`, type: 'anthropic', apiKey: 'sk-a9' },
       ds: { baseUrl: `http://127.0.0.1:${port}/ds`, type: 'openai', apiKey: 'sk-ds' },
       cf: { baseUrl: `http://127.0.0.1:${port}/cf/v1`, type: 'openai', apiKey: 'sk-cf' },
+      html: { baseUrl: `http://127.0.0.1:${port}/html`, type: 'anthropic', apiKey: 'sk-html' },
+      broke: { baseUrl: `http://127.0.0.1:${port}/broke/v1`, type: 'openai', apiKey: 'sk-broke' },
+      any: { baseUrl: `http://127.0.0.1:${port}/any/v1`, type: 'openai', apiKey: 'sk-any' },
+      flaky: { baseUrl: `http://127.0.0.1:${port}/flaky/v1`, type: 'openai', apiKey: 'sk-flaky' },
     },
     models: {
       'a9/gemini-3.8-flash': { provider: 'a9', model: 'gemini-3.8-flash', maxContextSize: 1000000 },
       'ds/deepseek-chat': { provider: 'ds', model: 'deepseek-chat', maxContextSize: 64000 },
       'cf/gpt-5': { provider: 'cf', model: 'gpt-5', maxContextSize: 128000 },
+      'html/m': { provider: 'html', model: 'm' },
+      'broke/m': { provider: 'broke', model: 'm' },
+      'any/m': { provider: 'any', model: 'm' },
+      'flaky/m': { provider: 'flaky', model: 'm' },
     },
   };
 
@@ -319,9 +355,23 @@ test('kimi providers auto-probe actual endpoints, normalize /v1 per protocol, ca
       await store.ready(5_000);
 
       // a9 (declared anthropic) probed all 3 -> available in codex, claude, grok, pi, dsh!
-      assert.deepEqual(store.catalog('claude').map((p) => p.key), ['kimi.a9']);
+      // ds (declared openai) also serves Anthropic under /anthropic -> joins claude too.
+      // html/any/broke prove nothing, so they keep their declared type with a warning.
+      assert.deepEqual(store.catalog('claude').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds', 'kimi.html']);
       assert.deepEqual(store.catalog('codex').map((p) => p.key).sort(), ['kimi.a9', 'kimi.ds']);
-      assert.deepEqual(store.catalog('grok').map((p) => p.key).sort(), ['kimi.a9', 'kimi.cf', 'kimi.ds']);
+      assert.deepEqual(store.catalog('grok').map((p) => p.key).sort(), ['kimi.a9', 'kimi.any', 'kimi.broke', 'kimi.cf', 'kimi.ds', 'kimi.flaky']);
+      assert.match(store.catalog('grok').find((p) => p.key === 'kimi.flaky')!.probe_warning ?? '', /502/, 'a 5xx page is a transient failure, not "unsupported"');
+
+      const claudeDs = store.catalog('claude').find((p) => p.key === 'kimi.ds')!;
+      assert.equal(claudeDs.base_url, `http://127.0.0.1:${port}/ds/anthropic`);
+      assert.deepEqual(claudeDs.detected_types, ['openai', 'openai_responses', 'anthropic']);
+      assert.equal(store.catalog('grok').find((p) => p.key === 'kimi.ds')!.base_url, `http://127.0.0.1:${port}/ds/v1`);
+
+      const html = store.catalog('claude').find((p) => p.key === 'kimi.html')!;
+      assert.equal(html.detected_types, undefined, 'HTML auth pages are not protocol evidence');
+      assert.match(html.probe_warning ?? '', /未探测/);
+      assert.match(store.catalog('grok').find((p) => p.key === 'kimi.broke')!.probe_warning ?? '', /余额/);
+      assert.match(store.catalog('grok').find((p) => p.key === 'kimi.any')!.probe_warning ?? '', /任意路径/);
 
       // Check per-protocol URL resolution (multi without /v1 -> /v1 for OpenAI/Responses, stripped for Anthropic).
       const codexA9 = store.catalog('codex').find((p) => p.key === 'kimi.a9')!;
